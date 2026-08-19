@@ -12,15 +12,15 @@ language governing permissions and limitations under the License.
 */
 
 // Package baremetalworker holds the CaaS bare-metal worker provisioning controller and the
-// narrow client seam it uses to talk to the fulfillment-service private API.
+// narrow client seams it uses to talk to its external dependencies: the fulfillment-service
+// private API (FulfillmentClient) and the assisted-service discovery ignition endpoint
+// (IgnitionFetcher).
 package baremetalworker
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"sync"
 	"time"
 
@@ -29,17 +29,14 @@ import (
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 )
 
-// callTimeout bounds every fulfillment-service gRPC call. The controller-runtime requeue
-// provides the retry loop; this deadline only prevents a hung call from blocking a worker.
+// callTimeout bounds every fulfillment-service gRPC call (and the ignition HTTP fetch). The
+// controller-runtime requeue provides the retry loop; this deadline only prevents a hung call
+// from blocking a worker.
 const callTimeout = 30 * time.Second
 
 // unavailableThreshold is the number of consecutive gRPC failures after which the client
-// reports the service as unavailable.
+// reports the fulfillment-service as unavailable.
 const unavailableThreshold = 3
-
-// maxIgnitionBytes bounds the discovery ignition response to guard operator memory against an
-// unexpectedly large or hostile response. Discovery ignition is ~15KB in practice.
-const maxIgnitionBytes = 1 << 20 // 1 MiB
 
 // ErrFulfillmentServiceUnavailable is returned (wrapped, matchable with errors.Is) once the
 // fulfillment-service gRPC calls have failed unavailableThreshold times in a row. The
@@ -47,8 +44,8 @@ const maxIgnitionBytes = 1 << 20 // 1 MiB
 var ErrFulfillmentServiceUnavailable = errors.New("fulfillment service unavailable")
 
 // FulfillmentClient is the narrow seam the bare-metal worker reconciler uses to talk to the
-// fulfillment-service private API and to fetch discovery ignition. It is intentionally small
-// so it can be faked in tests without a running fulfillment-service.
+// fulfillment-service private gRPC API. It is intentionally small so it can be faked in tests
+// without a running fulfillment-service.
 type FulfillmentClient interface {
 	// CreateBareMetalInstance creates a BareMetalInstance and returns the created object.
 	CreateBareMetalInstance(ctx context.Context, obj *privatev1.BareMetalInstance) (*privatev1.BareMetalInstance, error)
@@ -61,48 +58,39 @@ type FulfillmentClient interface {
 	ListBareMetalInstances(ctx context.Context, filter string) ([]*privatev1.BareMetalInstance, error)
 	// GetClusterVersion returns the ClusterVersion with the given id.
 	GetClusterVersion(ctx context.Context, id string) (*privatev1.ClusterVersion, error)
-	// FetchIgnition GETs the discovery ignition content from the given URL.
-	FetchIgnition(ctx context.Context, url string) ([]byte, error)
 }
 
-// client is the production FulfillmentClient. It wraps the generated gRPC clients, applies a
-// per-call deadline, and tracks consecutive gRPC failures for the unavailable signal.
-type client struct {
+// fulfillmentClient is the production FulfillmentClient. It wraps the generated gRPC clients,
+// applies a per-call deadline, and tracks consecutive gRPC failures for the unavailable signal.
+type fulfillmentClient struct {
 	bmis     privatev1.BareMetalInstancesClient
 	versions privatev1.ClusterVersionsClient
-	http     *http.Client
 
 	mu                  sync.Mutex
 	consecutiveFailures int
 }
 
-// NewClient builds a FulfillmentClient from already-constructed dependencies. A nil httpClient
-// defaults to a zero-value http.Client (per-call deadlines come from the context).
-func NewClient(
+// NewFulfillmentClient builds a FulfillmentClient from already-constructed generated clients.
+func NewFulfillmentClient(
 	bmis privatev1.BareMetalInstancesClient,
 	versions privatev1.ClusterVersionsClient,
-	httpClient *http.Client,
 ) FulfillmentClient {
-	if httpClient == nil {
-		httpClient = &http.Client{}
-	}
-	return &client{bmis: bmis, versions: versions, http: httpClient}
+	return &fulfillmentClient{bmis: bmis, versions: versions}
 }
 
-// NewClientFromConn wires the production FulfillmentClient from the shared gRPC connection
-// dialed in main(). This is what the reconciler is constructed with.
-func NewClientFromConn(conn *grpc.ClientConn, httpClient *http.Client) FulfillmentClient {
-	return NewClient(
+// NewFulfillmentClientFromConn wires the production FulfillmentClient from the shared gRPC
+// connection dialed in main(). This is what the reconciler is constructed with.
+func NewFulfillmentClientFromConn(conn *grpc.ClientConn) FulfillmentClient {
+	return NewFulfillmentClient(
 		privatev1.NewBareMetalInstancesClient(conn),
 		privatev1.NewClusterVersionsClient(conn),
-		httpClient,
 	)
 }
 
 // call runs a fulfillment-service gRPC operation under the per-call deadline and updates the
 // consecutive-failure counter. After unavailableThreshold consecutive failures it wraps the
 // underlying error with ErrFulfillmentServiceUnavailable; a success resets the counter.
-func (c *client) call(ctx context.Context, op func(ctx context.Context) error) error {
+func (c *fulfillmentClient) call(ctx context.Context, op func(ctx context.Context) error) error {
 	opCtx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
 	err := op(opCtx)
@@ -120,7 +108,7 @@ func (c *client) call(ctx context.Context, op func(ctx context.Context) error) e
 	return nil
 }
 
-func (c *client) CreateBareMetalInstance(
+func (c *fulfillmentClient) CreateBareMetalInstance(
 	ctx context.Context,
 	obj *privatev1.BareMetalInstance,
 ) (*privatev1.BareMetalInstance, error) {
@@ -136,14 +124,14 @@ func (c *client) CreateBareMetalInstance(
 	return out, err
 }
 
-func (c *client) DeleteBareMetalInstance(ctx context.Context, id string) error {
+func (c *fulfillmentClient) DeleteBareMetalInstance(ctx context.Context, id string) error {
 	return c.call(ctx, func(ctx context.Context) error {
 		_, err := c.bmis.Delete(ctx, privatev1.BareMetalInstancesDeleteRequest_builder{Id: id}.Build())
 		return err
 	})
 }
 
-func (c *client) GetBareMetalInstance(ctx context.Context, id string) (*privatev1.BareMetalInstance, error) {
+func (c *fulfillmentClient) GetBareMetalInstance(ctx context.Context, id string) (*privatev1.BareMetalInstance, error) {
 	var out *privatev1.BareMetalInstance
 	err := c.call(ctx, func(ctx context.Context) error {
 		resp, err := c.bmis.Get(ctx, privatev1.BareMetalInstancesGetRequest_builder{Id: id}.Build())
@@ -156,7 +144,10 @@ func (c *client) GetBareMetalInstance(ctx context.Context, id string) (*privatev
 	return out, err
 }
 
-func (c *client) ListBareMetalInstances(ctx context.Context, filter string) ([]*privatev1.BareMetalInstance, error) {
+func (c *fulfillmentClient) ListBareMetalInstances(
+	ctx context.Context,
+	filter string,
+) ([]*privatev1.BareMetalInstance, error) {
 	var out []*privatev1.BareMetalInstance
 	err := c.call(ctx, func(ctx context.Context) error {
 		req := privatev1.BareMetalInstancesListRequest_builder{}
@@ -173,7 +164,7 @@ func (c *client) ListBareMetalInstances(ctx context.Context, filter string) ([]*
 	return out, err
 }
 
-func (c *client) GetClusterVersion(ctx context.Context, id string) (*privatev1.ClusterVersion, error) {
+func (c *fulfillmentClient) GetClusterVersion(ctx context.Context, id string) (*privatev1.ClusterVersion, error) {
 	var out *privatev1.ClusterVersion
 	err := c.call(ctx, func(ctx context.Context) error {
 		resp, err := c.versions.Get(ctx, privatev1.ClusterVersionsGetRequest_builder{Id: id}.Build())
@@ -184,35 +175,4 @@ func (c *client) GetClusterVersion(ctx context.Context, id string) (*privatev1.C
 		return nil
 	})
 	return out, err
-}
-
-// FetchIgnition GETs the discovery ignition from url under the per-call deadline. It targets
-// the InfraEnv boot-artifacts endpoint (assisted-service), not the fulfillment-service, so it
-// does not affect the gRPC consecutive-failure counter.
-func (c *client) FetchIgnition(ctx context.Context, url string) ([]byte, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, callTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building ignition request: %w", err)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetching ignition: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxIgnitionBytes))
-	if err != nil {
-		return nil, fmt.Errorf("reading ignition body: %w", err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		snippet := body
-		if len(snippet) > 256 {
-			snippet = snippet[:256]
-		}
-		return nil, fmt.Errorf("fetching ignition: unexpected status %d: %s", resp.StatusCode, snippet)
-	}
-	return body, nil
 }
