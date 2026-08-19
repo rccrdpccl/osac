@@ -18,6 +18,7 @@ package osac.public.v1;
 import "google/api/field_behavior.proto";
 import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
+import "osac/public/v1/baremetal_instance_type_type.proto";
 import "osac/public/v1/cluster_catalog_item_type.proto";
 import "osac/public/v1/cluster_common_type.proto";
 import "osac/public/v1/cluster_template_type.proto";
@@ -378,6 +379,10 @@ message ClusterNetworkAttachment {
 
 // Defines a set of nodes that are part of the cluster, all of them of the same type of host.
 message ClusterNodeSet {
+  // Field 3 is reserved to mirror the private API's fabric_interface field, keeping
+  // baremetal_instance_type at the same field number in both APIs.
+  reserved 3;
+
   // Identifier of the type of hosts that are part of the set.
   //
   // The details of the host type can be obtained using the `List` and `Get` method of the `HostTypes` service. For
@@ -401,10 +406,18 @@ message ClusterNodeSet {
   // user.
   //
   // The user will not have permission to change this field.
+  //
+  // Retained for backward compatibility; superseded by baremetal_instance_type and slated
+  // for removal in OSAC-4154. New node sets should set baremetal_instance_type.
   HostTypeReference host_type = 1;
 
   // Number of nodes of the set.
   int32 size = 2;
+
+  // BareMetalInstanceType (hardware profile) for the nodes in this set.
+  //
+  // Immutable after creation.
+  BareMetalInstanceTypeReference baremetal_instance_type = 4 [(google.api.field_behavior) = IMMUTABLE];
 }
 
 // Local reference to a Cluster resource.
