@@ -219,6 +219,73 @@ type ClusterOrderStatus struct {
 	// +listType=map
 	// +listMapKey=name
 	NodeSets []NodeSetStatus `json:"nodeSets,omitempty"`
+
+	// DesiredWorkers is the total number of workers requested across all node sets.
+	// Aggregated by the ClusterOrder controller from Workers (CAPI MachineDeployment convention).
+	// +kubebuilder:validation:Optional
+	DesiredWorkers *int32 `json:"desiredWorkers,omitempty"`
+
+	// CurrentWorkers is the number of workers in a non-terminal phase
+	// (Provisioning, WaitingForAgent, Binding, or Ready).
+	// +kubebuilder:validation:Optional
+	CurrentWorkers *int32 `json:"currentWorkers,omitempty"`
+
+	// ReadyWorkers is the number of workers in the Ready phase.
+	// +kubebuilder:validation:Optional
+	ReadyWorkers *int32 `json:"readyWorkers,omitempty"`
+
+	// Workers holds per-worker lifecycle state for CaaS-managed worker resources.
+	// Populated by the BareMetalWorkerReconciler; the ClusterOrder controller reads it to
+	// compute the aggregate counts above.
+	// +kubebuilder:validation:Optional
+	// +listType=map
+	// +listMapKey=name
+	Workers []WorkerStatus `json:"workers,omitempty"`
+}
+
+// WorkerStatus holds the lifecycle state of a single CaaS-managed worker resource.
+type WorkerStatus struct {
+	// NodeSet identifies which node set this worker belongs to (e.g. "compute", "gpu").
+	// +kubebuilder:validation:Required
+	NodeSet string `json:"nodeSet"`
+
+	// Name is the worker slot name (e.g. "bm-cluster-a-worker-0"), unique within the cluster.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Kind of the backing resource (e.g. BareMetalInstance).
+	// +kubebuilder:validation:Required
+	Kind string `json:"kind"`
+
+	// ResourceID is the fulfillment-service resource ID of the backing object.
+	// +kubebuilder:validation:Optional
+	ResourceID string `json:"resourceID,omitempty"`
+
+	// Phase of the worker lifecycle.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=Provisioning;WaitingForAgent;Binding;Ready;Failed;Unbinding;Deleting
+	Phase string `json:"phase"`
+
+	// AttemptCount tracks how many times this worker slot has been provisioned.
+	AttemptCount int32 `json:"attemptCount"`
+
+	// LastFailureReason is a machine-readable reason for the last failure
+	// (e.g. AgentRegistrationTimeout).
+	// +kubebuilder:validation:Optional
+	LastFailureReason string `json:"lastFailureReason,omitempty"`
+
+	// LastFailureMessage is a human-readable description of the last failure.
+	// +kubebuilder:validation:Optional
+	LastFailureMessage string `json:"lastFailureMessage,omitempty"`
+
+	// LastFailureTime is when the last failure occurred.
+	// +kubebuilder:validation:Optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+
+	// NextRetryTime is when the controller will attempt the next retry.
+	// +kubebuilder:validation:Optional
+	NextRetryTime *metav1.Time `json:"nextRetryTime,omitempty"`
 }
 
 // NodeSetStatus holds networking status for a single node set.
