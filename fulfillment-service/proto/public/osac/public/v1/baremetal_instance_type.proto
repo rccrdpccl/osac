@@ -137,6 +137,10 @@ message BareMetalInstanceSpec {
   // with an ExternalIPAttachment for this instance atomically during creation.
   // Immutable after creation.
   bool auto_external_ip_attachment = 9 [(google.api.field_behavior) = IMMUTABLE];
+
+  // Name of the BareMetalInstanceType (hardware profile) that determines which host the
+  // backend allocates. Set by the CaaS controller when provisioning cluster workers.
+  string instance_type = 20;
 }
 
 // The status contains the details of the bare metal instance provided by the system.
