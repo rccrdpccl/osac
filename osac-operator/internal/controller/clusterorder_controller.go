@@ -183,6 +183,13 @@ func (r *ClusterOrderReconciler) patchStatusWithRetry(ctx context.Context, key c
 		latest.Status.DesiredConfigVersion = computed.DesiredConfigVersion
 		latest.Status.ApiEndpoint = computed.ApiEndpoint
 		latest.Status.IngressEndpoint = computed.IngressEndpoint
+		// Worker aggregate counts are owned by the ClusterOrder controller (computed from
+		// Workers[]). Workers[] itself is owned by the BareMetalWorkerReconciler and is
+		// deliberately not copied here, so the merge patch preserves it (same rationale as
+		// ClusterStorageJobs above).
+		latest.Status.DesiredWorkers = computed.DesiredWorkers
+		latest.Status.CurrentWorkers = computed.CurrentWorkers
+		latest.Status.ReadyWorkers = computed.ReadyWorkers
 		for _, c := range computed.Conditions {
 			meta.SetStatusCondition(&latest.Status.Conditions, c)
 		}
