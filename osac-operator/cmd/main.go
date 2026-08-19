@@ -63,6 +63,7 @@ import (
 	"github.com/osac-project/osac/osac-operator/helpers"
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller"
+	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker"
 	"github.com/osac-project/osac/osac-operator/internal/dispatcheradapter"
 	"github.com/osac-project/osac/osac-operator/internal/migrations"
 	"github.com/osac-project/osac/osac-operator/pkg/aap"
@@ -346,6 +347,18 @@ func setupClusterControllers(
 	maxJobHistory int,
 ) error {
 	localMgr := mgr.GetLocalManager()
+
+	// BareMetalWorkerReconciler watches the same ClusterOrders and manages bare-metal worker
+	// provisioning (currently: ensure the cluster InfraEnv + fetch discovery ignition).
+	if err := baremetalworker.NewReconciler(
+		localMgr.GetClient(), localMgr.GetAPIReader(), localMgr.GetScheme(),
+		baremetalworker.NewIgnitionFetcher(nil),
+		localMgr.GetEventRecorderFor("baremetalworker"),
+		os.Getenv(envClusterOrderNamespace),
+	).SetupWithManager(mgr); err != nil {
+		return err
+	}
+
 	return setupProvisioningController(
 		envClusterAAPProvisionTemplate, envClusterAAPDeprovisionTemplate,
 		func() error {
