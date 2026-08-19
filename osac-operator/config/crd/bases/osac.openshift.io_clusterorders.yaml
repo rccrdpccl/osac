@@ -309,11 +309,23 @@ spec:
                   - type
                   type: object
                 type: array
+              currentWorkers:
+                description: |-
+                  CurrentWorkers is the number of workers in a non-terminal phase
+                  (Provisioning, WaitingForAgent, Binding, or Ready).
+                format: int32
+                type: integer
               desiredConfigVersion:
                 description: |-
                   DesiredConfigVersion is a hash of the current spec, used to detect spec changes
                   that require re-provisioning.
                 type: string
+              desiredWorkers:
+                description: |-
+                  DesiredWorkers is the total number of workers requested across all node sets.
+                  Aggregated by the ClusterOrder controller from Workers (CAPI MachineDeployment convention).
+                format: int32
+                type: integer
               ingressEndpoint:
                 description: |-
                   IngressEndpoint is the internal ingress VIP allocated by MetalLB.
@@ -477,6 +489,80 @@ spec:
                   - type
                   type: object
                 type: array
+              readyWorkers:
+                description: ReadyWorkers is the number of workers in the Ready phase.
+                format: int32
+                type: integer
+              workers:
+                description: |-
+                  Workers holds per-worker lifecycle state for CaaS-managed worker resources.
+                  Populated by the BareMetalWorkerReconciler; the ClusterOrder controller reads it to
+                  compute the aggregate counts above.
+                items:
+                  description: WorkerStatus holds the lifecycle state of a single
+                    CaaS-managed worker resource.
+                  properties:
+                    attemptCount:
+                      description: AttemptCount tracks how many times this worker
+                        slot has been provisioned.
+                      format: int32
+                      type: integer
+                    kind:
+                      description: Kind of the backing resource (e.g. BareMetalInstance).
+                      type: string
+                    lastFailureMessage:
+                      description: LastFailureMessage is a human-readable description
+                        of the last failure.
+                      type: string
+                    lastFailureReason:
+                      description: |-
+                        LastFailureReason is a machine-readable reason for the last failure
+                        (e.g. AgentRegistrationTimeout).
+                      type: string
+                    lastFailureTime:
+                      description: LastFailureTime is when the last failure occurred.
+                      format: date-time
+                      type: string
+                    name:
+                      description: Name is the worker slot name (e.g. "bm-cluster-a-worker-0"),
+                        unique within the cluster.
+                      minLength: 1
+                      type: string
+                    nextRetryTime:
+                      description: NextRetryTime is when the controller will attempt
+                        the next retry.
+                      format: date-time
+                      type: string
+                    nodeSet:
+                      description: NodeSet identifies which node set this worker belongs
+                        to (e.g. "compute", "gpu").
+                      type: string
+                    phase:
+                      description: Phase of the worker lifecycle.
+                      enum:
+                      - Provisioning
+                      - WaitingForAgent
+                      - Binding
+                      - Ready
+                      - Failed
+                      - Unbinding
+                      - Deleting
+                      type: string
+                    resourceID:
+                      description: ResourceID is the fulfillment-service resource
+                        ID of the backing object.
+                      type: string
+                  required:
+                  - attemptCount
+                  - kind
+                  - name
+                  - nodeSet
+                  - phase
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
             type: object
         type: object
     served: true
