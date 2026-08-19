@@ -16,8 +16,6 @@ package baremetalworker
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -35,6 +33,16 @@ func TestBareMetalWorker(t *testing.T) {
 
 // errBackend is the canned error returned by the fakes when configured to fail.
 var errBackend = errors.New("backend boom")
+
+// expectCallDeadline asserts the given context carries a deadline within (25s, 30s].
+func expectCallDeadline(ctx context.Context) {
+	GinkgoHelper()
+	deadline, ok := ctx.Deadline()
+	Expect(ok).To(BeTrue(), "call context must carry a deadline")
+	remaining := time.Until(deadline)
+	Expect(remaining).To(BeNumerically(">", 25*time.Second))
+	Expect(remaining).To(BeNumerically("<=", 30*time.Second))
+}
 
 // fakeBMIClient is a hand-written stub of privatev1.BareMetalInstancesClient. It captures the
 // context of the last call and returns configurable objects/errors.
@@ -144,17 +152,6 @@ func (f *fakeCVClient) Signal(
 	return nil, errors.New("not implemented")
 }
 
-// captureRoundTripper records the request context and returns a canned response.
-type captureRoundTripper struct {
-	lastCtx context.Context
-	resp    *http.Response
-}
-
-func (rt *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	rt.lastCtx = req.Context()
-	return rt.resp, nil
-}
-
 var _ = Describe("FulfillmentClient wrapper", func() {
 	var (
 		bmi *fakeBMIClient
@@ -166,43 +163,34 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 	BeforeEach(func() {
 		bmi = &fakeBMIClient{object: &privatev1.BareMetalInstance{}}
 		cv = &fakeCVClient{object: &privatev1.ClusterVersion{}}
-		fc = NewClient(bmi, cv, nil)
+		fc = NewFulfillmentClient(bmi, cv)
 		ctx = context.Background()
 	})
-
-	assertDeadline := func(callCtx context.Context) {
-		GinkgoHelper()
-		deadline, ok := callCtx.Deadline()
-		Expect(ok).To(BeTrue(), "call context must carry a deadline")
-		remaining := time.Until(deadline)
-		Expect(remaining).To(BeNumerically(">", 25*time.Second))
-		Expect(remaining).To(BeNumerically("<=", 30*time.Second))
-	}
 
 	Context("applies the per-call deadline to gRPC calls", func() {
 		It("on CreateBareMetalInstance", func() {
 			_, err := fc.CreateBareMetalInstance(ctx, &privatev1.BareMetalInstance{})
 			Expect(err).ToNot(HaveOccurred())
-			assertDeadline(bmi.lastCtx)
+			expectCallDeadline(bmi.lastCtx)
 		})
 		It("on GetBareMetalInstance", func() {
 			_, err := fc.GetBareMetalInstance(ctx, "id")
 			Expect(err).ToNot(HaveOccurred())
-			assertDeadline(bmi.lastCtx)
+			expectCallDeadline(bmi.lastCtx)
 		})
 		It("on ListBareMetalInstances", func() {
 			_, err := fc.ListBareMetalInstances(ctx, "")
 			Expect(err).ToNot(HaveOccurred())
-			assertDeadline(bmi.lastCtx)
+			expectCallDeadline(bmi.lastCtx)
 		})
 		It("on DeleteBareMetalInstance", func() {
 			Expect(fc.DeleteBareMetalInstance(ctx, "id")).To(Succeed())
-			assertDeadline(bmi.lastCtx)
+			expectCallDeadline(bmi.lastCtx)
 		})
 		It("on GetClusterVersion", func() {
 			_, err := fc.GetClusterVersion(ctx, "4.18.0")
 			Expect(err).ToNot(HaveOccurred())
-			assertDeadline(cv.lastCtx)
+			expectCallDeadline(cv.lastCtx)
 		})
 	})
 
@@ -263,7 +251,7 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			func(invoke func(FulfillmentClient) error) {
 				b := &fakeBMIClient{err: errBackend, object: &privatev1.BareMetalInstance{}}
 				v := &fakeCVClient{err: errBackend, object: &privatev1.ClusterVersion{}}
-				c := NewClient(b, v, nil)
+				c := NewFulfillmentClient(b, v)
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeTrue())
@@ -299,55 +287,6 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			Expect(errors.Is(e2, ErrFulfillmentServiceUnavailable)).To(BeFalse())
 			_, e3 := fc.GetBareMetalInstance(ctx, "id") // failure 3
 			Expect(errors.Is(e3, ErrFulfillmentServiceUnavailable)).To(BeTrue())
-		})
-	})
-
-	Context("FetchIgnition", func() {
-		It("returns the body on a 2xx response", func() {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte("ignition-content"))
-			}))
-			defer srv.Close()
-
-			body, err := fc.FetchIgnition(ctx, srv.URL)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(string(body)).To(Equal("ignition-content"))
-		})
-
-		It("errors on a non-2xx response", func() {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusInternalServerError)
-			}))
-			defer srv.Close()
-
-			_, err := fc.FetchIgnition(ctx, srv.URL)
-			Expect(err).To(HaveOccurred())
-		})
-
-		It("applies the per-call deadline to the request", func() {
-			rt := &captureRoundTripper{resp: &http.Response{
-				StatusCode: http.StatusOK,
-				Body:       http.NoBody,
-			}}
-			fcHTTP := NewClient(bmi, cv, &http.Client{Transport: rt})
-			_, err := fcHTTP.FetchIgnition(ctx, "http://example.test/ignition")
-			Expect(err).ToNot(HaveOccurred())
-			assertDeadline(rt.lastCtx)
-		})
-
-		It("does not affect the gRPC consecutive-failure counter", func() {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.WriteHeader(http.StatusInternalServerError)
-			}))
-			defer srv.Close()
-
-			// Two ignition failures must not count toward the gRPC unavailable threshold.
-			_, _ = fc.FetchIgnition(ctx, srv.URL)
-			_, _ = fc.FetchIgnition(ctx, srv.URL)
-
-			bmi.err = errBackend
-			_, err := fc.GetBareMetalInstance(ctx, "id") // first *gRPC* failure
-			Expect(errors.Is(err, ErrFulfillmentServiceUnavailable)).To(BeFalse())
 		})
 	})
 })
