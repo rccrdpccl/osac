@@ -106,13 +106,21 @@ spec:
                   defaults. The selected template may limit what node types you can request.
                 items:
                   properties:
+                    baremetalInstanceType:
+                      description: |-
+                        BareMetalInstanceType names the BareMetalInstanceType (hardware profile) for the
+                        nodes in this request. Additive successor to ResourceClass.
+                      type: string
                     numberOfNodes:
                       description: NumberOfNodes describes the number of nodes you
                         want of the given resource class
                       type: integer
                     resourceClass:
-                      description: ResourceClass describes the type of node you are
-                        requesting
+                      description: |-
+                        ResourceClass describes the type of node you are requesting.
+
+                        Retained for backward compatibility; superseded by BareMetalInstanceType and slated
+                        for removal in OSAC-4154. New callers should set BareMetalInstanceType.
                       type: string
                   required:
                   - numberOfNodes
@@ -316,13 +324,21 @@ spec:
                   with the ClusterOrder
                 items:
                   properties:
+                    baremetalInstanceType:
+                      description: |-
+                        BareMetalInstanceType names the BareMetalInstanceType (hardware profile) for the
+                        nodes in this request. Additive successor to ResourceClass.
+                      type: string
                     numberOfNodes:
                       description: NumberOfNodes describes the number of nodes you
                         want of the given resource class
                       type: integer
                     resourceClass:
-                      description: ResourceClass describes the type of node you are
-                        requesting
+                      description: |-
+                        ResourceClass describes the type of node you are requesting.
+
+                        Retained for backward compatibility; superseded by BareMetalInstanceType and slated
+                        for removal in OSAC-4154. New callers should set BareMetalInstanceType.
                       type: string
                   required:
                   - numberOfNodes
