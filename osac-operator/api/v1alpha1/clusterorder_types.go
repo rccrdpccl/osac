@@ -111,13 +111,22 @@ type ClusterNetworkAttachment struct {
 }
 
 type NodeRequest struct {
-	// ResourceClass describes the type of node you are requesting
+	// ResourceClass describes the type of node you are requesting.
+	//
+	// Retained for backward compatibility; superseded by BareMetalInstanceType and slated
+	// for removal in OSAC-4154. New callers should set BareMetalInstanceType.
 	// +kubebuilder:validation:Required
 	ResourceClass string `json:"resourceClass"`
 	// NumberOfNodes describes the number of nodes you want of the given resource class
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	NumberOfNodes int `json:"numberOfNodes"`
+
+	// BareMetalInstanceType names the BareMetalInstanceType (hardware profile) for the
+	// nodes in this request. Additive successor to ResourceClass.
+	// +kubebuilder:validation:Optional
+	BareMetalInstanceType string `json:"baremetalInstanceType,omitempty"`
+
 	// FabricInterface is the host NIC name used for tenant network traffic.
 	// When set, IP discovery filters Agent inventory interfaces by this name,
 	// preventing the provisioning NIC address from being returned.
