@@ -106,11 +106,21 @@ spec:
                   defaults. The selected template may limit what node types you can request.
                 items:
                   properties:
-                    baremetalInstanceType:
+                    bareMetal:
                       description: |-
-                        BareMetalInstanceType names the BareMetalInstanceType (hardware profile) for the
-                        nodes in this request. Additive successor to ResourceClass.
-                      type: string
+                        BareMetal holds bare-metal-specific configuration for this node set.
+                        When set, this node request targets bare-metal workers.
+                        Mutually exclusive with future platform variants (e.g. Virtual).
+                      properties:
+                        instanceType:
+                          description: |-
+                            InstanceType names the BareMetalInstanceType (hardware profile) for the
+                            nodes in this request.
+                          minLength: 1
+                          type: string
+                      required:
+                      - instanceType
+                      type: object
                     numberOfNodes:
                       description: NumberOfNodes describes the number of nodes you
                         want of the given resource class
@@ -119,12 +129,11 @@ spec:
                       description: |-
                         ResourceClass describes the type of node you are requesting.
 
-                        Retained for backward compatibility; superseded by BareMetalInstanceType and slated
-                        for removal in OSAC-4154. New callers should set BareMetalInstanceType.
+                        Retained for backward compatibility; superseded by BareMetal.InstanceType and slated
+                        for removal in OSAC-4154. New callers should set BareMetal instead.
                       type: string
                   required:
                   - numberOfNodes
-                  - resourceClass
                   type: object
                 type: array
               pullSecret:
@@ -336,11 +345,21 @@ spec:
                   with the ClusterOrder
                 items:
                   properties:
-                    baremetalInstanceType:
+                    bareMetal:
                       description: |-
-                        BareMetalInstanceType names the BareMetalInstanceType (hardware profile) for the
-                        nodes in this request. Additive successor to ResourceClass.
-                      type: string
+                        BareMetal holds bare-metal-specific configuration for this node set.
+                        When set, this node request targets bare-metal workers.
+                        Mutually exclusive with future platform variants (e.g. Virtual).
+                      properties:
+                        instanceType:
+                          description: |-
+                            InstanceType names the BareMetalInstanceType (hardware profile) for the
+                            nodes in this request.
+                          minLength: 1
+                          type: string
+                      required:
+                      - instanceType
+                      type: object
                     numberOfNodes:
                       description: NumberOfNodes describes the number of nodes you
                         want of the given resource class
@@ -349,12 +368,11 @@ spec:
                       description: |-
                         ResourceClass describes the type of node you are requesting.
 
-                        Retained for backward compatibility; superseded by BareMetalInstanceType and slated
-                        for removal in OSAC-4154. New callers should set BareMetalInstanceType.
+                        Retained for backward compatibility; superseded by BareMetal.InstanceType and slated
+                        for removal in OSAC-4154. New callers should set BareMetal instead.
                       type: string
                   required:
                   - numberOfNodes
-                  - resourceClass
                   type: object
                 type: array
               nodeSets:
