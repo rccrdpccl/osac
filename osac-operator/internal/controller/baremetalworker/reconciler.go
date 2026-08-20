@@ -134,39 +134,47 @@ func hasBareMetalNodeSet(co *v1alpha1.ClusterOrder) bool {
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
 // then polls for and fetches its discovery ignition, setting the InfraEnvReady condition.
 func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
-	log := ctrllog.FromContext(ctx)
-
 	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
 		// InfraEnv already reconciled and its ignition fetched; nothing more to do in this slice.
 		return ctrl.Result{}, nil
 	}
 
-	name := co.Name + infraEnvNameSuffix
-	key := client.ObjectKey{Name: name, Namespace: co.Namespace}
-
+	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(infraEnvGVK)
 	err := r.Get(ctx, key, existing)
 	switch {
 	case apierrors.IsNotFound(err):
-		infraEnv, buildErr := r.buildInfraEnv(co, name)
-		if buildErr != nil {
-			return ctrl.Result{}, buildErr
-		}
-		if createErr := r.Create(ctx, infraEnv); createErr != nil && !apierrors.IsAlreadyExists(createErr) {
-			return ctrl.Result{}, fmt.Errorf("creating infraenv %s: %w", key, createErr)
-		}
-		log.Info("created InfraEnv", "infraenv", key.String())
-		if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonIgnitionPending,
-			"InfraEnv created; waiting for discovery ignition"); condErr != nil {
-			return ctrl.Result{}, condErr
-		}
-		return ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+		return r.createInfraEnv(ctx, co, key)
 	case err != nil:
 		return ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
 	}
+	return r.fetchDiscoveryIgnition(ctx, co, key, existing)
+}
 
-	ignitionURL, _, err := unstructured.NestedString(existing.Object, "status", "bootArtifacts", "discoveryIgnitionURL")
+// createInfraEnv creates the InfraEnv and marks InfraEnvReady=False (ignition pending), requeuing.
+func (r *Reconciler) createInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder, key client.ObjectKey) (ctrl.Result, error) {
+	infraEnv, err := r.buildInfraEnv(co, key.Name)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.Create(ctx, infraEnv); err != nil && !apierrors.IsAlreadyExists(err) {
+		return ctrl.Result{}, fmt.Errorf("creating infraenv %s: %w", key, err)
+	}
+	ctrllog.FromContext(ctx).Info("created InfraEnv", "infraenv", key.String())
+	if err := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonIgnitionPending,
+		"InfraEnv created; waiting for discovery ignition"); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+}
+
+// fetchDiscoveryIgnition polls the InfraEnv's discovery ignition URL and, once available, fetches
+// the ignition (warning if oversized) and marks InfraEnvReady=True.
+func (r *Reconciler) fetchDiscoveryIgnition(
+	ctx context.Context, co *v1alpha1.ClusterOrder, key client.ObjectKey, infraEnv *unstructured.Unstructured,
+) (ctrl.Result, error) {
+	ignitionURL, _, err := unstructured.NestedString(infraEnv.Object, "status", "bootArtifacts", "discoveryIgnitionURL")
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("reading infraenv %s ignition URL: %w", key, err)
 	}
@@ -186,9 +194,9 @@ func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrd
 		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonIgnitionSizeWarning,
 			"discovery ignition is %d bytes, exceeding the %d byte warning threshold", len(ignition), ignitionSizeWarningThreshold)
 	}
-	if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionTrue, reasonInfraEnvReady,
-		"discovery ignition fetched"); condErr != nil {
-		return ctrl.Result{}, condErr
+	if err := r.setInfraEnvReady(ctx, co, metav1.ConditionTrue, reasonInfraEnvReady,
+		"discovery ignition fetched"); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
 }
