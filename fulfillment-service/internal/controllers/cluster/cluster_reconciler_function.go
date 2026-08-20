@@ -484,10 +484,16 @@ func (t *task) prepareNodeRequests() []osacv1alpha1.NodeRequest {
 }
 
 func (t *task) prepareNodeRequest(nodeSet *privatev1.ClusterNodeSet) osacv1alpha1.NodeRequest {
-	return osacv1alpha1.NodeRequest{
+	nr := osacv1alpha1.NodeRequest{
 		ResourceClass: controllers.RefKeyStr(nodeSet.GetHostType()),
 		NumberOfNodes: int(nodeSet.GetSize()),
 	}
+	if bmit := nodeSet.GetBaremetalInstanceType(); bmit != nil && bmit.GetName() != "" {
+		nr.BareMetal = &osacv1alpha1.BareMetalNodeSpec{
+			InstanceType: bmit.GetName(),
+		}
+	}
+	return nr
 }
 
 func (t *task) delete(ctx context.Context) (err error) {
