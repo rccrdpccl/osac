@@ -56,9 +56,11 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 				TemplateID:   "test",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
-					ResourceClass:         "bm-standard",
-					NumberOfNodes:         1,
-					BareMetalInstanceType: "bm-standard",
+					ResourceClass: "bm-standard",
+					NumberOfNodes: 1,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
 				}},
 			},
 		}
