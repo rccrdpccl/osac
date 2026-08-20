@@ -113,20 +113,19 @@ type ClusterNetworkAttachment struct {
 type NodeRequest struct {
 	// ResourceClass describes the type of node you are requesting.
 	//
-	// Retained for backward compatibility; superseded by BareMetalInstanceType and slated
-	// for removal in OSAC-4154. New callers should set BareMetalInstanceType.
-	// +kubebuilder:validation:Required
-	ResourceClass string `json:"resourceClass"`
+	// Retained for backward compatibility; superseded by BareMetal.InstanceType and slated
+	// for removal in OSAC-4154. New callers should set BareMetal instead.
+	// +kubebuilder:validation:Optional
+	ResourceClass string `json:"resourceClass,omitempty"`
 	// NumberOfNodes describes the number of nodes you want of the given resource class
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	NumberOfNodes int `json:"numberOfNodes"`
-
-	// BareMetalInstanceType names the BareMetalInstanceType (hardware profile) for the
-	// nodes in this request. Additive successor to ResourceClass.
+	// BareMetal holds bare-metal-specific configuration for this node set.
+	// When set, this node request targets bare-metal workers.
+	// Mutually exclusive with future platform variants (e.g. Virtual).
 	// +kubebuilder:validation:Optional
-	BareMetalInstanceType string `json:"baremetalInstanceType,omitempty"`
-
+	BareMetal *BareMetalNodeSpec `json:"bareMetal,omitempty"`
 	// FabricInterface is the host NIC name used for tenant network traffic.
 	// When set, IP discovery filters Agent inventory interfaces by this name,
 	// preventing the provisioning NIC address from being returned.
@@ -134,6 +133,30 @@ type NodeRequest struct {
 	// expansion; may also be set explicitly.
 	// +kubebuilder:validation:Optional
 	FabricInterface string `json:"fabricInterface,omitempty"`
+}
+
+// BareMetalNodeSpec holds configuration specific to bare-metal node requests.
+type BareMetalNodeSpec struct {
+	// InstanceType names the BareMetalInstanceType (hardware profile) for the
+	// nodes in this request.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	InstanceType string `json:"instanceType"`
+}
+
+// IsBareMetal reports whether this node request targets bare-metal workers.
+func (nr NodeRequest) IsBareMetal() bool {
+	return nr.BareMetal != nil
+}
+
+// HasBareMetalNodeSet reports whether the ClusterOrder requests any bare-metal node set.
+func (co *ClusterOrder) HasBareMetalNodeSet() bool {
+	for i := range co.Spec.NodeRequests {
+		if co.Spec.NodeRequests[i].IsBareMetal() {
+			return true
+		}
+	}
+	return false
 }
 
 // ClusterOrderPhaseType is a valid value for .status.phase
