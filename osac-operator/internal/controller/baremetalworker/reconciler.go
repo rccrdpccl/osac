@@ -111,24 +111,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if v, ok := co.Annotations[managementStateAnnotation]; ok && v == managementStateUnmanaged {
 		return ctrl.Result{}, nil
 	}
-	if !hasBareMetalNodeSet(co) {
+	if !co.HasBareMetalNodeSet() {
 		return ctrl.Result{}, nil
 	}
 
 	// Later phases (reconcileWorkers OSAC-4159, correlateAgents OSAC-4160,
 	// reconcileNodePoolReplicas OSAC-4160) are intentionally not implemented yet.
 	return r.ensureInfraEnv(ctx, co)
-}
-
-// hasBareMetalNodeSet reports whether the ClusterOrder requests any bare-metal node set (a
-// nodeRequest carrying a BareMetalInstanceType).
-func hasBareMetalNodeSet(co *v1alpha1.ClusterOrder) bool {
-	for i := range co.Spec.NodeRequests {
-		if co.Spec.NodeRequests[i].BareMetalInstanceType != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
