@@ -52,21 +52,22 @@ var _ privatev1.ClustersServer = (*PrivateClustersServer)(nil)
 
 type PrivateClustersServer struct {
 	privatev1.UnimplementedClustersServer
-	logger                  *slog.Logger
-	notifier                events.Notifier
-	tenancyLogic            auth.TenancyLogic
-	templatesDao            *dao.GenericDAO[*privatev1.ClusterTemplate]
-	catalogItemsDao         *dao.GenericDAO[*privatev1.ClusterCatalogItem]
-	hostTypesDao            *dao.GenericDAO[*privatev1.HostType]
-	clusterVersionsDao      *dao.GenericDAO[*privatev1.ClusterVersion]
-	subnetsDao              *dao.GenericDAO[*privatev1.Subnet]
-	securityGroupsDao       *dao.GenericDAO[*privatev1.SecurityGroup]
-	externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
-	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
-	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
-	secretsDao              *dao.GenericDAO[*privatev1.Secret]
-	generic                 *GenericServer[*privatev1.Cluster]
-	lifecycle               *externalIPLifecycle
+	logger                    *slog.Logger
+	notifier                  events.Notifier
+	tenancyLogic              auth.TenancyLogic
+	templatesDao              *dao.GenericDAO[*privatev1.ClusterTemplate]
+	catalogItemsDao           *dao.GenericDAO[*privatev1.ClusterCatalogItem]
+	hostTypesDao              *dao.GenericDAO[*privatev1.HostType]
+	clusterVersionsDao        *dao.GenericDAO[*privatev1.ClusterVersion]
+	subnetsDao                *dao.GenericDAO[*privatev1.Subnet]
+	securityGroupsDao         *dao.GenericDAO[*privatev1.SecurityGroup]
+	externalIPPoolDao         *dao.GenericDAO[*privatev1.ExternalIPPool]
+	externalIPDao             *dao.GenericDAO[*privatev1.ExternalIP]
+	externalIPAttachmentDao   *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	secretsDao                *dao.GenericDAO[*privatev1.Secret]
+	bareMetalInstanceTypesDao *dao.GenericDAO[*privatev1.BareMetalInstanceType]
+	generic                   *GenericServer[*privatev1.Cluster]
+	lifecycle                 *externalIPLifecycle
 }
 
 func NewPrivateClustersServer() *PrivateClustersServerBuilder {
@@ -139,6 +140,16 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 
 	// Create the host types DAO:
 	hostTypesDao, err := dao.NewGenericDAO[*privatev1.HostType]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
+	// Create the bare metal instance types DAO:
+	bareMetalInstanceTypesDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -239,20 +250,21 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 
 	// Create and populate the object:
 	result = &PrivateClustersServer{
-		logger:                  b.logger,
-		notifier:                b.notifier,
-		tenancyLogic:            b.tenancyLogic,
-		templatesDao:            templatesDao,
-		catalogItemsDao:         catalogItemsDao,
-		hostTypesDao:            hostTypesDao,
-		clusterVersionsDao:      clusterVersionsDao,
-		subnetsDao:              subnetsDao,
-		securityGroupsDao:       securityGroupsDao,
-		externalIPPoolDao:       externalIPPoolDao,
-		externalIPDao:           externalIPDao,
-		externalIPAttachmentDao: externalIPAttachmentDao,
-		secretsDao:              secretsDao,
-		generic:                 generic,
+		logger:                    b.logger,
+		notifier:                  b.notifier,
+		tenancyLogic:              b.tenancyLogic,
+		templatesDao:              templatesDao,
+		catalogItemsDao:           catalogItemsDao,
+		hostTypesDao:              hostTypesDao,
+		clusterVersionsDao:        clusterVersionsDao,
+		subnetsDao:                subnetsDao,
+		securityGroupsDao:         securityGroupsDao,
+		externalIPPoolDao:         externalIPPoolDao,
+		externalIPDao:             externalIPDao,
+		externalIPAttachmentDao:   externalIPAttachmentDao,
+		secretsDao:                secretsDao,
+		bareMetalInstanceTypesDao: bareMetalInstanceTypesDao,
+		generic:                   generic,
 	}
 	result.lifecycle = newExternalIPLifecycle(
 		externalIPDao,
@@ -552,6 +564,41 @@ func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
 	return
 }
 
+func (s *PrivateClustersServer) lookupBareMetalInstanceType(ctx context.Context,
+	key string) (result *privatev1.BareMetalInstanceType, err error) {
+	if key == "" {
+		return
+	}
+	response, err := s.bareMetalInstanceTypesDao.List().
+		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
+		SetLimit(1).
+		Do(ctx)
+	if err != nil {
+		var deniedErr *dao.ErrDenied
+		if errors.As(err, &deniedErr) {
+			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
+		}
+		return
+	}
+	switch response.GetTotal() {
+	case 0:
+		err = grpcstatus.Errorf(
+			grpccodes.NotFound,
+			"there is no bare metal instance type with identifier or name '%s'",
+			key,
+		)
+	case 1:
+		result = response.GetItems()[0]
+	default:
+		err = grpcstatus.Errorf(
+			grpccodes.InvalidArgument,
+			"there are multiple bare metal instance types with identifier or name '%s'",
+			key,
+		)
+	}
+	return
+}
+
 // ensureClusterVersion makes sure the cluster spec has a usable version reference: if the user didn't provide one, it
 // resolves the system default. Either way, it validates that the resulting ClusterVersion isn't deleted, disabled,
 // or obsolete.
@@ -625,6 +672,9 @@ func (s *PrivateClustersServer) validateNodeSetsUpdate(ctx context.Context,
 		return err
 	}
 	if err := s.validateNodeSetHostTypeImmutability(existingNodeSets, newNodeSets); err != nil {
+		return err
+	}
+	if err := s.validateNodeSetBareMetalInstanceTypeImmutability(existingNodeSets, newNodeSets); err != nil {
 		return err
 	}
 
@@ -743,6 +793,29 @@ func (s *PrivateClustersServer) validateNodeSetHostTypeImmutability(
 				nodeSetName,
 				refKey(existingHostType),
 				refKey(newHostType),
+			)
+		}
+	}
+	return nil
+}
+
+func (s *PrivateClustersServer) validateNodeSetBareMetalInstanceTypeImmutability(
+	existingNodeSets map[string]*privatev1.ClusterNodeSet,
+	newNodeSets map[string]*privatev1.ClusterNodeSet) error {
+	for nodeSetName, existingNodeSet := range existingNodeSets {
+		newNodeSet, exists := newNodeSets[nodeSetName]
+		if !exists {
+			continue
+		}
+		existingBmit := existingNodeSet.GetBaremetalInstanceType()
+		newBmit := newNodeSet.GetBaremetalInstanceType()
+		if refKey(existingBmit) != refKey(newBmit) {
+			return grpcstatus.Errorf(
+				grpccodes.InvalidArgument,
+				"cannot change baremetal_instance_type for node set '%s' from '%s' to '%s': baremetal_instance_type is immutable",
+				nodeSetName,
+				refKey(existingBmit),
+				refKey(newBmit),
 			)
 		}
 	}
@@ -1012,27 +1085,52 @@ func (s *PrivateClustersServer) validateAutoExternalIPImmutability(ctx context.C
 func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, spec *privatev1.ClusterSpec) error {
 	for name, nodeSet := range spec.GetNodeSets() {
 		hostTypeKey := refKey(nodeSet.GetHostType())
-		if hostTypeKey == "" {
+		if hostTypeKey != "" {
+			hostType, err := s.lookupHostType(ctx, hostTypeKey)
+			if err != nil {
+				return err
+			}
+			if hostType == nil {
+				continue
+			}
+			fabricInterface := ""
+			for _, ni := range hostType.GetInterfaces() {
+				if strings.EqualFold(ni.GetRole(), "fabric") {
+					fabricInterface = ni.GetName()
+					break
+				}
+			}
+			if fabricInterface == "" {
+				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+					"node_sets[%s]: host type '%s' has no interface with role 'fabric'",
+					name, hostTypeKey)
+			}
+			nodeSet.SetFabricInterface(fabricInterface)
 			continue
 		}
-		hostType, err := s.lookupHostType(ctx, hostTypeKey)
+
+		bmitKey := refKey(nodeSet.GetBaremetalInstanceType())
+		if bmitKey == "" {
+			continue
+		}
+		bmit, err := s.lookupBareMetalInstanceType(ctx, bmitKey)
 		if err != nil {
 			return err
 		}
-		if hostType == nil {
+		if bmit == nil {
 			continue
 		}
 		fabricInterface := ""
-		for _, ni := range hostType.GetInterfaces() {
-			if strings.EqualFold(ni.GetRole(), "fabric") {
-				fabricInterface = ni.GetName()
+		for _, port := range bmit.GetSpec().GetHardware().GetNetworkPorts() {
+			if strings.EqualFold(port.GetRole(), "fabric") {
+				fabricInterface = port.GetName()
 				break
 			}
 		}
 		if fabricInterface == "" {
 			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-				"node_sets[%s]: host type '%s' has no interface with role 'fabric'",
-				name, hostTypeKey)
+				"node_sets[%s]: bare metal instance type '%s' has no network port with role 'fabric'",
+				name, bmitKey)
 		}
 		nodeSet.SetFabricInterface(fabricInterface)
 	}
@@ -1193,8 +1291,9 @@ func convertTemplateNodeSets(value map[string]*privatev1.ClusterTemplateNodeSet)
 		}
 		size := nodeSet.GetSize()
 		result[name] = privatev1.ClusterNodeSet_builder{
-			HostType: cloneMessage(nodeSet.GetHostType()),
-			Size:     &size,
+			HostType:              cloneMessage(nodeSet.GetHostType()),
+			BaremetalInstanceType: cloneMessage(nodeSet.GetBaremetalInstanceType()),
+			Size:                  &size,
 		}.Build()
 	}
 	return result
@@ -1236,6 +1335,33 @@ func (s *PrivateClustersServer) resolveClusterNodeSets(ctx context.Context, clus
 		if host == nil {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument, "host type for node set '%s' is required", name)
 		}
+		var templateBmit *privatev1.BareMetalInstanceType
+		if defaults := template.GetNodeSets()[name]; defaults != nil && defaults.GetBaremetalInstanceType() != nil {
+			ref := cloneMessage(defaults.GetBaremetalInstanceType())
+			var err error
+			templateBmit, err = resolveAndCanonicalizeReference(ctx, s.bareMetalInstanceTypesDao, template.GetMetadata(), ref, "bare metal instance type", grpccodes.NotFound)
+			if err != nil {
+				return err
+			}
+		}
+		bmit := templateBmit
+		if ref := node.GetBaremetalInstanceType(); !useTemplateMap && ref != nil {
+			if templateBmit == nil {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument,
+					"baremetal_instance_type for node set '%s' should be empty, like in template '%s', but it is '%s'",
+					name, template.GetId(), refKey(ref))
+			}
+			var err error
+			bmit, err = resolveAndCanonicalizeReference(ctx, s.bareMetalInstanceTypesDao, cluster.GetMetadata(), ref, "bare metal instance type", grpccodes.NotFound)
+			if err != nil {
+				return err
+			}
+			if bmit.GetId() != templateBmit.GetId() {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument,
+					"baremetal_instance_type for node set '%s' should be empty, '%s' or '%s', like in template '%s', but it is '%s'",
+					name, templateBmit.GetMetadata().GetName(), templateBmit.GetId(), template.GetId(), refKey(ref))
+			}
+		}
 		if !node.HasSize() {
 			return grpcstatus.Errorf(grpccodes.InvalidArgument, "size for node set '%s' is required", name)
 		}
@@ -1246,6 +1372,12 @@ func (s *PrivateClustersServer) resolveClusterNodeSets(ctx context.Context, clus
 			Id: host.GetId(), Name: host.GetMetadata().GetName(),
 			Shared: host.GetMetadata().GetTenant() == auth.SharedTenant, Project: host.GetMetadata().GetProject(),
 		}.Build())
+		if bmit != nil {
+			node.SetBaremetalInstanceType(privatev1.BareMetalInstanceTypeReference_builder{
+				Id: bmit.GetId(), Name: bmit.GetMetadata().GetName(),
+				Shared: bmit.GetMetadata().GetTenant() == auth.SharedTenant, Project: bmit.GetMetadata().GetProject(),
+			}.Build())
+		}
 	}
 	cluster.GetSpec().SetNodeSets(nodes)
 	return nil
