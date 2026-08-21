@@ -125,7 +125,7 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet envtest ## Run tests.
-	GOTOOLCHAIN=$(GOTOOLCHAIN_AUTO) KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v '/test/integration$$') -coverprofile cover.out
+	GOTOOLCHAIN=$(GOTOOLCHAIN_AUTO) KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v '/test/integration') -coverprofile cover.out
 
 .PHONY: test-integration
 test-integration: test test-kustomize test-smoke ## Run all tests including integration (kustomize + smoke).
@@ -161,6 +161,22 @@ test-smoke: kustomize ## Run smoke test in kind cluster (creates/deletes test cl
 .PHONY: test-integration-kind
 test-integration-kind:
 	go test ./test/integration/ -v -ginkgo.v
+
+.PHONY: sim-up
+sim-up: ## Create sim environment (kind + fulfillment-service + Postgres + self-signed CA).
+	hack/sim up
+
+.PHONY: sim-down
+sim-down: ## Tear down the sim environment.
+	hack/sim down
+
+.PHONY: test-integration-sim
+test-integration-sim: ## Run sim integration tests (requires 'make sim-up' first).
+	@if [ ! -f hack/sim.env ]; then \
+		echo "Error: sim environment not running. Run 'make sim-up' first."; \
+		exit 1; \
+	fi
+	go test ./test/integration/sim/ -v -ginkgo.v -timeout 10m
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
