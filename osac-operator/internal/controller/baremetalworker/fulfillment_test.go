@@ -105,6 +105,53 @@ func (f *fakeBMIClient) Signal(
 	return nil, errors.New("not implemented")
 }
 
+// fakeClustersClient is a hand-written stub of privatev1.ClustersClient.
+type fakeClustersClient struct {
+	lastCtx context.Context
+	err     error
+	object  *privatev1.Cluster
+}
+
+func (f *fakeClustersClient) Get(
+	ctx context.Context, _ *privatev1.ClustersGetRequest, _ ...grpc.CallOption,
+) (*privatev1.ClustersGetResponse, error) {
+	f.lastCtx = ctx
+	if f.err != nil {
+		return nil, f.err
+	}
+	return privatev1.ClustersGetResponse_builder{Object: f.object}.Build(), nil
+}
+
+func (f *fakeClustersClient) List(
+	context.Context, *privatev1.ClustersListRequest, ...grpc.CallOption,
+) (*privatev1.ClustersListResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeClustersClient) Create(
+	context.Context, *privatev1.ClustersCreateRequest, ...grpc.CallOption,
+) (*privatev1.ClustersCreateResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeClustersClient) Delete(
+	context.Context, *privatev1.ClustersDeleteRequest, ...grpc.CallOption,
+) (*privatev1.ClustersDeleteResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeClustersClient) Update(
+	context.Context, *privatev1.ClustersUpdateRequest, ...grpc.CallOption,
+) (*privatev1.ClustersUpdateResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeClustersClient) Signal(
+	context.Context, *privatev1.ClustersSignalRequest, ...grpc.CallOption,
+) (*privatev1.ClustersSignalResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 // fakeCVClient is a hand-written stub of privatev1.ClusterVersionsClient.
 type fakeCVClient struct {
 	lastCtx context.Context
@@ -154,16 +201,18 @@ func (f *fakeCVClient) Signal(
 
 var _ = Describe("FulfillmentClient wrapper", func() {
 	var (
-		bmi *fakeBMIClient
-		cv  *fakeCVClient
-		fc  FulfillmentClient
-		ctx context.Context
+		bmi      *fakeBMIClient
+		cv       *fakeCVClient
+		clusters *fakeClustersClient
+		fc       FulfillmentClient
+		ctx      context.Context
 	)
 
 	BeforeEach(func() {
 		bmi = &fakeBMIClient{object: &privatev1.BareMetalInstance{}}
 		cv = &fakeCVClient{object: &privatev1.ClusterVersion{}}
-		fc = NewFulfillmentClient(bmi, cv)
+		clusters = &fakeClustersClient{object: &privatev1.Cluster{}}
+		fc = NewFulfillmentClient(bmi, cv, clusters)
 		ctx = context.Background()
 	})
 
@@ -192,6 +241,11 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			Expect(err).ToNot(HaveOccurred())
 			expectCallDeadline(cv.lastCtx)
 		})
+		It("on GetCluster", func() {
+			_, err := fc.GetCluster(ctx, "cluster-uuid")
+			Expect(err).ToNot(HaveOccurred())
+			expectCallDeadline(clusters.lastCtx)
+		})
 	})
 
 	Context("unwraps responses", func() {
@@ -212,6 +266,13 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			want := &privatev1.ClusterVersion{}
 			cv.object = want
 			got, err := fc.GetClusterVersion(ctx, "4.18.0")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got).To(BeIdenticalTo(want))
+		})
+		It("returns the cluster", func() {
+			want := &privatev1.Cluster{}
+			clusters.object = want
+			got, err := fc.GetCluster(ctx, "cluster-uuid")
 			Expect(err).ToNot(HaveOccurred())
 			Expect(got).To(BeIdenticalTo(want))
 		})
@@ -251,7 +312,8 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			func(invoke func(FulfillmentClient) error) {
 				b := &fakeBMIClient{err: errBackend, object: &privatev1.BareMetalInstance{}}
 				v := &fakeCVClient{err: errBackend, object: &privatev1.ClusterVersion{}}
-				c := NewFulfillmentClient(b, v)
+				cl := &fakeClustersClient{err: errBackend, object: &privatev1.Cluster{}}
+				c := NewFulfillmentClient(b, v, cl)
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeTrue())
@@ -273,6 +335,10 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			}),
 			Entry("GetClusterVersion", func(c FulfillmentClient) error {
 				_, e := c.GetClusterVersion(context.Background(), "4.18.0")
+				return e
+			}),
+			Entry("GetCluster", func(c FulfillmentClient) error {
+				_, e := c.GetCluster(context.Background(), "cluster-uuid")
 				return e
 			}),
 		)

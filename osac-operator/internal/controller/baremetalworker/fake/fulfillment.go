@@ -43,14 +43,16 @@ type FulfillmentClient struct {
 	bmis            map[string]*privatev1.BareMetalInstance
 	hostMACs        map[string]string
 	clusterVersions map[string]*privatev1.ClusterVersion
+	clusters        map[string]*privatev1.Cluster
 	createErr       error
 	deleteErr       error
 
-	createCalls []*privatev1.BareMetalInstance
-	deleteCalls []string
-	getCalls    []string
-	listCalls   []string
-	getCVCalls  []string
+	createCalls     []*privatev1.BareMetalInstance
+	deleteCalls     []string
+	getCalls        []string
+	listCalls       []string
+	getCVCalls      []string
+	getClusterCalls []string
 }
 
 var _ baremetalworker.FulfillmentClient = (*FulfillmentClient)(nil)
@@ -61,6 +63,7 @@ func NewFulfillmentClient() *FulfillmentClient {
 		bmis:            map[string]*privatev1.BareMetalInstance{},
 		hostMACs:        map[string]string{},
 		clusterVersions: map[string]*privatev1.ClusterVersion{},
+		clusters:        map[string]*privatev1.Cluster{},
 	}
 }
 
@@ -70,6 +73,10 @@ func cloneBMI(b *privatev1.BareMetalInstance) *privatev1.BareMetalInstance {
 
 func cloneCV(c *privatev1.ClusterVersion) *privatev1.ClusterVersion {
 	return proto.Clone(c).(*privatev1.ClusterVersion)
+}
+
+func cloneCluster(c *privatev1.Cluster) *privatev1.Cluster {
+	return proto.Clone(c).(*privatev1.Cluster)
 }
 
 // CreateBareMetalInstance records the call, assigns an id (defaulting to metadata.name) and stores
@@ -171,7 +178,30 @@ func (f *FulfillmentClient) GetClusterVersion(
 	return cloneCV(cv), nil
 }
 
+// GetCluster records the call and returns a preloaded Cluster (see AddCluster), or an error
+// if none is registered for that id.
+func (f *FulfillmentClient) GetCluster(
+	_ context.Context, id string,
+) (*privatev1.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getClusterCalls = append(f.getClusterCalls, id)
+	cl, ok := f.clusters[id]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "cluster %q not found", id)
+	}
+	return cloneCluster(cl), nil
+}
+
 // --- Builder / control surface (test-only) ---
+
+// AddCluster preloads a Cluster so GetCluster can return it (keyed by id).
+func (f *FulfillmentClient) AddCluster(cl *privatev1.Cluster) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clusters[cl.GetId()] = cloneCluster(cl)
+}
 
 // AddClusterVersion preloads a ClusterVersion so GetClusterVersion can return it (keyed by id).
 func (f *FulfillmentClient) AddClusterVersion(cv *privatev1.ClusterVersion) {
@@ -252,4 +282,11 @@ func (f *FulfillmentClient) GetClusterVersionCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.getCVCalls...)
+}
+
+// GetClusterCalls returns the ids passed to GetCluster, in order.
+func (f *FulfillmentClient) GetClusterCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getClusterCalls...)
 }
