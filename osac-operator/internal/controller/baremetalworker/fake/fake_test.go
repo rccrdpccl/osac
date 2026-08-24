@@ -167,6 +167,22 @@ var _ = Describe("Fake FulfillmentClient", func() {
 		Expect(status.Code(err)).To(Equal(codes.NotFound))
 	})
 
+	It("preloads and returns Clusters", func() {
+		cl := privatev1.Cluster_builder{
+			Id:       "cluster-uuid",
+			Metadata: privatev1.Metadata_builder{Name: "my-cluster"}.Build(),
+		}.Build()
+		fc.AddCluster(cl)
+
+		got, err := fc.GetCluster(ctx, "cluster-uuid")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(got.GetMetadata().GetName()).To(Equal("my-cluster"))
+		Expect(fc.GetClusterCalls()).To(Equal([]string{"cluster-uuid"}))
+
+		_, err = fc.GetCluster(ctx, "nope")
+		Expect(status.Code(err)).To(Equal(codes.NotFound))
+	})
+
 	It("stores a settable host MAC per BMI for correlation", func() {
 		fc.SetHostMAC("bm-worker-0", "aa:bb:cc:dd:ee:ff")
 		Expect(fc.HostMAC("bm-worker-0")).To(Equal("aa:bb:cc:dd:ee:ff"))
