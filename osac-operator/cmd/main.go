@@ -324,10 +324,15 @@ func setupClusterControllers(
 
 	// BareMetalWorkerReconciler watches the same ClusterOrders and manages bare-metal worker
 	// provisioning (currently: ensure the cluster InfraEnv + fetch discovery ignition).
+	var bmwFulfillment baremetalworker.FulfillmentClient
+	if grpcConn != nil {
+		bmwFulfillment = baremetalworker.NewFulfillmentClientFromConn(grpcConn)
+	}
 	if err := baremetalworker.NewReconciler(
 		localMgr.GetClient(), localMgr.GetAPIReader(), localMgr.GetScheme(),
+		bmwFulfillment,
 		baremetalworker.NewIgnitionFetcher(nil),
-		localMgr.GetEventRecorderFor("baremetalworker"),
+		localMgr.GetEventRecorderFor("baremetalworker"), //nolint:staticcheck // TODO: migrate to events API
 		os.Getenv(envClusterOrderNamespace),
 	).SetupWithManager(mgr); err != nil {
 		return err
