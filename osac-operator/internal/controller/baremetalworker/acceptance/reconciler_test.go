@@ -35,6 +35,27 @@ import (
 	"github.com/osac-project/osac/osac-operator/internal/testing/envsim"
 )
 
+func newInstanceType(name string, fabricPort string, extraPorts ...*privatev1.BareMetalNetworkPortSpec) *privatev1.BareMetalInstanceType {
+	ports := append([]*privatev1.BareMetalNetworkPortSpec{
+		privatev1.BareMetalNetworkPortSpec_builder{
+			Name: fabricPort, Role: "fabric", Type: "Ethernet", Speed: "25Gbps",
+		}.Build(),
+	}, extraPorts...)
+	return privatev1.BareMetalInstanceType_builder{
+		Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+		Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+			Hardware: privatev1.BareMetalHardwareSpec_builder{
+				Cpu:          privatev1.BareMetalCPUSpec_builder{Cores: 64, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
+				Memory:       privatev1.BareMetalMemorySpec_builder{TotalGb: 256}.Build(),
+				NetworkPorts: ports,
+			}.Build(),
+			HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+				MatchLabels: map[string]string{"type": name},
+			}.Build(),
+		}.Build(),
+	}.Build()
+}
+
 var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 	var (
 		sim *envsim.Simulator
@@ -75,6 +96,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
 	}
 
 	newBareMetalClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
@@ -94,6 +116,10 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 						InstanceType: "bm-standard",
 					},
 				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
 			},
 		}
 	}
@@ -411,6 +437,10 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 						InstanceType: "bm-standard",
 					},
 				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
 			},
 		}
 	}
@@ -449,6 +479,10 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 			getClusterOrder(name).Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)).To(BeTrue())
 	}
 
+	addInstanceType := func(name string) {
+		fc.AddBareMetalInstanceType(newInstanceType(name, "data-0"))
+	}
+
 	It("resolves DiskImage ID from a ClusterVersion with disk_image set", func() {
 		fc.AddCluster(privatev1.Cluster_builder{
 			Id: clusterUUID,
@@ -462,6 +496,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		addInstanceType("bm-standard")
 
 		co := newBareMetalClusterOrder("bmw-resolve", map[string]string{clusterIDLabel: clusterUUID})
 		create(co)
@@ -477,6 +512,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 	})
 
 	It("sets RHCOSImageNotFound when ClusterVersion has no disk_image", func() {
+		addInstanceType("bm-standard")
 		fc.AddCluster(privatev1.Cluster_builder{
 			Id: clusterUUID,
 			Spec: privatev1.ClusterSpec_builder{
@@ -513,6 +549,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 	})
 
 	It("clears RHCOSImageNotFound when disk_image is later set on the ClusterVersion", func() {
+		addInstanceType("bm-standard")
 		fc.AddCluster(privatev1.Cluster_builder{
 			Id: clusterUUID,
 			Spec: privatev1.ClusterSpec_builder{
@@ -580,6 +617,13 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 
 	AfterEach(func() { ign.Close() })
 
+	addInstanceType := func(name, fabricPort string) {
+		mgmt := privatev1.BareMetalNetworkPortSpec_builder{
+			Name: "mgmt-0", Role: "management", Type: "Ethernet", Speed: "1Gbps",
+		}.Build()
+		fc.AddBareMetalInstanceType(newInstanceType(name, fabricPort, mgmt))
+	}
+
 	preloadDiskImageChain := func() {
 		fc.AddCluster(privatev1.Cluster_builder{
 			Id: clusterUUID,
@@ -593,6 +637,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		addInstanceType("bm-standard", "data-0")
 	}
 
 	newBareMetalClusterOrder := func(name string, numWorkers int) *osacv1alpha1.ClusterOrder {
@@ -813,5 +858,102 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		}
 		Expect(co.Status.Workers[0].Name).To(Equal("bmw-status-worker-0"))
 		Expect(co.Status.Workers[1].Name).To(Equal("bmw-status-worker-1"))
+	})
+
+	It("enriches BMI network attachment with interface from first fabric port and primary=true", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-enrich", 1)
+		create(co)
+		makeInfraEnvReady("bmw-enrich")
+
+		res, err := runReconcile("bmw-enrich")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(1))
+
+		netAttachments := calls[0].GetSpec().GetNetworkAttachments()
+		Expect(netAttachments).To(HaveLen(1))
+		Expect(netAttachments[0].GetSubnet().GetName()).To(Equal("my-subnet"))
+		Expect(netAttachments[0].GetSecurityGroups()).To(HaveLen(1))
+		Expect(netAttachments[0].GetSecurityGroups()[0].GetName()).To(Equal("sg-default"))
+		Expect(netAttachments[0].GetInterface()).To(Equal("data-0"))
+		Expect(netAttachments[0].GetPrimary()).To(BeTrue())
+	})
+
+	It("resolves different interfaces for different instance types across node sets", func() {
+		preloadDiskImageChain()
+		addInstanceType("bm-gpu", "gpu-data-0")
+
+		co := &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bmw-multi-type",
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{
+					{
+						ResourceClass: "bm-standard",
+						NumberOfNodes: 1,
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "bm-standard"},
+					},
+					{
+						ResourceClass: "bm-gpu",
+						NumberOfNodes: 1,
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "bm-gpu"},
+					},
+				},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+		create(co)
+		makeInfraEnvReady("bmw-multi-type")
+
+		res, err := runReconcile("bmw-multi-type")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(2))
+		Expect(calls[0].GetSpec().GetNetworkAttachments()[0].GetInterface()).To(Equal("data-0"))
+		Expect(calls[1].GetSpec().GetNetworkAttachments()[0].GetInterface()).To(Equal("gpu-data-0"))
+	})
+
+	It("returns an error when networkAttachment is missing from ClusterOrder", func() {
+		preloadDiskImageChain()
+		co := &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bmw-no-net",
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: 1,
+					BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "bm-standard"},
+				}},
+			},
+		}
+		create(co)
+
+		// First reconcile creates InfraEnv.
+		_, err := runReconcile("bmw-no-net")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-no-net-infraenv", testNamespace, ign.URL())).To(Succeed())
+
+		// Second reconcile reaches reconcileWorkers which fails on missing networkAttachment.
+		_, err = runReconcile("bmw-no-net")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("no networkAttachment"))
 	})
 })

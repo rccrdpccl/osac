@@ -189,6 +189,29 @@ var _ = Describe("Fake FulfillmentClient", func() {
 		Expect(fc.HostMAC("other")).To(BeEmpty())
 	})
 
+	It("preloads and returns BareMetalInstanceTypes", func() {
+		fc.AddBareMetalInstanceType(privatev1.BareMetalInstanceType_builder{
+			Metadata: privatev1.Metadata_builder{Name: "bm-standard"}.Build(),
+			Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+				Hardware: privatev1.BareMetalHardwareSpec_builder{
+					Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 64, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
+					Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 256}.Build(),
+				}.Build(),
+				HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+					MatchLabels: map[string]string{"type": "bm-standard"},
+				}.Build(),
+			}.Build(),
+		}.Build())
+
+		got, err := fc.GetBareMetalInstanceType(ctx, "bm-standard")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(got.GetMetadata().GetName()).To(Equal("bm-standard"))
+		Expect(fc.GetInstanceTypeCalls()).To(Equal([]string{"bm-standard"}))
+
+		_, err = fc.GetBareMetalInstanceType(ctx, "nope")
+		Expect(status.Code(err)).To(Equal(codes.NotFound))
+	})
+
 	Context("BareMetalInstanceCatalogItem operations", func() {
 		ciNamed := func(name string) *privatev1.BareMetalInstanceCatalogItem {
 			return privatev1.BareMetalInstanceCatalogItem_builder{
