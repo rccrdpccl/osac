@@ -433,11 +433,24 @@ func (r *Reconciler) reconcileNodeSets(
 	var workers []v1alpha1.WorkerStatus
 	globalIndex := 0
 
+	if co.Spec.NetworkAttachment == nil {
+		return nil, ctrl.Result{}, fmt.Errorf("ClusterOrder %s has no networkAttachment", co.Name)
+	}
+
 	for i := range co.Spec.NodeRequests {
 		nr := &co.Spec.NodeRequests[i]
 		if !nr.IsBareMetal() {
 			continue
 		}
+
+		fabricInterface, res, err := r.resolveFabricInterfaceForNodeSet(ctx, co, nr.BareMetal.InstanceType)
+		if err != nil {
+			return nil, ctrl.Result{}, err
+		}
+		if !res.IsZero() {
+			return nil, res, nil
+		}
+
 		for j := 0; j < nr.NumberOfNodes; j++ {
 			workerName := fmt.Sprintf("%s-worker-%d", co.Name, globalIndex)
 			globalIndex++
@@ -448,7 +461,7 @@ func (r *Reconciler) reconcileNodeSets(
 				continue
 			}
 
-			bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter)
+			bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
 			if err != nil {
 				return nil, ctrl.Result{}, err
 			}
@@ -463,13 +476,33 @@ func (r *Reconciler) reconcileNodeSets(
 	return workers, ctrl.Result{}, nil
 }
 
+// resolveFabricInterfaceForNodeSet resolves the fabric interface name from the BareMetalInstanceType
+// referenced by the node set.
+func (r *Reconciler) resolveFabricInterfaceForNodeSet(
+	ctx context.Context, co *v1alpha1.ClusterOrder, instanceTypeName string,
+) (string, ctrl.Result, error) {
+	it, err := r.fulfillment.GetBareMetalInstanceType(ctx, instanceTypeName)
+	if res, handled := r.handleUnavailable(ctx, co, err); handled {
+		return "", res, nil
+	}
+	if err != nil {
+		return "", ctrl.Result{}, fmt.Errorf("getting BareMetalInstanceType %s: %w", instanceTypeName, err)
+	}
+
+	iface, err := resolveFabricInterface(it)
+	if err != nil {
+		return "", ctrl.Result{}, err
+	}
+	return iface, ctrl.Result{}, nil
+}
+
 // ensureBMI creates a single BareMetalInstance, handling the AlreadyExists race by re-listing.
 // Returns the BMI, a non-zero result on unavailability backoff, or an error.
 func (r *Reconciler) ensureBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest,
-	workerName, diskImageID, ignitionB64, filter string,
+	workerName, diskImageID, ignitionB64, filter, fabricInterface string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
-	req := r.buildBMICreateRequest(co, nodeSet, workerName, diskImageID, ignitionB64)
+	req := r.buildBMICreateRequest(co, nodeSet, workerName, diskImageID, ignitionB64, fabricInterface)
 	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
 	if err == nil {
 		return created, ctrl.Result{}, nil
@@ -529,6 +562,17 @@ func newWorkerStatus(nodeSet, name, resourceID string) v1alpha1.WorkerStatus {
 	}
 }
 
+// resolveFabricInterface returns the name of the first network port with role "fabric" from the
+// BareMetalInstanceType. Returns an error if no fabric port is found.
+func resolveFabricInterface(it *privatev1.BareMetalInstanceType) (string, error) {
+	for _, port := range it.GetSpec().GetHardware().GetNetworkPorts() {
+		if port.GetRole() == "fabric" {
+			return port.GetName(), nil
+		}
+	}
+	return "", fmt.Errorf("BareMetalInstanceType %s has no fabric-role network port", it.GetMetadata().GetName())
+}
+
 func bmisByName(bmis []*privatev1.BareMetalInstance) map[string]*privatev1.BareMetalInstance {
 	m := make(map[string]*privatev1.BareMetalInstance, len(bmis))
 	for _, bmi := range bmis {
@@ -538,22 +582,24 @@ func bmisByName(bmis []*privatev1.BareMetalInstance) map[string]*privatev1.BareM
 }
 
 func (r *Reconciler) buildBMICreateRequest(
-	co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest, workerName, diskImageID, ignitionB64 string,
+	co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest, workerName, diskImageID, ignitionB64, fabricInterface string,
 ) *privatev1.BareMetalInstance {
 	labels := map[string]string{clusterOrderLabel: co.Name}
 	annotations := map[string]string{ownerReferenceAnnotation: fmt.Sprintf("ClusterOrder/%s", co.Name)}
 
-	var netAttachments []*privatev1.BareMetalNetworkAttachment
-	if co.Spec.NetworkAttachment != nil {
-		na := co.Spec.NetworkAttachment
-		sgRefs := make([]*privatev1.SecurityGroupLocalReference, 0, len(na.SecurityGroupRefs))
-		for _, sg := range na.SecurityGroupRefs {
-			sgRefs = append(sgRefs, privatev1.SecurityGroupLocalReference_builder{Name: sg}.Build())
-		}
-		netAttachments = append(netAttachments, privatev1.BareMetalNetworkAttachment_builder{
+	na := co.Spec.NetworkAttachment
+	sgRefs := make([]*privatev1.SecurityGroupLocalReference, 0, len(na.SecurityGroupRefs))
+	for _, sg := range na.SecurityGroupRefs {
+		sgRefs = append(sgRefs, privatev1.SecurityGroupLocalReference_builder{Name: sg}.Build())
+	}
+	primary := true
+	netAttachments := []*privatev1.BareMetalNetworkAttachment{
+		privatev1.BareMetalNetworkAttachment_builder{
 			Subnet:         privatev1.SubnetLocalReference_builder{Name: na.SubnetRef}.Build(),
 			SecurityGroups: sgRefs,
-		}.Build())
+			Interface:      &fabricInterface,
+			Primary:        &primary,
+		}.Build(),
 	}
 
 	return privatev1.BareMetalInstance_builder{
