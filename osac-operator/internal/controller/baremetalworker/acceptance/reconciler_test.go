@@ -254,3 +254,149 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		Expect(err).To(HaveOccurred())
 	})
 })
+
+var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
+	const (
+		clusterUUID    = "resolve-cluster-uuid"
+		cvID           = "4.18.0"
+		diskImageID    = "rhcos-4.18"
+		clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+	)
+
+	var (
+		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
+		ign *fake.IgnitionServer
+		rec *record.FakeRecorder
+		r   *baremetalworker.Reconciler
+	)
+
+	BeforeEach(func() {
+		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
+		ign = fake.NewIgnitionServer()
+		rec = record.NewFakeRecorder(10)
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+	})
+
+	AfterEach(func() { ign.Close() })
+
+	newBareMetalClusterOrder := func(name string, labels map[string]string) *osacv1alpha1.ClusterOrder {
+		return &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    labels,
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: 1,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+			},
+		}
+	}
+
+	runReconcile := func(name string) (reconcile.Result, error) {
+		return r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
+		})
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		GinkgoHelper()
+		co := &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, co)).To(Succeed())
+		return co
+	}
+
+	create := func(co *osacv1alpha1.ClusterOrder) {
+		GinkgoHelper()
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, co)
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+	}
+
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+		_, err = runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(apimeta.IsStatusConditionTrue(
+			getClusterOrder(name).Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)).To(BeTrue())
+	}
+
+	It("resolves DiskImage ID from a ClusterVersion with disk_image set", func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+
+		co := newBareMetalClusterOrder("bmw-resolve", map[string]string{clusterIDLabel: clusterUUID})
+		create(co)
+		makeInfraEnvReady("bmw-resolve")
+
+		res, err := runReconcile("bmw-resolve")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		cond := apimeta.FindStatusCondition(
+			getClusterOrder("bmw-resolve").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
+		Expect(cond).To(BeNil(), "RHCOSImageNotFound should not be set when disk_image is present")
+	})
+
+	It("sets RHCOSImageNotFound when ClusterVersion has no disk_image", func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id:   cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{}.Build(),
+		}.Build())
+
+		co := newBareMetalClusterOrder("bmw-nodisk", map[string]string{clusterIDLabel: clusterUUID})
+		create(co)
+		makeInfraEnvReady("bmw-nodisk")
+
+		res, err := runReconcile("bmw-nodisk")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		cond := apimeta.FindStatusCondition(
+			getClusterOrder("bmw-nodisk").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
+		Expect(cond).ToNot(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("requeues when the clusterorder-uuid label is absent", func() {
+		co := newBareMetalClusterOrder("bmw-nolabel", nil)
+		create(co)
+		makeInfraEnvReady("bmw-nolabel")
+
+		res, err := runReconcile("bmw-nolabel")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+	})
+})
