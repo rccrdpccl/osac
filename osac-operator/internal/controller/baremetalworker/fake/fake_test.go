@@ -188,6 +188,53 @@ var _ = Describe("Fake FulfillmentClient", func() {
 		Expect(fc.HostMAC("bm-worker-0")).To(Equal("aa:bb:cc:dd:ee:ff"))
 		Expect(fc.HostMAC("other")).To(BeEmpty())
 	})
+
+	Context("BareMetalInstanceCatalogItem operations", func() {
+		ciNamed := func(name string) *privatev1.BareMetalInstanceCatalogItem {
+			return privatev1.BareMetalInstanceCatalogItem_builder{
+				Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+			}.Build()
+		}
+
+		It("records Create and stores the catalog item retrievable by List", func() {
+			created, err := fc.CreateBareMetalInstanceCatalogItem(ctx, ciNamed("system-bmi-passthrough"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(created.GetId()).To(Equal("system-bmi-passthrough"))
+
+			Expect(fc.CreateCatalogItemCalls()).To(HaveLen(1))
+			Expect(fc.CreateCatalogItemCalls()[0].GetMetadata().GetName()).To(Equal("system-bmi-passthrough"))
+
+			items, err := fc.ListBareMetalInstanceCatalogItems(ctx, "")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(items).To(HaveLen(1))
+			Expect(items[0].GetMetadata().GetName()).To(Equal("system-bmi-passthrough"))
+		})
+
+		It("requires metadata.name on Create (InvalidArgument)", func() {
+			_, err := fc.CreateBareMetalInstanceCatalogItem(ctx, &privatev1.BareMetalInstanceCatalogItem{})
+			Expect(err).To(HaveOccurred())
+			Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		})
+
+		It("rejects a duplicate Create with AlreadyExists", func() {
+			_, err := fc.CreateBareMetalInstanceCatalogItem(ctx, ciNamed("system-bmi-passthrough"))
+			Expect(err).ToNot(HaveOccurred())
+			_, err = fc.CreateBareMetalInstanceCatalogItem(ctx, ciNamed("system-bmi-passthrough"))
+			Expect(status.Code(err)).To(Equal(codes.AlreadyExists))
+		})
+
+		It("lists all stored catalog items ordered by id and records the filter", func() {
+			_, _ = fc.CreateBareMetalInstanceCatalogItem(ctx, ciNamed("b-item"))
+			_, _ = fc.CreateBareMetalInstanceCatalogItem(ctx, ciNamed("a-item"))
+
+			items, err := fc.ListBareMetalInstanceCatalogItems(ctx, "metadata.name=='a-item'")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(items).To(HaveLen(2))
+			Expect(items[0].GetId()).To(Equal("a-item"))
+			Expect(items[1].GetId()).To(Equal("b-item"))
+			Expect(fc.ListCatalogItemCalls()).To(Equal([]string{"metadata.name=='a-item'"}))
+		})
+	})
 })
 
 var _ = Describe("Fake ignition endpoint", func() {
