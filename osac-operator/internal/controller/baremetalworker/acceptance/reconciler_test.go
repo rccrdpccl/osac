@@ -14,6 +14,9 @@ language governing permissions and limitations under the License.
 package acceptance
 
 import (
+	"encoding/base64"
+	"fmt"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -438,5 +441,268 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 			getClusterOrder("bmw-clear").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
 		Expect(cond).ToNot(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+	})
+})
+
+var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
+	const (
+		clusterUUID    = "workers-cluster-uuid"
+		cvID           = "4.18.0"
+		diskImageID    = "rhcos-4.18"
+		clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+	)
+
+	var (
+		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
+		ign *fake.IgnitionServer
+		rec *record.FakeRecorder
+		r   *baremetalworker.Reconciler
+	)
+
+	BeforeEach(func() {
+		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
+		ign = fake.NewIgnitionServer()
+		rec = record.NewFakeRecorder(10)
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+	})
+
+	AfterEach(func() { ign.Close() })
+
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+	}
+
+	newBareMetalClusterOrder := func(name string, numWorkers int) *osacv1alpha1.ClusterOrder {
+		co := &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: numWorkers,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+		return co
+	}
+
+	runReconcile := func(name string) (reconcile.Result, error) {
+		return r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
+		})
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		GinkgoHelper()
+		co := &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, co)).To(Succeed())
+		return co
+	}
+
+	create := func(co *osacv1alpha1.ClusterOrder) {
+		GinkgoHelper()
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, co)
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+	}
+
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+		_, err = runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(apimeta.IsStatusConditionTrue(
+			getClusterOrder(name).Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)).To(BeTrue())
+	}
+
+	It("creates BMIs with correct fields for a single-worker node set", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-create", 1)
+		create(co)
+		makeInfraEnvReady("bmw-create")
+
+		res, err := runReconcile("bmw-create")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(1))
+
+		bmi := calls[0]
+		Expect(bmi.GetMetadata().GetTenant()).To(Equal("system"))
+		Expect(bmi.GetMetadata().GetName()).To(Equal("bmw-create-worker-0"))
+		Expect(bmi.GetMetadata().GetLabels()).To(HaveKeyWithValue("osac.openshift.io/cluster-order", "bmw-create"))
+		Expect(bmi.GetMetadata().GetAnnotations()).To(HaveKeyWithValue(
+			"osac.openshift.io/owner-reference", "ClusterOrder/bmw-create"))
+		Expect(bmi.GetSpec().GetCatalogItem().GetName()).To(Equal("system-bmi-passthrough"))
+		Expect(bmi.GetSpec().GetImage().GetSourceType()).To(Equal("disk_image"))
+		Expect(bmi.GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageID))
+		Expect(bmi.GetSpec().GetInstanceType()).To(Equal("bm-standard"))
+
+		userData := bmi.GetSpec().GetUserData()
+		decoded, decErr := base64.StdEncoding.DecodeString(userData)
+		Expect(decErr).ToNot(HaveOccurred())
+		Expect(decoded).ToNot(BeEmpty())
+
+		netAttachments := bmi.GetSpec().GetNetworkAttachments()
+		Expect(netAttachments).To(HaveLen(1))
+		Expect(netAttachments[0].GetSubnet().GetName()).To(Equal("my-subnet"))
+		Expect(netAttachments[0].GetSecurityGroups()).To(HaveLen(1))
+		Expect(netAttachments[0].GetSecurityGroups()[0].GetName()).To(Equal("sg-default"))
+	})
+
+	It("creates N BMIs for a multi-worker node set", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-multi", 3)
+		create(co)
+		makeInfraEnvReady("bmw-multi")
+
+		res, err := runReconcile("bmw-multi")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(3))
+		for i, call := range calls {
+			Expect(call.GetMetadata().GetName()).To(Equal(fmt.Sprintf("bmw-multi-worker-%d", i)))
+		}
+
+		co = getClusterOrder("bmw-multi")
+		Expect(co.Status.Workers).To(HaveLen(3))
+	})
+
+	It("skips creation when BMI already exists (list-before-create)", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-idem", 1)
+		create(co)
+
+		// Pre-create the BMI in the fake BEFORE makeInfraEnvReady, because the second
+		// reconcile in makeInfraEnvReady reaches reconcileWorkers.
+		_, err := fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
+			Metadata: privatev1.Metadata_builder{
+				Tenant: "system",
+				Name:   "bmw-idem-worker-0",
+				Labels: map[string]string{"osac.openshift.io/cluster-order": "bmw-idem"},
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		makeInfraEnvReady("bmw-idem")
+
+		// makeInfraEnvReady's second reconcile and subsequent reconciles all skip
+		// creation because list-before-create finds the pre-existing BMI.
+		createCallsBefore := len(fc.CreateCalls())
+
+		res, err := runReconcile("bmw-idem")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		Expect(fc.CreateCalls()).To(HaveLen(createCallsBefore))
+
+		co = getClusterOrder("bmw-idem")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Name).To(Equal("bmw-idem-worker-0"))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Provisioning"))
+	})
+
+	It("handles AlreadyExists by re-listing and recording the existing BMI", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-exists", 1)
+		create(co)
+		makeInfraEnvReady("bmw-exists")
+
+		// First reconcile creates the BMI, second finds it via list (idempotent re-reconcile).
+		res, err := runReconcile("bmw-exists")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		// First reconcile created it.
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+
+		// Second reconcile — list finds it, no new create call.
+		res, err = runReconcile("bmw-exists")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		// Still only 1 create call total — second reconcile used list-before-create.
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+
+		co = getClusterOrder("bmw-exists")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].ResourceID).ToNot(BeEmpty())
+	})
+
+	It("returns an error when BMI creation fails", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-unavail", 1)
+		create(co)
+
+		// Set the create error BEFORE makeInfraEnvReady so it is active when
+		// the second reconcile reaches reconcileWorkers.
+		fc.SetCreateError(fmt.Errorf("connection refused"))
+
+		// First reconcile creates InfraEnv (no fulfillment call yet).
+		_, err := runReconcile("bmw-unavail")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-unavail-infraenv", testNamespace, ign.URL())).To(Succeed())
+
+		// Second reconcile fetches ignition, resolves disk image, then tries
+		// reconcileWorkers — which fails on Create.
+		_, err = runReconcile("bmw-unavail")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("creating BMI"))
+	})
+
+	It("updates status.workers with phase Provisioning", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-status", 2)
+		create(co)
+		makeInfraEnvReady("bmw-status")
+
+		res, err := runReconcile("bmw-status")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		co = getClusterOrder("bmw-status")
+		Expect(co.Status.Workers).To(HaveLen(2))
+		for _, w := range co.Status.Workers {
+			Expect(w.Phase).To(Equal("Provisioning"))
+			Expect(w.Kind).To(Equal("BareMetalInstance"))
+			Expect(w.ResourceID).ToNot(BeEmpty())
+			Expect(w.NodeSet).To(Equal("bm-standard"))
+		}
+		Expect(co.Status.Workers[0].Name).To(Equal("bmw-status-worker-0"))
+		Expect(co.Status.Workers[1].Name).To(Equal("bmw-status-worker-1"))
 	})
 })
