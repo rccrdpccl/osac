@@ -107,6 +107,7 @@ func (b *PrivateInstanceTypesServerBuilder) Build() (result *PrivateInstanceType
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetFilterDesc(b.filterDesc).
+		AddAllowedTenants(auth.SharedTenant).
 		Build()
 	if err != nil {
 		return
@@ -142,16 +143,6 @@ func (s *PrivateInstanceTypesServer) Create(ctx context.Context,
 	spec := request.GetObject().GetSpec()
 	if spec == nil {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object spec is mandatory")
-		return
-	}
-
-	// Validate required spec fields:
-	if spec.GetCores() <= 0 {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.cores' must be greater than zero")
-		return
-	}
-	if spec.GetMemoryGib() <= 0 {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'spec.memory_gib' must be greater than zero")
 		return
 	}
 

@@ -225,10 +225,10 @@ If you need to export the realm configuration for backup or modification:
    kubectl exec -n keycloak "${pod}" -- cat /tmp/realm.json > realm.json
    ```
 
-4. (Optional) Update the chart's realm file:
+4. (Optional) Update the chart's realm file (in the `osac-installer` repo, not here):
 
    ```bash
-   cp realm.json it/charts/keycloak/files/realm.json
+   cp realm.json osac-installer/charts/osac-infra/files/realm.json
    ```
 
 ## Fulfillment Service Configuration
@@ -438,13 +438,15 @@ fulfillment service. Valid values are `default` and `guest`.
 1. **Shared Tenant**: The `shared` tenant is a special tenant that is always included in the visible
    tenants for all users. Resources assigned to the `shared` tenant are visible to **everyone**.
    This is useful for templates, shared configurations, or other resources that should be accessible
-   across all tenants. Note that certain resource types — specifically **projects** and **identity
-   providers** — cannot be created in the `shared` tenant and must be scoped to a specific tenant.
+   across all tenants. Note that tenant-scoped resource types (such as projects, identity providers,
+   clusters, compute instances, and networking resources) cannot be created in the `shared` tenant
+   and must be scoped to a specific tenant. Platform-scoped resources (such as roles, users, host
+   types, instance types, templates, and catalog items) can be placed in the `shared` tenant.
 
 2. **System Tenant**: The `system` tenant is a special tenant used for objects that are only visible
    to the system itself. Resources assigned to the `system` tenant are not visible to regular users.
-   This is used internally for system-level resources. As with the `shared` tenant, **projects** and
-   **identity providers** cannot be created in the `system` tenant.
+   This is used internally for system-level resources. As with the `shared` tenant, tenant-scoped
+   resources cannot be created in the `system` tenant.
 
 3. **Single-Organization Limitation**: In Keycloak, a user can only be a member of one organization
    at a time. This means JWT users have access to exactly one tenant (plus the `shared` tenant for
@@ -477,10 +479,9 @@ JWT token claims (see [Subject Resolution](#subject-resolution)).
 - **Assignable Tenants**: All tenants from the subject
 - **Default Tenant**: First tenant from the subject. When the subject has access to all tenants
   (e.g., an admin with the universal set `["*"]`), the default tenant is `shared` because a
-  universal set cannot be stored as the tenant of an object. For resource types that cannot belong
-  to the `shared` tenant (projects and identity providers), admin users must explicitly specify
-  `metadata.tenant` in the create request; otherwise the request will be rejected with
-  `InvalidArgument`.
+  universal set cannot be stored as the tenant of an object. For tenant-scoped resource types that
+  cannot be placed in the `shared` tenant, admin users must explicitly specify `metadata.tenant`
+  in the create request; otherwise the request will be rejected with `PermissionDenied`.
 - **Visible Tenants**: All subject's tenants plus the `shared` tenant. For admins with the
   universal set, all tenants are visible.
 
@@ -674,7 +675,7 @@ The fulfillment service implements a comprehensive authorization model that comb
 
 **Permissions:** Read/write access to infrastructure resources:
 - Bare-metal instances, clusters, compute instances, disk images
-- Networking (virtual networks, subnets, network classes, security groups)
+- Networking (virtual networks, subnets, security groups)
 - IPs (external IPs and their attachments/pools)
 - Templates and catalog items (read-only)
 - Console sessions, events, host types, instance types
@@ -1044,5 +1045,4 @@ Test that authorization rules are working:
 
 - [Keycloak Documentation](https://www.keycloak.org/documentation)
 - [Open Policy Agent (OPA) Documentation](https://www.openpolicyagent.org/docs/latest/)
-- [Helm Chart README](it/charts/keycloak/README.md)
 - [Service Chart README](charts/service/README.md)
