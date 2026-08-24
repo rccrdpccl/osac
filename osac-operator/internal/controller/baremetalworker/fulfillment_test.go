@@ -251,14 +251,62 @@ func (f *fakeBMICatalogItemsClient) Signal(
 	return nil, errors.New("not implemented")
 }
 
+// fakeBMITypesClient is a hand-written stub of privatev1.BareMetalInstanceTypesClient.
+type fakeBMITypesClient struct {
+	lastCtx context.Context
+	err     error
+	object  *privatev1.BareMetalInstanceType
+}
+
+func (f *fakeBMITypesClient) Get(
+	ctx context.Context, _ *privatev1.BareMetalInstanceTypesGetRequest, _ ...grpc.CallOption,
+) (*privatev1.BareMetalInstanceTypesGetResponse, error) {
+	f.lastCtx = ctx
+	if f.err != nil {
+		return nil, f.err
+	}
+	return privatev1.BareMetalInstanceTypesGetResponse_builder{Object: f.object}.Build(), nil
+}
+
+func (f *fakeBMITypesClient) List(
+	context.Context, *privatev1.BareMetalInstanceTypesListRequest, ...grpc.CallOption,
+) (*privatev1.BareMetalInstanceTypesListResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeBMITypesClient) Create(
+	context.Context, *privatev1.BareMetalInstanceTypesCreateRequest, ...grpc.CallOption,
+) (*privatev1.BareMetalInstanceTypesCreateResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeBMITypesClient) Update(
+	context.Context, *privatev1.BareMetalInstanceTypesUpdateRequest, ...grpc.CallOption,
+) (*privatev1.BareMetalInstanceTypesUpdateResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeBMITypesClient) Delete(
+	context.Context, *privatev1.BareMetalInstanceTypesDeleteRequest, ...grpc.CallOption,
+) (*privatev1.BareMetalInstanceTypesDeleteResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeBMITypesClient) Signal(
+	context.Context, *privatev1.BareMetalInstanceTypesSignalRequest, ...grpc.CallOption,
+) (*privatev1.BareMetalInstanceTypesSignalResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 var _ = Describe("FulfillmentClient wrapper", func() {
 	var (
-		bmi          *fakeBMIClient
-		cv           *fakeCVClient
-		clusters     *fakeClustersClient
-		catalogItems *fakeBMICatalogItemsClient
-		fc           FulfillmentClient
-		ctx          context.Context
+		bmi           *fakeBMIClient
+		cv            *fakeCVClient
+		clusters      *fakeClustersClient
+		catalogItems  *fakeBMICatalogItemsClient
+		instanceTypes *fakeBMITypesClient
+		fc            FulfillmentClient
+		ctx           context.Context
 	)
 
 	BeforeEach(func() {
@@ -266,7 +314,8 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 		cv = &fakeCVClient{object: &privatev1.ClusterVersion{}}
 		clusters = &fakeClustersClient{object: &privatev1.Cluster{}}
 		catalogItems = &fakeBMICatalogItemsClient{object: &privatev1.BareMetalInstanceCatalogItem{}}
-		fc = NewFulfillmentClient(bmi, cv, clusters, catalogItems)
+		instanceTypes = &fakeBMITypesClient{object: &privatev1.BareMetalInstanceType{}}
+		fc = NewFulfillmentClient(bmi, cv, clusters, catalogItems, instanceTypes)
 		ctx = context.Background()
 	})
 
@@ -309,6 +358,11 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			_, err := fc.ListBareMetalInstanceCatalogItems(ctx, "")
 			Expect(err).ToNot(HaveOccurred())
 			expectCallDeadline(catalogItems.lastCtx)
+		})
+		It("on GetBareMetalInstanceType", func() {
+			_, err := fc.GetBareMetalInstanceType(ctx, "bm-standard")
+			Expect(err).ToNot(HaveOccurred())
+			expectCallDeadline(instanceTypes.lastCtx)
 		})
 	})
 
@@ -353,6 +407,13 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(got).To(HaveLen(2))
 		})
+		It("returns the instance type", func() {
+			want := &privatev1.BareMetalInstanceType{}
+			instanceTypes.object = want
+			got, err := fc.GetBareMetalInstanceType(ctx, "bm-standard")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got).To(BeIdenticalTo(want))
+		})
 	})
 
 	Context("consecutive-failure signalling", func() {
@@ -391,7 +452,8 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 				v := &fakeCVClient{err: errBackend, object: &privatev1.ClusterVersion{}}
 				cl := &fakeClustersClient{err: errBackend, object: &privatev1.Cluster{}}
 				ci := &fakeBMICatalogItemsClient{err: errBackend, object: &privatev1.BareMetalInstanceCatalogItem{}}
-				c := NewFulfillmentClient(b, v, cl, ci)
+				it := &fakeBMITypesClient{err: errBackend, object: &privatev1.BareMetalInstanceType{}}
+				c := NewFulfillmentClient(b, v, cl, ci, it)
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeTrue())
@@ -425,6 +487,10 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			}),
 			Entry("ListBareMetalInstanceCatalogItems", func(c FulfillmentClient) error {
 				_, e := c.ListBareMetalInstanceCatalogItems(context.Background(), "")
+				return e
+			}),
+			Entry("GetBareMetalInstanceType", func(c FulfillmentClient) error {
+				_, e := c.GetBareMetalInstanceType(context.Background(), "bm-standard")
 				return e
 			}),
 		)
