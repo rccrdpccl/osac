@@ -53,9 +53,15 @@ const (
 	managementStateAnnotation = "osac.openshift.io/management-state"
 	managementStateUnmanaged  = "unmanaged"
 
+	// clusterOrderIDLabel is the label set by the fulfillment-service provisioning flow, carrying
+	// the fulfillment-service Cluster UUID. Same key as controller.osacClusterOrderIDLabel (unexported).
+	clusterOrderIDLabel = "osac.openshift.io/clusterorder-uuid"
+
 	eventReasonIgnitionSizeWarning = "DiscoveryIgnitionSizeWarning"
 	reasonInfraEnvReady            = "InfraEnvReady"
 	reasonIgnitionPending          = "IgnitionPending"
+	reasonDiskImageNotFound        = "DiskImageNotFound"
+	reasonDiskImageResolved        = "DiskImageResolved"
 )
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv"}
@@ -68,6 +74,7 @@ type Reconciler struct {
 	client.Client
 	apiReader             client.Reader
 	scheme                *runtime.Scheme
+	fulfillment           FulfillmentClient
 	ignition              IgnitionFetcher
 	recorder              record.EventRecorder
 	clusterOrderNamespace string
@@ -78,6 +85,7 @@ func NewReconciler(
 	c client.Client,
 	apiReader client.Reader,
 	scheme *runtime.Scheme,
+	fulfillment FulfillmentClient,
 	ignition IgnitionFetcher,
 	recorder record.EventRecorder,
 	clusterOrderNamespace string,
@@ -86,6 +94,7 @@ func NewReconciler(
 		Client:                c,
 		apiReader:             apiReader,
 		scheme:                scheme,
+		fulfillment:           fulfillment,
 		ignition:              ignition,
 		recorder:              recorder,
 		clusterOrderNamespace: clusterOrderNamespace,
@@ -115,9 +124,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	res, err := r.ensureInfraEnv(ctx, co)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	_, res, err = r.resolveDiskImage(ctx, co)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
 	// Later phases (reconcileWorkers OSAC-4159, correlateAgents OSAC-4160,
 	// reconcileNodePoolReplicas OSAC-4160) are intentionally not implemented yet.
-	return r.ensureInfraEnv(ctx, co)
+	return ctrl.Result{}, nil
 }
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
@@ -231,6 +250,70 @@ func (r *Reconciler) setInfraEnvReady(
 		latest.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, status, message, reason)
 		// Optimistic lock so a concurrent ClusterOrder-controller status write yields a 409 that
 		// RetryOnConflict re-reads and re-applies, instead of silently clobbering its conditions.
+		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
+}
+
+// resolveDiskImage reads the Cluster's ClusterVersion reference via the fulfillment-service
+// private API and extracts the DiskImage ID. It re-resolves on every reconcile so a
+// ClusterVersion upgrade takes effect without controller restart.
+func (r *Reconciler) resolveDiskImage(ctx context.Context, co *v1alpha1.ClusterOrder) (string, ctrl.Result, error) {
+	log := ctrllog.FromContext(ctx)
+
+	clusterID := co.Labels[clusterOrderIDLabel]
+	if clusterID == "" {
+		log.Info("ClusterOrder missing clusterorder-uuid label, requeuing")
+		return "", ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+	}
+
+	cluster, err := r.fulfillment.GetCluster(ctx, clusterID)
+	if err != nil {
+		return "", ctrl.Result{}, fmt.Errorf("getting cluster %s: %w", clusterID, err)
+	}
+
+	versionID := cluster.GetSpec().GetVersion().GetId()
+	if versionID == "" {
+		return "", ctrl.Result{}, fmt.Errorf("cluster %s has no version reference", clusterID)
+	}
+
+	cv, err := r.fulfillment.GetClusterVersion(ctx, versionID)
+	if err != nil {
+		return "", ctrl.Result{}, fmt.Errorf("getting cluster version %s: %w", versionID, err)
+	}
+
+	diskImage := cv.GetSpec().GetDiskImage()
+	if diskImage == nil || diskImage.GetId() == "" {
+		log.Info("ClusterVersion has no disk_image, setting RHCOSImageNotFound", "clusterVersion", versionID)
+		if condErr := r.setRHCOSImageNotFound(ctx, co, metav1.ConditionTrue, reasonDiskImageNotFound,
+			fmt.Sprintf("ClusterVersion %s has no disk_image reference", versionID)); condErr != nil {
+			return "", ctrl.Result{}, condErr
+		}
+		return "", ctrl.Result{}, nil
+	}
+
+	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionRHCOSImageNotFound) {
+		if condErr := r.setRHCOSImageNotFound(ctx, co, metav1.ConditionFalse, reasonDiskImageResolved,
+			"disk_image reference resolved"); condErr != nil {
+			return "", ctrl.Result{}, condErr
+		}
+	}
+
+	return diskImage.GetId(), ctrl.Result{}, nil
+}
+
+// setRHCOSImageNotFound patches only the RHCOSImageNotFound condition on the ClusterOrder,
+// re-reading and retrying on conflict so it never clobbers status fields owned by other controllers.
+func (r *Reconciler) setRHCOSImageNotFound(
+	ctx context.Context, co *v1alpha1.ClusterOrder, status metav1.ConditionStatus, reason, message string,
+) error {
+	key := client.ObjectKeyFromObject(co)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &v1alpha1.ClusterOrder{}
+		if err := r.apiReader.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		base := latest.DeepCopy()
+		latest.SetStatusCondition(v1alpha1.ConditionRHCOSImageNotFound, status, message, reason)
 		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	})
 }
