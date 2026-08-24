@@ -64,15 +64,18 @@ type FulfillmentClient interface {
 	CreateBareMetalInstanceCatalogItem(ctx context.Context, obj *privatev1.BareMetalInstanceCatalogItem) (*privatev1.BareMetalInstanceCatalogItem, error)
 	// ListBareMetalInstanceCatalogItems returns the BareMetalInstanceCatalogItems matching the given CEL filter.
 	ListBareMetalInstanceCatalogItems(ctx context.Context, filter string) ([]*privatev1.BareMetalInstanceCatalogItem, error)
+	// GetBareMetalInstanceType returns the BareMetalInstanceType with the given id (or name).
+	GetBareMetalInstanceType(ctx context.Context, id string) (*privatev1.BareMetalInstanceType, error)
 }
 
 // fulfillmentClient is the production FulfillmentClient. It wraps the generated gRPC clients,
 // applies a per-call deadline, and tracks consecutive gRPC failures for the unavailable signal.
 type fulfillmentClient struct {
-	bmis         privatev1.BareMetalInstancesClient
-	versions     privatev1.ClusterVersionsClient
-	clusters     privatev1.ClustersClient
-	catalogItems privatev1.BareMetalInstanceCatalogItemsClient
+	bmis          privatev1.BareMetalInstancesClient
+	versions      privatev1.ClusterVersionsClient
+	clusters      privatev1.ClustersClient
+	catalogItems  privatev1.BareMetalInstanceCatalogItemsClient
+	instanceTypes privatev1.BareMetalInstanceTypesClient
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -84,8 +87,12 @@ func NewFulfillmentClient(
 	versions privatev1.ClusterVersionsClient,
 	clusters privatev1.ClustersClient,
 	catalogItems privatev1.BareMetalInstanceCatalogItemsClient,
+	instanceTypes privatev1.BareMetalInstanceTypesClient,
 ) FulfillmentClient {
-	return &fulfillmentClient{bmis: bmis, versions: versions, clusters: clusters, catalogItems: catalogItems}
+	return &fulfillmentClient{
+		bmis: bmis, versions: versions, clusters: clusters,
+		catalogItems: catalogItems, instanceTypes: instanceTypes,
+	}
 }
 
 // NewFulfillmentClientFromConn wires the production FulfillmentClient from the shared gRPC
@@ -96,6 +103,7 @@ func NewFulfillmentClientFromConn(conn *grpc.ClientConn) FulfillmentClient {
 		privatev1.NewClusterVersionsClient(conn),
 		privatev1.NewClustersClient(conn),
 		privatev1.NewBareMetalInstanceCatalogItemsClient(conn),
+		privatev1.NewBareMetalInstanceTypesClient(conn),
 	)
 }
 
@@ -233,6 +241,21 @@ func (c *fulfillmentClient) ListBareMetalInstanceCatalogItems(
 			return err
 		}
 		out = resp.GetItems()
+		return nil
+	})
+	return out, err
+}
+
+func (c *fulfillmentClient) GetBareMetalInstanceType(
+	ctx context.Context, id string,
+) (*privatev1.BareMetalInstanceType, error) {
+	var out *privatev1.BareMetalInstanceType
+	err := c.call(ctx, func(ctx context.Context) error {
+		resp, err := c.instanceTypes.Get(ctx, privatev1.BareMetalInstanceTypesGetRequest_builder{Id: id}.Build())
+		if err != nil {
+			return err
+		}
+		out = resp.GetObject()
 		return nil
 	})
 	return out, err
