@@ -15,9 +15,13 @@ package baremetalworker
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -36,6 +40,7 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 )
 
 const (
@@ -62,6 +67,17 @@ const (
 	reasonIgnitionPending          = "IgnitionPending"
 	reasonDiskImageNotFound        = "DiskImageNotFound"
 	reasonDiskImageResolved        = "DiskImageResolved"
+
+	systemTenant                 = "system"
+	systemCatalogItemName        = "system-bmi-passthrough"
+	clusterOrderLabel            = "osac.openshift.io/cluster-order"
+	ownerReferenceAnnotation     = "osac.openshift.io/owner-reference"
+	reasonFulfillmentUnavailable = "FulfillmentServiceUnavailable"
+	reasonFulfillmentAvailable   = "FulfillmentServiceAvailable"
+	unavailableBackoff           = 5 * time.Minute
+
+	workerKindBMI           = "BareMetalInstance"
+	workerPhaseProvisioning = "Provisioning"
 )
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv"}
@@ -124,38 +140,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	res, err := r.ensureInfraEnv(ctx, co)
+	ignition, res, err := r.ensureInfraEnv(ctx, co)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
 
-	_, res, err = r.resolveDiskImage(ctx, co)
+	diskImageID, res, err := r.resolveDiskImage(ctx, co)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
 
-	// Later phases (reconcileWorkers OSAC-4159, correlateAgents OSAC-4160,
-	// reconcileNodePoolReplicas OSAC-4160) are intentionally not implemented yet.
-	return ctrl.Result{}, nil
+	return r.reconcileWorkers(ctx, co, diskImageID, ignition)
 }
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
 // then polls for and fetches its discovery ignition, setting the InfraEnvReady condition.
-func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
-	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
-		// InfraEnv already reconciled and its ignition fetched; nothing more to do in this slice.
-		return ctrl.Result{}, nil
-	}
-
+// Returns the fetched ignition bytes once ready.
+func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) ([]byte, ctrl.Result, error) {
 	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(infraEnvGVK)
+
+	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
+		if err := r.Get(ctx, key, existing); err != nil {
+			return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+		}
+		return r.fetchDiscoveryIgnition(ctx, co, key, existing)
+	}
+
 	err := r.Get(ctx, key, existing)
 	switch {
 	case apierrors.IsNotFound(err):
-		return r.createInfraEnv(ctx, co, key)
+		res, createErr := r.createInfraEnv(ctx, co, key)
+		return nil, res, createErr
 	case err != nil:
-		return ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+		return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
 	}
 	return r.fetchDiscoveryIgnition(ctx, co, key, existing)
 }
@@ -178,35 +197,37 @@ func (r *Reconciler) createInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrd
 }
 
 // fetchDiscoveryIgnition polls the InfraEnv's discovery ignition URL and, once available, fetches
-// the ignition (warning if oversized) and marks InfraEnvReady=True.
+// the ignition (warning if oversized) and marks InfraEnvReady=True. Returns the fetched bytes.
 func (r *Reconciler) fetchDiscoveryIgnition(
 	ctx context.Context, co *v1alpha1.ClusterOrder, key client.ObjectKey, infraEnv *unstructured.Unstructured,
-) (ctrl.Result, error) {
+) ([]byte, ctrl.Result, error) {
 	ignitionURL, _, err := unstructured.NestedString(infraEnv.Object, "status", "bootArtifacts", "discoveryIgnitionURL")
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("reading infraenv %s ignition URL: %w", key, err)
+		return nil, ctrl.Result{}, fmt.Errorf("reading infraenv %s ignition URL: %w", key, err)
 	}
 	if ignitionURL == "" {
 		if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonIgnitionPending,
 			"waiting for discovery ignition URL"); condErr != nil {
-			return ctrl.Result{}, condErr
+			return nil, ctrl.Result{}, condErr
 		}
-		return ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+		return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
 	}
 
 	ignition, err := r.ignition.FetchIgnition(ctx, ignitionURL)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("fetching discovery ignition for %s: %w", key, err)
+		return nil, ctrl.Result{}, fmt.Errorf("fetching discovery ignition for %s: %w", key, err)
 	}
 	if len(ignition) > ignitionSizeWarningThreshold {
 		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonIgnitionSizeWarning,
 			"discovery ignition is %d bytes, exceeding the %d byte warning threshold", len(ignition), ignitionSizeWarningThreshold)
 	}
-	if err := r.setInfraEnvReady(ctx, co, metav1.ConditionTrue, reasonInfraEnvReady,
-		"discovery ignition fetched"); err != nil {
-		return ctrl.Result{}, err
+	if !apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
+		if err := r.setInfraEnvReady(ctx, co, metav1.ConditionTrue, reasonInfraEnvReady,
+			"discovery ignition fetched"); err != nil {
+			return nil, ctrl.Result{}, err
+		}
 	}
-	return ctrl.Result{}, nil
+	return ignition, ctrl.Result{}, nil
 }
 
 // buildInfraEnv constructs the (unstructured) InfraEnv object: late binding (no clusterRef),
@@ -314,6 +335,230 @@ func (r *Reconciler) setRHCOSImageNotFound(
 		}
 		base := latest.DeepCopy()
 		latest.SetStatusCondition(v1alpha1.ConditionRHCOSImageNotFound, status, message, reason)
+		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
+}
+
+// reconcileWorkers creates one BareMetalInstance per requested bare-metal worker, idempotently
+// (list-before-create + AlreadyExists handling), and updates status.workers.
+func (r *Reconciler) reconcileWorkers(
+	ctx context.Context, co *v1alpha1.ClusterOrder, diskImageID string, ignition []byte,
+) (ctrl.Result, error) {
+	filter := fmt.Sprintf(`metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
+	existing, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
+	if res, handled := r.handleUnavailable(ctx, co, err); handled {
+		return res, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing BMIs for %s: %w", co.Name, err)
+	}
+
+	existingByName := bmisByName(existing)
+	ignitionB64 := base64.StdEncoding.EncodeToString(ignition)
+
+	workers, res, err := r.reconcileNodeSets(ctx, co, existingByName, diskImageID, ignitionB64, filter)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionFulfillmentServiceUnavailable) {
+		if condErr := r.setFulfillmentServiceUnavailable(ctx, co, metav1.ConditionFalse,
+			reasonFulfillmentAvailable, "fulfillment service recovered"); condErr != nil {
+			return ctrl.Result{}, condErr
+		}
+	}
+
+	if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// reconcileNodeSets iterates bare-metal node requests and ensures a BMI exists for each worker slot.
+func (r *Reconciler) reconcileNodeSets(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	existingByName map[string]*privatev1.BareMetalInstance,
+	diskImageID, ignitionB64, filter string,
+) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
+	log := ctrllog.FromContext(ctx)
+	var workers []v1alpha1.WorkerStatus
+	globalIndex := 0
+
+	for i := range co.Spec.NodeRequests {
+		nr := &co.Spec.NodeRequests[i]
+		if !nr.IsBareMetal() {
+			continue
+		}
+		for j := 0; j < nr.NumberOfNodes; j++ {
+			workerName := fmt.Sprintf("%s-worker-%d", co.Name, globalIndex)
+			globalIndex++
+
+			if bmi, ok := existingByName[workerName]; ok {
+				log.Info("worker BMI already exists, skipping create", "name", workerName)
+				workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()))
+				continue
+			}
+
+			bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter)
+			if err != nil {
+				return nil, ctrl.Result{}, err
+			}
+			if !res.IsZero() {
+				return nil, res, nil
+			}
+			log.Info("created BMI", "name", workerName, "id", bmi.GetId())
+			workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()))
+		}
+	}
+
+	return workers, ctrl.Result{}, nil
+}
+
+// ensureBMI creates a single BareMetalInstance, handling the AlreadyExists race by re-listing.
+// Returns the BMI, a non-zero result on unavailability backoff, or an error.
+func (r *Reconciler) ensureBMI(
+	ctx context.Context, co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest,
+	workerName, diskImageID, ignitionB64, filter string,
+) (*privatev1.BareMetalInstance, ctrl.Result, error) {
+	req := r.buildBMICreateRequest(co, nodeSet, workerName, diskImageID, ignitionB64)
+	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
+	if err == nil {
+		return created, ctrl.Result{}, nil
+	}
+
+	if res, handled := r.handleUnavailable(ctx, co, err); handled {
+		return nil, res, nil
+	}
+
+	if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
+		bmi, listErr := r.findBMIByName(ctx, filter, workerName)
+		if listErr != nil {
+			return nil, ctrl.Result{}, listErr
+		}
+		return bmi, ctrl.Result{}, nil
+	}
+
+	return nil, ctrl.Result{}, fmt.Errorf("creating BMI %s: %w", workerName, err)
+}
+
+// handleUnavailable checks whether err is ErrFulfillmentServiceUnavailable and, if so, sets the
+// condition and returns a backoff result. Returns (result, true) when handled, (zero, false) otherwise.
+func (r *Reconciler) handleUnavailable(ctx context.Context, co *v1alpha1.ClusterOrder, err error) (ctrl.Result, bool) {
+	if !errors.Is(err, ErrFulfillmentServiceUnavailable) {
+		return ctrl.Result{}, false
+	}
+	ctrllog.FromContext(ctx).Info("fulfillment service unavailable, backing off")
+	if condErr := r.setFulfillmentServiceUnavailable(ctx, co, metav1.ConditionTrue,
+		reasonFulfillmentUnavailable, err.Error()); condErr != nil {
+		return ctrl.Result{}, false
+	}
+	return ctrl.Result{RequeueAfter: unavailableBackoff}, true
+}
+
+// findBMIByName re-lists BMIs and returns the one matching the given name.
+func (r *Reconciler) findBMIByName(ctx context.Context, filter, name string) (*privatev1.BareMetalInstance, error) {
+	ctrllog.FromContext(ctx).Info("BMI create returned AlreadyExists, re-listing", "name", name)
+	refreshed, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("re-listing BMIs after AlreadyExists: %w", err)
+	}
+	for _, bmi := range refreshed {
+		if bmi.GetMetadata().GetName() == name {
+			return bmi, nil
+		}
+	}
+	return nil, fmt.Errorf("BMI %s returned AlreadyExists but not found in re-list", name)
+}
+
+func newWorkerStatus(nodeSet, name, resourceID string) v1alpha1.WorkerStatus {
+	return v1alpha1.WorkerStatus{
+		NodeSet:    nodeSet,
+		Name:       name,
+		Kind:       workerKindBMI,
+		ResourceID: resourceID,
+		Phase:      workerPhaseProvisioning,
+	}
+}
+
+func bmisByName(bmis []*privatev1.BareMetalInstance) map[string]*privatev1.BareMetalInstance {
+	m := make(map[string]*privatev1.BareMetalInstance, len(bmis))
+	for _, bmi := range bmis {
+		m[bmi.GetMetadata().GetName()] = bmi
+	}
+	return m
+}
+
+func (r *Reconciler) buildBMICreateRequest(
+	co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest, workerName, diskImageID, ignitionB64 string,
+) *privatev1.BareMetalInstance {
+	labels := map[string]string{clusterOrderLabel: co.Name}
+	annotations := map[string]string{ownerReferenceAnnotation: fmt.Sprintf("ClusterOrder/%s", co.Name)}
+
+	var netAttachments []*privatev1.BareMetalNetworkAttachment
+	if co.Spec.NetworkAttachment != nil {
+		na := co.Spec.NetworkAttachment
+		sgRefs := make([]*privatev1.SecurityGroupLocalReference, 0, len(na.SecurityGroupRefs))
+		for _, sg := range na.SecurityGroupRefs {
+			sgRefs = append(sgRefs, privatev1.SecurityGroupLocalReference_builder{Name: sg}.Build())
+		}
+		netAttachments = append(netAttachments, privatev1.BareMetalNetworkAttachment_builder{
+			Subnet:         privatev1.SubnetLocalReference_builder{Name: na.SubnetRef}.Build(),
+			SecurityGroups: sgRefs,
+		}.Build())
+	}
+
+	return privatev1.BareMetalInstance_builder{
+		Metadata: privatev1.Metadata_builder{
+			Tenant:      systemTenant,
+			Name:        workerName,
+			Labels:      labels,
+			Annotations: annotations,
+		}.Build(),
+		Spec: privatev1.BareMetalInstanceSpec_builder{
+			CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
+				Name: systemCatalogItemName,
+			}.Build(),
+			Image: privatev1.BareMetalInstanceImage_builder{
+				SourceType: "disk_image",
+				SourceRef:  diskImageID,
+			}.Build(),
+			UserData:           &ignitionB64,
+			InstanceType:       nodeSet.BareMetal.InstanceType,
+			NetworkAttachments: netAttachments,
+		}.Build(),
+	}.Build()
+}
+
+// setFulfillmentServiceUnavailable patches the FulfillmentServiceUnavailable condition on the
+// ClusterOrder, re-reading and retrying on conflict.
+func (r *Reconciler) setFulfillmentServiceUnavailable(
+	ctx context.Context, co *v1alpha1.ClusterOrder, condStatus metav1.ConditionStatus, reason, message string,
+) error {
+	key := client.ObjectKeyFromObject(co)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &v1alpha1.ClusterOrder{}
+		if err := r.apiReader.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		base := latest.DeepCopy()
+		latest.SetStatusCondition(v1alpha1.ConditionFulfillmentServiceUnavailable, condStatus, message, reason)
+		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
+}
+
+// updateWorkerStatus patches status.workers on the ClusterOrder, re-reading and retrying on conflict.
+func (r *Reconciler) updateWorkerStatus(
+	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
+) error {
+	key := client.ObjectKeyFromObject(co)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &v1alpha1.ClusterOrder{}
+		if err := r.apiReader.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		base := latest.DeepCopy()
+		latest.Status.Workers = workers
 		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	})
 }
