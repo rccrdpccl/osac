@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker"
 	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker/fake"
 	"github.com/osac-project/osac/osac-operator/internal/testing/envsim"
@@ -34,6 +35,7 @@ import (
 var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 	var (
 		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
 		rec *record.FakeRecorder
 		r   *baremetalworker.Reconciler
@@ -41,17 +43,44 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 
 	BeforeEach(func() {
 		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
 		rec = record.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
-			baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
 
 	AfterEach(func() { ign.Close() })
 
+	const (
+		clusterUUID    = "test-cluster-uuid"
+		cvID           = "4.18.0"
+		diskImageID    = "rhcos-4.18"
+		clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+	)
+
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+	}
+
 	newBareMetalClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
 		return &osacv1alpha1.ClusterOrder{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
@@ -90,6 +119,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 	}
 
 	It("creates an InfraEnv (late binding, owned by the ClusterOrder) and fetches its ignition [green]", func() {
+		preloadDiskImageChain()
 		co := newBareMetalClusterOrder("bmw-green")
 		create(co)
 
@@ -150,6 +180,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 	})
 
 	It("emits DiscoveryIgnitionSizeWarning when ignition exceeds 48KB", func() {
+		preloadDiskImageChain()
 		create(newBareMetalClusterOrder("bmw-big"))
 
 		_, err := runReconcile("bmw-big")
