@@ -35,6 +35,27 @@ import (
 	"github.com/osac-project/osac/osac-operator/internal/testing/envsim"
 )
 
+func newInstanceType(name string, fabricPort string, extraPorts ...*privatev1.BareMetalNetworkPortSpec) *privatev1.BareMetalInstanceType {
+	ports := append([]*privatev1.BareMetalNetworkPortSpec{
+		privatev1.BareMetalNetworkPortSpec_builder{
+			Name: fabricPort, Role: "fabric", Type: "Ethernet", Speed: "25Gbps",
+		}.Build(),
+	}, extraPorts...)
+	return privatev1.BareMetalInstanceType_builder{
+		Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+		Spec: privatev1.BareMetalInstanceTypeSpec_builder{
+			Hardware: privatev1.BareMetalHardwareSpec_builder{
+				Cpu:          privatev1.BareMetalCPUSpec_builder{Cores: 64, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
+				Memory:       privatev1.BareMetalMemorySpec_builder{TotalGb: 256}.Build(),
+				NetworkPorts: ports,
+			}.Build(),
+			HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
+				MatchLabels: map[string]string{"type": name},
+			}.Build(),
+		}.Build(),
+	}.Build()
+}
+
 var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 	var (
 		sim *envsim.Simulator
@@ -75,23 +96,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
-		fc.AddBareMetalInstanceType(privatev1.BareMetalInstanceType_builder{
-			Metadata: privatev1.Metadata_builder{Name: "bm-standard"}.Build(),
-			Spec: privatev1.BareMetalInstanceTypeSpec_builder{
-				Hardware: privatev1.BareMetalHardwareSpec_builder{
-					Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 64, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
-					Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 256}.Build(),
-					NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
-						privatev1.BareMetalNetworkPortSpec_builder{
-							Name: "data-0", Role: "fabric", Type: "Ethernet", Speed: "25Gbps",
-						}.Build(),
-					},
-				}.Build(),
-				HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
-					MatchLabels: map[string]string{"type": "bm-standard"},
-				}.Build(),
-			}.Build(),
-		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
 	}
 
 	newBareMetalClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
@@ -475,23 +480,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 	}
 
 	addInstanceType := func(name string) {
-		fc.AddBareMetalInstanceType(privatev1.BareMetalInstanceType_builder{
-			Metadata: privatev1.Metadata_builder{Name: name}.Build(),
-			Spec: privatev1.BareMetalInstanceTypeSpec_builder{
-				Hardware: privatev1.BareMetalHardwareSpec_builder{
-					Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 64, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
-					Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 256}.Build(),
-					NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
-						privatev1.BareMetalNetworkPortSpec_builder{
-							Name: "data-0", Role: "fabric", Type: "Ethernet", Speed: "25Gbps",
-						}.Build(),
-					},
-				}.Build(),
-				HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
-					MatchLabels: map[string]string{"type": name},
-				}.Build(),
-			}.Build(),
-		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType(name, "data-0"))
 	}
 
 	It("resolves DiskImage ID from a ClusterVersion with disk_image set", func() {
@@ -629,26 +618,10 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 	AfterEach(func() { ign.Close() })
 
 	addInstanceType := func(name, fabricPort string) {
-		fc.AddBareMetalInstanceType(privatev1.BareMetalInstanceType_builder{
-			Metadata: privatev1.Metadata_builder{Name: name}.Build(),
-			Spec: privatev1.BareMetalInstanceTypeSpec_builder{
-				Hardware: privatev1.BareMetalHardwareSpec_builder{
-					Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 64, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
-					Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 256}.Build(),
-					NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
-						privatev1.BareMetalNetworkPortSpec_builder{
-							Name: fabricPort, Role: "fabric", Type: "Ethernet", Speed: "25Gbps",
-						}.Build(),
-						privatev1.BareMetalNetworkPortSpec_builder{
-							Name: "mgmt-0", Role: "management", Type: "Ethernet", Speed: "1Gbps",
-						}.Build(),
-					},
-				}.Build(),
-				HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
-					MatchLabels: map[string]string{"type": name},
-				}.Build(),
-			}.Build(),
-		}.Build())
+		mgmt := privatev1.BareMetalNetworkPortSpec_builder{
+			Name: "mgmt-0", Role: "management", Type: "Ethernet", Speed: "1Gbps",
+		}.Build()
+		fc.AddBareMetalInstanceType(newInstanceType(name, fabricPort, mgmt))
 	}
 
 	preloadDiskImageChain := func() {
