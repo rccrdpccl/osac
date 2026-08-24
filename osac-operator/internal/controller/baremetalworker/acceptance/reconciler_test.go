@@ -399,4 +399,44 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
 	})
+
+	It("clears RHCOSImageNotFound when disk_image is later set on the ClusterVersion", func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id:   cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{}.Build(),
+		}.Build())
+
+		co := newBareMetalClusterOrder("bmw-clear", map[string]string{clusterIDLabel: clusterUUID})
+		create(co)
+		makeInfraEnvReady("bmw-clear")
+
+		_, err := runReconcile("bmw-clear")
+		Expect(err).ToNot(HaveOccurred())
+		cond := apimeta.FindStatusCondition(
+			getClusterOrder("bmw-clear").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
+		Expect(cond).ToNot(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+
+		res, err := runReconcile("bmw-clear")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		cond = apimeta.FindStatusCondition(
+			getClusterOrder("bmw-clear").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
+		Expect(cond).ToNot(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+	})
 })
