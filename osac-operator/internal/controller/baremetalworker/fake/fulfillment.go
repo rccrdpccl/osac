@@ -45,6 +45,7 @@ type FulfillmentClient struct {
 	clusterVersions map[string]*privatev1.ClusterVersion
 	clusters        map[string]*privatev1.Cluster
 	catalogItems    map[string]*privatev1.BareMetalInstanceCatalogItem
+	instanceTypes   map[string]*privatev1.BareMetalInstanceType
 	createErr       error
 	deleteErr       error
 
@@ -56,6 +57,7 @@ type FulfillmentClient struct {
 	getClusterCalls        []string
 	createCatalogItemCalls []*privatev1.BareMetalInstanceCatalogItem
 	listCatalogItemCalls   []string
+	getInstanceTypeCalls   []string
 }
 
 var _ baremetalworker.FulfillmentClient = (*FulfillmentClient)(nil)
@@ -68,6 +70,7 @@ func NewFulfillmentClient() *FulfillmentClient {
 		clusterVersions: map[string]*privatev1.ClusterVersion{},
 		clusters:        map[string]*privatev1.Cluster{},
 		catalogItems:    map[string]*privatev1.BareMetalInstanceCatalogItem{},
+		instanceTypes:   map[string]*privatev1.BareMetalInstanceType{},
 	}
 }
 
@@ -249,7 +252,35 @@ func (f *FulfillmentClient) ListBareMetalInstanceCatalogItems(
 	return out, nil
 }
 
+func cloneInstanceType(t *privatev1.BareMetalInstanceType) *privatev1.BareMetalInstanceType {
+	return proto.Clone(t).(*privatev1.BareMetalInstanceType)
+}
+
+// GetBareMetalInstanceType records the call and returns a preloaded BareMetalInstanceType
+// (see AddBareMetalInstanceType), or an error if none is registered for that id.
+func (f *FulfillmentClient) GetBareMetalInstanceType(
+	_ context.Context, id string,
+) (*privatev1.BareMetalInstanceType, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getInstanceTypeCalls = append(f.getInstanceTypeCalls, id)
+	it, ok := f.instanceTypes[id]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "baremetalinstancetype %q not found", id)
+	}
+	return cloneInstanceType(it), nil
+}
+
 // --- Builder / control surface (test-only) ---
+
+// AddBareMetalInstanceType preloads a BareMetalInstanceType so GetBareMetalInstanceType
+// can return it (keyed by name from metadata).
+func (f *FulfillmentClient) AddBareMetalInstanceType(it *privatev1.BareMetalInstanceType) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.instanceTypes[it.GetMetadata().GetName()] = cloneInstanceType(it)
+}
 
 // AddCluster preloads a Cluster so GetCluster can return it (keyed by id).
 func (f *FulfillmentClient) AddCluster(cl *privatev1.Cluster) {
@@ -362,4 +393,11 @@ func (f *FulfillmentClient) ListCatalogItemCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.listCatalogItemCalls...)
+}
+
+// GetInstanceTypeCalls returns the ids passed to GetBareMetalInstanceType, in order.
+func (f *FulfillmentClient) GetInstanceTypeCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getInstanceTypeCalls...)
 }
