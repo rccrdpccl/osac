@@ -190,7 +190,7 @@ var _ = Describe("Fake FulfillmentClient", func() {
 	})
 
 	It("preloads and returns BareMetalInstanceTypes", func() {
-		it := privatev1.BareMetalInstanceType_builder{
+		fc.AddBareMetalInstanceType(privatev1.BareMetalInstanceType_builder{
 			Metadata: privatev1.Metadata_builder{Name: "bm-standard"}.Build(),
 			Spec: privatev1.BareMetalInstanceTypeSpec_builder{
 				Hardware: privatev1.BareMetalHardwareSpec_builder{
@@ -201,8 +201,7 @@ var _ = Describe("Fake FulfillmentClient", func() {
 					MatchLabels: map[string]string{"type": "bm-standard"},
 				}.Build(),
 			}.Build(),
-		}.Build()
-		fc.AddBareMetalInstanceType(it)
+		}.Build())
 
 		got, err := fc.GetBareMetalInstanceType(ctx, "bm-standard")
 		Expect(err).ToNot(HaveOccurred())
