@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -80,12 +81,11 @@ const (
 	workerPhaseProvisioning = "Provisioning"
 )
 
-var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv"}
+var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "InfraEnv"}
 
 // Reconciler is the bare-metal worker reconciler (BareMetalWorkerReconciler). It watches
-// ClusterOrder resources with bare-metal node sets and, for now, ensures a cluster-specific
-// InfraEnv exists and its discovery ignition is fetched. Later slices add worker provisioning,
-// agent correlation, and NodePool convergence.
+// ClusterOrder resources with bare-metal node sets, ensures a cluster-specific InfraEnv exists,
+// creates BMIs, correlates registered Agents by MAC, and converges NodePool replicas.
 type Reconciler struct {
 	client.Client
 	apiReader             client.Reader
@@ -94,6 +94,7 @@ type Reconciler struct {
 	ignition              IgnitionFetcher
 	recorder              record.EventRecorder
 	clusterOrderNamespace string
+	macResolver           MACResolver
 }
 
 // NewReconciler builds the bare-metal worker reconciler.
@@ -114,16 +115,25 @@ func NewReconciler(
 		ignition:              ignition,
 		recorder:              recorder,
 		clusterOrderNamespace: clusterOrderNamespace,
+		macResolver:           func(string) string { return "" },
 	}
+}
+
+// SetMACResolver sets the function used to resolve a BMI's host MAC address for agent
+// correlation. In tests, this is wired to the fake's HostMAC; in production, it will read
+// from the BMI status once the proto field lands (OSAC-2308/OSAC-3254).
+func (r *Reconciler) SetMACResolver(resolver MACResolver) {
+	r.macResolver = resolver
 }
 
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents,verbs=get;list;watch;patch;delete
+// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=nodepools,verbs=get;list;watch;patch
 
-// Reconcile ensures the InfraEnv for a bare-metal ClusterOrder exists and its discovery ignition
-// is fetched. Worker provisioning, agent correlation, and NodePool convergence are later slices,
-// so workers legitimately remain absent here.
+// Reconcile ensures the InfraEnv for a bare-metal ClusterOrder exists, creates BMIs, correlates
+// registered Agents by MAC, and converges NodePool replicas.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	co := &v1alpha1.ClusterOrder{}
 	if err := r.Get(ctx, req.NamespacedName, co); err != nil {
@@ -154,7 +164,34 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return res, err
 	}
 
-	return r.reconcileWorkers(ctx, co, diskImageID, ignition)
+	res, err = r.reconcileWorkers(ctx, co, diskImageID, ignition)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+
+	// Re-read the ClusterOrder to pick up the workers just written by reconcileWorkers.
+	if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder: %w", err)
+	}
+
+	workers, res, err := r.correlateAgents(ctx, co, co.Status.Workers)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	npRes, npErr := r.reconcileNodePoolReplicas(ctx, co, workers)
+	if npErr != nil {
+		return ctrl.Result{}, npErr
+	}
+
+	if err := r.updateWorkerStatusWithCorrelation(ctx, co, workers); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !res.IsZero() {
+		return res, nil
+	}
+	return npRes, nil
 }
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
@@ -260,22 +297,11 @@ func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name string) (*uns
 	return infraEnv, nil
 }
 
-// setInfraEnvReady patches only the InfraEnvReady condition on the ClusterOrder, re-reading and
-// retrying on conflict so it never clobbers status fields owned by the ClusterOrder controller.
 func (r *Reconciler) setInfraEnvReady(
 	ctx context.Context, co *v1alpha1.ClusterOrder, status metav1.ConditionStatus, reason, message string,
 ) error {
-	key := client.ObjectKeyFromObject(co)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &v1alpha1.ClusterOrder{}
-		if err := r.apiReader.Get(ctx, key, latest); err != nil {
-			return err
-		}
-		base := latest.DeepCopy()
+	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, status, message, reason)
-		// Optimistic lock so a concurrent ClusterOrder-controller status write yields a 409 that
-		// RetryOnConflict re-reads and re-applies, instead of silently clobbering its conditions.
-		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	})
 }
 
@@ -370,25 +396,17 @@ func (r *Reconciler) resolveDiskImage(ctx context.Context, co *v1alpha1.ClusterO
 	return diskImage.GetId(), ctrl.Result{}, nil
 }
 
-// setRHCOSImageNotFound patches only the RHCOSImageNotFound condition on the ClusterOrder,
-// re-reading and retrying on conflict so it never clobbers status fields owned by other controllers.
 func (r *Reconciler) setRHCOSImageNotFound(
 	ctx context.Context, co *v1alpha1.ClusterOrder, status metav1.ConditionStatus, reason, message string,
 ) error {
-	key := client.ObjectKeyFromObject(co)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &v1alpha1.ClusterOrder{}
-		if err := r.apiReader.Get(ctx, key, latest); err != nil {
-			return err
-		}
-		base := latest.DeepCopy()
+	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionRHCOSImageNotFound, status, message, reason)
-		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	})
 }
 
 // reconcileWorkers creates one BareMetalInstance per requested bare-metal worker, idempotently
-// (list-before-create + AlreadyExists handling), and updates status.workers.
+// (list-before-create + AlreadyExists handling), and updates status.workers. Preserves existing
+// worker phases (Binding, Ready, etc.) for workers that have already been correlated.
 func (r *Reconciler) reconcileWorkers(
 	ctx context.Context, co *v1alpha1.ClusterOrder, diskImageID string, ignition []byte,
 ) (ctrl.Result, error) {
@@ -423,13 +441,16 @@ func (r *Reconciler) reconcileWorkers(
 	return ctrl.Result{}, nil
 }
 
-// reconcileNodeSets iterates bare-metal node requests and ensures a BMI exists for each worker slot.
+// reconcileNodeSets iterates bare-metal node requests and ensures a BMI exists for each worker
+// slot. Reuses existing WorkerStatus entries (preserving phase/failure fields) for workers that
+// already exist; only creates new entries for genuinely new workers.
 func (r *Reconciler) reconcileNodeSets(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	existingByName map[string]*privatev1.BareMetalInstance,
 	diskImageID, ignitionB64, filter string,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
+	existingWorkers := workersByName(co.Status.Workers)
 	var workers []v1alpha1.WorkerStatus
 	globalIndex := 0
 
@@ -455,9 +476,15 @@ func (r *Reconciler) reconcileNodeSets(
 			workerName := fmt.Sprintf("%s-worker-%d", co.Name, globalIndex)
 			globalIndex++
 
-			if bmi, ok := existingByName[workerName]; ok {
+			if prev, ok := existingWorkers[workerName]; ok {
+				workers = append(workers, prev)
+				continue
+			}
+
+			bmiID, ok := existingByName[workerName]
+			if ok {
 				log.Info("worker BMI already exists, skipping create", "name", workerName)
-				workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()))
+				workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmiID.GetId()))
 				continue
 			}
 
@@ -474,6 +501,14 @@ func (r *Reconciler) reconcileNodeSets(
 	}
 
 	return workers, ctrl.Result{}, nil
+}
+
+func workersByName(workers []v1alpha1.WorkerStatus) map[string]v1alpha1.WorkerStatus {
+	m := make(map[string]v1alpha1.WorkerStatus, len(workers))
+	for _, w := range workers {
+		m[w.Name] = w
+	}
+	return m
 }
 
 // resolveFabricInterfaceForNodeSet resolves the fabric interface name from the BareMetalInstanceType
@@ -558,7 +593,7 @@ func newWorkerStatus(nodeSet, name, resourceID string) v1alpha1.WorkerStatus {
 		Name:       name,
 		Kind:       workerKindBMI,
 		ResourceID: resourceID,
-		Phase:      workerPhaseProvisioning,
+		Phase:      workerPhaseWaitingForAgent,
 	}
 }
 
@@ -624,26 +659,26 @@ func (r *Reconciler) buildBMICreateRequest(
 	}.Build()
 }
 
-// setFulfillmentServiceUnavailable patches the FulfillmentServiceUnavailable condition on the
-// ClusterOrder, re-reading and retrying on conflict.
 func (r *Reconciler) setFulfillmentServiceUnavailable(
 	ctx context.Context, co *v1alpha1.ClusterOrder, condStatus metav1.ConditionStatus, reason, message string,
 ) error {
-	key := client.ObjectKeyFromObject(co)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &v1alpha1.ClusterOrder{}
-		if err := r.apiReader.Get(ctx, key, latest); err != nil {
-			return err
-		}
-		base := latest.DeepCopy()
+	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionFulfillmentServiceUnavailable, condStatus, message, reason)
-		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	})
 }
 
-// updateWorkerStatus patches status.workers on the ClusterOrder, re-reading and retrying on conflict.
 func (r *Reconciler) updateWorkerStatus(
 	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
+) error {
+	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
+		latest.Status.Workers = workers
+	})
+}
+
+// patchStatusWithRetry re-reads the ClusterOrder and applies the mutate function to its status,
+// retrying on conflict with optimistic locking.
+func (r *Reconciler) patchStatusWithRetry(
+	ctx context.Context, co *v1alpha1.ClusterOrder, mutate func(*v1alpha1.ClusterOrder),
 ) error {
 	key := client.ObjectKeyFromObject(co)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -652,7 +687,7 @@ func (r *Reconciler) updateWorkerStatus(
 			return err
 		}
 		base := latest.DeepCopy()
-		latest.Status.Workers = workers
+		mutate(latest)
 		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 	})
 }
@@ -664,18 +699,61 @@ func namespacePredicate(namespace string) predicate.Predicate {
 }
 
 // SetupWithManager registers the reconciler, watching ClusterOrder in the configured namespace.
-//
-// Agent watching (for MAC correlation) lands in OSAC-4160, where it can be gated on the
-// assisted-service Agent CRD's presence: watching that CRD unconditionally here would make it a
-// hard startup dependency for every osac-operator deployment (the manager fails to start if the
-// CRD is absent).
+// Agent and NodePool watches are gated on CRD presence to avoid hard startup dependencies.
 func (r *Reconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	localMgr := mgr.GetLocalManager()
 	if localMgr == nil {
 		return fmt.Errorf("local manager is nil")
 	}
-	return ctrl.NewControllerManagedBy(localMgr).
+
+	log := ctrl.Log.WithName("baremetalworker")
+	bld := ctrl.NewControllerManagedBy(localMgr).
 		Named("baremetalworker").
-		For(&v1alpha1.ClusterOrder{}, builder.WithPredicates(namespacePredicate(r.clusterOrderNamespace))).
-		Complete(r)
+		For(&v1alpha1.ClusterOrder{}, builder.WithPredicates(namespacePredicate(r.clusterOrderNamespace)))
+
+	if crdExists(mgr, agentGVK) {
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		bld = bld.Watches(agentObj, handler.EnqueueRequestsFromMapFunc(r.labelToClusterOrderMapper(clusterOrderLabel)))
+		log.Info("watching Agent CRs for MAC correlation")
+	} else {
+		log.Info("Agent CRD not found, skipping Agent watch")
+	}
+
+	npGVK := schema.GroupVersionKind{Group: "hypershift.openshift.io", Version: "v1beta1", Kind: "NodePool"}
+	if crdExists(mgr, npGVK) {
+		npObj := &unstructured.Unstructured{}
+		npObj.SetGroupVersionKind(npGVK)
+		bld = bld.Watches(npObj, handler.EnqueueRequestsFromMapFunc(r.labelToClusterOrderMapper("osac.openshift.io/clusterorder")))
+		log.Info("watching NodePool CRs for replica convergence")
+	} else {
+		log.Info("NodePool CRD not found, skipping NodePool watch")
+	}
+
+	return bld.Complete(r)
+}
+
+// crdExists checks whether a CRD for the given GVK is registered in the API server.
+func crdExists(mgr mcmanager.Manager, gvk schema.GroupVersionKind) bool {
+	localMgr := mgr.GetLocalManager()
+	if localMgr == nil {
+		return false
+	}
+	mapper := localMgr.GetRESTMapper()
+	_, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+	return err == nil
+}
+
+// labelToClusterOrderMapper returns a MapFunc that maps events to ClusterOrder reconcile
+// requests by reading a label value as the ClusterOrder name.
+func (r *Reconciler) labelToClusterOrderMapper(labelKey string) handler.MapFunc {
+	return func(_ context.Context, obj client.Object) []ctrl.Request {
+		coName := obj.GetLabels()[labelKey]
+		if coName == "" {
+			return nil
+		}
+		return []ctrl.Request{{
+			NamespacedName: client.ObjectKey{Name: coName, Namespace: r.clusterOrderNamespace},
+		}}
+	}
 }
