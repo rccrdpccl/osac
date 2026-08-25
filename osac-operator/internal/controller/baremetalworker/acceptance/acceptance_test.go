@@ -30,7 +30,10 @@ import (
 
 const testNamespace = "default"
 
-var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv"}
+var (
+	infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "InfraEnv"}
+	agentGVK    = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: "v1beta1", Kind: "Agent"}
+)
 
 // bmiNamed builds a minimal BareMetalInstance the fake accepts (metadata.name required).
 func bmiNamed(name string) *privatev1.BareMetalInstance {

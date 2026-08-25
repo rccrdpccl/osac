@@ -179,10 +179,10 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		// Simulator makes the discovery ignition available at the fake endpoint.
 		Expect(sim.MarkInfraEnvReady(ctx, "bmw-green-infraenv", testNamespace, ign.URL())).To(Succeed())
 
-		// Second reconcile: ignition fetched, InfraEnvReady=True, no requeue.
+		// Second reconcile: ignition fetched, InfraEnvReady=True, requeues for agent correlation.
 		res, err = runReconcile("bmw-green")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "requeues for agent correlation")
 
 		Expect(apimeta.IsStatusConditionTrue(
 			getClusterOrder("bmw-green").Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)).To(BeTrue())
@@ -502,9 +502,8 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		create(co)
 		makeInfraEnvReady("bmw-resolve")
 
-		res, err := runReconcile("bmw-resolve")
+		_, err := runReconcile("bmw-resolve")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		cond := apimeta.FindStatusCondition(
 			getClusterOrder("bmw-resolve").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
@@ -528,9 +527,8 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		create(co)
 		makeInfraEnvReady("bmw-nodisk")
 
-		res, err := runReconcile("bmw-nodisk")
+		_, err := runReconcile("bmw-nodisk")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		cond := apimeta.FindStatusCondition(
 			getClusterOrder("bmw-nodisk").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
@@ -579,9 +577,8 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 			}.Build(),
 		}.Build())
 
-		res, err := runReconcile("bmw-clear")
+		_, err = runReconcile("bmw-clear")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		cond = apimeta.FindStatusCondition(
 			getClusterOrder("bmw-clear").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
@@ -706,9 +703,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		create(co)
 		makeInfraEnvReady("bmw-create")
 
-		res, err := runReconcile("bmw-create")
+		_, err := runReconcile("bmw-create")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		calls := fc.CreateCalls()
 		Expect(calls).To(HaveLen(1))
@@ -742,9 +738,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		create(co)
 		makeInfraEnvReady("bmw-multi")
 
-		res, err := runReconcile("bmw-multi")
+		_, err := runReconcile("bmw-multi")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		calls := fc.CreateCalls()
 		Expect(calls).To(HaveLen(3))
@@ -778,16 +773,15 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		// creation because list-before-create finds the pre-existing BMI.
 		createCallsBefore := len(fc.CreateCalls())
 
-		res, err := runReconcile("bmw-idem")
+		_, err = runReconcile("bmw-idem")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		Expect(fc.CreateCalls()).To(HaveLen(createCallsBefore))
 
 		co = getClusterOrder("bmw-idem")
 		Expect(co.Status.Workers).To(HaveLen(1))
 		Expect(co.Status.Workers[0].Name).To(Equal("bmw-idem-worker-0"))
-		Expect(co.Status.Workers[0].Phase).To(Equal("Provisioning"))
+		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
 	})
 
 	It("handles AlreadyExists by re-listing and recording the existing BMI", func() {
@@ -797,17 +791,15 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		makeInfraEnvReady("bmw-exists")
 
 		// First reconcile creates the BMI, second finds it via list (idempotent re-reconcile).
-		res, err := runReconcile("bmw-exists")
+		_, err := runReconcile("bmw-exists")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		// First reconcile created it.
 		Expect(fc.CreateCalls()).To(HaveLen(1))
 
 		// Second reconcile — list finds it, no new create call.
-		res, err = runReconcile("bmw-exists")
+		_, err = runReconcile("bmw-exists")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		// Still only 1 create call total — second reconcile used list-before-create.
 		Expect(fc.CreateCalls()).To(HaveLen(1))
@@ -838,7 +830,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(err.Error()).To(ContainSubstring("creating BMI"))
 	})
 
-	It("updates status.workers with phase Provisioning", func() {
+	It("updates status.workers with phase WaitingForAgent", func() {
 		preloadDiskImageChain()
 		co := newBareMetalClusterOrder("bmw-status", 2)
 		create(co)
@@ -846,12 +838,12 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 
 		res, err := runReconcile("bmw-status")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "requeues for agent correlation")
 
 		co = getClusterOrder("bmw-status")
 		Expect(co.Status.Workers).To(HaveLen(2))
 		for _, w := range co.Status.Workers {
-			Expect(w.Phase).To(Equal("Provisioning"))
+			Expect(w.Phase).To(Equal("WaitingForAgent"))
 			Expect(w.Kind).To(Equal("BareMetalInstance"))
 			Expect(w.ResourceID).ToNot(BeEmpty())
 			Expect(w.NodeSet).To(Equal("bm-standard"))
@@ -866,9 +858,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		create(co)
 		makeInfraEnvReady("bmw-enrich")
 
-		res, err := runReconcile("bmw-enrich")
+		_, err := runReconcile("bmw-enrich")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		calls := fc.CreateCalls()
 		Expect(calls).To(HaveLen(1))
@@ -916,9 +907,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		create(co)
 		makeInfraEnvReady("bmw-multi-type")
 
-		res, err := runReconcile("bmw-multi-type")
+		_, err := runReconcile("bmw-multi-type")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeZero())
 
 		calls := fc.CreateCalls()
 		Expect(calls).To(HaveLen(2))
@@ -955,5 +945,290 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		_, err = runReconcile("bmw-no-net")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("no networkAttachment"))
+	})
+})
+
+var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
+	const (
+		clusterUUID    = "correlate-cluster-uuid"
+		cvID           = "4.18.0"
+		diskImageID    = "rhcos-4.18"
+		clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+	)
+
+	var (
+		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
+		ign *fake.IgnitionServer
+		rec *record.FakeRecorder
+		r   *baremetalworker.Reconciler
+	)
+
+	BeforeEach(func() {
+		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
+		ign = fake.NewIgnitionServer()
+		rec = record.NewFakeRecorder(10)
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		r.SetMACResolver(fc.HostMAC)
+	})
+
+	AfterEach(func() { ign.Close() })
+
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+	}
+
+	newBareMetalClusterOrder := func(name string, numWorkers int) *osacv1alpha1.ClusterOrder {
+		return &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: numWorkers,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+	}
+
+	runReconcile := func(name string) (reconcile.Result, error) {
+		return r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
+		})
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		GinkgoHelper()
+		co := &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, co)).To(Succeed())
+		return co
+	}
+
+	create := func(co *osacv1alpha1.ClusterOrder) {
+		GinkgoHelper()
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, co)
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+	}
+
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+	}
+
+	createWorkersAndSetMAC := func(name string, numWorkers int) {
+		GinkgoHelper()
+		makeInfraEnvReady(name)
+		// Reconcile to create BMIs and enter WaitingForAgent.
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+
+		co := getClusterOrder(name)
+		Expect(co.Status.Workers).To(HaveLen(numWorkers))
+		for _, w := range co.Status.Workers {
+			Expect(w.Phase).To(Equal("WaitingForAgent"))
+			fc.SetHostMAC(w.ResourceID, fmt.Sprintf("aa:bb:cc:dd:ee:%02d", w.AttemptCount))
+		}
+		// Set unique MACs for each worker based on their index.
+		for i, w := range co.Status.Workers {
+			fc.SetHostMAC(w.ResourceID, fmt.Sprintf("aa:bb:cc:dd:ee:%02d", i))
+		}
+	}
+
+	It("correlates an agent to a worker by unique MAC match", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-corr", 1)
+		create(co)
+		createWorkersAndSetMAC("bmw-corr", 1)
+
+		// Register an agent with the matching MAC.
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: "bmw-corr-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:dd:ee:00",
+		})).To(Succeed())
+		// Label the agent with the cluster-order label (simulates the controller's watch filter).
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-corr-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = "bmw-corr"
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		// Reconcile — the agent should be correlated.
+		_, err := runReconcile("bmw-corr")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-corr")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Binding"))
+
+		// Verify the agent got the worker-name label and clusterDeploymentName.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-corr-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		Expect(agentObj.GetLabels()).To(HaveKeyWithValue("osac.openshift.io/worker-name", "bmw-corr-worker-0"))
+		Expect(agentObj.GetLabels()).To(HaveKeyWithValue("agentBareMetal", "true"))
+		cdName, _, _ := unstructured.NestedString(agentObj.Object, "spec", "clusterDeploymentName", "name")
+		Expect(cdName).To(Equal("bmw-corr"))
+
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+	})
+
+	It("stays in WaitingForAgent when no agent matches", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-no-match", 1)
+		create(co)
+		createWorkersAndSetMAC("bmw-no-match", 1)
+
+		// No agent registered — reconcile should requeue.
+		res, err := runReconcile("bmw-no-match")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+		co = getClusterOrder("bmw-no-match")
+		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+	})
+
+	It("does not bind when multiple BMIs match the same agent MAC", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-ambig", 2)
+		create(co)
+		createWorkersAndSetMAC("bmw-ambig", 2)
+
+		// Set both BMIs to the same MAC so the agent's MAC matches ambiguously.
+		co = getClusterOrder("bmw-ambig")
+		fc.SetHostMAC(co.Status.Workers[0].ResourceID, "aa:bb:cc:dd:ee:99")
+		fc.SetHostMAC(co.Status.Workers[1].ResourceID, "aa:bb:cc:dd:ee:99")
+
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: "bmw-ambig-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:dd:ee:99",
+		})).To(Succeed())
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-ambig-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = "bmw-ambig"
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		_, err := runReconcile("bmw-ambig")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-ambig")
+		for _, w := range co.Status.Workers {
+			Expect(w.Phase).To(Equal("WaitingForAgent"), "ambiguous match should not bind")
+		}
+
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+	})
+
+	It("uses cached worker-name label on subsequent reconciles", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-cache", 1)
+		create(co)
+		createWorkersAndSetMAC("bmw-cache", 1)
+
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: "bmw-cache-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:dd:ee:00",
+		})).To(Succeed())
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-cache-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = "bmw-cache"
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		// First reconcile: correlates agent.
+		_, err := runReconcile("bmw-cache")
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-cache")
+		Expect(co.Status.Workers[0].Phase).To(Equal("Binding"))
+
+		// Clear the host MAC to prove correlation doesn't re-run (cached).
+		fc.SetHostMAC(co.Status.Workers[0].ResourceID, "")
+
+		// Second reconcile: uses cached label, doesn't re-correlate.
+		_, err = runReconcile("bmw-cache")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Worker is still Binding (or would advance to Ready once installed).
+		co = getClusterOrder("bmw-cache")
+		Expect(co.Status.Workers[0].Phase).To(Equal("Binding"))
+
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+	})
+
+	It("updates aggregate worker counts on the ClusterOrder", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-agg", 2)
+		create(co)
+		createWorkersAndSetMAC("bmw-agg", 2)
+
+		// Correlate only one agent.
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: "bmw-agg-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:dd:ee:00",
+		})).To(Succeed())
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-agg-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = "bmw-agg"
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		_, err := runReconcile("bmw-agg")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-agg")
+		Expect(co.Status.DesiredWorkers).ToNot(BeNil())
+		Expect(*co.Status.DesiredWorkers).To(Equal(int32(2)))
+		Expect(co.Status.CurrentWorkers).ToNot(BeNil())
+		Expect(*co.Status.CurrentWorkers).To(Equal(int32(2)))
+		Expect(co.Status.ReadyWorkers).ToNot(BeNil())
+		Expect(*co.Status.ReadyWorkers).To(Equal(int32(0)))
+
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
 	})
 })
