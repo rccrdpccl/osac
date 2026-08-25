@@ -37,6 +37,7 @@ rules:
   resources:
   - agents
   verbs:
+  - delete
   - get
   - list
   - patch
@@ -73,7 +74,6 @@ rules:
   - hypershift.openshift.io
   resources:
   - hostedclusters
-  - nodepools
   verbs:
   - get
   - list
@@ -84,6 +84,15 @@ rules:
   - hostedcontrolplanes
   verbs:
   - get
+- apiGroups:
+  - hypershift.openshift.io
+  resources:
+  - nodepools
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
 - apiGroups:
   - k8s.ovn.org
   resources:
