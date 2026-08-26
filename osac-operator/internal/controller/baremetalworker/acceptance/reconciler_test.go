@@ -16,6 +16,7 @@ package acceptance
 import (
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -24,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -61,7 +62,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -69,7 +70,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -288,14 +289,14 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 	var (
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
 	BeforeEach(func() {
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -405,7 +406,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -413,7 +414,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -599,7 +600,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -607,7 +608,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -960,7 +961,7 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -968,7 +969,7 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 		r.SetMACResolver(fc.HostMAC)
@@ -1228,6 +1229,266 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		Expect(*co.Status.CurrentWorkers).To(Equal(int32(2)))
 		Expect(co.Status.ReadyWorkers).ToNot(BeNil())
 		Expect(*co.Status.ReadyWorkers).To(Equal(int32(0)))
+
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+	})
+})
+
+var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
+	const (
+		clusterUUID    = "retry-cluster-uuid"
+		cvID           = "4.18.0"
+		diskImageID    = "rhcos-4.18"
+		clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+	)
+
+	var (
+		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
+		ign *fake.IgnitionServer
+		rec *events.FakeRecorder
+		r   *baremetalworker.Reconciler
+	)
+
+	BeforeEach(func() {
+		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
+		ign = fake.NewIgnitionServer()
+		rec = events.NewFakeRecorder(20)
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		r.SetMACResolver(fc.HostMAC)
+	})
+
+	AfterEach(func() { ign.Close() })
+
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+	}
+
+	newBareMetalClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		return &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: 1,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+	}
+
+	runReconcile := func(name string) (reconcile.Result, error) {
+		return r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
+		})
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		GinkgoHelper()
+		co := &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, co)).To(Succeed())
+		return co
+	}
+
+	create := func(co *osacv1alpha1.ClusterOrder) {
+		GinkgoHelper()
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, co)
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+	}
+
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+	}
+
+	// setWorkerFailed patches a worker's status to Failed with the given reason,
+	// simulating any failure path (agent timeout, BMI provisioning error, etc.).
+	setWorkerFailed := func(name, workerName, reason, message string) {
+		GinkgoHelper()
+		co := getClusterOrder(name)
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Name == workerName {
+				co.Status.Workers[i].Phase = "Failed"
+				co.Status.Workers[i].LastFailureReason = reason
+				co.Status.Workers[i].LastFailureMessage = message
+				failTime := metav1.Now()
+				co.Status.Workers[i].LastFailureTime = &failTime
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+	}
+
+	It("deletes a failed BMI, increments attemptCount, and sets NextRetryTime", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-retry-del")
+		create(co)
+		makeInfraEnvReady("bmw-retry-del")
+
+		// Create worker → WaitingForAgent.
+		_, err := runReconcile("bmw-retry-del")
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-retry-del")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		Expect(co.Status.Workers[0].ResourceID).ToNot(BeEmpty())
+
+		// Simulate failure.
+		setWorkerFailed("bmw-retry-del", "bmw-retry-del-worker-0", "InfrastructureError", "host allocation failed")
+
+		// Reconcile → handleFailedWorkers deletes the BMI and sets backoff.
+		_, err = runReconcile("bmw-retry-del")
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(fc.DeleteCalls()).To(HaveLen(1))
+
+		co = getClusterOrder("bmw-retry-del")
+		w := co.Status.Workers[0]
+		Expect(w.Phase).To(Equal("Failed"))
+		Expect(w.AttemptCount).To(Equal(int32(1)))
+		Expect(w.ResourceID).To(BeEmpty())
+		Expect(w.NextRetryTime).ToNot(BeNil())
+	})
+
+	It("creates a replacement BMI when NextRetryTime has passed", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-retry-repl")
+		create(co)
+		makeInfraEnvReady("bmw-retry-repl")
+
+		// Create worker → WaitingForAgent.
+		_, err := runReconcile("bmw-retry-repl")
+		Expect(err).ToNot(HaveOccurred())
+		initialCreateCalls := len(fc.CreateCalls())
+
+		// Simulate failure.
+		setWorkerFailed("bmw-retry-repl", "bmw-retry-repl-worker-0", "InfrastructureError", "host failed")
+
+		// Reconcile → deletes BMI, sets NextRetryTime in the future.
+		_, err = runReconcile("bmw-retry-repl")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Move NextRetryTime to the past so retry is due.
+		co = getClusterOrder("bmw-retry-repl")
+		pastTime := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+		co.Status.Workers[0].NextRetryTime = &pastTime
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+		// Reconcile → creates replacement BMI.
+		_, err = runReconcile("bmw-retry-repl")
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(fc.CreateCalls()).To(HaveLen(initialCreateCalls + 1))
+
+		co = getClusterOrder("bmw-retry-repl")
+		w := co.Status.Workers[0]
+		Expect(w.Phase).To(Equal("WaitingForAgent"))
+		Expect(w.ResourceID).ToNot(BeEmpty())
+		Expect(w.NextRetryTime).To(BeNil())
+		Expect(w.AttemptCount).To(Equal(int32(1)))
+	})
+
+	It("clears WorkersFailed condition when replacement reaches Ready", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-retry-clear")
+		create(co)
+		makeInfraEnvReady("bmw-retry-clear")
+
+		// Create worker → WaitingForAgent.
+		_, err := runReconcile("bmw-retry-clear")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Simulate failure.
+		setWorkerFailed("bmw-retry-clear", "bmw-retry-clear-worker-0", "AgentRegistrationTimeout", "timeout")
+
+		// Reconcile → deletes BMI, sets backoff.
+		_, err = runReconcile("bmw-retry-clear")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Set NextRetryTime to past.
+		co = getClusterOrder("bmw-retry-clear")
+		pastTime := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+		co.Status.Workers[0].NextRetryTime = &pastTime
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+		// Reconcile → creates replacement BMI.
+		_, err = runReconcile("bmw-retry-clear")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Now simulate the replacement reaching Ready: register an agent, correlate, install.
+		co = getClusterOrder("bmw-retry-clear")
+		fc.SetHostMAC(co.Status.Workers[0].ResourceID, "aa:bb:cc:dd:ee:42")
+
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: "bmw-retry-clear-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:dd:ee:42",
+		})).To(Succeed())
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-retry-clear-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = "bmw-retry-clear"
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		// Reconcile → correlates agent → Binding.
+		_, err = runReconcile("bmw-retry-clear")
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-retry-clear")
+		Expect(co.Status.Workers[0].Phase).To(Equal("Binding"))
+
+		// Set agent debugInfo.state to "installed" to trigger Binding→Ready.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-retry-clear-agent-0", Namespace: testNamespace}, agentObj)).To(Succeed())
+		Expect(unstructured.SetNestedField(agentObj.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		// Reconcile → Binding → Ready.
+		_, err = runReconcile("bmw-retry-clear")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-retry-clear")
+		Expect(co.Status.Workers[0].Phase).To(Equal("Ready"))
+		Expect(co.Status.Workers[0].ReadySince).ToNot(BeNil())
+		Expect(co.Status.Workers[0].AttemptCount).To(Equal(int32(1)))
+
+		// WorkersFailed condition is cleared.
+		cond := apimeta.FindStatusCondition(co.Status.Conditions, osacv1alpha1.ConditionWorkersFailed)
+		if cond != nil {
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		}
 
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
 	})

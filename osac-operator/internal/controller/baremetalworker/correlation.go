@@ -19,7 +19,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -169,8 +171,12 @@ func (r *Reconciler) advanceBindingWorkers(
 		}
 		if r.isAgentInstalled(agents, workers[i].Name) {
 			workers[i].Phase = workerPhaseReady
+			if workers[i].ReadySince == nil {
+				now := metav1.Now()
+				workers[i].ReadySince = &now
+			}
 			log.Info("worker ready", "worker", workers[i].Name)
-			r.recorder.Eventf(co, corev1.EventTypeNormal, eventReasonWorkerReady,
+			r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerReady, "AdvanceWorker",
 				"worker %s is ready", workers[i].Name)
 		}
 	}
@@ -219,7 +225,7 @@ func (r *Reconciler) tryCorrelateAgent(
 
 	setWorkerPhase(workers, workerName, workerPhaseBinding)
 	log.Info("agent correlated", "agent", agent.GetName(), "worker", workerName)
-	r.recorder.Eventf(co, corev1.EventTypeNormal, eventReasonAgentCorrelated,
+	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
 		"agent %s correlated to worker %s", agent.GetName(), workerName)
 	return true
 }
@@ -290,7 +296,7 @@ func (r *Reconciler) checkAgentRegistrationTimeout(
 		failTime := metav1.NewTime(now)
 		w.LastFailureTime = &failTime
 		log.Info("agent registration timeout", "worker", w.Name)
-		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonAgentRegistrationTimeout,
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonAgentRegistrationTimeout, "CheckTimeout",
 			"worker %s: no agent registered within %s", w.Name, agentRegistrationTimeout)
 	}
 	return workers
@@ -379,18 +385,53 @@ func countCorrelatedWorkers(workers []v1alpha1.WorkerStatus) int64 {
 	return n
 }
 
-// updateWorkerStatusWithCorrelation patches status.workers and aggregate counts on the
-// ClusterOrder, re-reading and retrying on conflict.
+// updateWorkerStatusWithCorrelation patches status.workers, aggregate counts, and the
+// WorkersFailed condition on the ClusterOrder, re-reading and retrying on conflict.
+// It also resets attemptCount for workers that have been Ready for MinHealthyDuration.
 func (r *Reconciler) updateWorkerStatusWithCorrelation(
 	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
 ) error {
+	log := ctrllog.FromContext(ctx)
+	resetHealthyWorkers(log, co, workers)
 	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.Status.Workers = workers
 		desired, current, ready := computeWorkerAggregates(workers)
 		latest.Status.DesiredWorkers = &desired
 		latest.Status.CurrentWorkers = &current
 		latest.Status.ReadyWorkers = &ready
+
+		failedMsg := FormatWorkersFailed(workers)
+		switch {
+		case failedMsg != "":
+			latest.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+				metav1.ConditionTrue, failedMsg, reasonWorkersFailed)
+		case apimeta.IsStatusConditionTrue(latest.Status.Conditions, v1alpha1.ConditionWorkersFailed):
+			latest.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+				metav1.ConditionFalse, "all workers healthy", reasonWorkersFailedCleared)
+		}
 	})
+}
+
+// resetHealthyWorkers resets attemptCount for workers that have been Ready for at least
+// MinHealthyDuration, clearing their failure history.
+func resetHealthyWorkers(log logr.Logger, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus) {
+	now := time.Now()
+	for i := range workers {
+		w := &workers[i]
+		if w.Phase != workerPhaseReady || w.AttemptCount == 0 || w.ReadySince == nil {
+			continue
+		}
+		if now.Sub(w.ReadySince.Time) < minHealthyDuration {
+			continue
+		}
+		log.Info("worker healthy for MinHealthyDuration, resetting attemptCount",
+			"worker", w.Name, "previousAttempts", w.AttemptCount)
+		w.AttemptCount = 0
+		w.LastFailureReason = ""
+		w.LastFailureMessage = ""
+		w.LastFailureTime = nil
+		w.NextRetryTime = nil
+	}
 }
 
 func computeWorkerAggregates(workers []v1alpha1.WorkerStatus) (desired, current, ready int32) {
