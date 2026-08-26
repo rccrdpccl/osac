@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -79,6 +79,11 @@ const (
 
 	workerKindBMI           = "BareMetalInstance"
 	workerPhaseProvisioning = "Provisioning"
+
+	eventReasonWorkerRetry     = "WorkerRetry"
+	eventReasonWorkerFailed    = "WorkerFailed"
+	reasonWorkersFailed        = "WorkersRetrying"
+	reasonWorkersFailedCleared = "AllWorkersHealthy"
 )
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "InfraEnv"}
@@ -92,7 +97,7 @@ type Reconciler struct {
 	scheme                *runtime.Scheme
 	fulfillment           FulfillmentClient
 	ignition              IgnitionFetcher
-	recorder              record.EventRecorder
+	recorder              events.EventRecorder
 	clusterOrderNamespace string
 	macResolver           MACResolver
 }
@@ -104,7 +109,7 @@ func NewReconciler(
 	scheme *runtime.Scheme,
 	fulfillment FulfillmentClient,
 	ignition IgnitionFetcher,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 	clusterOrderNamespace string,
 ) *Reconciler {
 	return &Reconciler{
@@ -259,7 +264,7 @@ func (r *Reconciler) fetchDiscoveryIgnition(
 		return nil, ctrl.Result{}, fmt.Errorf("fetching discovery ignition for %s: %w", key, err)
 	}
 	if len(ignition) > ignitionSizeWarningThreshold {
-		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonIgnitionSizeWarning,
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonIgnitionSizeWarning, "FetchIgnition",
 			"discovery ignition is %d bytes, exceeding the %d byte warning threshold", len(ignition), ignitionSizeWarningThreshold)
 	}
 	if !apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
@@ -407,6 +412,8 @@ func (r *Reconciler) setRHCOSImageNotFound(
 // reconcileWorkers creates one BareMetalInstance per requested bare-metal worker, idempotently
 // (list-before-create + AlreadyExists handling), and updates status.workers. Preserves existing
 // worker phases (Binding, Ready, etc.) for workers that have already been correlated.
+// Failed workers are retried with escalating backoff: the failed BMI is deleted, and a
+// replacement is created once NextRetryTime has passed.
 func (r *Reconciler) reconcileWorkers(
 	ctx context.Context, co *v1alpha1.ClusterOrder, diskImageID string, ignition []byte,
 ) (ctrl.Result, error) {
@@ -422,6 +429,8 @@ func (r *Reconciler) reconcileWorkers(
 	existingByName := bmisByName(existing)
 	ignitionB64 := base64.StdEncoding.EncodeToString(ignition)
 
+	r.handleFailedWorkers(ctx, co, existingByName)
+
 	workers, res, err := r.reconcileNodeSets(ctx, co, existingByName, diskImageID, ignitionB64, filter)
 	if err != nil || !res.IsZero() {
 		return res, err
@@ -434,11 +443,13 @@ func (r *Reconciler) reconcileWorkers(
 		}
 	}
 
+	retryResult := r.earliestRetryRequeue(workers)
+
 	if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return retryResult, nil
 }
 
 // reconcileNodeSets iterates bare-metal node requests and ensures a BMI exists for each worker
@@ -477,6 +488,21 @@ func (r *Reconciler) reconcileNodeSets(
 			globalIndex++
 
 			if prev, ok := existingWorkers[workerName]; ok {
+				if prev.Phase == workerPhaseFailed && prev.ResourceID == "" && isRetryDue(prev) {
+					bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
+					if err != nil {
+						return nil, ctrl.Result{}, err
+					}
+					if !res.IsZero() {
+						return nil, res, nil
+					}
+					log.Info("created replacement BMI for failed worker", "name", workerName, "attempt", prev.AttemptCount, "id", bmi.GetId())
+					prev.ResourceID = bmi.GetId()
+					prev.Phase = workerPhaseWaitingForAgent
+					prev.NextRetryTime = nil
+					r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerRetry, "RetryWorker",
+						"worker %s: retry attempt %d", workerName, prev.AttemptCount)
+				}
 				workers = append(workers, prev)
 				continue
 			}
@@ -501,6 +527,72 @@ func (r *Reconciler) reconcileNodeSets(
 	}
 
 	return workers, ctrl.Result{}, nil
+}
+
+// handleFailedWorkers processes workers in Failed phase: deletes their BMIs via the
+// fulfillment API, increments attemptCount, computes failure-appropriate backoff, and
+// sets NextRetryTime. The failed BMI's ResourceID is cleared so reconcileNodeSets
+// creates a replacement when the retry is due.
+func (r *Reconciler) handleFailedWorkers(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	existingByName map[string]*privatev1.BareMetalInstance,
+) {
+	log := ctrllog.FromContext(ctx)
+	for i := range co.Status.Workers {
+		w := &co.Status.Workers[i]
+		if w.Phase != workerPhaseFailed || w.ResourceID == "" {
+			continue
+		}
+		if err := r.fulfillment.DeleteBareMetalInstance(ctx, w.ResourceID); err != nil {
+			log.Error(err, "deleting failed BMI", "worker", w.Name, "bmiID", w.ResourceID)
+			continue
+		}
+		log.Info("deleted failed BMI", "worker", w.Name, "bmiID", w.ResourceID)
+		delete(existingByName, w.Name)
+
+		w.AttemptCount++
+		category := ClassifyFailure(w.LastFailureReason)
+		backoff := ComputeBackoff(category, w.AttemptCount)
+		now := metav1.Now()
+		retryTime := metav1.NewTime(now.Add(backoff))
+		w.NextRetryTime = &retryTime
+		w.ResourceID = ""
+		w.ReadySince = nil
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonWorkerFailed, "HandleFailedWorker",
+			"worker %s: failed (attempt %d, reason %s), next retry in %s",
+			w.Name, w.AttemptCount, w.LastFailureReason, backoff)
+	}
+}
+
+// isRetryDue returns true if a Failed worker's NextRetryTime has passed (or is nil).
+func isRetryDue(w v1alpha1.WorkerStatus) bool {
+	if w.NextRetryTime == nil {
+		return true
+	}
+	return !time.Now().Before(w.NextRetryTime.Time)
+}
+
+// earliestRetryRequeue returns a RequeueAfter result for the earliest pending retry
+// among Failed workers, or a zero result if no retries are pending.
+func (r *Reconciler) earliestRetryRequeue(workers []v1alpha1.WorkerStatus) ctrl.Result {
+	var earliest time.Time
+	for i := range workers {
+		w := &workers[i]
+		if w.Phase != workerPhaseFailed || w.NextRetryTime == nil {
+			continue
+		}
+		if earliest.IsZero() || w.NextRetryTime.Time.Before(earliest) {
+			earliest = w.NextRetryTime.Time
+		}
+	}
+	if earliest.IsZero() {
+		return ctrl.Result{}
+	}
+	delay := time.Until(earliest)
+	if delay < time.Second {
+		delay = time.Second
+	}
+	return ctrl.Result{RequeueAfter: delay}
 }
 
 func workersByName(workers []v1alpha1.WorkerStatus) map[string]v1alpha1.WorkerStatus {
