@@ -14,14 +14,14 @@ language governing permissions and limitations under the License.
 package baremetalworker
 
 import (
-	"testing"
-
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
 
-func TestMatchAgentToBMI(t *testing.T) {
+var _ = Describe("matchAgentToBMI", func() {
 	makeAgent := func(macs ...string) *unstructured.Unstructured {
 		interfaces := make([]interface{}, 0, len(macs))
 		for _, mac := range macs {
@@ -33,85 +33,55 @@ func TestMatchAgentToBMI(t *testing.T) {
 		return agent
 	}
 
-	workers := []v1alpha1.WorkerStatus{
-		{Name: "w-0", ResourceID: "bmi-0", Phase: workerPhaseWaitingForAgent},
-		{Name: "w-1", ResourceID: "bmi-1", Phase: workerPhaseWaitingForAgent},
-		{Name: "w-2", ResourceID: "bmi-2", Phase: workerPhaseBinding},
-	}
+	var (
+		workers  []v1alpha1.WorkerStatus
+		resolver func(string) string
+	)
 
-	hostMACs := map[string]string{
-		"bmi-0": "aa:bb:cc:dd:ee:00",
-		"bmi-1": "aa:bb:cc:dd:ee:11",
-		"bmi-2": "aa:bb:cc:dd:ee:22",
-	}
-	resolver := func(id string) string { return hostMACs[id] }
+	BeforeEach(func() {
+		workers = []v1alpha1.WorkerStatus{
+			{Name: "w-0", ResourceID: "bmi-0", Phase: workerPhaseWaitingForAgent},
+			{Name: "w-1", ResourceID: "bmi-1", Phase: workerPhaseWaitingForAgent},
+			{Name: "w-2", ResourceID: "bmi-2", Phase: workerPhaseBinding},
+		}
+		hostMACs := map[string]string{
+			"bmi-0": "aa:bb:cc:dd:ee:00",
+			"bmi-1": "aa:bb:cc:dd:ee:11",
+			"bmi-2": "aa:bb:cc:dd:ee:22",
+		}
+		resolver = func(id string) string { return hostMACs[id] }
+	})
 
-	tests := []struct {
-		name       string
-		agentMACs  []string
-		wantWorker string
-		wantAmbig  bool
-	}{
-		{
-			name:       "unique match",
-			agentMACs:  []string{"aa:bb:cc:dd:ee:00"},
-			wantWorker: "w-0",
-		},
-		{
-			name:       "case-insensitive match",
-			agentMACs:  []string{"AA:BB:CC:DD:EE:11"},
-			wantWorker: "w-1",
-		},
-		{
-			name:       "no match",
-			agentMACs:  []string{"ff:ff:ff:ff:ff:ff"},
-			wantWorker: "",
-		},
-		{
-			name:       "empty agent MACs",
-			agentMACs:  nil,
-			wantWorker: "",
-		},
-		{
-			name:      "ambiguous — agent MAC matches two BMIs",
-			agentMACs: []string{"aa:bb:cc:dd:ee:00", "aa:bb:cc:dd:ee:11"},
-			wantAmbig: true,
-		},
-		{
-			name:       "skips workers not in WaitingForAgent phase",
-			agentMACs:  []string{"aa:bb:cc:dd:ee:22"},
-			wantWorker: "",
-		},
-		{
-			name:       "multiple interfaces, one matches",
-			agentMACs:  []string{"ff:ff:ff:ff:ff:ff", "aa:bb:cc:dd:ee:00"},
-			wantWorker: "w-0",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			agent := makeAgent(tt.agentMACs...)
+	DescribeTable("matches agents to workers by MAC",
+		func(agentMACs []string, wantWorker string, wantAmbig bool) {
+			agent := makeAgent(agentMACs...)
 			gotWorker, gotAmbig := matchAgentToBMI(agent, workers, resolver)
-			if gotWorker != tt.wantWorker {
-				t.Errorf("workerName = %q, want %q", gotWorker, tt.wantWorker)
-			}
-			if gotAmbig != tt.wantAmbig {
-				t.Errorf("ambiguous = %v, want %v", gotAmbig, tt.wantAmbig)
-			}
-		})
-	}
-}
+			Expect(gotWorker).To(Equal(wantWorker))
+			Expect(gotAmbig).To(Equal(wantAmbig))
+		},
+		Entry("unique match", []string{"aa:bb:cc:dd:ee:00"}, "w-0", false),
+		Entry("case-insensitive match", []string{"AA:BB:CC:DD:EE:11"}, "w-1", false),
+		Entry("no match", []string{"ff:ff:ff:ff:ff:ff"}, "", false),
+		Entry("empty agent MACs", nil, "", false),
+		Entry("ambiguous — agent MAC matches two BMIs", []string{"aa:bb:cc:dd:ee:00", "aa:bb:cc:dd:ee:11"}, "", true),
+		Entry("skips workers not in WaitingForAgent phase", []string{"aa:bb:cc:dd:ee:22"}, "", false),
+		Entry("multiple interfaces, one matches", []string{"ff:ff:ff:ff:ff:ff", "aa:bb:cc:dd:ee:00"}, "w-0", false),
+	)
+})
 
-func TestExtractAgentMACs(t *testing.T) {
-	tests := []struct {
-		name string
-		obj  map[string]interface{}
-		want []string
-	}{
-		{
-			name: "single interface",
-			obj: map[string]interface{}{
+var _ = Describe("extractAgentMACs", func() {
+	DescribeTable("extracts MAC addresses from agent inventory",
+		func(obj map[string]interface{}, want []string) {
+			agent := &unstructured.Unstructured{Object: obj}
+			got := extractAgentMACs(agent)
+			if want == nil {
+				Expect(got).To(BeNil())
+			} else {
+				Expect(got).To(Equal(want))
+			}
+		},
+		Entry("single interface",
+			map[string]interface{}{
 				"status": map[string]interface{}{
 					"inventory": map[string]interface{}{
 						"interfaces": []interface{}{
@@ -120,11 +90,10 @@ func TestExtractAgentMACs(t *testing.T) {
 					},
 				},
 			},
-			want: []string{"aa:bb:cc:dd:ee:ff"},
-		},
-		{
-			name: "multiple interfaces",
-			obj: map[string]interface{}{
+			[]string{"aa:bb:cc:dd:ee:ff"},
+		),
+		Entry("multiple interfaces",
+			map[string]interface{}{
 				"status": map[string]interface{}{
 					"inventory": map[string]interface{}{
 						"interfaces": []interface{}{
@@ -134,38 +103,21 @@ func TestExtractAgentMACs(t *testing.T) {
 					},
 				},
 			},
-			want: []string{"11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"},
-		},
-		{
-			name: "no inventory",
-			obj:  map[string]interface{}{},
-			want: nil,
-		},
-		{
-			name: "empty interfaces",
-			obj: map[string]interface{}{
+			[]string{"11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"},
+		),
+		Entry("no inventory",
+			map[string]interface{}{},
+			nil,
+		),
+		Entry("empty interfaces",
+			map[string]interface{}{
 				"status": map[string]interface{}{
 					"inventory": map[string]interface{}{
 						"interfaces": []interface{}{},
 					},
 				},
 			},
-			want: []string{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			agent := &unstructured.Unstructured{Object: tt.obj}
-			got := extractAgentMACs(agent)
-			if len(got) != len(tt.want) {
-				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Errorf("mac[%d] = %q, want %q", i, got[i], tt.want[i])
-				}
-			}
-		})
-	}
-}
+			[]string{},
+		),
+	)
+})

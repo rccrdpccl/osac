@@ -14,123 +14,97 @@ language governing permissions and limitations under the License.
 package baremetalworker
 
 import (
-	"testing"
 	"time"
 
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
 
-func TestClassifyFailure(t *testing.T) {
-	tests := []struct {
-		name   string
-		reason string
-		want   FailureCategory
-	}{
-		{name: "agent timeout", reason: "AgentRegistrationTimeout", want: FailureCategoryAgentTimeout},
-		{name: "no host available", reason: "NoHostAvailable", want: FailureCategoryResource},
-		{name: "resource exhausted", reason: "ResourceExhausted", want: FailureCategoryResource},
-		{name: "transient infra error", reason: "InfrastructureError", want: FailureCategoryTransient},
-		{name: "unknown reason", reason: "SomethingUnexpected", want: FailureCategoryTransient},
-		{name: "empty reason", reason: "", want: FailureCategoryTransient},
-		{name: "BMI creation failed", reason: "BMICreationFailed", want: FailureCategoryTransient},
-		{name: "provisioning failed", reason: "ProvisioningFailed", want: FailureCategoryTransient},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ClassifyFailure(tt.reason)
-			if got != tt.want {
-				t.Errorf("ClassifyFailure(%q) = %d, want %d", tt.reason, got, tt.want)
-			}
-		})
-	}
-}
+var _ = Describe("ClassifyFailure", func() {
+	DescribeTable("maps failure reasons to categories",
+		func(reason string, want FailureCategory) {
+			Expect(ClassifyFailure(reason)).To(Equal(want))
+		},
+		Entry("agent timeout", "AgentRegistrationTimeout", FailureCategoryAgentTimeout),
+		Entry("no host available", "NoHostAvailable", FailureCategoryResource),
+		Entry("resource exhausted", "ResourceExhausted", FailureCategoryResource),
+		Entry("transient infra error", "InfrastructureError", FailureCategoryTransient),
+		Entry("unknown reason", "SomethingUnexpected", FailureCategoryTransient),
+		Entry("empty reason", "", FailureCategoryTransient),
+		Entry("BMI creation failed", "BMICreationFailed", FailureCategoryTransient),
+		Entry("provisioning failed", "ProvisioningFailed", FailureCategoryTransient),
+	)
+})
 
-func TestComputeBackoff(t *testing.T) {
-	tests := []struct {
-		name     string
-		category FailureCategory
-		attempt  int32
-		want     time.Duration
-	}{
+var _ = Describe("ComputeBackoff", func() {
+	DescribeTable("computes escalating backoff with caps",
+		func(category FailureCategory, attempt int32, want time.Duration) {
+			Expect(ComputeBackoff(category, attempt)).To(Equal(want))
+		},
 		// Transient: 30s, 60s, 120s, cap 5m
-		{name: "transient attempt 1", category: FailureCategoryTransient, attempt: 1, want: 30 * time.Second},
-		{name: "transient attempt 2", category: FailureCategoryTransient, attempt: 2, want: 60 * time.Second},
-		{name: "transient attempt 3", category: FailureCategoryTransient, attempt: 3, want: 120 * time.Second},
-		{name: "transient attempt 4 capped", category: FailureCategoryTransient, attempt: 4, want: 5 * time.Minute},
-		{name: "transient attempt 10 capped", category: FailureCategoryTransient, attempt: 10, want: 5 * time.Minute},
+		Entry("transient attempt 1", FailureCategoryTransient, int32(1), 30*time.Second),
+		Entry("transient attempt 2", FailureCategoryTransient, int32(2), 60*time.Second),
+		Entry("transient attempt 3", FailureCategoryTransient, int32(3), 120*time.Second),
+		Entry("transient attempt 4 capped", FailureCategoryTransient, int32(4), 5*time.Minute),
+		Entry("transient attempt 10 capped", FailureCategoryTransient, int32(10), 5*time.Minute),
 
 		// Resource: 5m, 15m, 30m, cap 30m
-		{name: "resource attempt 1", category: FailureCategoryResource, attempt: 1, want: 5 * time.Minute},
-		{name: "resource attempt 2", category: FailureCategoryResource, attempt: 2, want: 15 * time.Minute},
-		{name: "resource attempt 3", category: FailureCategoryResource, attempt: 3, want: 30 * time.Minute},
-		{name: "resource attempt 4 capped", category: FailureCategoryResource, attempt: 4, want: 30 * time.Minute},
+		Entry("resource attempt 1", FailureCategoryResource, int32(1), 5*time.Minute),
+		Entry("resource attempt 2", FailureCategoryResource, int32(2), 15*time.Minute),
+		Entry("resource attempt 3", FailureCategoryResource, int32(3), 30*time.Minute),
+		Entry("resource attempt 4 capped", FailureCategoryResource, int32(4), 30*time.Minute),
 
 		// Agent timeout: same schedule as resource
-		{name: "agent timeout attempt 1", category: FailureCategoryAgentTimeout, attempt: 1, want: 5 * time.Minute},
-		{name: "agent timeout attempt 2", category: FailureCategoryAgentTimeout, attempt: 2, want: 15 * time.Minute},
-		{name: "agent timeout attempt 3", category: FailureCategoryAgentTimeout, attempt: 3, want: 30 * time.Minute},
-		{name: "agent timeout attempt 4 capped", category: FailureCategoryAgentTimeout, attempt: 4, want: 30 * time.Minute},
+		Entry("agent timeout attempt 1", FailureCategoryAgentTimeout, int32(1), 5*time.Minute),
+		Entry("agent timeout attempt 2", FailureCategoryAgentTimeout, int32(2), 15*time.Minute),
+		Entry("agent timeout attempt 3", FailureCategoryAgentTimeout, int32(3), 30*time.Minute),
+		Entry("agent timeout attempt 4 capped", FailureCategoryAgentTimeout, int32(4), 30*time.Minute),
 
 		// Edge: attempt 0 treated as attempt 1
-		{name: "transient attempt 0", category: FailureCategoryTransient, attempt: 0, want: 30 * time.Second},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ComputeBackoff(tt.category, tt.attempt)
-			if got != tt.want {
-				t.Errorf("ComputeBackoff(%d, %d) = %v, want %v", tt.category, tt.attempt, got, tt.want)
-			}
-		})
-	}
-}
+		Entry("transient attempt 0", FailureCategoryTransient, int32(0), 30*time.Second),
+	)
+})
 
-func TestFormatWorkersFailed(t *testing.T) {
-	now := metav1.Now()
-	retryTime := metav1.NewTime(now.Add(30 * time.Second))
+var _ = Describe("FormatWorkersFailed", func() {
+	var retryTime metav1.Time
 
-	tests := []struct {
-		name    string
-		workers []v1alpha1.WorkerStatus
-		want    string
-	}{
-		{
-			name:    "no failed workers",
-			workers: []v1alpha1.WorkerStatus{{Name: "w-0", Phase: workerPhaseReady}},
-			want:    "",
-		},
-		{
-			name: "one failed worker",
-			workers: []v1alpha1.WorkerStatus{
-				{Name: "w-0", Phase: workerPhaseFailed, AttemptCount: 2, NextRetryTime: &retryTime},
-			},
-			want: "w-0: attempt 2, next retry " + retryTime.UTC().Format(time.RFC3339),
-		},
-		{
-			name: "multiple failed workers",
-			workers: []v1alpha1.WorkerStatus{
-				{Name: "w-0", Phase: workerPhaseReady},
-				{Name: "w-1", Phase: workerPhaseFailed, AttemptCount: 1, NextRetryTime: &retryTime},
-				{Name: "w-2", Phase: workerPhaseFailed, AttemptCount: 3, NextRetryTime: &retryTime},
-			},
-			want: "w-1: attempt 1, next retry " + retryTime.UTC().Format(time.RFC3339) +
+	BeforeEach(func() {
+		retryTime = metav1.NewTime(time.Date(2026, 8, 26, 12, 0, 30, 0, time.UTC))
+	})
+
+	It("returns empty string for no failed workers", func() {
+		workers := []v1alpha1.WorkerStatus{{Name: "w-0", Phase: workerPhaseReady}}
+		Expect(FormatWorkersFailed(workers)).To(BeEmpty())
+	})
+
+	It("formats one failed worker", func() {
+		workers := []v1alpha1.WorkerStatus{
+			{Name: "w-0", Phase: workerPhaseFailed, AttemptCount: 2, NextRetryTime: &retryTime},
+		}
+		Expect(FormatWorkersFailed(workers)).To(Equal(
+			"w-0: attempt 2, next retry " + retryTime.UTC().Format(time.RFC3339),
+		))
+	})
+
+	It("formats multiple failed workers", func() {
+		workers := []v1alpha1.WorkerStatus{
+			{Name: "w-0", Phase: workerPhaseReady},
+			{Name: "w-1", Phase: workerPhaseFailed, AttemptCount: 1, NextRetryTime: &retryTime},
+			{Name: "w-2", Phase: workerPhaseFailed, AttemptCount: 3, NextRetryTime: &retryTime},
+		}
+		Expect(FormatWorkersFailed(workers)).To(Equal(
+			"w-1: attempt 1, next retry " + retryTime.UTC().Format(time.RFC3339) +
 				"; w-2: attempt 3, next retry " + retryTime.UTC().Format(time.RFC3339),
-		},
-		{
-			name: "failed worker without next retry time",
-			workers: []v1alpha1.WorkerStatus{
-				{Name: "w-0", Phase: workerPhaseFailed, AttemptCount: 1},
-			},
-			want: "w-0: attempt 1, next retry pending",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := FormatWorkersFailed(tt.workers)
-			if got != tt.want {
-				t.Errorf("FormatWorkersFailed() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
+		))
+	})
+
+	It("shows pending when next retry time is nil", func() {
+		workers := []v1alpha1.WorkerStatus{
+			{Name: "w-0", Phase: workerPhaseFailed, AttemptCount: 1},
+		}
+		Expect(FormatWorkersFailed(workers)).To(Equal("w-0: attempt 1, next retry pending"))
+	})
+})
