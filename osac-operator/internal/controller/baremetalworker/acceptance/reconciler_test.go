@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -62,7 +62,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -70,7 +70,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -289,14 +289,14 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 	var (
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
 	BeforeEach(func() {
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -406,7 +406,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -414,7 +414,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -600,7 +600,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -608,7 +608,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 	})
@@ -961,7 +961,7 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -969,7 +969,7 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(10)
+		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 		r.SetMACResolver(fc.HostMAC)
@@ -1246,7 +1246,7 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		sim *envsim.Simulator
 		fc  *fake.FulfillmentClient
 		ign *fake.IgnitionServer
-		rec *record.FakeRecorder
+		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
 	)
 
@@ -1254,7 +1254,7 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		sim = envsim.New(k8sClient)
 		fc = fake.NewFulfillmentClient()
 		ign = fake.NewIgnitionServer()
-		rec = record.NewFakeRecorder(20)
+		rec = events.NewFakeRecorder(20)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
 		r.SetMACResolver(fc.HostMAC)

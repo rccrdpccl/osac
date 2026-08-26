@@ -176,7 +176,7 @@ func (r *Reconciler) advanceBindingWorkers(
 				workers[i].ReadySince = &now
 			}
 			log.Info("worker ready", "worker", workers[i].Name)
-			r.recorder.Eventf(co, corev1.EventTypeNormal, eventReasonWorkerReady,
+			r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerReady, "AdvanceWorker",
 				"worker %s is ready", workers[i].Name)
 		}
 	}
@@ -225,7 +225,7 @@ func (r *Reconciler) tryCorrelateAgent(
 
 	setWorkerPhase(workers, workerName, workerPhaseBinding)
 	log.Info("agent correlated", "agent", agent.GetName(), "worker", workerName)
-	r.recorder.Eventf(co, corev1.EventTypeNormal, eventReasonAgentCorrelated,
+	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
 		"agent %s correlated to worker %s", agent.GetName(), workerName)
 	return true
 }
@@ -296,7 +296,7 @@ func (r *Reconciler) checkAgentRegistrationTimeout(
 		failTime := metav1.NewTime(now)
 		w.LastFailureTime = &failTime
 		log.Info("agent registration timeout", "worker", w.Name)
-		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonAgentRegistrationTimeout,
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonAgentRegistrationTimeout, "CheckTimeout",
 			"worker %s: no agent registered within %s", w.Name, agentRegistrationTimeout)
 	}
 	return workers

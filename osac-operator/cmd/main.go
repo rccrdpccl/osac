@@ -355,7 +355,7 @@ func setupClusterControllers(
 		localMgr.GetClient(), localMgr.GetAPIReader(), localMgr.GetScheme(),
 		bmwFulfillment,
 		baremetalworker.NewIgnitionFetcher(nil),
-		localMgr.GetEventRecorderFor("baremetalworker"), //nolint:staticcheck // TODO: migrate to events API
+		localMgr.GetEventRecorder("baremetalworker"),
 		os.Getenv(envClusterOrderNamespace),
 	).SetupWithManager(mgr); err != nil {
 		return err

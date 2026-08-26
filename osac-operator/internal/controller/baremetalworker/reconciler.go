@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -97,7 +97,7 @@ type Reconciler struct {
 	scheme                *runtime.Scheme
 	fulfillment           FulfillmentClient
 	ignition              IgnitionFetcher
-	recorder              record.EventRecorder
+	recorder              events.EventRecorder
 	clusterOrderNamespace string
 	macResolver           MACResolver
 }
@@ -109,7 +109,7 @@ func NewReconciler(
 	scheme *runtime.Scheme,
 	fulfillment FulfillmentClient,
 	ignition IgnitionFetcher,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 	clusterOrderNamespace string,
 ) *Reconciler {
 	return &Reconciler{
@@ -264,7 +264,7 @@ func (r *Reconciler) fetchDiscoveryIgnition(
 		return nil, ctrl.Result{}, fmt.Errorf("fetching discovery ignition for %s: %w", key, err)
 	}
 	if len(ignition) > ignitionSizeWarningThreshold {
-		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonIgnitionSizeWarning,
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonIgnitionSizeWarning, "FetchIgnition",
 			"discovery ignition is %d bytes, exceeding the %d byte warning threshold", len(ignition), ignitionSizeWarningThreshold)
 	}
 	if !apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
@@ -500,7 +500,7 @@ func (r *Reconciler) reconcileNodeSets(
 					prev.ResourceID = bmi.GetId()
 					prev.Phase = workerPhaseWaitingForAgent
 					prev.NextRetryTime = nil
-					r.recorder.Eventf(co, corev1.EventTypeNormal, eventReasonWorkerRetry,
+					r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerRetry, "RetryWorker",
 						"worker %s: retry attempt %d", workerName, prev.AttemptCount)
 				}
 				workers = append(workers, prev)
@@ -558,7 +558,7 @@ func (r *Reconciler) handleFailedWorkers(
 		w.NextRetryTime = &retryTime
 		w.ResourceID = ""
 		w.ReadySince = nil
-		r.recorder.Eventf(co, corev1.EventTypeWarning, eventReasonWorkerFailed,
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonWorkerFailed, "HandleFailedWorker",
 			"worker %s: failed (attempt %d, reason %s), next retry in %s",
 			w.Name, w.AttemptCount, w.LastFailureReason, backoff)
 	}
