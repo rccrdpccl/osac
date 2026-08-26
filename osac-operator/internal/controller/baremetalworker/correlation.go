@@ -438,7 +438,8 @@ func computeWorkerAggregates(workers []v1alpha1.WorkerStatus) (desired, current,
 	for _, w := range workers {
 		desired++
 		switch w.Phase {
-		case workerPhaseProvisioning, workerPhaseWaitingForAgent, workerPhaseBinding, workerPhaseReady:
+		case workerPhaseProvisioning, workerPhaseWaitingForAgent, workerPhaseBinding, workerPhaseReady,
+			workerPhaseUnbinding, workerPhaseDeleting:
 			current++
 		}
 		if w.Phase == workerPhaseReady {

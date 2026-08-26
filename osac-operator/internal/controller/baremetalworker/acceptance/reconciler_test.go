@@ -1968,3 +1968,400 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
 	})
 })
+
+var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
+	const (
+		clusterUUID    = "scaledown-cluster-uuid"
+		cvID           = "4.18.0"
+		diskImageID    = "rhcos-4.18"
+		clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+	)
+
+	var (
+		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
+		ign *fake.IgnitionServer
+		rec *events.FakeRecorder
+		r   *baremetalworker.Reconciler
+	)
+
+	BeforeEach(func() {
+		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
+		ign = fake.NewIgnitionServer()
+		rec = events.NewFakeRecorder(20)
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		r.SetMACResolver(fc.HostMAC)
+	})
+
+	AfterEach(func() { ign.Close() })
+
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+	}
+
+	newBareMetalClusterOrder := func(name string, numWorkers int) *osacv1alpha1.ClusterOrder {
+		return &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: numWorkers,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+	}
+
+	runReconcile := func(name string) (reconcile.Result, error) {
+		return r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
+		})
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		GinkgoHelper()
+		co := &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, co)).To(Succeed())
+		return co
+	}
+
+	create := func(co *osacv1alpha1.ClusterOrder) {
+		GinkgoHelper()
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, co)
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+	}
+
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+	}
+
+	setWorkerFailed := func(name, workerName, reason, message string) {
+		GinkgoHelper()
+		co := getClusterOrder(name)
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Name == workerName {
+				co.Status.Workers[i].Phase = "Failed"
+				co.Status.Workers[i].LastFailureReason = reason
+				co.Status.Workers[i].LastFailureMessage = message
+				failTime := metav1.Now()
+				co.Status.Workers[i].LastFailureTime = &failTime
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+	}
+
+	registerAndBindAgent := func(coName, agentName string, workerIndex int) *unstructured.Unstructured {
+		GinkgoHelper()
+		co := getClusterOrder(coName)
+		mac := fmt.Sprintf("aa:bb:cc:dd:ee:%02d", workerIndex)
+		fc.SetHostMAC(co.Status.Workers[workerIndex].ResourceID, mac)
+
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: agentName, Namespace: testNamespace, MAC: mac,
+		})).To(Succeed())
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: testNamespace}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = coName
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		_, err := runReconcile(coName)
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder(coName)
+		Expect(co.Status.Workers[workerIndex].Phase).To(Equal("Binding"))
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: testNamespace}, agentObj)).To(Succeed())
+		Expect(unstructured.SetNestedField(agentObj.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+
+		_, err = runReconcile(coName)
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder(coName)
+		Expect(co.Status.Workers[workerIndex].Phase).To(Equal("Ready"))
+
+		return agentObj
+	}
+
+	It("removes Failed workers first on scale-down", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-sd-failed", 3)
+		create(co)
+		makeInfraEnvReady("bmw-sd-failed")
+
+		_, err := runReconcile("bmw-sd-failed")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-failed")
+		Expect(co.Status.Workers).To(HaveLen(3))
+
+		setWorkerFailed("bmw-sd-failed", "bmw-sd-failed-worker-1", "InfrastructureError", "host allocation failed")
+
+		deletesBeforeScaleDown := len(fc.DeleteCalls())
+
+		co = getClusterOrder("bmw-sd-failed")
+		co.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, co)).To(Succeed())
+
+		_, err = runReconcile("bmw-sd-failed")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-failed")
+
+		workerNames := map[string]bool{}
+		for _, w := range co.Status.Workers {
+			workerNames[w.Name] = true
+		}
+		Expect(workerNames).ToNot(HaveKey("bmw-sd-failed-worker-1"), "Failed worker-1 should be removed")
+
+		deletesAfterScaleDown := fc.DeleteCalls()
+		Expect(len(deletesAfterScaleDown)).To(BeNumerically(">", deletesBeforeScaleDown),
+			"BMI for failed worker should have been deleted")
+
+		// Worker-2 (WaitingForAgent, no bound agent) transitions Unbinding → Deleting in one
+		// reconcile since there is no agent to wait for unbinding.
+		hasTeardown := false
+		for _, w := range co.Status.Workers {
+			if w.Phase == "Unbinding" || w.Phase == "Deleting" {
+				hasTeardown = true
+			}
+		}
+		Expect(hasTeardown).To(BeTrue(), "non-failed excess worker-2 should be in teardown")
+	})
+
+	It("handles Agent unbinding lifecycle and removes worker after BMI deletion confirmed", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-sd-unbind", 2)
+		create(co)
+		makeInfraEnvReady("bmw-sd-unbind")
+
+		_, err := runReconcile("bmw-sd-unbind")
+		Expect(err).ToNot(HaveOccurred())
+
+		agent0 := registerAndBindAgent("bmw-sd-unbind", "bmw-sd-unbind-agent-0", 0)
+		agent1 := registerAndBindAgent("bmw-sd-unbind", "bmw-sd-unbind-agent-1", 1)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, agent0)
+			_ = k8sClient.Delete(ctx, agent1)
+		})
+
+		co = getClusterOrder("bmw-sd-unbind")
+		Expect(co.Status.Workers).To(HaveLen(2))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Ready"))
+		Expect(co.Status.Workers[1].Phase).To(Equal("Ready"))
+
+		co.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, co)).To(Succeed())
+
+		_, err = runReconcile("bmw-sd-unbind")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-unbind")
+		var unbindingWorker *osacv1alpha1.WorkerStatus
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Phase == "Unbinding" {
+				unbindingWorker = &co.Status.Workers[i]
+			}
+		}
+		Expect(unbindingWorker).ToNot(BeNil(), "excess worker should be in Unbinding phase")
+
+		Expect(sim.UnbindAgent(ctx, "bmw-sd-unbind-agent-1", testNamespace)).To(Succeed())
+
+		deletesBeforeUnbind := len(fc.DeleteCalls())
+
+		_, err = runReconcile("bmw-sd-unbind")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-unbind")
+		var deletingWorker *osacv1alpha1.WorkerStatus
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Name == unbindingWorker.Name {
+				deletingWorker = &co.Status.Workers[i]
+			}
+		}
+		Expect(deletingWorker).ToNot(BeNil(), "worker should still exist during Deleting phase")
+		Expect(deletingWorker.Phase).To(Equal("Deleting"))
+
+		deletesAfterUnbind := fc.DeleteCalls()
+		Expect(len(deletesAfterUnbind)).To(BeNumerically(">", deletesBeforeUnbind),
+			"BMI should have been deleted")
+
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: "bmw-sd-unbind-agent-1", Namespace: testNamespace}, agentObj)
+		Expect(err).To(HaveOccurred(), "Agent CR should have been deleted")
+
+		_, err = runReconcile("bmw-sd-unbind")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-unbind")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Name).To(Equal("bmw-sd-unbind-worker-0"))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Ready"))
+	})
+
+	It("unbinding timeout sets AgentUnbindingTimeout reason without replacement", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-sd-timeout", 2)
+		create(co)
+		makeInfraEnvReady("bmw-sd-timeout")
+
+		_, err := runReconcile("bmw-sd-timeout")
+		Expect(err).ToNot(HaveOccurred())
+
+		agent0 := registerAndBindAgent("bmw-sd-timeout", "bmw-sd-timeout-agent-0", 0)
+		agent1 := registerAndBindAgent("bmw-sd-timeout", "bmw-sd-timeout-agent-1", 1)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, agent0)
+			_ = k8sClient.Delete(ctx, agent1)
+		})
+
+		co = getClusterOrder("bmw-sd-timeout")
+		co.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, co)).To(Succeed())
+
+		_, err = runReconcile("bmw-sd-timeout")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-timeout")
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Phase == "Unbinding" {
+				pastTime := metav1.NewTime(time.Now().Add(-31 * time.Minute))
+				co.Status.Workers[i].LastFailureTime = &pastTime
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+		_, err = runReconcile("bmw-sd-timeout")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-timeout")
+		var timedOutWorker *osacv1alpha1.WorkerStatus
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Name == "bmw-sd-timeout-worker-1" {
+				timedOutWorker = &co.Status.Workers[i]
+			}
+		}
+		Expect(timedOutWorker).ToNot(BeNil())
+		Expect(timedOutWorker.Phase).To(Equal("Unbinding"), "worker should stay in Unbinding, not transition to Failed")
+		Expect(timedOutWorker.LastFailureReason).To(Equal("AgentUnbindingTimeout"))
+	})
+
+	It("retains worker in Deleting until BMI deletion is confirmed", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-sd-delwait", 2)
+		create(co)
+		makeInfraEnvReady("bmw-sd-delwait")
+
+		_, err := runReconcile("bmw-sd-delwait")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-delwait")
+		Expect(co.Status.Workers).To(HaveLen(2))
+
+		co.Status.Workers[1].Phase = "Deleting"
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+		co = getClusterOrder("bmw-sd-delwait")
+		co.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, co)).To(Succeed())
+
+		fc.SetDeleteError(fmt.Errorf("temporary failure"))
+
+		_, err = runReconcile("bmw-sd-delwait")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-delwait")
+		var deletingWorker *osacv1alpha1.WorkerStatus
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Name == "bmw-sd-delwait-worker-1" {
+				deletingWorker = &co.Status.Workers[i]
+			}
+		}
+		Expect(deletingWorker).ToNot(BeNil(), "worker should be retained in Deleting while BMI exists")
+		Expect(deletingWorker.Phase).To(Equal("Deleting"))
+
+		fc.SetDeleteError(nil)
+
+		// Reconcile — retries delete (succeeds, removes BMI from map), stays in Deleting.
+		_, err = runReconcile("bmw-sd-delwait")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-delwait")
+		deletingWorker = nil
+		for i := range co.Status.Workers {
+			if co.Status.Workers[i].Name == "bmw-sd-delwait-worker-1" {
+				deletingWorker = &co.Status.Workers[i]
+			}
+		}
+		Expect(deletingWorker).ToNot(BeNil(), "worker should still be in Deleting after retry succeeds")
+		Expect(deletingWorker.Phase).To(Equal("Deleting"))
+
+		// Reconcile — GetBMI returns NotFound, entry removed.
+		_, err = runReconcile("bmw-sd-delwait")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-delwait")
+		for _, w := range co.Status.Workers {
+			Expect(w.Name).ToNot(Equal("bmw-sd-delwait-worker-1"),
+				"worker should be removed after BMI deletion confirmed")
+		}
+	})
+
+	It("requeues when teardown workers exist", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-sd-requeue", 2)
+		create(co)
+		makeInfraEnvReady("bmw-sd-requeue")
+
+		_, err := runReconcile("bmw-sd-requeue")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-sd-requeue")
+		co.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, co)).To(Succeed())
+
+		res, err := runReconcile("bmw-sd-requeue")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "should requeue while teardown is in progress")
+	})
+})
