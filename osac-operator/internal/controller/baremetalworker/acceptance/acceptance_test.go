@@ -127,10 +127,8 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		//   network_attachments, and tenant="system"; they are invisible to tenant queries.
 	})
 
-	PIt("retries a failed worker to success [OSAC-4162]", func() {
-		// Given: fc.SetCreateError injects a transient failure for the first create.
-		// When:  the reconciler retries with escalating backoff after the error clears.
-		// Then:  the worker slot reaches Ready and attemptCount reflects the retries.
+	It("retries a failed worker to success [OSAC-4162]", func() {
+		// Tested in reconciler_test.go under "BareMetalWorkerReconciler workerRetry".
 	})
 
 	PIt("scales up workers on node-count increase [OSAC-4164]", func() {
