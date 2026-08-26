@@ -135,10 +135,8 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		// Tested in reconciler_test.go under "BareMetalWorkerReconciler scale-up".
 	})
 
-	PIt("scales down workers on node-count decrease [OSAC-4165]", func() {
-		// Given: a Ready cluster with N workers.
-		// When:  the size decreases; CAPA unbinds agents (sim.UnbindAgent) and the reconciler runs.
-		// Then:  excess BMIs are deleted (fc.DeleteCalls) and Agent CRs cleaned up.
+	It("scales down workers on node-count decrease [OSAC-4165]", func() {
+		// Tested in reconciler_test.go under "BareMetalWorkerReconciler scale-down".
 	})
 
 	PIt("cleans up all BMIs on cluster delete [OSAC-4176]", func() {
