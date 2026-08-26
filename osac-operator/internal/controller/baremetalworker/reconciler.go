@@ -82,7 +82,6 @@ const (
 
 	eventReasonWorkerRetry     = "WorkerRetry"
 	eventReasonWorkerFailed    = "WorkerFailed"
-	eventReasonWorkerHealthy   = "WorkerHealthy"
 	reasonWorkersFailed        = "WorkersRetrying"
 	reasonWorkersFailedCleared = "AllWorkersHealthy"
 )
