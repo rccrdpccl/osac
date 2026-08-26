@@ -55,7 +55,7 @@ var backoffSchedules = map[FailureCategory]backoffSchedule{
 // ClassifyFailure maps a LastFailureReason string to a FailureCategory.
 func ClassifyFailure(reason string) FailureCategory {
 	switch reason {
-	case "AgentRegistrationTimeout":
+	case eventReasonAgentRegistrationTimeout:
 		return FailureCategoryAgentTimeout
 	case "NoHostAvailable", "ResourceExhausted":
 		return FailureCategoryResource
