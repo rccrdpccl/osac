@@ -30,6 +30,8 @@ const (
 	FailureCategoryAgentTimeout                 // agent did not register within the timeout
 )
 
+const minHealthyDuration = 1 * time.Hour
+
 type backoffSchedule struct {
 	steps []time.Duration
 	cap   time.Duration
