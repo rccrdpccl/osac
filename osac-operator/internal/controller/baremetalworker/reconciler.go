@@ -89,6 +89,15 @@ const (
 	eventReasonStaleIgnition         = "StaleIgnition"
 	reasonInfraEnvRecreated          = "InfraEnvRecreated"
 	reasonStaleIgnitionWorkersMarked = "StaleIgnitionWorkersMarked"
+
+	workerPhaseUnbinding = "Unbinding"
+	workerPhaseDeleting  = "Deleting"
+
+	agentUnbindingState              = "unbinding-pending-user-action"
+	agentUnbindingTimeout            = 30 * time.Minute
+	eventReasonWorkerDeleted         = "WorkerDeleted"
+	eventReasonAgentUnbindingTimeout = "AgentUnbindingTimeout"
+	teardownRequeueInterval          = 30 * time.Second
 )
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "InfraEnv"}
@@ -191,6 +200,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder: %w", err)
 	}
 
+	teardownWorkers := co.Status.Workers
+	teardownWorkers = r.handleUnbindingWorkers(ctx, co, teardownWorkers)
+	teardownWorkers = r.handleDeletingWorkers(ctx, co, teardownWorkers)
+	if !workerSlicesEqual(co.Status.Workers, teardownWorkers) {
+		if err := r.updateWorkerStatus(ctx, co, teardownWorkers); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating worker status after teardown: %w", err)
+		}
+		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after teardown: %w", err)
+		}
+	}
+
 	workers, res, err := r.correlateAgents(ctx, co, co.Status.Workers)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -207,6 +228,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	if !res.IsZero() {
 		return res, nil
+	}
+	if hasTeardownWorkers(workers) {
+		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 	return npRes, nil
 }
@@ -610,7 +634,229 @@ func (r *Reconciler) reconcileNodeSets(
 		}
 	}
 
+	excess := r.identifyExcessWorkers(co, workers)
+	if len(excess) > 0 {
+		workers = r.handleScaleDown(ctx, co, workers, excess)
+	}
+
 	return workers, ctrl.Result{}, nil
+}
+
+// desiredWorkerNames returns the set of worker names derived from the current NodeRequests.
+func desiredWorkerNames(co *v1alpha1.ClusterOrder) map[string]bool {
+	names := make(map[string]bool)
+	globalIndex := 0
+	for i := range co.Spec.NodeRequests {
+		nr := &co.Spec.NodeRequests[i]
+		if !nr.IsBareMetal() {
+			continue
+		}
+		for j := 0; j < nr.NumberOfNodes; j++ {
+			names[fmt.Sprintf("%s-worker-%d", co.Name, globalIndex)] = true
+			globalIndex++
+		}
+	}
+	return names
+}
+
+// identifyExcessWorkers returns workers in status that are not in the desired set and are not
+// already in a teardown phase (Unbinding/Deleting).
+func (r *Reconciler) identifyExcessWorkers(
+	co *v1alpha1.ClusterOrder, currentWorkers []v1alpha1.WorkerStatus,
+) []v1alpha1.WorkerStatus {
+	desired := desiredWorkerNames(co)
+	var excess []v1alpha1.WorkerStatus
+	for _, w := range co.Status.Workers {
+		if desired[w.Name] {
+			continue
+		}
+		alreadyTracked := false
+		for _, cw := range currentWorkers {
+			if cw.Name == w.Name {
+				alreadyTracked = true
+				break
+			}
+		}
+		if alreadyTracked {
+			continue
+		}
+		excess = append(excess, w)
+	}
+	return excess
+}
+
+// handleScaleDown processes excess workers: removes Failed workers first (deleting their BMIs),
+// then marks remaining excess as Unbinding. Failed-first ordering ensures dead workers are cleaned
+// before healthy ones are touched.
+func (r *Reconciler) handleScaleDown(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	workers []v1alpha1.WorkerStatus, excess []v1alpha1.WorkerStatus,
+) []v1alpha1.WorkerStatus {
+	log := ctrllog.FromContext(ctx)
+
+	// Remove Failed excess first.
+	var remaining []v1alpha1.WorkerStatus
+	for _, w := range excess {
+		if w.Phase == workerPhaseFailed {
+			if w.ResourceID != "" {
+				if err := r.fulfillment.DeleteBareMetalInstance(ctx, w.ResourceID); err != nil {
+					log.Error(err, "deleting excess failed BMI", "worker", w.Name)
+					workers = append(workers, w)
+					continue
+				}
+				log.Info("deleted excess failed BMI", "worker", w.Name, "bmiID", w.ResourceID)
+			}
+			r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ScaleDown",
+				"removed failed worker %s during scale-down", w.Name)
+			continue
+		}
+		remaining = append(remaining, w)
+	}
+
+	// Mark non-failed excess as Unbinding.
+	now := metav1.Now()
+	for i := range remaining {
+		w := &remaining[i]
+		if w.Phase == workerPhaseUnbinding || w.Phase == workerPhaseDeleting {
+			workers = append(workers, *w)
+			continue
+		}
+		log.Info("marking worker for scale-down", "worker", w.Name, "previousPhase", w.Phase)
+		w.Phase = workerPhaseUnbinding
+		w.LastFailureTime = &now
+		r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ScaleDown",
+			"worker %s marked for unbinding during scale-down", w.Name)
+		workers = append(workers, *w)
+	}
+
+	return workers
+}
+
+// handleUnbindingWorkers processes workers in Unbinding phase: finds matching Agents via the
+// worker-name label, waits for the Agent to enter unbinding-pending-user-action, then deletes
+// the Agent CR and calls BareMetalInstances.Delete. Transitions to Deleting after BMI delete
+// is initiated. Checks for unbinding timeout (30 min).
+func (r *Reconciler) handleUnbindingWorkers(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	workers []v1alpha1.WorkerStatus,
+) []v1alpha1.WorkerStatus {
+	log := ctrllog.FromContext(ctx)
+	agents, err := r.listAgents(ctx, co)
+	if err != nil {
+		log.Error(err, "listing agents for unbinding check")
+		return workers
+	}
+
+	now := time.Now()
+	for i := range workers {
+		w := &workers[i]
+		if w.Phase != workerPhaseUnbinding {
+			continue
+		}
+
+		agent := findAgentByWorkerName(agents, w.Name)
+		if agent == nil {
+			log.Info("no agent found for unbinding worker, transitioning to Deleting", "worker", w.Name)
+			w.Phase = workerPhaseDeleting
+			continue
+		}
+
+		state, _, _ := unstructured.NestedString(agent.Object, "status", "debugInfo", "state")
+		if state != agentUnbindingState {
+			if w.LastFailureTime != nil && now.Sub(w.LastFailureTime.Time) > agentUnbindingTimeout {
+				log.Info("agent unbinding timeout", "worker", w.Name, "agent", agent.GetName())
+				w.LastFailureReason = eventReasonAgentUnbindingTimeout
+				w.LastFailureMessage = fmt.Sprintf("agent %s stuck unbinding for > %s", agent.GetName(), agentUnbindingTimeout)
+				r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonAgentUnbindingTimeout, "UnbindTimeout",
+					"worker %s: agent %s stuck unbinding", w.Name, agent.GetName())
+			}
+			continue
+		}
+
+		if err := r.Delete(ctx, agent); err != nil {
+			log.Error(err, "deleting agent CR", "agent", agent.GetName())
+			continue
+		}
+		log.Info("deleted agent CR", "worker", w.Name, "agent", agent.GetName())
+		w.Phase = workerPhaseDeleting
+	}
+	return workers
+}
+
+// handleDeletingWorkers processes workers in Deleting phase: checks if the BMI is confirmed
+// deleted (GetBareMetalInstance returns NotFound), and removes the entry. Retries Delete if
+// the BMI still exists.
+func (r *Reconciler) handleDeletingWorkers(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	workers []v1alpha1.WorkerStatus,
+) []v1alpha1.WorkerStatus {
+	log := ctrllog.FromContext(ctx)
+	var kept []v1alpha1.WorkerStatus
+	for i := range workers {
+		w := &workers[i]
+		if w.Phase != workerPhaseDeleting {
+			kept = append(kept, *w)
+			continue
+		}
+		if w.ResourceID == "" {
+			log.Info("worker deletion confirmed (no resource ID)", "worker", w.Name)
+			r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ConfirmDeletion",
+				"worker %s removed after BMI deletion confirmed", w.Name)
+			continue
+		}
+		_, err := r.fulfillment.GetBareMetalInstance(ctx, w.ResourceID)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				log.Info("worker BMI deletion confirmed", "worker", w.Name, "bmiID", w.ResourceID)
+				r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ConfirmDeletion",
+					"worker %s removed after BMI %s deletion confirmed", w.Name, w.ResourceID)
+				continue
+			}
+			log.Error(err, "checking BMI existence for deleting worker", "worker", w.Name)
+		} else {
+			if delErr := r.fulfillment.DeleteBareMetalInstance(ctx, w.ResourceID); delErr != nil {
+				log.Error(delErr, "retrying BMI deletion", "worker", w.Name)
+			}
+		}
+		kept = append(kept, *w)
+	}
+	return kept
+}
+
+// findAgentByWorkerName finds an Agent with the given worker-name label.
+func findAgentByWorkerName(agents *unstructured.UnstructuredList, workerName string) *unstructured.Unstructured {
+	for idx := range agents.Items {
+		agent := &agents.Items[idx]
+		if agent.GetLabels()[workerNameLabel] == workerName {
+			return agent
+		}
+	}
+	return nil
+}
+
+// workerSlicesEqual returns true if the two worker slices have the same length and
+// each worker has the same Name and Phase. Used to detect whether teardown handlers
+// changed anything.
+func workerSlicesEqual(a, b []v1alpha1.WorkerStatus) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].Phase != b[i].Phase {
+			return false
+		}
+	}
+	return true
+}
+
+// hasTeardownWorkers returns true if any workers are in Unbinding or Deleting phase.
+func hasTeardownWorkers(workers []v1alpha1.WorkerStatus) bool {
+	for _, w := range workers {
+		if w.Phase == workerPhaseUnbinding || w.Phase == workerPhaseDeleting {
+			return true
+		}
+	}
+	return false
 }
 
 // handleFailedWorkers processes workers in Failed phase: deletes their BMIs via the
