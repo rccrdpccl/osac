@@ -131,10 +131,8 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		// Tested in reconciler_test.go under "BareMetalWorkerReconciler workerRetry".
 	})
 
-	PIt("scales up workers on node-count increase [OSAC-4164]", func() {
-		// Given: a Ready cluster with N workers.
-		// When:  the node-set size increases to N+M and the reconciler runs.
-		// Then:  M new BMIs are created and reach Ready; aggregates update.
+	It("scales up workers on node-count increase [OSAC-4164]", func() {
+		// Tested in reconciler_test.go under "BareMetalWorkerReconciler scale-up".
 	})
 
 	PIt("scales down workers on node-count decrease [OSAC-4165]", func() {

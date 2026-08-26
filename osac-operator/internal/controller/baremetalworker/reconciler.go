@@ -84,6 +84,11 @@ const (
 	eventReasonWorkerFailed    = "WorkerFailed"
 	reasonWorkersFailed        = "WorkersRetrying"
 	reasonWorkersFailedCleared = "AllWorkersHealthy"
+
+	infraEnvUIDAnnotation            = "osac.openshift.io/infraenv-uid"
+	eventReasonStaleIgnition         = "StaleIgnition"
+	reasonInfraEnvRecreated          = "InfraEnvRecreated"
+	reasonStaleIgnitionWorkersMarked = "StaleIgnitionWorkersMarked"
 )
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "InfraEnv"}
@@ -159,10 +164,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return res, err
 	}
 
-	ignition, res, err := r.ensureInfraEnv(ctx, co)
+	ignition, infraEnvUID, res, err := r.ensureInfraEnv(ctx, co)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
+
+	if r.detectStaleIgnitionWorkers(ctx, co, infraEnvUID) {
+		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after stale detection: %w", err)
+		}
+	}
+	r.trackInfraEnvUID(ctx, co, infraEnvUID)
 
 	diskImageID, res, err := r.resolveDiskImage(ctx, co)
 	if err != nil || !res.IsZero() {
@@ -201,28 +213,39 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
 // then polls for and fetches its discovery ignition, setting the InfraEnvReady condition.
-// Returns the fetched ignition bytes once ready.
-func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) ([]byte, ctrl.Result, error) {
+// Returns the fetched ignition bytes and the InfraEnv's UID once ready.
+func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) ([]byte, string, ctrl.Result, error) {
 	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(infraEnvGVK)
 
 	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
 		if err := r.Get(ctx, key, existing); err != nil {
-			return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+			if !apierrors.IsNotFound(err) {
+				return nil, "", ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+			}
+			ctrllog.FromContext(ctx).Info("InfraEnv deleted while InfraEnvReady=True, resetting condition", "infraenv", key)
+			if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonInfraEnvRecreated,
+				"InfraEnv was deleted; recreating"); condErr != nil {
+				return nil, "", ctrl.Result{}, condErr
+			}
+			res, createErr := r.createInfraEnv(ctx, co, key)
+			return nil, "", res, createErr
 		}
-		return r.fetchDiscoveryIgnition(ctx, co, key, existing)
+		ign, res, err := r.fetchDiscoveryIgnition(ctx, co, key, existing)
+		return ign, string(existing.GetUID()), res, err
 	}
 
 	err := r.Get(ctx, key, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		res, createErr := r.createInfraEnv(ctx, co, key)
-		return nil, res, createErr
+		return nil, "", res, createErr
 	case err != nil:
-		return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+		return nil, "", ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
 	}
-	return r.fetchDiscoveryIgnition(ctx, co, key, existing)
+	ign, res, fetchErr := r.fetchDiscoveryIgnition(ctx, co, key, existing)
+	return ign, string(existing.GetUID()), res, fetchErr
 }
 
 // createInfraEnv creates the InfraEnv and marks InfraEnvReady=False (ignition pending), requeuing.
@@ -308,6 +331,67 @@ func (r *Reconciler) setInfraEnvReady(
 	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, status, message, reason)
 	})
+}
+
+// trackInfraEnvUID stores the InfraEnv's UID as an annotation on the ClusterOrder so
+// stale ignition can be detected after InfraEnv deletion+recreation.
+func (r *Reconciler) trackInfraEnvUID(
+	ctx context.Context, co *v1alpha1.ClusterOrder, uid string,
+) {
+	if uid == "" {
+		return
+	}
+	if co.Annotations != nil && co.Annotations[infraEnvUIDAnnotation] == uid {
+		return
+	}
+	base := co.DeepCopy()
+	if co.Annotations == nil {
+		co.Annotations = make(map[string]string)
+	}
+	co.Annotations[infraEnvUIDAnnotation] = uid
+	if err := r.Patch(ctx, co, client.MergeFrom(base)); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "patching infraenv-uid annotation")
+	}
+}
+
+// detectStaleIgnitionWorkers checks whether the InfraEnv was recreated since the last
+// reconcile. If so, workers in WaitingForAgent phase have stale ignition and are marked
+// Failed with AgentRegistrationTimeout so they enter the retry pipeline.
+func (r *Reconciler) detectStaleIgnitionWorkers(
+	ctx context.Context, co *v1alpha1.ClusterOrder, infraEnvUID string,
+) bool {
+	storedUID := ""
+	if co.Annotations != nil {
+		storedUID = co.Annotations[infraEnvUIDAnnotation]
+	}
+	if storedUID == "" || storedUID == infraEnvUID {
+		return false
+	}
+
+	log := ctrllog.FromContext(ctx)
+	marked := false
+	now := metav1.Now()
+	for i := range co.Status.Workers {
+		w := &co.Status.Workers[i]
+		if w.Phase != workerPhaseWaitingForAgent {
+			continue
+		}
+		log.Info("marking worker as stale-ignition failure", "worker", w.Name)
+		w.Phase = workerPhaseFailed
+		w.LastFailureReason = eventReasonAgentRegistrationTimeout
+		w.LastFailureMessage = "stale ignition: InfraEnv was recreated"
+		w.LastFailureTime = &now
+		marked = true
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonStaleIgnition, "DetectStaleIgnition",
+			"worker %s: marked failed due to stale ignition after InfraEnv recreation", w.Name)
+	}
+
+	if marked {
+		if err := r.updateWorkerStatus(ctx, co, co.Status.Workers); err != nil {
+			log.Error(err, "updating worker status after stale ignition detection")
+		}
+	}
+	return marked
 }
 
 // ensureSystemCatalogItem creates the system-owned BareMetalInstanceCatalogItem
