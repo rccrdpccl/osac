@@ -43,14 +43,21 @@ type FulfillmentClient struct {
 	bmis            map[string]*privatev1.BareMetalInstance
 	hostMACs        map[string]string
 	clusterVersions map[string]*privatev1.ClusterVersion
+	clusters        map[string]*privatev1.Cluster
+	catalogItems    map[string]*privatev1.BareMetalInstanceCatalogItem
+	instanceTypes   map[string]*privatev1.BareMetalInstanceType
 	createErr       error
 	deleteErr       error
 
-	createCalls []*privatev1.BareMetalInstance
-	deleteCalls []string
-	getCalls    []string
-	listCalls   []string
-	getCVCalls  []string
+	createCalls            []*privatev1.BareMetalInstance
+	deleteCalls            []string
+	getCalls               []string
+	listCalls              []string
+	getCVCalls             []string
+	getClusterCalls        []string
+	createCatalogItemCalls []*privatev1.BareMetalInstanceCatalogItem
+	listCatalogItemCalls   []string
+	getInstanceTypeCalls   []string
 }
 
 var _ baremetalworker.FulfillmentClient = (*FulfillmentClient)(nil)
@@ -61,6 +68,9 @@ func NewFulfillmentClient() *FulfillmentClient {
 		bmis:            map[string]*privatev1.BareMetalInstance{},
 		hostMACs:        map[string]string{},
 		clusterVersions: map[string]*privatev1.ClusterVersion{},
+		clusters:        map[string]*privatev1.Cluster{},
+		catalogItems:    map[string]*privatev1.BareMetalInstanceCatalogItem{},
+		instanceTypes:   map[string]*privatev1.BareMetalInstanceType{},
 	}
 }
 
@@ -70,6 +80,10 @@ func cloneBMI(b *privatev1.BareMetalInstance) *privatev1.BareMetalInstance {
 
 func cloneCV(c *privatev1.ClusterVersion) *privatev1.ClusterVersion {
 	return proto.Clone(c).(*privatev1.ClusterVersion)
+}
+
+func cloneCluster(c *privatev1.Cluster) *privatev1.Cluster {
+	return proto.Clone(c).(*privatev1.Cluster)
 }
 
 // CreateBareMetalInstance records the call, assigns an id (defaulting to metadata.name) and stores
@@ -171,7 +185,109 @@ func (f *FulfillmentClient) GetClusterVersion(
 	return cloneCV(cv), nil
 }
 
+// GetCluster records the call and returns a preloaded Cluster (see AddCluster), or an error
+// if none is registered for that id.
+func (f *FulfillmentClient) GetCluster(
+	_ context.Context, id string,
+) (*privatev1.Cluster, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getClusterCalls = append(f.getClusterCalls, id)
+	cl, ok := f.clusters[id]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "cluster %q not found", id)
+	}
+	return cloneCluster(cl), nil
+}
+
+func cloneCatalogItem(c *privatev1.BareMetalInstanceCatalogItem) *privatev1.BareMetalInstanceCatalogItem {
+	return proto.Clone(c).(*privatev1.BareMetalInstanceCatalogItem)
+}
+
+// CreateBareMetalInstanceCatalogItem records the call, assigns an id (defaulting to metadata.name)
+// and stores the catalog item. Returns AlreadyExists on duplicate names.
+func (f *FulfillmentClient) CreateBareMetalInstanceCatalogItem(
+	_ context.Context, obj *privatev1.BareMetalInstanceCatalogItem,
+) (*privatev1.BareMetalInstanceCatalogItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.createCatalogItemCalls = append(f.createCatalogItemCalls, cloneCatalogItem(obj))
+	name := obj.GetMetadata().GetName()
+	if name == "" {
+		return nil, status.Error(codes.InvalidArgument, "catalogitem metadata.name is required")
+	}
+	stored := cloneCatalogItem(obj)
+	id := stored.GetId()
+	if id == "" {
+		id = name
+		stored.SetId(id)
+	}
+	if _, exists := f.catalogItems[id]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "catalogitem %q already exists", id)
+	}
+	f.catalogItems[id] = stored
+	return cloneCatalogItem(stored), nil
+}
+
+// ListBareMetalInstanceCatalogItems records the filter and returns copies of all stored catalog
+// items, ordered by id for deterministic tests.
+func (f *FulfillmentClient) ListBareMetalInstanceCatalogItems(
+	_ context.Context, filter string,
+) ([]*privatev1.BareMetalInstanceCatalogItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.listCatalogItemCalls = append(f.listCatalogItemCalls, filter)
+	ids := make([]string, 0, len(f.catalogItems))
+	for id := range f.catalogItems {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]*privatev1.BareMetalInstanceCatalogItem, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, cloneCatalogItem(f.catalogItems[id]))
+	}
+	return out, nil
+}
+
+func cloneInstanceType(t *privatev1.BareMetalInstanceType) *privatev1.BareMetalInstanceType {
+	return proto.Clone(t).(*privatev1.BareMetalInstanceType)
+}
+
+// GetBareMetalInstanceType records the call and returns a preloaded BareMetalInstanceType
+// (see AddBareMetalInstanceType), or an error if none is registered for that id.
+func (f *FulfillmentClient) GetBareMetalInstanceType(
+	_ context.Context, id string,
+) (*privatev1.BareMetalInstanceType, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getInstanceTypeCalls = append(f.getInstanceTypeCalls, id)
+	it, ok := f.instanceTypes[id]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "baremetalinstancetype %q not found", id)
+	}
+	return cloneInstanceType(it), nil
+}
+
 // --- Builder / control surface (test-only) ---
+
+// AddBareMetalInstanceType preloads a BareMetalInstanceType so GetBareMetalInstanceType
+// can return it (keyed by name from metadata).
+func (f *FulfillmentClient) AddBareMetalInstanceType(it *privatev1.BareMetalInstanceType) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.instanceTypes[it.GetMetadata().GetName()] = cloneInstanceType(it)
+}
+
+// AddCluster preloads a Cluster so GetCluster can return it (keyed by id).
+func (f *FulfillmentClient) AddCluster(cl *privatev1.Cluster) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clusters[cl.GetId()] = cloneCluster(cl)
+}
 
 // AddClusterVersion preloads a ClusterVersion so GetClusterVersion can return it (keyed by id).
 func (f *FulfillmentClient) AddClusterVersion(cv *privatev1.ClusterVersion) {
@@ -252,4 +368,36 @@ func (f *FulfillmentClient) GetClusterVersionCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.getCVCalls...)
+}
+
+// GetClusterCalls returns the ids passed to GetCluster, in order.
+func (f *FulfillmentClient) GetClusterCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getClusterCalls...)
+}
+
+// CreateCatalogItemCalls returns copies of the catalog items passed to CreateBareMetalInstanceCatalogItem.
+func (f *FulfillmentClient) CreateCatalogItemCalls() []*privatev1.BareMetalInstanceCatalogItem {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*privatev1.BareMetalInstanceCatalogItem, len(f.createCatalogItemCalls))
+	for i, c := range f.createCatalogItemCalls {
+		out[i] = cloneCatalogItem(c)
+	}
+	return out
+}
+
+// ListCatalogItemCalls returns the filters passed to ListBareMetalInstanceCatalogItems, in order.
+func (f *FulfillmentClient) ListCatalogItemCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.listCatalogItemCalls...)
+}
+
+// GetInstanceTypeCalls returns the ids passed to GetBareMetalInstanceType, in order.
+func (f *FulfillmentClient) GetInstanceTypeCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getInstanceTypeCalls...)
 }

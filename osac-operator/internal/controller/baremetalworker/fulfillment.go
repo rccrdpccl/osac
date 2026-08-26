@@ -58,13 +58,24 @@ type FulfillmentClient interface {
 	ListBareMetalInstances(ctx context.Context, filter string) ([]*privatev1.BareMetalInstance, error)
 	// GetClusterVersion returns the ClusterVersion with the given id.
 	GetClusterVersion(ctx context.Context, id string) (*privatev1.ClusterVersion, error)
+	// GetCluster returns the Cluster with the given id.
+	GetCluster(ctx context.Context, id string) (*privatev1.Cluster, error)
+	// CreateBareMetalInstanceCatalogItem creates a BareMetalInstanceCatalogItem and returns the created object.
+	CreateBareMetalInstanceCatalogItem(ctx context.Context, obj *privatev1.BareMetalInstanceCatalogItem) (*privatev1.BareMetalInstanceCatalogItem, error)
+	// ListBareMetalInstanceCatalogItems returns the BareMetalInstanceCatalogItems matching the given CEL filter.
+	ListBareMetalInstanceCatalogItems(ctx context.Context, filter string) ([]*privatev1.BareMetalInstanceCatalogItem, error)
+	// GetBareMetalInstanceType returns the BareMetalInstanceType with the given id (or name).
+	GetBareMetalInstanceType(ctx context.Context, id string) (*privatev1.BareMetalInstanceType, error)
 }
 
 // fulfillmentClient is the production FulfillmentClient. It wraps the generated gRPC clients,
 // applies a per-call deadline, and tracks consecutive gRPC failures for the unavailable signal.
 type fulfillmentClient struct {
-	bmis     privatev1.BareMetalInstancesClient
-	versions privatev1.ClusterVersionsClient
+	bmis          privatev1.BareMetalInstancesClient
+	versions      privatev1.ClusterVersionsClient
+	clusters      privatev1.ClustersClient
+	catalogItems  privatev1.BareMetalInstanceCatalogItemsClient
+	instanceTypes privatev1.BareMetalInstanceTypesClient
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -74,8 +85,14 @@ type fulfillmentClient struct {
 func NewFulfillmentClient(
 	bmis privatev1.BareMetalInstancesClient,
 	versions privatev1.ClusterVersionsClient,
+	clusters privatev1.ClustersClient,
+	catalogItems privatev1.BareMetalInstanceCatalogItemsClient,
+	instanceTypes privatev1.BareMetalInstanceTypesClient,
 ) FulfillmentClient {
-	return &fulfillmentClient{bmis: bmis, versions: versions}
+	return &fulfillmentClient{
+		bmis: bmis, versions: versions, clusters: clusters,
+		catalogItems: catalogItems, instanceTypes: instanceTypes,
+	}
 }
 
 // NewFulfillmentClientFromConn wires the production FulfillmentClient from the shared gRPC
@@ -84,6 +101,9 @@ func NewFulfillmentClientFromConn(conn *grpc.ClientConn) FulfillmentClient {
 	return NewFulfillmentClient(
 		privatev1.NewBareMetalInstancesClient(conn),
 		privatev1.NewClusterVersionsClient(conn),
+		privatev1.NewClustersClient(conn),
+		privatev1.NewBareMetalInstanceCatalogItemsClient(conn),
+		privatev1.NewBareMetalInstanceTypesClient(conn),
 	)
 }
 
@@ -168,6 +188,70 @@ func (c *fulfillmentClient) GetClusterVersion(ctx context.Context, id string) (*
 	var out *privatev1.ClusterVersion
 	err := c.call(ctx, func(ctx context.Context) error {
 		resp, err := c.versions.Get(ctx, privatev1.ClusterVersionsGetRequest_builder{Id: id}.Build())
+		if err != nil {
+			return err
+		}
+		out = resp.GetObject()
+		return nil
+	})
+	return out, err
+}
+
+func (c *fulfillmentClient) GetCluster(ctx context.Context, id string) (*privatev1.Cluster, error) {
+	var out *privatev1.Cluster
+	err := c.call(ctx, func(ctx context.Context) error {
+		resp, err := c.clusters.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+		if err != nil {
+			return err
+		}
+		out = resp.GetObject()
+		return nil
+	})
+	return out, err
+}
+
+func (c *fulfillmentClient) CreateBareMetalInstanceCatalogItem(
+	ctx context.Context,
+	obj *privatev1.BareMetalInstanceCatalogItem,
+) (*privatev1.BareMetalInstanceCatalogItem, error) {
+	var out *privatev1.BareMetalInstanceCatalogItem
+	err := c.call(ctx, func(ctx context.Context) error {
+		resp, err := c.catalogItems.Create(ctx, privatev1.BareMetalInstanceCatalogItemsCreateRequest_builder{Object: obj}.Build())
+		if err != nil {
+			return err
+		}
+		out = resp.GetObject()
+		return nil
+	})
+	return out, err
+}
+
+func (c *fulfillmentClient) ListBareMetalInstanceCatalogItems(
+	ctx context.Context,
+	filter string,
+) ([]*privatev1.BareMetalInstanceCatalogItem, error) {
+	var out []*privatev1.BareMetalInstanceCatalogItem
+	err := c.call(ctx, func(ctx context.Context) error {
+		req := privatev1.BareMetalInstanceCatalogItemsListRequest_builder{}
+		if filter != "" {
+			req.Filter = &filter
+		}
+		resp, err := c.catalogItems.List(ctx, req.Build())
+		if err != nil {
+			return err
+		}
+		out = resp.GetItems()
+		return nil
+	})
+	return out, err
+}
+
+func (c *fulfillmentClient) GetBareMetalInstanceType(
+	ctx context.Context, id string,
+) (*privatev1.BareMetalInstanceType, error) {
+	var out *privatev1.BareMetalInstanceType
+	err := c.call(ctx, func(ctx context.Context) error {
+		resp, err := c.instanceTypes.Get(ctx, privatev1.BareMetalInstanceTypesGetRequest_builder{Id: id}.Build())
 		if err != nil {
 			return err
 		}
