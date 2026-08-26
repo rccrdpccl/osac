@@ -291,7 +291,7 @@ func (r *Reconciler) checkAgentRegistrationTimeout(
 			continue
 		}
 		w.Phase = workerPhaseFailed
-		w.LastFailureReason = "AgentRegistrationTimeout"
+		w.LastFailureReason = eventReasonAgentRegistrationTimeout
 		w.LastFailureMessage = fmt.Sprintf("no agent registered within %s", agentRegistrationTimeout)
 		failTime := metav1.NewTime(now)
 		w.LastFailureTime = &failTime
