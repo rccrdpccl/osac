@@ -566,6 +566,12 @@ spec:
                       - Unbinding
                       - Deleting
                       type: string
+                    readySince:
+                      description: |-
+                        ReadySince is when the worker first transitioned to Ready after the most recent retry.
+                        Used to determine when attemptCount can be reset after MinHealthyDuration.
+                      format: date-time
+                      type: string
                     resourceID:
                       description: ResourceID is the fulfillment-service resource
                         ID of the backing object.

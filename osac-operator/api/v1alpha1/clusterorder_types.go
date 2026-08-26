@@ -311,6 +311,11 @@ type WorkerStatus struct {
 	// NextRetryTime is when the controller will attempt the next retry.
 	// +kubebuilder:validation:Optional
 	NextRetryTime *metav1.Time `json:"nextRetryTime,omitempty"`
+
+	// ReadySince is when the worker first transitioned to Ready after the most recent retry.
+	// Used to determine when attemptCount can be reset after MinHealthyDuration.
+	// +kubebuilder:validation:Optional
+	ReadySince *metav1.Time `json:"readySince,omitempty"`
 }
 
 // NodeSetStatus holds networking status for a single node set.
