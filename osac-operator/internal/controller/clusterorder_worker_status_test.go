@@ -43,6 +43,7 @@ var _ = Describe("ClusterOrder worker status contract (OSAC-4147)", func() {
 					ResourceID:         "uuid-0",
 					Phase:              "Failed",
 					AttemptCount:       2,
+					CreationTimestamp:  now,
 					LastFailureReason:  "AgentRegistrationTimeout",
 					LastFailureMessage: "Agent did not register within 30m",
 					LastFailureTime:    &now,
@@ -101,12 +102,14 @@ var _ = Describe("ClusterOrder worker status contract (OSAC-4147)", func() {
 			// Simulate the BareMetalWorkerReconciler writing Workers[].
 			co := &v1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(ctx, key, co)).To(Succeed())
+			now := metav1.Now()
 			co.Status.Workers = []v1alpha1.WorkerStatus{{
-				NodeSet:      "compute",
-				Name:         "bm-cluster-a-worker-0",
-				Kind:         "BareMetalInstance",
-				Phase:        "Ready",
-				AttemptCount: 1,
+				NodeSet:           "compute",
+				Name:              "bm-cluster-a-worker-0",
+				Kind:              "BareMetalInstance",
+				Phase:             "Ready",
+				AttemptCount:      1,
+				CreationTimestamp: now,
 			}}
 			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
 

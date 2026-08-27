@@ -556,6 +556,11 @@ spec:
                         slot has been provisioned.
                       format: int32
                       type: integer
+                    creationTimestamp:
+                      description: CreationTimestamp is when this worker entry was
+                        first created.
+                      format: date-time
+                      type: string
                     kind:
                       description: Kind of the backing resource (e.g. BareMetalInstance).
                       type: string
@@ -609,6 +614,7 @@ spec:
                       type: string
                   required:
                   - attemptCount
+                  - creationTimestamp
                   - kind
                   - name
                   - nodeSet
