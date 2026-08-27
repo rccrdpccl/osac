@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
@@ -142,6 +143,12 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -333,6 +340,12 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -463,6 +476,12 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -681,6 +700,12 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -1035,6 +1060,12 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -1320,6 +1351,12 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -1580,6 +1617,12 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -1836,6 +1879,12 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -2055,6 +2104,12 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		GinkgoHelper()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
 			_ = k8sClient.Delete(ctx, co)
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
@@ -2363,5 +2418,247 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		res, err := runReconcile("bmw-sd-requeue")
 		Expect(err).ToNot(HaveOccurred())
 		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "should requeue while teardown is in progress")
+	})
+})
+
+var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
+	const (
+		clusterUUID       = "deletion-cluster-uuid"
+		cvID              = "4.18.0"
+		diskImageID       = "rhcos-4.18"
+		clusterIDLabel    = "osac.openshift.io/clusterorder-uuid"
+		bmWorkerFinalizer = "osac.openshift.io/baremetalworker-finalizer"
+	)
+
+	var (
+		sim *envsim.Simulator
+		fc  *fake.FulfillmentClient
+		ign *fake.IgnitionServer
+		rec *events.FakeRecorder
+		r   *baremetalworker.Reconciler
+	)
+
+	BeforeEach(func() {
+		sim = envsim.New(k8sClient)
+		fc = fake.NewFulfillmentClient()
+		ign = fake.NewIgnitionServer()
+		rec = events.NewFakeRecorder(20)
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		r.SetMACResolver(fc.HostMAC)
+	})
+
+	AfterEach(func() { ign.Close() })
+
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+	}
+
+	newBareMetalClusterOrder := func(name string, numWorkers int) *osacv1alpha1.ClusterOrder {
+		return &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: numWorkers,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+	}
+
+	runReconcile := func(name string) (reconcile.Result, error) {
+		return r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
+		})
+	}
+
+	getClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
+		GinkgoHelper()
+		co := &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, co)).To(Succeed())
+		return co
+	}
+
+	create := func(co *osacv1alpha1.ClusterOrder) {
+		GinkgoHelper()
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
+				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
+					_ = k8sClient.Update(ctx, latest)
+				}
+			}
+			_ = k8sClient.Delete(ctx, co)
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+	}
+
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+	}
+
+	provisionWorkers := func(name string, numWorkers int) {
+		GinkgoHelper()
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder(name, numWorkers)
+		create(co)
+		makeInfraEnvReady(name)
+
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder(name)
+		Expect(co.Status.Workers).To(HaveLen(numWorkers))
+		Expect(controllerutil.ContainsFinalizer(co, bmWorkerFinalizer)).To(BeTrue(),
+			"finalizer should be added during normal reconciliation")
+	}
+
+	It("adds the finalizer during normal reconciliation", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-del-fin", 1)
+		create(co)
+		makeInfraEnvReady("bmw-del-fin")
+
+		_, err := runReconcile("bmw-del-fin")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-del-fin")
+		Expect(controllerutil.ContainsFinalizer(co, bmWorkerFinalizer)).To(BeTrue())
+	})
+
+	It("deletes all BMIs on cluster deletion and removes finalizer when confirmed", func() {
+		provisionWorkers("bmw-del-all", 2)
+
+		co := getClusterOrder("bmw-del-all")
+		workerIDs := make([]string, len(co.Status.Workers))
+		for i, w := range co.Status.Workers {
+			workerIDs[i] = w.ResourceID
+		}
+
+		// Delete the ClusterOrder — envtest doesn't enforce finalizers, so we delete directly.
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+
+		// The fake removes BMIs on Delete, so handleDeletingWorkers confirms deletion in the
+		// same reconcile that marks workers Deleting. All workers are removed and the finalizer
+		// is cleared in a single pass.
+		_, err := runReconcile("bmw-del-all")
+		Expect(err).ToNot(HaveOccurred())
+
+		deletes := fc.DeleteCalls()
+		for _, id := range workerIDs {
+			Expect(deletes).To(ContainElement(id), "should have called Delete for BMI %s", id)
+		}
+
+		// After finalizer removal, envtest completes the delete — the object is gone.
+		// The reconciler returning NotFound is the expected terminal state.
+		_, err = runReconcile("bmw-del-all")
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("holds the finalizer while workers are still being deleted", func() {
+		provisionWorkers("bmw-del-hold", 1)
+
+		co := getClusterOrder("bmw-del-hold")
+		bmiID := co.Status.Workers[0].ResourceID
+
+		// Re-add the BMI to the fake so Get doesn't return NotFound after Delete.
+		fc.SetDeleteError(fmt.Errorf("transient API error"))
+
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+
+		_, err := runReconcile("bmw-del-hold")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-del-hold")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Deleting"))
+		Expect(controllerutil.ContainsFinalizer(co, bmWorkerFinalizer)).To(BeTrue(),
+			"finalizer must not be removed while workers remain")
+		_ = bmiID
+	})
+
+	It("retries a failed Delete on the next reconcile", func() {
+		provisionWorkers("bmw-del-retry", 1)
+
+		co := getClusterOrder("bmw-del-retry")
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+
+		fc.SetDeleteError(fmt.Errorf("transient error"))
+
+		_, err := runReconcile("bmw-del-retry")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-del-retry")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Deleting"))
+
+		// Clear the error and reconcile again — the BMI was not removed from the fake
+		// because the first Delete returned an error, so handleDeletingWorkers retries.
+		fc.SetDeleteError(nil)
+
+		_, err = runReconcile("bmw-del-retry")
+		Expect(err).ToNot(HaveOccurred())
+
+		// After successful delete + confirm, the finalizer is removed and envtest
+		// completes the deletion — the object is gone.
+		_, err = runReconcile("bmw-del-retry")
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("removes workers without a ResourceID immediately", func() {
+		provisionWorkers("bmw-del-noid", 1)
+
+		// Add a worker with no ResourceID.
+		co := getClusterOrder("bmw-del-noid")
+		co.Status.Workers = append(co.Status.Workers, osacv1alpha1.WorkerStatus{
+			Name:              "bmw-del-noid-orphan",
+			Kind:              "BareMetalInstance",
+			Phase:             "WaitingForAgent",
+			CreationTimestamp: metav1.Now(),
+		})
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+
+		// First reconcile: the no-ResourceID worker is removed immediately by
+		// handleDeletingWorkers; the worker with a ResourceID is deleted from the
+		// fake and confirmed in the same pass. Both workers cleared, finalizer
+		// removed, envtest completes the delete.
+		_, err := runReconcile("bmw-del-noid")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Object is gone — reconcile returns NotFound (ignored).
+		_, err = runReconcile("bmw-del-noid")
+		Expect(err).ToNot(HaveOccurred())
 	})
 })

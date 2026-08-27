@@ -90,6 +90,8 @@ const (
 	reasonInfraEnvRecreated          = "InfraEnvRecreated"
 	reasonStaleIgnitionWorkersMarked = "StaleIgnitionWorkersMarked"
 
+	bmWorkerFinalizer = "osac.openshift.io/baremetalworker-finalizer"
+
 	workerPhaseUnbinding = "Unbinding"
 	workerPhaseDeleting  = "Deleting"
 
@@ -159,14 +161,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !co.DeletionTimestamp.IsZero() {
-		// Deletion / finalizer-driven BMI cleanup lands in OSAC-4176.
-		return ctrl.Result{}, nil
+		return r.handleClusterDeletion(ctx, co)
 	}
 	if v, ok := co.Annotations[managementStateAnnotation]; ok && v == managementStateUnmanaged {
 		return ctrl.Result{}, nil
 	}
 	if !co.HasBareMetalNodeSet() {
 		return ctrl.Result{}, nil
+	}
+
+	if controllerutil.AddFinalizer(co, bmWorkerFinalizer) {
+		if err := r.Update(ctx, co); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
@@ -233,6 +240,51 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 	return npRes, nil
+}
+
+func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(co, bmWorkerFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	log := ctrllog.FromContext(ctx)
+	log.Info("handling cluster deletion", "clusterOrder", co.Name)
+
+	workers := co.Status.Workers
+	changed := false
+	for i := range workers {
+		if workers[i].Kind != workerKindBMI {
+			continue
+		}
+		if workers[i].Phase != workerPhaseDeleting {
+			workers[i].Phase = workerPhaseDeleting
+			changed = true
+		}
+	}
+
+	workers = r.handleDeletingWorkers(ctx, co, workers)
+
+	if changed || !workerSlicesEqual(co.Status.Workers, workers) {
+		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating worker status during cluster deletion: %w", err)
+		}
+	}
+
+	if len(workers) > 0 {
+		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
+	}
+
+	latest := &v1alpha1.ClusterOrder{}
+	if err := r.apiReader.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder for finalizer removal: %w", err)
+	}
+	if controllerutil.RemoveFinalizer(latest, bmWorkerFinalizer) {
+		if err := r.Update(ctx, latest); err != nil {
+			return ctrl.Result{}, fmt.Errorf("removing baremetalworker finalizer: %w", err)
+		}
+	}
+	log.Info("cluster deletion complete, finalizer removed", "clusterOrder", co.Name)
+	return ctrl.Result{}, nil
 }
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
