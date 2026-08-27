@@ -25,8 +25,10 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
@@ -653,6 +655,182 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(mockClient.lastUpdate.GetStatus().GetIngressEndpoint()).To(BeEmpty())
 		})
 
+		It("should translate WorkersFailed=True to WORKER_PROVISIONING_FAILED with count-only message", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			co.Status.DesiredWorkers = ptr.To(int32(5))
+			co.Status.Workers = []osacv1alpha1.WorkerStatus{
+				{NodeSet: "compute", Name: "bm-w-0", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-1", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-2", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-3", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 2, CreationTimestamp: metav1.Now(), LastFailureReason: "AgentRegistrationTimeout", LastFailureMessage: "Agent did not register within 30m"},
+				{NodeSet: "compute", Name: "bm-w-4", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 1, CreationTimestamp: metav1.Now(), LastFailureReason: "BMICreationFailed", LastFailureMessage: "gRPC error: unavailable"},
+			}
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionWorkersFailed, Status: metav1.ConditionTrue,
+				Reason: "WorkersRetrying", Message: "internal details here",
+			})
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.updateCalled).To(BeTrue())
+
+			cond := findProtoCondition(mockClient.lastUpdate, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+			Expect(cond.GetMessage()).To(ContainSubstring("2 of 5"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("bm-w-3"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("bm-w-4"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("AgentRegistrationTimeout"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("gRPC"))
+		})
+
+		It("should include retry info in WORKER_PROVISIONING_FAILED message for retrying workers", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			co.Status.DesiredWorkers = ptr.To(int32(3))
+			retryTime := metav1.Now()
+			co.Status.Workers = []osacv1alpha1.WorkerStatus{
+				{NodeSet: "compute", Name: "bm-w-0", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-1", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 3, CreationTimestamp: metav1.Now(), NextRetryTime: &retryTime},
+				{NodeSet: "compute", Name: "bm-w-2", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 2, CreationTimestamp: metav1.Now(), NextRetryTime: &retryTime},
+			}
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionWorkersFailed, Status: metav1.ConditionTrue,
+				Reason: "WorkersRetrying", Message: "internal",
+			})
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+
+			cond := findProtoCondition(mockClient.lastUpdate, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.GetMessage()).To(ContainSubstring("2 of 3"))
+			Expect(cond.GetMessage()).To(ContainSubstring("retrying"))
+		})
+
+		It("should translate InfraEnvReady=False to WORKER_PROVISIONING_BLOCKED", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionInfraEnvReady, Status: metav1.ConditionFalse,
+				Reason: "IgnitionPending", Message: "internal infra detail",
+			})
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+
+			cond := findProtoCondition(mockClient.lastUpdate, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+			Expect(cond.GetMessage()).To(ContainSubstring("blocked"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("IgnitionPending"))
+		})
+
+		It("should translate RHCOSImageNotFound=True to WORKER_PROVISIONING_BLOCKED", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionRHCOSImageNotFound, Status: metav1.ConditionTrue,
+				Reason: "NotFound", Message: "DiskImage xyz not found",
+			})
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+
+			cond := findProtoCondition(mockClient.lastUpdate, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+			Expect(cond.GetMessage()).To(ContainSubstring("blocked"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("DiskImage"))
+		})
+
+		It("should clear worker conditions when all workers are Ready", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			co.Status.DesiredWorkers = ptr.To(int32(3))
+			co.Status.Workers = []osacv1alpha1.WorkerStatus{
+				{NodeSet: "compute", Name: "bm-w-0", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-1", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-2", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+			}
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionInfraEnvReady, Status: metav1.ConditionTrue,
+				Reason: "InfraEnvReady", Message: "ready",
+			})
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			// Pre-set the remote proto with active worker conditions to verify clearing.
+			failedCond := findClusterCondition(mockClient.getResponse.GetObject(),
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED)
+			failedCond.SetStatus(privatev1.ConditionStatus_CONDITION_STATUS_TRUE)
+			blockedCond := findClusterCondition(mockClient.getResponse.GetObject(),
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED)
+			blockedCond.SetStatus(privatev1.ConditionStatus_CONDITION_STATUS_TRUE)
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.updateCalled).To(BeTrue())
+
+			clearedFailed := findProtoCondition(mockClient.lastUpdate,
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED)
+			Expect(clearedFailed).NotTo(BeNil())
+			Expect(clearedFailed.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+
+			clearedBlocked := findProtoCondition(mockClient.lastUpdate,
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED)
+			Expect(clearedBlocked).NotTo(BeNil())
+			Expect(clearedBlocked.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		})
+
+		It("should handle both WorkersFailed and InfraEnvReady=False simultaneously", func() {
+			co := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
+			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
+			co.Status.DesiredWorkers = ptr.To(int32(2))
+			co.Status.Workers = []osacv1alpha1.WorkerStatus{
+				{NodeSet: "compute", Name: "bm-w-0", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "bm-w-1", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+			}
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionWorkersFailed, Status: metav1.ConditionTrue,
+				Reason: "WorkersRetrying", Message: "internal",
+			})
+			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
+				Type: osacv1alpha1.ConditionInfraEnvReady, Status: metav1.ConditionFalse,
+				Reason: "IgnitionPending", Message: "internal",
+			})
+			Expect(k8sClient.Status().Update(testCtx, co)).To(Succeed())
+
+			request := reconcile.Request{NamespacedName: typeNamespacedName}
+			_, err := reconciler.Reconcile(testCtx, request)
+			Expect(err).NotTo(HaveOccurred())
+
+			failedCond := findProtoCondition(mockClient.lastUpdate,
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED)
+			Expect(failedCond).NotTo(BeNil())
+			Expect(failedCond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+
+			blockedCond := findProtoCondition(mockClient.lastUpdate,
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED)
+			Expect(blockedCond).NotTo(BeNil())
+			Expect(blockedCond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_TRUE))
+		})
+
 		It("should not call update when reconciled twice with same data", func() {
 			co := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
@@ -670,3 +848,12 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		})
 	})
 })
+
+func findProtoCondition(cluster *privatev1.Cluster, condType privatev1.ClusterConditionType) *privatev1.ClusterCondition {
+	for _, c := range cluster.GetStatus().GetConditions() {
+		if c.GetType() == condType {
+			return c
+		}
+	}
+	return nil
+}
