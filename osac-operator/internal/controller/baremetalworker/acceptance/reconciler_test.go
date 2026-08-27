@@ -144,12 +144,18 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -341,12 +347,18 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -477,12 +489,18 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -701,12 +719,18 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -1061,12 +1085,18 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -1352,12 +1382,18 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -1618,12 +1654,18 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -1880,12 +1922,18 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -2105,12 +2153,18 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
@@ -2509,12 +2563,18 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err == nil {
-				if controllerutil.RemoveFinalizer(latest, "osac.openshift.io/baremetalworker-finalizer") {
-					_ = k8sClient.Update(ctx, latest)
-				}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
 			}
-			_ = k8sClient.Delete(ctx, co)
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
 			ie := newInfraEnv(co.Name + "-infraenv")
 			_ = k8sClient.Delete(ctx, ie)
 		})
