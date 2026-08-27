@@ -127,22 +127,6 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		//   network_attachments, and tenant="system"; they are invisible to tenant queries.
 	})
 
-	It("retries a failed worker to success [OSAC-4162]", func() {
-		// Tested in reconciler_test.go under "BareMetalWorkerReconciler workerRetry".
-	})
-
-	PIt("scales up workers on node-count increase [OSAC-4164]", func() {
-		// Given: a Ready cluster with N workers.
-		// When:  the node-set size increases to N+M and the reconciler runs.
-		// Then:  M new BMIs are created and reach Ready; aggregates update.
-	})
-
-	PIt("scales down workers on node-count decrease [OSAC-4165]", func() {
-		// Given: a Ready cluster with N workers.
-		// When:  the size decreases; CAPA unbinds agents (sim.UnbindAgent) and the reconciler runs.
-		// Then:  excess BMIs are deleted (fc.DeleteCalls) and Agent CRs cleaned up.
-	})
-
 	PIt("cleans up all BMIs on cluster delete [OSAC-4176]", func() {
 		// Given: a Ready cluster with workers.
 		// When:  the ClusterOrder is deleted and the finalizer runs.

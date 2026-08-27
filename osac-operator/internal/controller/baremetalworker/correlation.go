@@ -291,7 +291,7 @@ func (r *Reconciler) checkAgentRegistrationTimeout(
 			continue
 		}
 		w.Phase = workerPhaseFailed
-		w.LastFailureReason = "AgentRegistrationTimeout"
+		w.LastFailureReason = eventReasonAgentRegistrationTimeout
 		w.LastFailureMessage = fmt.Sprintf("no agent registered within %s", agentRegistrationTimeout)
 		failTime := metav1.NewTime(now)
 		w.LastFailureTime = &failTime
@@ -438,7 +438,8 @@ func computeWorkerAggregates(workers []v1alpha1.WorkerStatus) (desired, current,
 	for _, w := range workers {
 		desired++
 		switch w.Phase {
-		case workerPhaseProvisioning, workerPhaseWaitingForAgent, workerPhaseBinding, workerPhaseReady:
+		case workerPhaseProvisioning, workerPhaseWaitingForAgent, workerPhaseBinding, workerPhaseReady,
+			workerPhaseUnbinding, workerPhaseDeleting:
 			current++
 		}
 		if w.Phase == workerPhaseReady {

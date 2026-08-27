@@ -84,6 +84,20 @@ const (
 	eventReasonWorkerFailed    = "WorkerFailed"
 	reasonWorkersFailed        = "WorkersRetrying"
 	reasonWorkersFailedCleared = "AllWorkersHealthy"
+
+	infraEnvUIDAnnotation            = "osac.openshift.io/infraenv-uid"
+	eventReasonStaleIgnition         = "StaleIgnition"
+	reasonInfraEnvRecreated          = "InfraEnvRecreated"
+	reasonStaleIgnitionWorkersMarked = "StaleIgnitionWorkersMarked"
+
+	workerPhaseUnbinding = "Unbinding"
+	workerPhaseDeleting  = "Deleting"
+
+	agentUnbindingState              = "unbinding-pending-user-action"
+	agentUnbindingTimeout            = 30 * time.Minute
+	eventReasonWorkerDeleted         = "WorkerDeleted"
+	eventReasonAgentUnbindingTimeout = "AgentUnbindingTimeout"
+	teardownRequeueInterval          = 30 * time.Second
 )
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "InfraEnv"}
@@ -159,10 +173,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return res, err
 	}
 
-	ignition, res, err := r.ensureInfraEnv(ctx, co)
+	ignition, infraEnvUID, res, err := r.ensureInfraEnv(ctx, co)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
+
+	if r.detectStaleIgnitionWorkers(ctx, co, infraEnvUID) {
+		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after stale detection: %w", err)
+		}
+	}
+	r.trackInfraEnvUID(ctx, co, infraEnvUID)
 
 	diskImageID, res, err := r.resolveDiskImage(ctx, co)
 	if err != nil || !res.IsZero() {
@@ -177,6 +198,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Re-read the ClusterOrder to pick up the workers just written by reconcileWorkers.
 	if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
 		return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder: %w", err)
+	}
+
+	teardownWorkers := co.Status.Workers
+	teardownWorkers = r.handleUnbindingWorkers(ctx, co, teardownWorkers)
+	teardownWorkers = r.handleDeletingWorkers(ctx, co, teardownWorkers)
+	if !workerSlicesEqual(co.Status.Workers, teardownWorkers) {
+		if err := r.updateWorkerStatus(ctx, co, teardownWorkers); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating worker status after teardown: %w", err)
+		}
+		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after teardown: %w", err)
+		}
 	}
 
 	workers, res, err := r.correlateAgents(ctx, co, co.Status.Workers)
@@ -196,33 +229,47 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if !res.IsZero() {
 		return res, nil
 	}
+	if hasTeardownWorkers(workers) {
+		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
+	}
 	return npRes, nil
 }
 
 // ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
 // then polls for and fetches its discovery ignition, setting the InfraEnvReady condition.
-// Returns the fetched ignition bytes once ready.
-func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) ([]byte, ctrl.Result, error) {
+// Returns the fetched ignition bytes and the InfraEnv's UID once ready.
+func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) ([]byte, string, ctrl.Result, error) {
 	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(infraEnvGVK)
 
 	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
 		if err := r.Get(ctx, key, existing); err != nil {
-			return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+			if !apierrors.IsNotFound(err) {
+				return nil, "", ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+			}
+			ctrllog.FromContext(ctx).Info("InfraEnv deleted while InfraEnvReady=True, resetting condition", "infraenv", key)
+			if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonInfraEnvRecreated,
+				"InfraEnv was deleted; recreating"); condErr != nil {
+				return nil, "", ctrl.Result{}, condErr
+			}
+			res, createErr := r.createInfraEnv(ctx, co, key)
+			return nil, "", res, createErr
 		}
-		return r.fetchDiscoveryIgnition(ctx, co, key, existing)
+		ign, res, err := r.fetchDiscoveryIgnition(ctx, co, key, existing)
+		return ign, string(existing.GetUID()), res, err
 	}
 
 	err := r.Get(ctx, key, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		res, createErr := r.createInfraEnv(ctx, co, key)
-		return nil, res, createErr
+		return nil, "", res, createErr
 	case err != nil:
-		return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+		return nil, "", ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
 	}
-	return r.fetchDiscoveryIgnition(ctx, co, key, existing)
+	ign, res, fetchErr := r.fetchDiscoveryIgnition(ctx, co, key, existing)
+	return ign, string(existing.GetUID()), res, fetchErr
 }
 
 // createInfraEnv creates the InfraEnv and marks InfraEnvReady=False (ignition pending), requeuing.
@@ -308,6 +355,67 @@ func (r *Reconciler) setInfraEnvReady(
 	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, status, message, reason)
 	})
+}
+
+// trackInfraEnvUID stores the InfraEnv's UID as an annotation on the ClusterOrder so
+// stale ignition can be detected after InfraEnv deletion+recreation.
+func (r *Reconciler) trackInfraEnvUID(
+	ctx context.Context, co *v1alpha1.ClusterOrder, uid string,
+) {
+	if uid == "" {
+		return
+	}
+	if co.Annotations != nil && co.Annotations[infraEnvUIDAnnotation] == uid {
+		return
+	}
+	base := co.DeepCopy()
+	if co.Annotations == nil {
+		co.Annotations = make(map[string]string)
+	}
+	co.Annotations[infraEnvUIDAnnotation] = uid
+	if err := r.Patch(ctx, co, client.MergeFrom(base)); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "patching infraenv-uid annotation")
+	}
+}
+
+// detectStaleIgnitionWorkers checks whether the InfraEnv was recreated since the last
+// reconcile. If so, workers in WaitingForAgent phase have stale ignition and are marked
+// Failed with AgentRegistrationTimeout so they enter the retry pipeline.
+func (r *Reconciler) detectStaleIgnitionWorkers(
+	ctx context.Context, co *v1alpha1.ClusterOrder, infraEnvUID string,
+) bool {
+	storedUID := ""
+	if co.Annotations != nil {
+		storedUID = co.Annotations[infraEnvUIDAnnotation]
+	}
+	if storedUID == "" || storedUID == infraEnvUID {
+		return false
+	}
+
+	log := ctrllog.FromContext(ctx)
+	marked := false
+	now := metav1.Now()
+	for i := range co.Status.Workers {
+		w := &co.Status.Workers[i]
+		if w.Phase != workerPhaseWaitingForAgent {
+			continue
+		}
+		log.Info("marking worker as stale-ignition failure", "worker", w.Name)
+		w.Phase = workerPhaseFailed
+		w.LastFailureReason = eventReasonAgentRegistrationTimeout
+		w.LastFailureMessage = "stale ignition: InfraEnv was recreated"
+		w.LastFailureTime = &now
+		marked = true
+		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonStaleIgnition, "DetectStaleIgnition",
+			"worker %s: marked failed due to stale ignition after InfraEnv recreation", w.Name)
+	}
+
+	if marked {
+		if err := r.updateWorkerStatus(ctx, co, co.Status.Workers); err != nil {
+			log.Error(err, "updating worker status after stale ignition detection")
+		}
+	}
+	return marked
 }
 
 // ensureSystemCatalogItem creates the system-owned BareMetalInstanceCatalogItem
@@ -460,7 +568,6 @@ func (r *Reconciler) reconcileNodeSets(
 	existingByName map[string]*privatev1.BareMetalInstance,
 	diskImageID, ignitionB64, filter string,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
-	log := ctrllog.FromContext(ctx)
 	existingWorkers := workersByName(co.Status.Workers)
 	var workers []v1alpha1.WorkerStatus
 	globalIndex := 0
@@ -488,45 +595,87 @@ func (r *Reconciler) reconcileNodeSets(
 			globalIndex++
 
 			if prev, ok := existingWorkers[workerName]; ok {
-				if prev.Phase == workerPhaseFailed && prev.ResourceID == "" && isRetryDue(prev) {
-					bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
-					if err != nil {
-						return nil, ctrl.Result{}, err
-					}
-					if !res.IsZero() {
-						return nil, res, nil
-					}
-					log.Info("created replacement BMI for failed worker", "name", workerName, "attempt", prev.AttemptCount, "id", bmi.GetId())
-					prev.ResourceID = bmi.GetId()
-					prev.Phase = workerPhaseWaitingForAgent
-					prev.NextRetryTime = nil
-					r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerRetry, "RetryWorker",
-						"worker %s: retry attempt %d", workerName, prev.AttemptCount)
+				res, err := r.retryFailedWorker(ctx, co, nr, &prev, diskImageID, ignitionB64, filter, fabricInterface)
+				if err != nil {
+					return nil, ctrl.Result{}, err
+				}
+				if !res.IsZero() {
+					return nil, res, nil
 				}
 				workers = append(workers, prev)
 				continue
 			}
 
-			bmiID, ok := existingByName[workerName]
-			if ok {
-				log.Info("worker BMI already exists, skipping create", "name", workerName)
-				workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmiID.GetId()))
-				continue
-			}
-
-			bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
+			ws, res, err := r.ensureWorkerBMI(ctx, co, nr, workerName, existingByName, diskImageID, ignitionB64, filter, fabricInterface)
 			if err != nil {
 				return nil, ctrl.Result{}, err
 			}
 			if !res.IsZero() {
 				return nil, res, nil
 			}
-			log.Info("created BMI", "name", workerName, "id", bmi.GetId())
-			workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()))
+			workers = append(workers, ws)
 		}
 	}
 
+	excess := r.identifyExcessWorkers(co, workers)
+	if len(excess) > 0 {
+		workers = r.handleScaleDown(ctx, co, workers, excess)
+	}
+
 	return workers, ctrl.Result{}, nil
+}
+
+// retryFailedWorker creates a replacement BMI for a failed worker whose retry is due.
+// Returns a non-zero result if the fulfillment service is unavailable. If the worker is not
+// eligible for retry, this is a no-op.
+func (r *Reconciler) retryFailedWorker(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
+	diskImageID, ignitionB64, filter, fabricInterface string,
+) (ctrl.Result, error) {
+	if prev.Phase != workerPhaseFailed || prev.ResourceID != "" || !isRetryDue(*prev) {
+		return ctrl.Result{}, nil
+	}
+	log := ctrllog.FromContext(ctx)
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, prev.Name, diskImageID, ignitionB64, filter, fabricInterface)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !res.IsZero() {
+		return res, nil
+	}
+	log.Info("created replacement BMI for failed worker", "name", prev.Name, "attempt", prev.AttemptCount, "id", bmi.GetId())
+	prev.ResourceID = bmi.GetId()
+	prev.Phase = workerPhaseWaitingForAgent
+	prev.NextRetryTime = nil
+	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerRetry, "RetryWorker",
+		"worker %s: retry attempt %d", prev.Name, prev.AttemptCount)
+	return ctrl.Result{}, nil
+}
+
+// ensureWorkerBMI creates a BMI for a new worker slot, skipping creation if a BMI with the
+// same name already exists (list-before-create idempotency after controller restart).
+func (r *Reconciler) ensureWorkerBMI(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	nr *v1alpha1.NodeRequest, workerName string,
+	existingByName map[string]*privatev1.BareMetalInstance,
+	diskImageID, ignitionB64, filter, fabricInterface string,
+) (v1alpha1.WorkerStatus, ctrl.Result, error) {
+	log := ctrllog.FromContext(ctx)
+	if bmi, ok := existingByName[workerName]; ok {
+		log.Info("worker BMI already exists, skipping create", "name", workerName)
+		return newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()), ctrl.Result{}, nil
+	}
+
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
+	if err != nil {
+		return v1alpha1.WorkerStatus{}, ctrl.Result{}, err
+	}
+	if !res.IsZero() {
+		return v1alpha1.WorkerStatus{}, res, nil
+	}
+	log.Info("created BMI", "name", workerName, "id", bmi.GetId())
+	return newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()), ctrl.Result{}, nil
 }
 
 // handleFailedWorkers processes workers in Failed phase: deletes their BMIs via the
@@ -681,11 +830,12 @@ func (r *Reconciler) findBMIByName(ctx context.Context, filter, name string) (*p
 
 func newWorkerStatus(nodeSet, name, resourceID string) v1alpha1.WorkerStatus {
 	return v1alpha1.WorkerStatus{
-		NodeSet:    nodeSet,
-		Name:       name,
-		Kind:       workerKindBMI,
-		ResourceID: resourceID,
-		Phase:      workerPhaseWaitingForAgent,
+		NodeSet:           nodeSet,
+		Name:              name,
+		Kind:              workerKindBMI,
+		ResourceID:        resourceID,
+		Phase:             workerPhaseWaitingForAgent,
+		CreationTimestamp: metav1.Now(),
 	}
 }
 
