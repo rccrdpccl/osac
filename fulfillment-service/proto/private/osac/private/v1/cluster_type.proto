@@ -136,6 +136,8 @@ enum ClusterConditionType {
   CLUSTER_CONDITION_TYPE_READY = 2;
   CLUSTER_CONDITION_TYPE_FAILED = 3;
   CLUSTER_CONDITION_TYPE_DEGRADED = 4;
+  CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED = 5;
+  CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED = 6;
 }
 
 // Defines the network attachment for a cluster, connecting it to a tenant subnet with optional security groups.

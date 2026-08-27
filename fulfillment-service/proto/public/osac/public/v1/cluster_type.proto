@@ -356,6 +356,13 @@ enum ClusterConditionType {
 
   // Indicates that the cluster is degraded.
   CLUSTER_CONDITION_TYPE_DEGRADED = 4;
+
+  // Indicates that one or more CaaS-managed worker nodes failed to provision.
+  CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED = 5;
+
+  // Indicates that worker provisioning is blocked by an infrastructure issue
+  // requiring Cloud Infrastructure Admin intervention.
+  CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED = 6;
 }
 
 // Defines the network attachment for a cluster, connecting it to a tenant subnet with optional security groups.
