@@ -292,6 +292,10 @@ type WorkerStatus struct {
 	// +kubebuilder:validation:Enum=Provisioning;WaitingForAgent;Binding;Ready;Failed;Unbinding;Deleting
 	Phase string `json:"phase"`
 
+	// CreationTimestamp is when this worker entry was first created.
+	// +kubebuilder:validation:Required
+	CreationTimestamp metav1.Time `json:"creationTimestamp"`
+
 	// AttemptCount tracks how many times this worker slot has been provisioned.
 	AttemptCount int32 `json:"attemptCount"`
 
