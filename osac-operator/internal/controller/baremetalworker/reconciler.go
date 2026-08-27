@@ -176,6 +176,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
+	if changed, err := r.rebuildWorkerState(ctx, co); err != nil {
+		return ctrl.Result{}, fmt.Errorf("rebuilding worker state: %w", err)
+	} else if changed {
+		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
+			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after rebuild: %w", err)
+		}
+	}
+
 	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
 		return res, err
 	}
