@@ -20,6 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
@@ -133,10 +137,176 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		// Then:  every BMI in status.workers is deleted before the finalizer is removed.
 	})
 
-	PIt("rebuilds worker state after controller restart [OSAC-4167]", func() {
-		// Given: a cluster mid-provisioning with persisted status.workers.
-		// When:  a fresh reconciler starts and re-derives phases from live BMI/Agent state.
-		// Then:  phases are rebuilt while attemptCount/failure history are preserved.
+	It("rebuilds worker state after controller restart [OSAC-4167]", func() {
+		const (
+			clusterUUID    = "rebuild-cluster-uuid"
+			cvID           = "4.18.0"
+			diskImageID    = "rhcos-4.18"
+			clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+		)
+
+		rec := events.NewFakeRecorder(10)
+		r := baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		r.SetMACResolver(fc.HostMAC)
+
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+
+		co := &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "bmw-rebuild",
+				Namespace:  testNamespace,
+				Labels:     map[string]string{clusterIDLabel: clusterUUID},
+				Finalizers: []string{"baremetalworker.osac.openshift.io/finalizer"},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: 2,
+					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
+						InstanceType: "bm-standard",
+					},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
+			}
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{
+					NamespacedName: client.ObjectKeyFromObject(co),
+				})
+			}
+			ie := newInfraEnv(co.Name + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+
+		// Create BMIs in the fake for two workers. The fake defaults resource ID to name.
+		_, err := fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
+			Metadata: privatev1.Metadata_builder{
+				Tenant: "system",
+				Name:   "bmw-rebuild-worker-0",
+				Labels: map[string]string{"osac.openshift.io/cluster-order": "bmw-rebuild"},
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		_, err = fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
+			Metadata: privatev1.Metadata_builder{
+				Tenant: "system",
+				Name:   "bmw-rebuild-worker-1",
+				Labels: map[string]string{"osac.openshift.io/cluster-order": "bmw-rebuild"},
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		fc.SetHostMAC("bmw-rebuild-worker-0", "aa:bb:cc:00:00:00")
+		fc.SetHostMAC("bmw-rebuild-worker-1", "aa:bb:cc:11:11:11")
+
+		// Pre-seed status.workers as if the controller had previously written them.
+		now := metav1.Now()
+		co.Status.Workers = []osacv1alpha1.WorkerStatus{
+			{
+				Name:              "bmw-rebuild-worker-0",
+				Kind:              "BareMetalInstance",
+				ResourceID:        "bmw-rebuild-worker-0",
+				NodeSet:           "bm-standard",
+				Phase:             "Provisioning",
+				CreationTimestamp: now,
+			},
+			{
+				Name:               "bmw-rebuild-worker-1",
+				Kind:               "BareMetalInstance",
+				ResourceID:         "bmw-rebuild-worker-1",
+				NodeSet:            "bm-standard",
+				Phase:              "Binding",
+				CreationTimestamp:  now,
+				AttemptCount:       2,
+				LastFailureReason:  "AgentRegistrationTimeout",
+				LastFailureMessage: "no agent registered within 30m",
+				LastFailureTime:    &now,
+			},
+		}
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+		// Register an agent for worker-0 that is bound and installed (simulating Ready state).
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: "bmw-rebuild-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:00:00:00",
+		})).To(Succeed())
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: "bmw-rebuild-agent-0", Namespace: testNamespace,
+		}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = "bmw-rebuild"
+		agentLabels["osac.openshift.io/worker-name"] = "bmw-rebuild-worker-0"
+		agentObj.SetLabels(agentLabels)
+		Expect(unstructured.SetNestedField(agentObj.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+
+		// No agent for worker-1 — should rebuild to WaitingForAgent.
+
+		// Set up InfraEnv so the rest of the reconcile doesn't error.
+		Expect(sim.EnsureClusterDeployment(ctx, "bmw-rebuild-cd", testNamespace)).To(Succeed())
+		ie := newInfraEnv("bmw-rebuild-infraenv")
+		Expect(k8sClient.Create(ctx, ie)).To(Succeed())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-rebuild-infraenv", testNamespace, ign.URL())).To(Succeed())
+
+		// Run reconcile — rebuild should re-derive phases from live state.
+		_, err = r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "bmw-rebuild", Namespace: testNamespace},
+		})
+		Expect(err).ToNot(HaveOccurred())
+
+		// Verify rebuilt phases.
+		co = &osacv1alpha1.ClusterOrder{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: "bmw-rebuild", Namespace: testNamespace,
+		}, co)).To(Succeed())
+
+		Expect(co.Status.Workers).To(HaveLen(2))
+		Expect(co.Status.Workers[0].Name).To(Equal("bmw-rebuild-worker-0"))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Ready"))
+		Expect(co.Status.Workers[1].Name).To(Equal("bmw-rebuild-worker-1"))
+		Expect(co.Status.Workers[1].Phase).To(Equal("WaitingForAgent"))
+
+		// Failure history preserved.
+		Expect(co.Status.Workers[1].AttemptCount).To(Equal(int32(2)))
+		Expect(co.Status.Workers[1].LastFailureReason).To(Equal("AgentRegistrationTimeout"))
+		Expect(co.Status.Workers[1].LastFailureMessage).To(Equal("no agent registered within 30m"))
+		Expect(co.Status.Workers[1].LastFailureTime).ToNot(BeNil())
+
+		// Zero additional BMI creates (the pre-seeded creates don't count).
+		Expect(fc.CreateCalls()).To(HaveLen(2))
 	})
 
 	PIt("translates worker status to tenant-visible Cluster status [OSAC-4169]", func() {
