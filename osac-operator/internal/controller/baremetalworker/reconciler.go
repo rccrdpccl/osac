@@ -568,7 +568,6 @@ func (r *Reconciler) reconcileNodeSets(
 	existingByName map[string]*privatev1.BareMetalInstance,
 	diskImageID, ignitionB64, filter string,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
-	log := ctrllog.FromContext(ctx)
 	existingWorkers := workersByName(co.Status.Workers)
 	var workers []v1alpha1.WorkerStatus
 	globalIndex := 0
@@ -596,41 +595,25 @@ func (r *Reconciler) reconcileNodeSets(
 			globalIndex++
 
 			if prev, ok := existingWorkers[workerName]; ok {
-				if prev.Phase == workerPhaseFailed && prev.ResourceID == "" && isRetryDue(prev) {
-					bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
-					if err != nil {
-						return nil, ctrl.Result{}, err
-					}
-					if !res.IsZero() {
-						return nil, res, nil
-					}
-					log.Info("created replacement BMI for failed worker", "name", workerName, "attempt", prev.AttemptCount, "id", bmi.GetId())
-					prev.ResourceID = bmi.GetId()
-					prev.Phase = workerPhaseWaitingForAgent
-					prev.NextRetryTime = nil
-					r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerRetry, "RetryWorker",
-						"worker %s: retry attempt %d", workerName, prev.AttemptCount)
+				res, err := r.retryFailedWorker(ctx, co, nr, &prev, diskImageID, ignitionB64, filter, fabricInterface)
+				if err != nil {
+					return nil, ctrl.Result{}, err
+				}
+				if !res.IsZero() {
+					return nil, res, nil
 				}
 				workers = append(workers, prev)
 				continue
 			}
 
-			bmiID, ok := existingByName[workerName]
-			if ok {
-				log.Info("worker BMI already exists, skipping create", "name", workerName)
-				workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmiID.GetId()))
-				continue
-			}
-
-			bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
+			ws, res, err := r.ensureWorkerBMI(ctx, co, nr, workerName, existingByName, diskImageID, ignitionB64, filter, fabricInterface)
 			if err != nil {
 				return nil, ctrl.Result{}, err
 			}
 			if !res.IsZero() {
 				return nil, res, nil
 			}
-			log.Info("created BMI", "name", workerName, "id", bmi.GetId())
-			workers = append(workers, newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()))
+			workers = append(workers, ws)
 		}
 	}
 
@@ -640,6 +623,59 @@ func (r *Reconciler) reconcileNodeSets(
 	}
 
 	return workers, ctrl.Result{}, nil
+}
+
+// retryFailedWorker creates a replacement BMI for a failed worker whose retry is due.
+// Returns a non-zero result if the fulfillment service is unavailable. If the worker is not
+// eligible for retry, this is a no-op.
+func (r *Reconciler) retryFailedWorker(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
+	diskImageID, ignitionB64, filter, fabricInterface string,
+) (ctrl.Result, error) {
+	if prev.Phase != workerPhaseFailed || prev.ResourceID != "" || !isRetryDue(*prev) {
+		return ctrl.Result{}, nil
+	}
+	log := ctrllog.FromContext(ctx)
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, prev.Name, diskImageID, ignitionB64, filter, fabricInterface)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !res.IsZero() {
+		return res, nil
+	}
+	log.Info("created replacement BMI for failed worker", "name", prev.Name, "attempt", prev.AttemptCount, "id", bmi.GetId())
+	prev.ResourceID = bmi.GetId()
+	prev.Phase = workerPhaseWaitingForAgent
+	prev.NextRetryTime = nil
+	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerRetry, "RetryWorker",
+		"worker %s: retry attempt %d", prev.Name, prev.AttemptCount)
+	return ctrl.Result{}, nil
+}
+
+// ensureWorkerBMI creates a BMI for a new worker slot, skipping creation if a BMI with the
+// same name already exists (list-before-create idempotency after controller restart).
+func (r *Reconciler) ensureWorkerBMI(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+	nr *v1alpha1.NodeRequest, workerName string,
+	existingByName map[string]*privatev1.BareMetalInstance,
+	diskImageID, ignitionB64, filter, fabricInterface string,
+) (v1alpha1.WorkerStatus, ctrl.Result, error) {
+	log := ctrllog.FromContext(ctx)
+	if bmi, ok := existingByName[workerName]; ok {
+		log.Info("worker BMI already exists, skipping create", "name", workerName)
+		return newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()), ctrl.Result{}, nil
+	}
+
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
+	if err != nil {
+		return v1alpha1.WorkerStatus{}, ctrl.Result{}, err
+	}
+	if !res.IsZero() {
+		return v1alpha1.WorkerStatus{}, res, nil
+	}
+	log.Info("created BMI", "name", workerName, "id", bmi.GetId())
+	return newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()), ctrl.Result{}, nil
 }
 
 // desiredWorkerNames returns the set of worker names derived from the current NodeRequests.

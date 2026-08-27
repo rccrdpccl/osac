@@ -127,18 +127,6 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		//   network_attachments, and tenant="system"; they are invisible to tenant queries.
 	})
 
-	It("retries a failed worker to success [OSAC-4162]", func() {
-		// Tested in reconciler_test.go under "BareMetalWorkerReconciler workerRetry".
-	})
-
-	It("scales up workers on node-count increase [OSAC-4164]", func() {
-		// Tested in reconciler_test.go under "BareMetalWorkerReconciler scale-up".
-	})
-
-	It("scales down workers on node-count decrease [OSAC-4165]", func() {
-		// Tested in reconciler_test.go under "BareMetalWorkerReconciler scale-down".
-	})
-
 	PIt("cleans up all BMIs on cluster delete [OSAC-4176]", func() {
 		// Given: a Ready cluster with workers.
 		// When:  the ClusterOrder is deleted and the finalizer runs.
