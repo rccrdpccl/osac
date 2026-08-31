@@ -176,7 +176,7 @@ func syncClusterOrderWorkerConditions(obj *ckv1alpha1.ClusterOrder, remote *priv
 		failedStatus = privatev1.ConditionStatus_CONDITION_STATUS_TRUE
 		failedMessage = buildWorkerFailedMessage(obj.Status.Workers, desired)
 	}
-	setClusterCondition(remote, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED, failedStatus, failedMessage)
+	setWorkerCondition(remote, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED, failedStatus, failedMessage)
 
 	infraEnvReady := apimeta.FindStatusCondition(obj.Status.Conditions, ckv1alpha1.ConditionInfraEnvReady)
 	rhcosNotFound := apimeta.FindStatusCondition(obj.Status.Conditions, ckv1alpha1.ConditionRHCOSImageNotFound)
@@ -190,7 +190,19 @@ func syncClusterOrderWorkerConditions(obj *ckv1alpha1.ClusterOrder, remote *priv
 		blockedStatus = privatev1.ConditionStatus_CONDITION_STATUS_TRUE
 		blockedMessage = "Worker provisioning is blocked — infrastructure issue requires Cloud Infrastructure Admin intervention"
 	}
-	setClusterCondition(remote, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED, blockedStatus, blockedMessage)
+	setWorkerCondition(remote, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED, blockedStatus, blockedMessage)
+}
+
+// setWorkerCondition reports a worker problem condition on the remote. It creates the
+// condition only when reporting a problem (status TRUE); when the computed status is the
+// default FALSE it only clears an already-present condition, and does not append a fresh
+// "no problem" condition. This keeps the sync idempotent — reconciling with no worker
+// problems must not mutate the remote and trigger a needless Save.
+func setWorkerCondition(remote *privatev1.Cluster, condType privatev1.ClusterConditionType, status privatev1.ConditionStatus, message string) {
+	if status != privatev1.ConditionStatus_CONDITION_STATUS_TRUE && findExistingClusterCondition(remote, condType) == nil {
+		return
+	}
+	setClusterCondition(remote, condType, status, message)
 }
 
 func buildWorkerFailedMessage(workers []ckv1alpha1.WorkerStatus, desired int32) string {
@@ -355,11 +367,21 @@ func calculateConsoleURL(hc *hypershiftv1beta1.HostedCluster) string {
 	)
 }
 
-func findClusterCondition(remote *privatev1.Cluster, kind privatev1.ClusterConditionType) *privatev1.ClusterCondition {
+// findExistingClusterCondition returns the condition of the given type if it is already
+// present on the remote, or nil otherwise. Unlike findClusterCondition it does not append
+// a new condition as a side effect.
+func findExistingClusterCondition(remote *privatev1.Cluster, kind privatev1.ClusterConditionType) *privatev1.ClusterCondition {
 	for _, current := range remote.Status.Conditions {
 		if current.Type == kind {
 			return current
 		}
+	}
+	return nil
+}
+
+func findClusterCondition(remote *privatev1.Cluster, kind privatev1.ClusterConditionType) *privatev1.ClusterCondition {
+	if existing := findExistingClusterCondition(remote, kind); existing != nil {
+		return existing
 	}
 	condition := &privatev1.ClusterCondition{
 		Type:   kind,
