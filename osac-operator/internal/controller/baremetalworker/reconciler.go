@@ -98,6 +98,7 @@ const (
 	agentUnbindingState              = "unbinding-pending-user-action"
 	agentUnbindingTimeout            = 30 * time.Minute
 	eventReasonWorkerDeleted         = "WorkerDeleted"
+	eventReasonWorkerCreated         = "WorkerCreated"
 	eventReasonAgentUnbindingTimeout = "AgentUnbindingTimeout"
 	teardownRequeueInterval          = 30 * time.Second
 )
@@ -169,6 +170,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if !co.HasBareMetalNodeSet() {
 		return ctrl.Result{}, nil
 	}
+
+	// Refresh the worker gauges from the full ClusterOrder set at the end of every
+	// bare-metal reconcile, so desired/ready/failed converge as status changes.
+	defer r.syncWorkerGauges(ctx)
 
 	if controllerutil.AddFinalizer(co, bmWorkerFinalizer) {
 		if err := r.Update(ctx, co); err != nil {
@@ -465,6 +470,7 @@ func (r *Reconciler) detectStaleIgnitionWorkers(
 		w.LastFailureReason = eventReasonAgentRegistrationTimeout
 		w.LastFailureMessage = "stale ignition: InfraEnv was recreated"
 		w.LastFailureTime = &now
+		observeProvisioningFailure(tenantOf(co), *w)
 		marked = true
 		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonStaleIgnition, "DetectStaleIgnition",
 			"worker %s: marked failed due to stale ignition after InfraEnv recreation", w.Name)
@@ -724,7 +730,7 @@ func (r *Reconciler) ensureWorkerBMI(
 	log := ctrllog.FromContext(ctx)
 	if bmi, ok := existingByName[workerName]; ok {
 		log.Info("worker BMI already exists, skipping create", "name", workerName)
-		return newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()), ctrl.Result{}, nil
+		return newWorkerStatus(nr.ResourceClass, nr.BareMetal.InstanceType, workerName, bmi.GetId()), ctrl.Result{}, nil
 	}
 
 	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
@@ -735,7 +741,9 @@ func (r *Reconciler) ensureWorkerBMI(
 		return v1alpha1.WorkerStatus{}, res, nil
 	}
 	log.Info("created BMI", "name", workerName, "id", bmi.GetId())
-	return newWorkerStatus(nr.ResourceClass, workerName, bmi.GetId()), ctrl.Result{}, nil
+	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerCreated, "CreateWorker",
+		"worker %s: BMI %s created", workerName, bmi.GetId())
+	return newWorkerStatus(nr.ResourceClass, nr.BareMetal.InstanceType, workerName, bmi.GetId()), ctrl.Result{}, nil
 }
 
 // handleFailedWorkers processes workers in Failed phase: deletes their BMIs via the
@@ -888,9 +896,10 @@ func (r *Reconciler) findBMIByName(ctx context.Context, filter, name string) (*p
 	return nil, fmt.Errorf("BMI %s returned AlreadyExists but not found in re-list", name)
 }
 
-func newWorkerStatus(nodeSet, name, resourceID string) v1alpha1.WorkerStatus {
+func newWorkerStatus(nodeSet, instanceType, name, resourceID string) v1alpha1.WorkerStatus {
 	return v1alpha1.WorkerStatus{
 		NodeSet:           nodeSet,
+		InstanceType:      instanceType,
 		Name:              name,
 		Kind:              workerKindBMI,
 		ResourceID:        resourceID,
@@ -1033,6 +1042,20 @@ func (r *Reconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	}
 
 	return bld.Complete(r)
+}
+
+// syncWorkerGauges recomputes the desired/ready/failed worker gauges from all ClusterOrders in
+// the configured namespace, following the aggregate-gauge convention (see updateWorkerGauges).
+// Called at the end of each reconcile so the gauges converge as worker status changes and drop
+// series for deleted clusters. Errors are logged and swallowed — a failed metrics refresh must
+// not fail reconciliation.
+func (r *Reconciler) syncWorkerGauges(ctx context.Context) {
+	list := &v1alpha1.ClusterOrderList{}
+	if err := r.List(ctx, list, client.InNamespace(r.clusterOrderNamespace)); err != nil {
+		ctrllog.FromContext(ctx).Error(err, "listing ClusterOrders for worker metrics")
+		return
+	}
+	updateWorkerGauges(list.Items)
 }
 
 // crdExists checks whether a CRD for the given GVK is registered in the API server.
