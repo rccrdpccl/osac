@@ -257,10 +257,12 @@ aap:
     # Enable ConfigMap-based bare metal agent import. Sets
     # OSAC_IMPORT_AGENTS_ENABLED=true in the config-as-code-ig Secret
     # and gates the import-agents-inventory ConfigMap.
+    # DEPRECATED for CaaS (pre-boot pool removed) — retained for BMaaS.
     importAgentsEnabled: false
     # Enable BCM (NVIDIA Base Command Manager) inventory backend. Sets
     # OSAC_IMPORT_BCM_AGENTS_ENABLED=true in the config-as-code-ig Secret
     # and gates the bcm-certs Secret.
+    # DEPRECATED for CaaS (pre-boot pool removed) — retained for BMaaS.
     importBcmAgentsEnabled: false
 
   # Server inventory for bare metal agent import.
@@ -418,6 +420,7 @@ clusterFulfillment:
     # Effective default: "hardware-inventory"
     IMPORT_AGENTS_NAMESPACE: ""
     # Effective default: "infraenv"
+    # DEPRECATED for CaaS (per-cluster InfraEnvs created on-demand) — retained for BMaaS.
     IMPORT_AGENTS_INFRAENV_NAME: ""
     # Effective default: "pull-secret"
     IMPORT_AGENTS_PULL_SECRET_NAME: ""

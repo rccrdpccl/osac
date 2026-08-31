@@ -136,7 +136,12 @@ aap:
     eeImage: ""
     projectGitUri: ""
     projectGitBranch: ""
+    # DEPRECATED for CaaS: the pre-boot bare-metal pool is removed — CaaS workers
+    # are provisioned on-demand, so this toggle stays false for CaaS deployments.
+    # Retained for BMaaS host-inventory import.
     importAgentsEnabled: false
+    # DEPRECATED for CaaS: the BCM pool backend is tied to the removed pre-boot
+    # pool model — stays false for CaaS. Retained for BMaaS.
     importBcmAgentsEnabled: false
   importAgents:
     servers: []
@@ -172,6 +177,9 @@ aap:
         HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: ""
         PARKING_VNET_NAME: ""
         IMPORT_AGENTS_NAMESPACE: ""
+        # DEPRECATED for CaaS: CaaS creates per-cluster InfraEnvs on-demand, so no
+        # shared discovery InfraEnv name is used. Retained for BMaaS (which may use
+        # a shared InfraEnv).
         IMPORT_AGENTS_INFRAENV_NAME: ""
         IMPORT_AGENTS_PULL_SECRET_NAME: ""
         IMPORT_AGENTS_DISABLE_BMC_CERT_VERIFICATION: ""

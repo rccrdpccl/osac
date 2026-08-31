@@ -606,12 +606,12 @@
             },
             "importAgentsEnabled": {
               "type": "boolean",
-              "description": "Enable ConfigMap-based bare metal agent import. Sets OSAC_IMPORT_AGENTS_ENABLED=true in the config-as-code-ig Secret and gates the import-agents-inventory ConfigMap.",
+              "description": "Enable ConfigMap-based bare metal agent import. Sets OSAC_IMPORT_AGENTS_ENABLED=true in the config-as-code-ig Secret and gates the import-agents-inventory ConfigMap. DEPRECATED for CaaS: the pre-boot pool is removed, so CaaS leaves this false; retained for BMaaS host-inventory import.",
               "default": false
             },
             "importBcmAgentsEnabled": {
               "type": "boolean",
-              "description": "Enable BCM inventory backend. Sets OSAC_IMPORT_BCM_AGENTS_ENABLED=true in the config-as-code-ig Secret and gates the bcm-certs Secret.",
+              "description": "Enable BCM inventory backend. Sets OSAC_IMPORT_BCM_AGENTS_ENABLED=true in the config-as-code-ig Secret and gates the bcm-certs Secret. DEPRECATED for CaaS: tied to the removed pre-boot pool model, so CaaS leaves this false; retained for BMaaS.",
               "default": false
             }
           }
@@ -834,7 +834,7 @@
                     },
                     "IMPORT_AGENTS_INFRAENV_NAME": {
                       "type": "string",
-                      "description": "InfraEnv CR name for agent discovery (effective default: infraenv)"
+                      "description": "InfraEnv CR name for agent discovery (effective default: infraenv). DEPRECATED for CaaS: CaaS creates per-cluster InfraEnvs on-demand and does not use a shared discovery InfraEnv; retained for BMaaS."
                     },
                     "IMPORT_AGENTS_PULL_SECRET_NAME": {
                       "type": "string",
