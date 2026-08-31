@@ -532,6 +532,12 @@ spec:
                         first created.
                       format: date-time
                       type: string
+                    instanceType:
+                      description: |-
+                        InstanceType is the BareMetalInstanceType (hardware profile) this worker was
+                        provisioned from. Exposed as the instance_type metric label; sourced from
+                        spec.nodeRequests[].bareMetal.instanceType (not the deprecated resourceClass).
+                      type: string
                     kind:
                       description: Kind of the backing resource (e.g. BareMetalInstance).
                       type: string
