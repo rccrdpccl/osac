@@ -60,6 +60,12 @@ cnv:
 mce:
   enabled: false
   channel: "stable-2.17"
+  # Assisted image service. When disabled, osImages is omitted from the
+  # AgentServiceConfig so no discovery ISO images are served — required for
+  # CaaS on-demand provisioning, where the image service would otherwise
+  # reclaim Agents on scale-down instead of letting them unbind.
+  imageService:
+    enabled: true
   osImages: []
 
 kafka:

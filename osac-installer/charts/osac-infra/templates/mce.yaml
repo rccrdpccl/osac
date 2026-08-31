@@ -30,7 +30,7 @@ data:
         resources:
           requests:
             storage: 50Gi
-{{- if .Values.mce.osImages }}
+{{- if and .Values.mce.imageService.enabled .Values.mce.osImages }}
       osImages:
 {{ toYaml .Values.mce.osImages | indent 8 }}
 {{- end }}

@@ -15,11 +15,11 @@ cnv:
   enabled: false
 mce:
   enabled: true
-  osImages:
-    - openshiftVersion: "4.22"
-      version: "9.8.20260428-0"
-      url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/dependencies/rhcos/4.22/4.22.0/rhcos-4.22.0-x86_64-live-iso.x86_64.iso"
-      cpuArchitecture: "x86_64"
+  # CaaS on-demand provisioning: the assisted image service is disabled so
+  # Agents unbind directly (unbinding-pending-user-action) instead of being
+  # reclaimed on scale-down. No osImages are served.
+  imageService:
+    enabled: false
 
 # --- Infrastructure (osac-infra) ---
 caIssuer:
