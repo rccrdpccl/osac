@@ -782,6 +782,29 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(netAttachments[0].GetSecurityGroups()[0].GetName()).To(Equal("sg-default"))
 	})
 
+	It("emits a WorkerCreated event when a new worker BMI is created", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-event", 1)
+		create(co)
+		makeInfraEnvReady("bmw-event")
+
+		_, err := runReconcile("bmw-event")
+		Expect(err).ToNot(HaveOccurred())
+
+		var events []string
+		for done := false; !done; {
+			select {
+			case e := <-rec.Events:
+				events = append(events, e)
+			default:
+				done = true
+			}
+		}
+		Expect(events).To(ContainElement(SatisfyAll(
+			ContainSubstring("WorkerCreated"),
+			ContainSubstring("bmw-event-worker-0"))))
+	})
+
 	It("creates N BMIs for a multi-worker node set", func() {
 		preloadDiskImageChain()
 		co := newBareMetalClusterOrder("bmw-multi", 3)

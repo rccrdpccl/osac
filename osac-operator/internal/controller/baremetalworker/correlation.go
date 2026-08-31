@@ -176,6 +176,7 @@ func (r *Reconciler) advanceBindingWorkers(
 				workers[i].ReadySince = &now
 			}
 			log.Info("worker ready", "worker", workers[i].Name)
+			observeProvisioningDuration(tenantOf(co), workers[i])
 			r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerReady, "AdvanceWorker",
 				"worker %s is ready", workers[i].Name)
 		}
@@ -224,6 +225,9 @@ func (r *Reconciler) tryCorrelateAgent(
 	}
 
 	setWorkerPhase(workers, workerName, workerPhaseBinding)
+	if w := workerByName(workers, workerName); w != nil {
+		observeCorrelationDuration(tenantOf(co), *w)
+	}
 	log.Info("agent correlated", "agent", agent.GetName(), "worker", workerName)
 	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
 		"agent %s correlated to worker %s", agent.GetName(), workerName)
@@ -295,6 +299,7 @@ func (r *Reconciler) checkAgentRegistrationTimeout(
 		w.LastFailureMessage = fmt.Sprintf("no agent registered within %s", agentRegistrationTimeout)
 		failTime := metav1.NewTime(now)
 		w.LastFailureTime = &failTime
+		observeProvisioningFailure(tenantOf(co), *w)
 		log.Info("agent registration timeout", "worker", w.Name)
 		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonAgentRegistrationTimeout, "CheckTimeout",
 			"worker %s: no agent registered within %s", w.Name, agentRegistrationTimeout)
@@ -466,4 +471,13 @@ func setWorkerPhase(workers []v1alpha1.WorkerStatus, name, phase string) {
 			return
 		}
 	}
+}
+
+func workerByName(workers []v1alpha1.WorkerStatus, name string) *v1alpha1.WorkerStatus {
+	for i := range workers {
+		if workers[i].Name == name {
+			return &workers[i]
+		}
+	}
+	return nil
 }

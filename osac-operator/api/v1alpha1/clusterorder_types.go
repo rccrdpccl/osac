@@ -274,6 +274,12 @@ type WorkerStatus struct {
 	// +kubebuilder:validation:Required
 	NodeSet string `json:"nodeSet"`
 
+	// InstanceType is the BareMetalInstanceType (hardware profile) this worker was
+	// provisioned from. Exposed as the instance_type metric label; sourced from
+	// spec.nodeRequests[].bareMetal.instanceType (not the deprecated resourceClass).
+	// +kubebuilder:validation:Optional
+	InstanceType string `json:"instanceType,omitempty"`
+
 	// Name is the worker slot name (e.g. "bm-cluster-a-worker-0"), unique within the cluster.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
