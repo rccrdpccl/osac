@@ -280,6 +280,37 @@ bmf:
     inventoryConfig: "osac-inventory-config"
     managementConfig: "osac-management-config"
     osClouds: "osac-os-clouds"
+  # System-owned BareMetalInstanceCatalogItem seeded via a post-install/upgrade
+  # hook when the bare-metal integration is enabled (AC4, OSAC-4173). With the
+  # CaaS pre-boot pool removed, on-demand provisioning needs a default catalog
+  # item so tenants can create bare-metal instances without an admin
+  # pre-creating one. Complements the operator self-heal (OSAC-4156): the hook
+  # seeds the item at install time; the controller reconciles it if missing.
+  # The hook only renders when systemCatalogItem.template is set (the API
+  # requires a template reference).
+  systemCatalogItem:
+    # Run the seed-baremetal-catalog-item hook. Defaults to true; set false to
+    # let the controller own the catalog item exclusively.
+    enabled: true
+    # Metadata name of the catalog item.
+    name: "system-default"
+    # Human-friendly one-line title.
+    title: "Bare metal instance"
+    # Human-friendly long description (Markdown).
+    description: "System-provided bare metal instance offering."
+    # Name of the underlying BareMetalInstanceTemplate this item references.
+    # [REQUIRED for the hook to run] -- empty disables seeding.
+    template: ""
+    # Whether the item is published and visible to tenants.
+    published: true
+    # Tenant scope. "system" keeps the item system-owned; an empty string makes
+    # it global (visible to all tenants).
+    tenant: "system"
+    # Field definitions controlling which spec fields tenants may set. Empty
+    # means all parameters pass through unlocked (no admin-enforced defaults).
+    # Entries use the private-API JSON field names: path, display_name,
+    # editable, default, validation_schema.
+    fieldDefinitions: []
   # Kind/IT only -- see templates/bmf-metal3-test-secrets.yaml
   testBackend:
     metal3:
