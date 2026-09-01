@@ -15,6 +15,10 @@ cnv:
   enabled: true
 mce:
   enabled: true
+  # full-ci serves discovery ISO images, so the assisted image service must be
+  # on (the chart default is now off, tuned for CaaS on-demand provisioning).
+  imageService:
+    enabled: true
   osImages:
     - openshiftVersion: "4.22"
       version: "9.8.20260428-0"
