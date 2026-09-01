@@ -66,9 +66,10 @@ spec:
             }
 
             {{- $item := .Values.bmf.systemCatalogItem }}
-            create_catalog_item \
-              {{ $item.name | quote }} \
-              {{ dict
+            # Payload is base64-encoded at render time and decoded here so that
+            # free-text fields (e.g. the Markdown "description") containing shell
+            # metacharacters ($, `, \) are never reprocessed by bash.
+            PAYLOAD=$(printf %s '{{ dict
                   "metadata" (dict "name" $item.name)
                   "title" $item.title
                   "description" $item.description
@@ -76,7 +77,8 @@ spec:
                   "published" $item.published
                   "tenant" $item.tenant
                   "field_definitions" $item.fieldDefinitions
-                | toJson | quote }}
+                | toJson | b64enc }}' | base64 -d)
+            create_catalog_item {{ $item.name | quote }} "${PAYLOAD}"
         env:
         - name: HOME
           value: /tmp
