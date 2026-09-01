@@ -960,6 +960,46 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 		})
 
+		It("treats empty clusterdeployment-namespace as unclaimed and skips bound agents", func() {
+			// MCE stamps agent-install.openshift.io/clusterdeployment-namespace on every
+			// agent from an InfraEnv, empty until the agent is bound to a ClusterDeployment.
+			// Unbound (empty) agents must be selectable; bound (non-empty) must be skipped.
+			createAgentWithClaim := func(name, resourceClass, serverName, claim string) {
+				agent := &unstructured.Unstructured{}
+				agent.SetGroupVersionKind(agentGVK)
+				agent.SetName(name)
+				agent.SetNamespace(agentNS)
+				agent.SetLabels(map[string]string{
+					agentResourceClassLabel:  resourceClass,
+					agentServerNameLabel:     serverName,
+					agentClaimedByHypershift: claim,
+				})
+				Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+			}
+			createAgentWithClaim("agent-unbound-1", "fc430", "server-01", "")
+			createAgentWithClaim("agent-unbound-2", "fc430", "server-02", "")
+			createAgentWithClaim("agent-bound", "fc430", "server-03", "some-cd-namespace")
+
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{
+						{ResourceClass: "fc430", NumberOfNodes: 2},
+					},
+				},
+			}
+
+			result, err := reconciler.reconcileAgentSelection(ctx, instance)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+			Expect(instance.Status.NodeSets).To(HaveLen(1))
+			Expect(instance.Status.NodeSets[0].Agents).To(HaveLen(2))
+			for _, agentStatus := range instance.Status.NodeSets[0].Agents {
+				Expect(agentStatus.AgentName).NotTo(Equal("agent-bound"))
+			}
+		})
+
 		It("requeues when not enough agents available", func() {
 			createAgent("agent-1", "fc430", "server-01")
 
