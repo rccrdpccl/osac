@@ -134,8 +134,6 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		rec := events.NewFakeRecorder(20)
 		r := baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		// The MAC resolver stands in for the not-yet-landed BMI status MAC field (OSAC-2308/OSAC-3254).
-		r.SetMACResolver(fc.HostMAC)
 
 		// Preload the disk-image chain (Cluster -> ClusterVersion -> DiskImage) and the instance type
 		// carrying a fabric-role port, so the reconciler can resolve everything a BMI create needs.
@@ -342,7 +340,6 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		rec := events.NewFakeRecorder(10)
 		r := baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 
 		fc.AddCluster(privatev1.Cluster_builder{
 			Id: clusterUUID,

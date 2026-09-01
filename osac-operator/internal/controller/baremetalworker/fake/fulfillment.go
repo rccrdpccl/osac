@@ -145,7 +145,36 @@ func (f *FulfillmentClient) GetBareMetalInstance(
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "baremetalinstance %q not found", id)
 	}
-	return cloneBMI(b), nil
+	out := cloneBMI(b)
+	f.injectHostMAC(out, id)
+	return out, nil
+}
+
+// injectHostMAC surfaces a MAC recorded via SetHostMAC through the returned BMI's
+// status.hardware.nics — the same field the real inventory backend populates at allocation
+// time (OSAC-4203) and that the production MAC resolver reads. If the BMI already carries NICs
+// with that MAC, this is a no-op. Caller must hold f.mu.
+func (f *FulfillmentClient) injectHostMAC(bmi *privatev1.BareMetalInstance, id string) {
+	mac := f.hostMACs[id]
+	if mac == "" {
+		return
+	}
+	for _, nic := range bmi.GetStatus().GetHardware().GetNics() {
+		if nic.GetMac() == mac {
+			return
+		}
+	}
+	st := bmi.GetStatus()
+	if st == nil {
+		st = privatev1.BareMetalInstanceStatus_builder{}.Build()
+		bmi.SetStatus(st)
+	}
+	hw := st.GetHardware()
+	if hw == nil {
+		hw = privatev1.BareMetalHardware_builder{}.Build()
+		st.SetHardware(hw)
+	}
+	hw.SetNics(append(hw.GetNics(), privatev1.BareMetalNICStatus_builder{Mac: mac}.Build()))
 }
 
 // ListBareMetalInstances records the filter and returns copies of all stored objects, ordered by
@@ -297,11 +326,9 @@ func (f *FulfillmentClient) AddClusterVersion(cv *privatev1.ClusterVersion) {
 }
 
 // SetHostMAC records the allocated host MAC for a BMI so correlation tests can drive Agent
-// matching.
-//
-// The canonical BMI status MAC field does not exist in the proto yet (design §MAC Address
-// Correlation; pending OSAC-2308/OSAC-3254), so the fake exposes it out of band via HostMAC.
-// Once the proto gains the field, this should also populate it on the stored object's status.
+// matching. GetBareMetalInstance surfaces it through status.hardware.nics (OSAC-4203) — the
+// same field the real inventory backend populates and the production MAC resolver reads — so
+// tests exercise the default resolver rather than a side channel.
 func (f *FulfillmentClient) SetHostMAC(bmiID, mac string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
