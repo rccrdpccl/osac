@@ -32,6 +32,7 @@ operator:
     tenant: true
     networking: true
     storage: true
+    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
@@ -156,15 +157,16 @@ validation:
   enabled: true
 
 # --- Bare Metal Fulfillment Operator ---
-# BMaaS is enabled (so CaaS satisfies the "requires VMaaS or BMaaS" constraint
-# and BMaaS API endpoints register), but the BMF operator runs with zero
-# replicas because the CaaS CI cluster has no Metal3 infrastructure.
 bmf:
-  replicaCount: 0
+  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest
     pullPolicy: Always
+  env:
+    aapUrl: "http://osac-aap/api/controller"
+    aapInsecureSkipVerify: "true"
+    enableNetworkingProvisioning: "false"
 
 # --- Cluster Versions ---
 clusterVersions:
