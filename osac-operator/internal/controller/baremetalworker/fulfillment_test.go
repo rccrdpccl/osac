@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/genproto/googleapis/api/httpbody"
 	"google.golang.org/grpc"
 
 	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
@@ -120,6 +121,32 @@ func (f *fakeClustersClient) Get(
 		return nil, f.err
 	}
 	return privatev1.ClustersGetResponse_builder{Object: f.object}.Build(), nil
+}
+
+func (f *fakeClustersClient) GetKubeconfig(
+	context.Context, *privatev1.ClustersGetKubeconfigRequest, ...grpc.CallOption,
+) (*privatev1.ClustersGetKubeconfigResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+//nolint:staticcheck // method name must match the generated ClustersClient interface
+func (f *fakeClustersClient) GetKubeconfigViaHttp(
+	context.Context, *privatev1.ClustersGetKubeconfigViaHttpRequest, ...grpc.CallOption,
+) (*httpbody.HttpBody, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeClustersClient) GetPassword(
+	context.Context, *privatev1.ClustersGetPasswordRequest, ...grpc.CallOption,
+) (*privatev1.ClustersGetPasswordResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+//nolint:staticcheck // method name must match the generated ClustersClient interface
+func (f *fakeClustersClient) GetPasswordViaHttp(
+	context.Context, *privatev1.ClustersGetPasswordViaHttpRequest, ...grpc.CallOption,
+) (*httpbody.HttpBody, error) {
+	return nil, errors.New("not implemented")
 }
 
 func (f *fakeClustersClient) List(
