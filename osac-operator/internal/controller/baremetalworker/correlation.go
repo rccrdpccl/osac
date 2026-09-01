@@ -55,18 +55,20 @@ var agentGVK = schema.GroupVersionKind{
 	Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "Agent",
 }
 
-// MACResolver returns the allocated host MAC for a BMI by its resource ID. The production
-// implementation will read it from the BMI status once the proto field lands (OSAC-2308/OSAC-3254);
-// the fake provides it out-of-band via SetHostMAC.
-type MACResolver func(bmiID string) string
+// MACResolver returns the allocated host NIC MACs for a BMI by its resource ID. The production
+// implementation (Reconciler.resolveHostMACs) reads them from the BMI's status.hardware.nics
+// field, populated by the inventory backend at allocation time (OSAC-4203). A BMI may report
+// multiple NICs; correlation matches an Agent to it if any NIC MAC matches.
+type MACResolver func(ctx context.Context, bmiID string) []string
 
 // matchAgentToBMI performs the three-dimension match: the Agent must be in the correct namespace,
 // carry the cluster-order label, and have an inventory MAC that uniquely matches one BMI's host
-// MAC. Returns the matched worker name, or empty string with ambiguous=true if multiple match.
+// NIC MACs. Returns the matched worker name, or empty string with ambiguous=true if multiple match.
 func matchAgentToBMI(
+	ctx context.Context,
 	agent *unstructured.Unstructured,
 	workers []v1alpha1.WorkerStatus,
-	hostMAC MACResolver,
+	hostMACs MACResolver,
 ) (workerName string, ambiguous bool) {
 	agentMACs := extractAgentMACs(agent)
 	if len(agentMACs) == 0 {
@@ -79,21 +81,30 @@ func matchAgentToBMI(
 		if w.Phase != workerPhaseWaitingForAgent {
 			continue
 		}
-		bmiMAC := hostMAC(w.ResourceID)
-		if bmiMAC == "" {
+		bmiMACs := hostMACs(ctx, w.ResourceID)
+		if len(bmiMACs) == 0 {
 			continue
 		}
-		for _, aMAC := range agentMACs {
-			if strings.EqualFold(aMAC, bmiMAC) {
-				if matched != "" {
-					return "", true
-				}
-				matched = w.Name
-				break
+		if macsIntersect(agentMACs, bmiMACs) {
+			if matched != "" {
+				return "", true
 			}
+			matched = w.Name
 		}
 	}
 	return matched, false
+}
+
+// macsIntersect reports whether any MAC in a matches any MAC in b, case-insensitively.
+func macsIntersect(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if strings.EqualFold(x, y) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // extractAgentMACs reads all MAC addresses from the Agent's status.inventory.interfaces[].macAddress.
@@ -210,7 +221,7 @@ func (r *Reconciler) tryCorrelateAgent(
 ) bool {
 	log := ctrllog.FromContext(ctx)
 
-	workerName, isAmbiguous := matchAgentToBMI(agent, workers, r.macResolver)
+	workerName, isAmbiguous := matchAgentToBMI(ctx, agent, workers, r.macResolver)
 	if isAmbiguous {
 		log.Error(nil, "multiple BMIs match agent MAC, skipping bind", "agent", agent.GetName())
 		return false

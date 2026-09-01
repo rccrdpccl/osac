@@ -14,6 +14,8 @@ language governing permissions and limitations under the License.
 package baremetalworker
 
 import (
+	"context"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,7 +37,7 @@ var _ = Describe("matchAgentToBMI", func() {
 
 	var (
 		workers  []v1alpha1.WorkerStatus
-		resolver func(string) string
+		resolver MACResolver
 	)
 
 	BeforeEach(func() {
@@ -44,18 +46,19 @@ var _ = Describe("matchAgentToBMI", func() {
 			{Name: "w-1", ResourceID: "bmi-1", Phase: workerPhaseWaitingForAgent},
 			{Name: "w-2", ResourceID: "bmi-2", Phase: workerPhaseBinding},
 		}
-		hostMACs := map[string]string{
-			"bmi-0": "aa:bb:cc:dd:ee:00",
-			"bmi-1": "aa:bb:cc:dd:ee:11",
-			"bmi-2": "aa:bb:cc:dd:ee:22",
+		// bmi-1 reports two NICs — correlation must match against any of them.
+		hostMACs := map[string][]string{
+			"bmi-0": {"aa:bb:cc:dd:ee:00"},
+			"bmi-1": {"aa:bb:cc:dd:ee:11", "aa:bb:cc:dd:ee:1f"},
+			"bmi-2": {"aa:bb:cc:dd:ee:22"},
 		}
-		resolver = func(id string) string { return hostMACs[id] }
+		resolver = func(_ context.Context, id string) []string { return hostMACs[id] }
 	})
 
 	DescribeTable("matches agents to workers by MAC",
 		func(agentMACs []string, wantWorker string, wantAmbig bool) {
 			agent := makeAgent(agentMACs...)
-			gotWorker, gotAmbig := matchAgentToBMI(agent, workers, resolver)
+			gotWorker, gotAmbig := matchAgentToBMI(context.Background(), agent, workers, resolver)
 			Expect(gotWorker).To(Equal(wantWorker))
 			Expect(gotAmbig).To(Equal(wantAmbig))
 		},
@@ -66,6 +69,7 @@ var _ = Describe("matchAgentToBMI", func() {
 		Entry("ambiguous — agent MAC matches two BMIs", []string{"aa:bb:cc:dd:ee:00", "aa:bb:cc:dd:ee:11"}, "", true),
 		Entry("skips workers not in WaitingForAgent phase", []string{"aa:bb:cc:dd:ee:22"}, "", false),
 		Entry("multiple interfaces, one matches", []string{"ff:ff:ff:ff:ff:ff", "aa:bb:cc:dd:ee:00"}, "w-0", false),
+		Entry("matches a BMI's secondary NIC", []string{"aa:bb:cc:dd:ee:1f"}, "w-1", false),
 	)
 })
 
