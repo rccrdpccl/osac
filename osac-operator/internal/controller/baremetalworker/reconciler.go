@@ -206,12 +206,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	r.trackInfraEnvUID(ctx, co, infraEnvUID)
 
-	diskImageID, res, err := r.resolveDiskImage(ctx, co)
+	image, res, err := r.resolveDiskImage(ctx, co)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
 
-	res, err = r.reconcileWorkers(ctx, co, diskImageID, ignition)
+	res, err = r.reconcileWorkers(ctx, co, image, ignition)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
@@ -530,30 +530,37 @@ func (r *Reconciler) ensureSystemCatalogItem(ctx context.Context, co *v1alpha1.C
 }
 
 // resolveDiskImage reads the Cluster's ClusterVersion reference via the fulfillment-service
-// private API and extracts the DiskImage ID. It re-resolves on every reconcile so a
-// ClusterVersion upgrade takes effect without controller restart.
-func (r *Reconciler) resolveDiskImage(ctx context.Context, co *v1alpha1.ClusterOrder) (string, ctrl.Result, error) {
+// private API and resolves its DiskImage into concrete BMI image coordinates (source_type +
+// source_ref). It fetches the DiskImage object with GetDiskImage and maps its source fields the
+// same way the ComputeInstance reconciler does (OSAC-3724), so a bootable OCI URL lands on the
+// BMI rather than a raw DiskImage id. It re-resolves on every reconcile so a ClusterVersion
+// upgrade takes effect without controller restart. Returns a nil image (and no error) when the
+// ClusterVersion carries no disk_image reference, mirroring the pre-existing behavior of
+// continuing to reconcile workers while RHCOSImageNotFound is set.
+func (r *Reconciler) resolveDiskImage(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+) (*privatev1.BareMetalInstanceImage, ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 
 	clusterID := co.Labels[clusterOrderIDLabel]
 	if clusterID == "" {
 		log.Info("ClusterOrder missing clusterorder-uuid label, requeuing")
-		return "", ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+		return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
 	}
 
 	cluster, err := r.fulfillment.GetCluster(ctx, clusterID)
 	if err != nil {
-		return "", ctrl.Result{}, fmt.Errorf("getting cluster %s: %w", clusterID, err)
+		return nil, ctrl.Result{}, fmt.Errorf("getting cluster %s: %w", clusterID, err)
 	}
 
 	versionID := cluster.GetSpec().GetVersion().GetId()
 	if versionID == "" {
-		return "", ctrl.Result{}, fmt.Errorf("cluster %s has no version reference", clusterID)
+		return nil, ctrl.Result{}, fmt.Errorf("cluster %s has no version reference", clusterID)
 	}
 
 	cv, err := r.fulfillment.GetClusterVersion(ctx, versionID)
 	if err != nil {
-		return "", ctrl.Result{}, fmt.Errorf("getting cluster version %s: %w", versionID, err)
+		return nil, ctrl.Result{}, fmt.Errorf("getting cluster version %s: %w", versionID, err)
 	}
 
 	diskImage := cv.GetSpec().GetDiskImage()
@@ -561,19 +568,43 @@ func (r *Reconciler) resolveDiskImage(ctx context.Context, co *v1alpha1.ClusterO
 		log.Info("ClusterVersion has no disk_image, setting RHCOSImageNotFound", "clusterVersion", versionID)
 		if condErr := r.setRHCOSImageNotFound(ctx, co, metav1.ConditionTrue, reasonDiskImageNotFound,
 			fmt.Sprintf("ClusterVersion %s has no disk_image reference", versionID)); condErr != nil {
-			return "", ctrl.Result{}, condErr
+			return nil, ctrl.Result{}, condErr
 		}
-		return "", ctrl.Result{}, nil
+		return nil, ctrl.Result{}, nil
 	}
+
+	di, err := r.fulfillment.GetDiskImage(ctx, diskImage.GetId())
+	if err != nil {
+		return nil, ctrl.Result{}, fmt.Errorf("getting disk image %s: %w", diskImage.GetId(), err)
+	}
+	diSpec := di.GetSpec()
+	image := privatev1.BareMetalInstanceImage_builder{
+		SourceType: mapDiskImageSourceType(diSpec.GetSourceType()),
+		SourceRef:  diSpec.GetSourceRef(),
+	}.Build()
 
 	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionRHCOSImageNotFound) {
 		if condErr := r.setRHCOSImageNotFound(ctx, co, metav1.ConditionFalse, reasonDiskImageResolved,
 			"disk_image reference resolved"); condErr != nil {
-			return "", ctrl.Result{}, condErr
+			return nil, ctrl.Result{}, condErr
 		}
 	}
 
-	return diskImage.GetId(), ctrl.Result{}, nil
+	return image, ctrl.Result{}, nil
+}
+
+// mapDiskImageSourceType converts the fulfillment-service DiskImage source-type enum into the
+// free-form source_type string a BareMetalInstance image carries. It mirrors the ComputeInstance
+// reconciler's mapping (OSAC-3724): the only defined vocabulary is "registry" (an OCI reference),
+// and unspecified/unknown values default to it. Kept as a local helper because the canonical
+// mapping lives in the separate fulfillment-service Go module and cannot be imported here.
+func mapDiskImageSourceType(st privatev1.SourceType) string {
+	switch st {
+	case privatev1.SourceType_SOURCE_TYPE_REGISTRY:
+		return string(v1alpha1.ImageSourceTypeRegistry)
+	default:
+		return string(v1alpha1.ImageSourceTypeRegistry)
+	}
 }
 
 func (r *Reconciler) setRHCOSImageNotFound(
@@ -590,7 +621,7 @@ func (r *Reconciler) setRHCOSImageNotFound(
 // Failed workers are retried with escalating backoff: the failed BMI is deleted, and a
 // replacement is created once NextRetryTime has passed.
 func (r *Reconciler) reconcileWorkers(
-	ctx context.Context, co *v1alpha1.ClusterOrder, diskImageID string, ignition []byte,
+	ctx context.Context, co *v1alpha1.ClusterOrder, image *privatev1.BareMetalInstanceImage, ignition []byte,
 ) (ctrl.Result, error) {
 	filter := fmt.Sprintf(`metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	existing, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
@@ -606,7 +637,7 @@ func (r *Reconciler) reconcileWorkers(
 
 	r.handleFailedWorkers(ctx, co, existingByName)
 
-	workers, res, err := r.reconcileNodeSets(ctx, co, existingByName, diskImageID, ignitionB64, filter)
+	workers, res, err := r.reconcileNodeSets(ctx, co, existingByName, image, ignitionB64, filter)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
@@ -633,7 +664,7 @@ func (r *Reconciler) reconcileWorkers(
 func (r *Reconciler) reconcileNodeSets(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	existingByName map[string]*privatev1.BareMetalInstance,
-	diskImageID, ignitionB64, filter string,
+	image *privatev1.BareMetalInstanceImage, ignitionB64, filter string,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
 	existingWorkers := workersByName(co.Status.Workers)
 	var workers []v1alpha1.WorkerStatus
@@ -662,7 +693,7 @@ func (r *Reconciler) reconcileNodeSets(
 			globalIndex++
 
 			if prev, ok := existingWorkers[workerName]; ok {
-				res, err := r.retryFailedWorker(ctx, co, nr, &prev, diskImageID, ignitionB64, filter, fabricInterface)
+				res, err := r.retryFailedWorker(ctx, co, nr, &prev, image, ignitionB64, filter, fabricInterface)
 				if err != nil {
 					return nil, ctrl.Result{}, err
 				}
@@ -673,7 +704,7 @@ func (r *Reconciler) reconcileNodeSets(
 				continue
 			}
 
-			ws, res, err := r.ensureWorkerBMI(ctx, co, nr, workerName, existingByName, diskImageID, ignitionB64, filter, fabricInterface)
+			ws, res, err := r.ensureWorkerBMI(ctx, co, nr, workerName, existingByName, image, ignitionB64, filter, fabricInterface)
 			if err != nil {
 				return nil, ctrl.Result{}, err
 			}
@@ -698,13 +729,13 @@ func (r *Reconciler) reconcileNodeSets(
 func (r *Reconciler) retryFailedWorker(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
-	diskImageID, ignitionB64, filter, fabricInterface string,
+	image *privatev1.BareMetalInstanceImage, ignitionB64, filter, fabricInterface string,
 ) (ctrl.Result, error) {
 	if prev.Phase != workerPhaseFailed || prev.ResourceID != "" || !isRetryDue(*prev) {
 		return ctrl.Result{}, nil
 	}
 	log := ctrllog.FromContext(ctx)
-	bmi, res, err := r.ensureBMI(ctx, co, *nr, prev.Name, diskImageID, ignitionB64, filter, fabricInterface)
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, prev.Name, image, ignitionB64, filter, fabricInterface)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -726,7 +757,7 @@ func (r *Reconciler) ensureWorkerBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	nr *v1alpha1.NodeRequest, workerName string,
 	existingByName map[string]*privatev1.BareMetalInstance,
-	diskImageID, ignitionB64, filter, fabricInterface string,
+	image *privatev1.BareMetalInstanceImage, ignitionB64, filter, fabricInterface string,
 ) (v1alpha1.WorkerStatus, ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 	if bmi, ok := existingByName[workerName]; ok {
@@ -734,7 +765,7 @@ func (r *Reconciler) ensureWorkerBMI(
 		return newWorkerStatus(nr.ResourceClass, nr.BareMetal.InstanceType, workerName, bmi.GetId()), ctrl.Result{}, nil
 	}
 
-	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, diskImageID, ignitionB64, filter, fabricInterface)
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, image, ignitionB64, filter, fabricInterface)
 	if err != nil {
 		return v1alpha1.WorkerStatus{}, ctrl.Result{}, err
 	}
@@ -845,9 +876,9 @@ func (r *Reconciler) resolveFabricInterfaceForNodeSet(
 // Returns the BMI, a non-zero result on unavailability backoff, or an error.
 func (r *Reconciler) ensureBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest,
-	workerName, diskImageID, ignitionB64, filter, fabricInterface string,
+	workerName string, image *privatev1.BareMetalInstanceImage, ignitionB64, filter, fabricInterface string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
-	req := r.buildBMICreateRequest(co, nodeSet, workerName, diskImageID, ignitionB64, fabricInterface)
+	req := r.buildBMICreateRequest(co, nodeSet, workerName, image, ignitionB64, fabricInterface)
 	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
 	if err == nil {
 		return created, ctrl.Result{}, nil
@@ -929,7 +960,8 @@ func bmisByName(bmis []*privatev1.BareMetalInstance) map[string]*privatev1.BareM
 }
 
 func (r *Reconciler) buildBMICreateRequest(
-	co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest, workerName, diskImageID, ignitionB64, fabricInterface string,
+	co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest, workerName string,
+	image *privatev1.BareMetalInstanceImage, ignitionB64, fabricInterface string,
 ) *privatev1.BareMetalInstance {
 	labels := map[string]string{clusterOrderLabel: co.Name}
 	annotations := map[string]string{ownerReferenceAnnotation: fmt.Sprintf("ClusterOrder/%s", co.Name)}
@@ -960,10 +992,7 @@ func (r *Reconciler) buildBMICreateRequest(
 			CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
 				Name: systemCatalogItemName,
 			}.Build(),
-			Image: privatev1.BareMetalInstanceImage_builder{
-				SourceType: "disk_image",
-				SourceRef:  diskImageID,
-			}.Build(),
+			Image:              image,
 			UserData:           &ignitionB64,
 			InstanceType:       nodeSet.BareMetal.InstanceType,
 			NetworkAttachments: netAttachments,

@@ -226,6 +226,53 @@ func (f *fakeCVClient) Signal(
 	return nil, errors.New("not implemented")
 }
 
+// fakeDiskImagesClient is a hand-written stub of privatev1.DiskImagesClient.
+type fakeDiskImagesClient struct {
+	lastCtx context.Context
+	err     error
+	object  *privatev1.DiskImage
+}
+
+func (f *fakeDiskImagesClient) Get(
+	ctx context.Context, _ *privatev1.DiskImagesGetRequest, _ ...grpc.CallOption,
+) (*privatev1.DiskImagesGetResponse, error) {
+	f.lastCtx = ctx
+	if f.err != nil {
+		return nil, f.err
+	}
+	return privatev1.DiskImagesGetResponse_builder{Object: f.object}.Build(), nil
+}
+
+func (f *fakeDiskImagesClient) List(
+	context.Context, *privatev1.DiskImagesListRequest, ...grpc.CallOption,
+) (*privatev1.DiskImagesListResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeDiskImagesClient) Create(
+	context.Context, *privatev1.DiskImagesCreateRequest, ...grpc.CallOption,
+) (*privatev1.DiskImagesCreateResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeDiskImagesClient) Update(
+	context.Context, *privatev1.DiskImagesUpdateRequest, ...grpc.CallOption,
+) (*privatev1.DiskImagesUpdateResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeDiskImagesClient) Delete(
+	context.Context, *privatev1.DiskImagesDeleteRequest, ...grpc.CallOption,
+) (*privatev1.DiskImagesDeleteResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeDiskImagesClient) Signal(
+	context.Context, *privatev1.DiskImagesSignalRequest, ...grpc.CallOption,
+) (*privatev1.DiskImagesSignalResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 // fakeBMICatalogItemsClient is a hand-written stub of privatev1.BareMetalInstanceCatalogItemsClient.
 type fakeBMICatalogItemsClient struct {
 	lastCtx context.Context
@@ -330,6 +377,7 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 		bmi           *fakeBMIClient
 		cv            *fakeCVClient
 		clusters      *fakeClustersClient
+		diskImages    *fakeDiskImagesClient
 		catalogItems  *fakeBMICatalogItemsClient
 		instanceTypes *fakeBMITypesClient
 		fc            FulfillmentClient
@@ -340,9 +388,10 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 		bmi = &fakeBMIClient{object: &privatev1.BareMetalInstance{}}
 		cv = &fakeCVClient{object: &privatev1.ClusterVersion{}}
 		clusters = &fakeClustersClient{object: &privatev1.Cluster{}}
+		diskImages = &fakeDiskImagesClient{object: &privatev1.DiskImage{}}
 		catalogItems = &fakeBMICatalogItemsClient{object: &privatev1.BareMetalInstanceCatalogItem{}}
 		instanceTypes = &fakeBMITypesClient{object: &privatev1.BareMetalInstanceType{}}
-		fc = NewFulfillmentClient(bmi, cv, clusters, catalogItems, instanceTypes)
+		fc = NewFulfillmentClient(bmi, cv, clusters, diskImages, catalogItems, instanceTypes)
 		ctx = context.Background()
 	})
 
@@ -375,6 +424,11 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			_, err := fc.GetCluster(ctx, "cluster-uuid")
 			Expect(err).ToNot(HaveOccurred())
 			expectCallDeadline(clusters.lastCtx)
+		})
+		It("on GetDiskImage", func() {
+			_, err := fc.GetDiskImage(ctx, "rhcos-4.18")
+			Expect(err).ToNot(HaveOccurred())
+			expectCallDeadline(diskImages.lastCtx)
 		})
 		It("on CreateBareMetalInstanceCatalogItem", func() {
 			_, err := fc.CreateBareMetalInstanceCatalogItem(ctx, &privatev1.BareMetalInstanceCatalogItem{})
@@ -418,6 +472,13 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			want := &privatev1.Cluster{}
 			clusters.object = want
 			got, err := fc.GetCluster(ctx, "cluster-uuid")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(got).To(BeIdenticalTo(want))
+		})
+		It("returns the disk image", func() {
+			want := &privatev1.DiskImage{}
+			diskImages.object = want
+			got, err := fc.GetDiskImage(ctx, "rhcos-4.18")
 			Expect(err).ToNot(HaveOccurred())
 			Expect(got).To(BeIdenticalTo(want))
 		})
@@ -478,9 +539,10 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 				b := &fakeBMIClient{err: errBackend, object: &privatev1.BareMetalInstance{}}
 				v := &fakeCVClient{err: errBackend, object: &privatev1.ClusterVersion{}}
 				cl := &fakeClustersClient{err: errBackend, object: &privatev1.Cluster{}}
+				di := &fakeDiskImagesClient{err: errBackend, object: &privatev1.DiskImage{}}
 				ci := &fakeBMICatalogItemsClient{err: errBackend, object: &privatev1.BareMetalInstanceCatalogItem{}}
 				it := &fakeBMITypesClient{err: errBackend, object: &privatev1.BareMetalInstanceType{}}
-				c := NewFulfillmentClient(b, v, cl, ci, it)
+				c := NewFulfillmentClient(b, v, cl, di, ci, it)
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
 				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeTrue())
@@ -506,6 +568,10 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 			}),
 			Entry("GetCluster", func(c FulfillmentClient) error {
 				_, e := c.GetCluster(context.Background(), "cluster-uuid")
+				return e
+			}),
+			Entry("GetDiskImage", func(c FulfillmentClient) error {
+				_, e := c.GetDiskImage(context.Background(), "rhcos-4.18")
 				return e
 			}),
 			Entry("CreateBareMetalInstanceCatalogItem", func(c FulfillmentClient) error {
