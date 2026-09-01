@@ -16,6 +16,7 @@ package acceptance
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -115,13 +116,206 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 	// Each body sketches arrange/act/assert with existing harness helpers; the "act = reconcile"
 	// step is a comment because the BareMetalWorkerReconciler is OSAC-4152.
 
-	PIt("provisions a bare-metal cluster to Ready [OSAC-4152/OSAC-4159/OSAC-4160]", func() {
-		// Given: a ClusterOrder with a bare-metal node set, ClusterDeployment present, DiskImage/
-		//   ClusterVersion preloaded in the fake, InfraEnv marked ready with discovery ignition.
-		// When:  the BareMetalWorkerReconciler reconciles (OSAC-4152); the simulator registers an
-		//   Agent whose MAC matches the created BMI (OSAC-4160).
-		// Then:  ClusterOrder.status.workers reach Ready and aggregate counts converge; NodePool
-		//   replicas match.
+	// Tier-1 end-to-end: drives the whole provisioning-start arc through the real reconciler
+	// (InfraEnv -> discovery ignition -> BMI creation -> WaitingForAgent -> agent registration ->
+	// Binding) and then asserts the flow STALLS at Binding, which is exactly where a real cluster
+	// blocks until the fabric/MetalLB network (OSAC-1436) lets the host install RHCOS and join the
+	// HostedCluster. It reuses the seams the fake private API + environment simulator provide, so it
+	// needs no hardware, no HyperShift, and no real network. The full path to Ready stays PIt below.
+	It("starts worker provisioning and stalls at Binding without networking [OSAC-1436 seam]", func() {
+		const (
+			clusterUUID    = "provstart-cluster-uuid"
+			cvID           = "4.18.0"
+			diskImageID    = "rhcos-4.18"
+			clusterIDLabel = "osac.openshift.io/clusterorder-uuid"
+			coName         = "bmw-provstart"
+		)
+
+		rec := events.NewFakeRecorder(20)
+		r := baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
+			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		// The MAC resolver stands in for the not-yet-landed BMI status MAC field (OSAC-2308/OSAC-3254).
+		r.SetMACResolver(fc.HostMAC)
+
+		// Preload the disk-image chain (Cluster -> ClusterVersion -> DiskImage) and the instance type
+		// carrying a fabric-role port, so the reconciler can resolve everything a BMI create needs.
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+
+		// A ClusterOrder with a 2-node bare-metal node set. Its NetworkAttachment names a Subnet and
+		// SecurityGroup that are NEVER resolved against a real network — that unresolved reference is
+		// precisely the OSAC-1436 seam; the reconciler passes the names through onto each BMI.
+		co := &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      coName,
+				Namespace: testNamespace,
+				Labels:    map[string]string{clusterIDLabel: clusterUUID},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID:   "test",
+				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
+				NodeRequests: []osacv1alpha1.NodeRequest{{
+					ResourceClass: "bm-standard",
+					NumberOfNodes: 2,
+					BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "bm-standard"},
+				}},
+				NetworkAttachment: &osacv1alpha1.ClusterNetworkAttachment{
+					SubnetRef:         "my-subnet",
+					SecurityGroupRefs: []string{"sg-default"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, co)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &osacv1alpha1.ClusterOrder{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+				return
+			}
+			if latest.DeletionTimestamp.IsZero() {
+				_ = k8sClient.Delete(ctx, latest)
+			}
+			fc.SetDeleteError(nil)
+			for range 3 {
+				_, _ = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+			}
+			ie := newInfraEnv(coName + "-infraenv")
+			_ = k8sClient.Delete(ctx, ie)
+		})
+
+		runReconcile := func() (reconcile.Result, error) {
+			return r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: coName, Namespace: testNamespace},
+			})
+		}
+		get := func() *osacv1alpha1.ClusterOrder {
+			GinkgoHelper()
+			latest := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: coName, Namespace: testNamespace}, latest)).To(Succeed())
+			return latest
+		}
+		workerByName := func(latest *osacv1alpha1.ClusterOrder, name string) osacv1alpha1.WorkerStatus {
+			GinkgoHelper()
+			for _, w := range latest.Status.Workers {
+				if w.Name == name {
+					return w
+				}
+			}
+			Fail("worker not found: " + name)
+			return osacv1alpha1.WorkerStatus{}
+		}
+
+		// --- Phase A: provisioning starts ---
+
+		// First reconcile: InfraEnv created (late binding), discovery ignition not ready yet -> requeue.
+		res, err := runReconcile()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+		// Simulator: the discovery ignition becomes available at the fake endpoint.
+		Expect(sim.MarkInfraEnvReady(ctx, coName+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+
+		// Second reconcile: ignition fetched, InfraEnvReady=True.
+		_, err = runReconcile()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(apimeta.IsStatusConditionTrue(
+			get().Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)).To(BeTrue())
+
+		// Third reconcile: BMIs are created for both worker slots; workers enter WaitingForAgent.
+		res, err = runReconcile()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0), "requeues for agent correlation")
+
+		co = get()
+		Expect(co.Status.Workers).To(HaveLen(2))
+		for _, w := range co.Status.Workers {
+			Expect(w.Phase).To(Equal("WaitingForAgent"))
+			Expect(w.Kind).To(Equal("BareMetalInstance"))
+			Expect(w.ResourceID).ToNot(BeEmpty())
+		}
+
+		// Two worker BMIs were created, tenant-invisible (system tenant) and carrying the
+		// unresolved network attachment names — provisioning has genuinely started.
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(2))
+		for _, bmi := range calls {
+			Expect(bmi.GetMetadata().GetTenant()).To(Equal("system"))
+			na := bmi.GetSpec().GetNetworkAttachments()
+			Expect(na).To(HaveLen(1))
+			Expect(na[0].GetSubnet().GetName()).To(Equal("my-subnet"))
+		}
+
+		// --- Phase B: an agent registers and binds ---
+
+		// One host boots the discovery ISO and registers as an Agent whose MAC matches worker-0's BMI.
+		co = get()
+		worker0 := workerByName(co, coName+"-worker-0")
+		fc.SetHostMAC(worker0.ResourceID, "aa:bb:cc:00:00:00")
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: coName + "-agent-0", Namespace: testNamespace, MAC: "aa:bb:cc:00:00:00",
+		})).To(Succeed())
+
+		// Label the agent with the cluster-order label (simulates the controller's watch filter).
+		agentObj := &unstructured.Unstructured{}
+		agentObj.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: coName + "-agent-0", Namespace: testNamespace,
+		}, agentObj)).To(Succeed())
+		agentLabels := agentObj.GetLabels()
+		if agentLabels == nil {
+			agentLabels = make(map[string]string)
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = coName
+		agentObj.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agentObj)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+
+		// Reconcile: worker-0 correlates by MAC and advances to Binding; worker-1 (no agent) waits.
+		_, err = runReconcile()
+		Expect(err).ToNot(HaveOccurred())
+
+		co = get()
+		Expect(workerByName(co, coName+"-worker-0").Phase).To(Equal("Binding"))
+		Expect(workerByName(co, coName+"-worker-1").Phase).To(Equal("WaitingForAgent"))
+
+		// The controller completed late binding on the agent.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Name: coName + "-agent-0", Namespace: testNamespace,
+		}, agentObj)).To(Succeed())
+		Expect(agentObj.GetLabels()).To(HaveKeyWithValue("osac.openshift.io/worker-name", coName+"-worker-0"))
+
+		// --- Phase C: the stall (assert the boundary; do NOT cross it) ---
+
+		// We deliberately DO NOT set the bound agent's status.debugInfo.state="installed". That step
+		// is the simulated stand-in for the OSAC-1436-dependent RHCOS install + node join over the
+		// fabric/MetalLB network; setting it here would falsely advance past the real-world block.
+		// So reconciling again must hold at Binding and never reach Ready.
+		_, err = runReconcile()
+		Expect(err).ToNot(HaveOccurred())
+
+		co = get()
+		Expect(workerByName(co, coName+"-worker-0").Phase).To(Equal("Binding"),
+			"worker stalls at Binding until networking (OSAC-1436) lets the host install and join")
+		Expect(workerByName(co, coName+"-worker-1").Phase).To(Equal("WaitingForAgent"))
+		Expect(co.Status.ReadyWorkers).ToNot(BeNil())
+		Expect(*co.Status.ReadyWorkers).To(Equal(int32(0)), "no worker reaches Ready without networking")
+	})
+
+	PIt("provisions a bare-metal cluster to Ready [OSAC-4152/OSAC-4159/OSAC-4160 + OSAC-1436]", func() {
+		// The full happy path to Ready additionally requires the OSAC-1436 fabric/MetalLB network so
+		// the host can install RHCOS and join the HostedCluster (Binding -> Ready gate). Stays pending
+		// until OSAC-1436 lands in OSAC-2135; the acceptance analogue would drive the agent's
+		// status.debugInfo.state="installed" step that the tier-1 test above intentionally omits.
 	})
 
 	PIt("creates BMIs with correct fields and keeps them tenant-invisible [OSAC-4159]", func() {
