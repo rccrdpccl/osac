@@ -22,6 +22,7 @@ operator:
     tenant: true
     networking: true
     storage: true
+    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
@@ -143,11 +144,15 @@ validation:
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
-  enabled: false
+  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest
     pullPolicy: Always
+  env:
+    aapUrl: "http://osac-aap/api/controller"
+    aapInsecureSkipVerify: "true"
+    enableNetworkingProvisioning: "false"
 
 # --- Cluster Versions ---
 clusterVersions:
