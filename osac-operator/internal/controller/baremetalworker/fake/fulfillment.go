@@ -44,6 +44,7 @@ type FulfillmentClient struct {
 	hostMACs        map[string]string
 	clusterVersions map[string]*privatev1.ClusterVersion
 	clusters        map[string]*privatev1.Cluster
+	diskImages      map[string]*privatev1.DiskImage
 	catalogItems    map[string]*privatev1.BareMetalInstanceCatalogItem
 	instanceTypes   map[string]*privatev1.BareMetalInstanceType
 	createErr       error
@@ -55,6 +56,7 @@ type FulfillmentClient struct {
 	listCalls              []string
 	getCVCalls             []string
 	getClusterCalls        []string
+	getDiskImageCalls      []string
 	createCatalogItemCalls []*privatev1.BareMetalInstanceCatalogItem
 	listCatalogItemCalls   []string
 	getInstanceTypeCalls   []string
@@ -69,6 +71,7 @@ func NewFulfillmentClient() *FulfillmentClient {
 		hostMACs:        map[string]string{},
 		clusterVersions: map[string]*privatev1.ClusterVersion{},
 		clusters:        map[string]*privatev1.Cluster{},
+		diskImages:      map[string]*privatev1.DiskImage{},
 		catalogItems:    map[string]*privatev1.BareMetalInstanceCatalogItem{},
 		instanceTypes:   map[string]*privatev1.BareMetalInstanceType{},
 	}
@@ -84,6 +87,10 @@ func cloneCV(c *privatev1.ClusterVersion) *privatev1.ClusterVersion {
 
 func cloneCluster(c *privatev1.Cluster) *privatev1.Cluster {
 	return proto.Clone(c).(*privatev1.Cluster)
+}
+
+func cloneDiskImage(d *privatev1.DiskImage) *privatev1.DiskImage {
+	return proto.Clone(d).(*privatev1.DiskImage)
 }
 
 // CreateBareMetalInstance records the call, assigns an id (defaulting to metadata.name) and stores
@@ -230,6 +237,22 @@ func (f *FulfillmentClient) GetCluster(
 	return cloneCluster(cl), nil
 }
 
+// GetDiskImage records the call and returns a preloaded DiskImage (see AddDiskImage), or an
+// error if none is registered for that id.
+func (f *FulfillmentClient) GetDiskImage(
+	_ context.Context, id string,
+) (*privatev1.DiskImage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getDiskImageCalls = append(f.getDiskImageCalls, id)
+	di, ok := f.diskImages[id]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "diskimage %q not found", id)
+	}
+	return cloneDiskImage(di), nil
+}
+
 func cloneCatalogItem(c *privatev1.BareMetalInstanceCatalogItem) *privatev1.BareMetalInstanceCatalogItem {
 	return proto.Clone(c).(*privatev1.BareMetalInstanceCatalogItem)
 }
@@ -325,6 +348,13 @@ func (f *FulfillmentClient) AddClusterVersion(cv *privatev1.ClusterVersion) {
 	f.clusterVersions[cv.GetId()] = cloneCV(cv)
 }
 
+// AddDiskImage preloads a DiskImage so GetDiskImage can return it (keyed by id).
+func (f *FulfillmentClient) AddDiskImage(di *privatev1.DiskImage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.diskImages[di.GetId()] = cloneDiskImage(di)
+}
+
 // SetHostMAC records the allocated host MAC for a BMI so correlation tests can drive Agent
 // matching. GetBareMetalInstance surfaces it through status.hardware.nics (OSAC-4203) — the
 // same field the real inventory backend populates and the production MAC resolver reads — so
@@ -402,6 +432,13 @@ func (f *FulfillmentClient) GetClusterCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.getClusterCalls...)
+}
+
+// GetDiskImageCalls returns the ids passed to GetDiskImage, in order.
+func (f *FulfillmentClient) GetDiskImageCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.getDiskImageCalls...)
 }
 
 // CreateCatalogItemCalls returns copies of the catalog items passed to CreateBareMetalInstanceCatalogItem.

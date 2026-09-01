@@ -149,6 +149,13 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
 
 		// A ClusterOrder with a 2-node bare-metal node set. Its NetworkAttachment names a Subnet and
@@ -351,6 +358,13 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 			Id: cvID,
 			Spec: privatev1.ClusterVersionSpec_builder{
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
 			}.Build(),
 		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))

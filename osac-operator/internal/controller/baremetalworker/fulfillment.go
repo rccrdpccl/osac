@@ -60,6 +60,8 @@ type FulfillmentClient interface {
 	GetClusterVersion(ctx context.Context, id string) (*privatev1.ClusterVersion, error)
 	// GetCluster returns the Cluster with the given id.
 	GetCluster(ctx context.Context, id string) (*privatev1.Cluster, error)
+	// GetDiskImage returns the DiskImage with the given id.
+	GetDiskImage(ctx context.Context, id string) (*privatev1.DiskImage, error)
 	// CreateBareMetalInstanceCatalogItem creates a BareMetalInstanceCatalogItem and returns the created object.
 	CreateBareMetalInstanceCatalogItem(ctx context.Context, obj *privatev1.BareMetalInstanceCatalogItem) (*privatev1.BareMetalInstanceCatalogItem, error)
 	// ListBareMetalInstanceCatalogItems returns the BareMetalInstanceCatalogItems matching the given CEL filter.
@@ -74,6 +76,7 @@ type fulfillmentClient struct {
 	bmis          privatev1.BareMetalInstancesClient
 	versions      privatev1.ClusterVersionsClient
 	clusters      privatev1.ClustersClient
+	diskImages    privatev1.DiskImagesClient
 	catalogItems  privatev1.BareMetalInstanceCatalogItemsClient
 	instanceTypes privatev1.BareMetalInstanceTypesClient
 
@@ -86,11 +89,12 @@ func NewFulfillmentClient(
 	bmis privatev1.BareMetalInstancesClient,
 	versions privatev1.ClusterVersionsClient,
 	clusters privatev1.ClustersClient,
+	diskImages privatev1.DiskImagesClient,
 	catalogItems privatev1.BareMetalInstanceCatalogItemsClient,
 	instanceTypes privatev1.BareMetalInstanceTypesClient,
 ) FulfillmentClient {
 	return &fulfillmentClient{
-		bmis: bmis, versions: versions, clusters: clusters,
+		bmis: bmis, versions: versions, clusters: clusters, diskImages: diskImages,
 		catalogItems: catalogItems, instanceTypes: instanceTypes,
 	}
 }
@@ -102,6 +106,7 @@ func NewFulfillmentClientFromConn(conn *grpc.ClientConn) FulfillmentClient {
 		privatev1.NewBareMetalInstancesClient(conn),
 		privatev1.NewClusterVersionsClient(conn),
 		privatev1.NewClustersClient(conn),
+		privatev1.NewDiskImagesClient(conn),
 		privatev1.NewBareMetalInstanceCatalogItemsClient(conn),
 		privatev1.NewBareMetalInstanceTypesClient(conn),
 	)
@@ -201,6 +206,19 @@ func (c *fulfillmentClient) GetCluster(ctx context.Context, id string) (*private
 	var out *privatev1.Cluster
 	err := c.call(ctx, func(ctx context.Context) error {
 		resp, err := c.clusters.Get(ctx, privatev1.ClustersGetRequest_builder{Id: id}.Build())
+		if err != nil {
+			return err
+		}
+		out = resp.GetObject()
+		return nil
+	})
+	return out, err
+}
+
+func (c *fulfillmentClient) GetDiskImage(ctx context.Context, id string) (*privatev1.DiskImage, error) {
+	var out *privatev1.DiskImage
+	err := c.call(ctx, func(ctx context.Context) error {
+		resp, err := c.diskImages.Get(ctx, privatev1.DiskImagesGetRequest_builder{Id: id}.Build())
 		if err != nil {
 			return err
 		}

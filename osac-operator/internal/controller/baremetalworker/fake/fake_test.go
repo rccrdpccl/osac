@@ -167,6 +167,27 @@ var _ = Describe("Fake FulfillmentClient", func() {
 		Expect(status.Code(err)).To(Equal(codes.NotFound))
 	})
 
+	It("preloads and returns DiskImages", func() {
+		di := privatev1.DiskImage_builder{
+			Id:       "rhcos-4.18",
+			Metadata: privatev1.Metadata_builder{Name: "rhcos-4-18"}.Build(),
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  "oci://registry.example.com/rhcos:4.18",
+			}.Build(),
+		}.Build()
+		fc.AddDiskImage(di)
+
+		got, err := fc.GetDiskImage(ctx, "rhcos-4.18")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(got.GetSpec().GetSourceType()).To(Equal(privatev1.SourceType_SOURCE_TYPE_REGISTRY))
+		Expect(got.GetSpec().GetSourceRef()).To(Equal("oci://registry.example.com/rhcos:4.18"))
+		Expect(fc.GetDiskImageCalls()).To(Equal([]string{"rhcos-4.18"}))
+
+		_, err = fc.GetDiskImage(ctx, "nope")
+		Expect(status.Code(err)).To(Equal(codes.NotFound))
+	})
+
 	It("preloads and returns Clusters", func() {
 		cl := privatev1.Cluster_builder{
 			Id:       "cluster-uuid",
