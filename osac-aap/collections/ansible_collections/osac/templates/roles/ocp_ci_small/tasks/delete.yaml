@@ -45,12 +45,6 @@
     cluster_infra_name: "{{ cluster_order.metadata.name }}"
     cluster_infra_namespace: "{{ cluster_working_namespace }}"
     cluster_infra_node_requests: "{{ cluster_order.spec.nodeRequests | unique(attribute='resourceClass') }}"
-    cluster_working_namespace: "{{ cluster_working_namespace }}"
-    cluster_order: "{{ cluster_order }}"
-    cluster_order_label: "{{ cluster_order_label }}"
-    agent_resource_class_label: "{{ agent_resource_class_label }}"
-    default_agent_namespace: "{{ default_agent_namespace }}"
-    network_steps_collection: "{{ network_steps_collection }}"
 
 - name: Step - Remove port forwarding
   ansible.builtin.include_role:
