@@ -37,6 +37,12 @@ import (
 	"github.com/osac-project/osac/osac-operator/internal/testing/envsim"
 )
 
+// diskImageSourceRef is the resolved OCI image URL the fake DiskImage carries. The reconciler
+// resolves the ClusterVersion's DiskImage reference to concrete source_type/source_ref via
+// GetDiskImage (mirroring ComputeInstance, OSAC-3724), so BMIs land a bootable OCI URL rather
+// than a raw DiskImage id.
+const diskImageSourceRef = "oci://registry.example.com/rhcos:4.18"
+
 func newInstanceType(name string, fabricPort string, extraPorts ...*privatev1.BareMetalNetworkPortSpec) *privatev1.BareMetalInstanceType {
 	ports := append([]*privatev1.BareMetalNetworkPortSpec{
 		privatev1.BareMetalNetworkPortSpec_builder{
@@ -96,6 +102,13 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 			Id: cvID,
 			Spec: privatev1.ClusterVersionSpec_builder{
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
 			}.Build(),
 		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
@@ -534,6 +547,13 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
 		addInstanceType("bm-standard")
 
 		co := newBareMetalClusterOrder("bmw-resolve", map[string]string{clusterIDLabel: clusterUUID})
@@ -614,6 +634,13 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
 
 		_, err = runReconcile("bmw-clear")
 		Expect(err).ToNot(HaveOccurred())
@@ -670,6 +697,13 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 			Id: cvID,
 			Spec: privatev1.ClusterVersionSpec_builder{
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
 			}.Build(),
 		}.Build())
 		addInstanceType("bm-standard", "data-0")
@@ -766,8 +800,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(bmi.GetMetadata().GetAnnotations()).To(HaveKeyWithValue(
 			"osac.openshift.io/owner-reference", "ClusterOrder/bmw-create"))
 		Expect(bmi.GetSpec().GetCatalogItem().GetName()).To(Equal("system-bmi-passthrough"))
-		Expect(bmi.GetSpec().GetImage().GetSourceType()).To(Equal("disk_image"))
-		Expect(bmi.GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageID))
+		Expect(bmi.GetSpec().GetImage().GetSourceType()).To(Equal("registry"))
+		Expect(bmi.GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageSourceRef))
 		Expect(bmi.GetSpec().GetInstanceType()).To(Equal("bm-standard"))
 
 		userData := bmi.GetSpec().GetUserData()
@@ -1059,6 +1093,13 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 			Id: cvID,
 			Spec: privatev1.ClusterVersionSpec_builder{
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
 			}.Build(),
 		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
@@ -1357,6 +1398,13 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
 	}
 
@@ -1628,6 +1676,13 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
 	}
 
@@ -1895,6 +1950,13 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
 			}.Build(),
 		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
 	}
 
@@ -2123,6 +2185,13 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 			Id: cvID,
 			Spec: privatev1.ClusterVersionSpec_builder{
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
 			}.Build(),
 		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
@@ -2532,6 +2601,13 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 			Id: cvID,
 			Spec: privatev1.ClusterVersionSpec_builder{
 				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
 			}.Build(),
 		}.Build())
 		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
