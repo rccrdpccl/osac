@@ -129,7 +129,7 @@ func NewReconciler(
 	recorder events.EventRecorder,
 	clusterOrderNamespace string,
 ) *Reconciler {
-	return &Reconciler{
+	r := &Reconciler{
 		Client:                c,
 		apiReader:             apiReader,
 		scheme:                scheme,
@@ -137,13 +137,14 @@ func NewReconciler(
 		ignition:              ignition,
 		recorder:              recorder,
 		clusterOrderNamespace: clusterOrderNamespace,
-		macResolver:           func(string) string { return "" },
 	}
+	r.macResolver = r.resolveHostMACs
+	return r
 }
 
-// SetMACResolver sets the function used to resolve a BMI's host MAC address for agent
-// correlation. In tests, this is wired to the fake's HostMAC; in production, it will read
-// from the BMI status once the proto field lands (OSAC-2308/OSAC-3254).
+// SetMACResolver overrides the function used to resolve a BMI's host NIC MACs for agent
+// correlation. The default is Reconciler.resolveHostMACs, which reads them from the BMI's
+// status.hardware.nics (OSAC-4203); tests use it to inject a stub resolver.
 func (r *Reconciler) SetMACResolver(resolver MACResolver) {
 	r.macResolver = resolver
 }
