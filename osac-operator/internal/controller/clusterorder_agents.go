@@ -138,11 +138,11 @@ func (r *ClusterOrderReconciler) selectAgents(
 		return nil, fmt.Errorf("building label requirement: %w", err)
 	}
 	selector = selector.Add(*noClusterOrder)
-	noClaimed, err := labels.NewRequirement(agentClaimedByHypershift, selection.DoesNotExist, nil)
-	if err != nil {
-		return nil, fmt.Errorf("building label requirement: %w", err)
-	}
-	selector = selector.Add(*noClaimed)
+	// NOTE: agentClaimedByHypershift (clusterdeployment-namespace) is NOT added as a
+	// DoesNotExist requirement here. MCE/assisted-service stamps that label on every
+	// Agent created from an InfraEnv and leaves it empty until the agent is bound to a
+	// ClusterDeployment. A DoesNotExist selector would therefore exclude all unbound
+	// agents. We filter on the label VALUE below instead (empty/absent == unclaimed).
 
 	agentList := &unstructured.UnstructuredList{}
 	agentList.SetGroupVersionKind(schema.GroupVersionKind{
@@ -163,6 +163,10 @@ func (r *ClusterOrderReconciler) selectAgents(
 	for i := range agentList.Items {
 		if len(result) >= count {
 			break
+		}
+		// Skip agents already bound to a ClusterDeployment (non-empty value).
+		if agentList.Items[i].GetLabels()[agentClaimedByHypershift] != "" {
+			continue
 		}
 		result = append(result, &agentList.Items[i])
 	}
