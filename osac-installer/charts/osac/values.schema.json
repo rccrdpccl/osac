@@ -1292,54 +1292,6 @@
             }
           }
         },
-        "systemCatalogItem": {
-          "type": "object",
-          "description": "System-owned BareMetalInstanceCatalogItem seeded via a post-install/upgrade hook when the bare-metal integration is enabled (OSAC-4173). Only seeded when template is set.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Run the seed-baremetal-catalog-item hook (set false to let the controller own the catalog item exclusively)",
-              "default": true
-            },
-            "name": {
-              "type": "string",
-              "description": "Metadata name of the catalog item",
-              "default": "system-default"
-            },
-            "title": {
-              "type": "string",
-              "description": "Human-friendly one-line title",
-              "default": "Bare metal instance"
-            },
-            "description": {
-              "type": "string",
-              "description": "Human-friendly long description (Markdown)",
-              "default": "System-provided bare metal instance offering."
-            },
-            "template": {
-              "type": "string",
-              "description": "Name of the underlying BareMetalInstanceTemplate this item references. Required for the hook to run; empty disables seeding.",
-              "default": ""
-            },
-            "published": {
-              "type": "boolean",
-              "description": "Whether the item is published and visible to tenants",
-              "default": true
-            },
-            "tenant": {
-              "type": "string",
-              "description": "Tenant scope. 'system' keeps the item system-owned; an empty string makes it global (visible to all tenants).",
-              "default": "system"
-            },
-            "fieldDefinitions": {
-              "type": "array",
-              "description": "Field definitions controlling which spec fields tenants may set. Empty means all parameters pass through unlocked. Entries use the private-API JSON field names.",
-              "items": {
-                "type": "object"
-              }
-            }
-          }
-        },
         "testBackend": {
           "type": "object",
           "description": "Kind/IT only: seeds a fake backend so BMF can run without real OpenStack/Ironic",
