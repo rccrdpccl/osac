@@ -1,8 +1,8 @@
 ---
-- name: Set skip network detach for Netris
-  ansible.builtin.set_fact:
-    manage_agents_skip_network_detach: true
-
+# OSAC-2135 (interim bridge until OSAC-1436): agent detach/unlabel is no longer
+# done here — the osac-operator owns agent binding/unbinding and NodePool scaling.
+# This role tears down ONLY the Netris fabric it created plus the NMStateConfig CRs
+# and the InfraEnv nmstate label selector.
 - name: List agents allocated to this cluster for nmstate revert
   kubernetes.core.k8s_info:
     kind: Agent
@@ -41,13 +41,6 @@
     infraenv_info.resources | length > 0 and
     cluster_order_label in
     (infraenv_info.resources[0].spec.nmStateConfigLabelSelector.matchLabels | default({}))
-
-- name: Detach agents from cluster
-  ansible.builtin.include_role:
-    name: osac.service.manage_agents
-    tasks_from: detach_and_unlabel_all_removed_agents
-  vars:
-    manage_agents_cluster_order_name: "{{ cluster_infra_name }}"
 
 - name: Delete SNAT rule for VPC subnet
   ansible.builtin.include_role:
