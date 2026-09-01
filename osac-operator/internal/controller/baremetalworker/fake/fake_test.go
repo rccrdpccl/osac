@@ -189,6 +189,21 @@ var _ = Describe("Fake FulfillmentClient", func() {
 		Expect(fc.HostMAC("other")).To(BeEmpty())
 	})
 
+	It("surfaces the host MAC through GetBareMetalInstance status.hardware.nics", func() {
+		_, err := fc.CreateBareMetalInstance(ctx, bmiNamed("bm-worker-0"))
+		Expect(err).ToNot(HaveOccurred())
+		fc.SetHostMAC("bm-worker-0", "aa:bb:cc:dd:ee:ff")
+
+		got, err := fc.GetBareMetalInstance(ctx, "bm-worker-0")
+		Expect(err).ToNot(HaveOccurred())
+		nics := got.GetStatus().GetHardware().GetNics()
+		macs := make([]string, 0, len(nics))
+		for _, nic := range nics {
+			macs = append(macs, nic.GetMac())
+		}
+		Expect(macs).To(ContainElement("aa:bb:cc:dd:ee:ff"))
+	})
+
 	It("preloads and returns BareMetalInstanceTypes", func() {
 		fc.AddBareMetalInstanceType(privatev1.BareMetalInstanceType_builder{
 			Metadata: privatev1.Metadata_builder{Name: "bm-standard"}.Build(),
