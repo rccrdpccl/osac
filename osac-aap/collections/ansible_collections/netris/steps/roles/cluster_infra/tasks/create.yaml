@@ -1,67 +1,21 @@
 ---
+# OSAC-2135 (interim bridge until OSAC-1436): the CaaS BareMetalPool model is
+# decommissioned (OSAC-4172). Worker agents are now bound to the cluster by the
+# osac-operator BareMetalWorkerReconciler, which sets spec.clusterDeploymentName
+# (late binding) plus the worker-name / baremetal-role labels, and also owns
+# NodePool replica scaling. This role therefore no longer selects, labels for
+# membership, detaches, scales, or approves agents via osac.service.manage_agents.
+# It waits for the operator-bound agents, then provisions ONLY the Netris fabric
+# (server cluster + VPC + IPAM/SNAT + NMStateConfig) that unblocks their install.
 - name: Show node requests
   ansible.builtin.debug:
     var: cluster_infra_node_requests
 
-# Handle scale down **before** scale up.
-
-- name: Retrieve all currently allocated node pools
-  kubernetes.core.k8s_info:
-    api_version: hypershift.openshift.io/v1beta1
-    kind: NodePool
-    namespace: "{{ cluster_working_namespace }}"
-  register: current_node_pools
-
-- name: Set resource classes included in the request
+- name: Compute expected worker count for this cluster
   ansible.builtin.set_fact:
-    requested_resource_classes: >
-      {{ cluster_infra_node_requests | map(attribute='resourceClass') }}
+    _cluster_infra_expected_agents: "{{ cluster_infra_node_requests | map(attribute='numberOfNodes') | map('int') | sum }}"
 
-- name: Determine which resource classes are no longer needed
-  ansible.builtin.set_fact:
-    removed_resource_classes: "{{ removed_resource_classes | default([]) + [item.metadata.labels[agent_resource_class_label]] }}"
-  with_items: "{{ current_node_pools.resources }}"
-  when:
-    - item.metadata.labels is defined
-    - agent_resource_class_label in item.metadata.labels
-    - item.metadata.labels[agent_resource_class_label] not in requested_resource_classes
-
-- name: Display additional resource classes to be removed
-  ansible.builtin.debug:
-    msg: "The following resource classes are no longer requested: {{ removed_resource_classes | default([]) }}"
-
-- name: Initialize updated cluster infra node requests that will include removed resource classes
-  ansible.builtin.set_fact:
-    updated_cluster_infra_node_requests: "{{ cluster_infra_node_requests }}"
-
-- name: Add removed resource classes to updated cluster infra node requests
-  ansible.builtin.set_fact:
-    updated_cluster_infra_node_requests: "{{ updated_cluster_infra_node_requests + [{'numberOfNodes': '0', 'resourceClass': item}] }}"
-  with_items: "{{ removed_resource_classes | default([]) }}"
-
-- name: Wait for the Agents to be removed from the cluster
-  ansible.builtin.include_role:
-    name: osac.service.manage_agents
-    tasks_from: wait_for_agents_to_be_removed
-  vars:
-    manage_agents_cluster_order_name: "{{ cluster_infra_name }}"
-    manage_agents_desired_count: "{{ item.numberOfNodes | int }}"
-    manage_agents_resource_class: "{{ item.resourceClass }}"
-  loop: "{{ updated_cluster_infra_node_requests }}"
-
-- name: Set skip network detach and attach for Netris
-  ansible.builtin.set_fact:
-    manage_agents_skip_network_detach: true
-    manage_agents_skip_network_attach: true
-
-- name: Detach agents from cluster
-  ansible.builtin.include_role:
-    name: osac.service.manage_agents
-    tasks_from: detach_and_unlabel_all_removed_agents
-  vars:
-    manage_agents_cluster_order_name: "{{ cluster_infra_name }}"
-
-- name: List already allocated agents
+- name: Record agents already labeled for this cluster (for live-nmstate newly-added detection)
   kubernetes.core.k8s_info:
     kind: Agent
     api_version: agent-install.openshift.io/v1beta1
@@ -70,28 +24,45 @@
       - "{{ cluster_order_label }}={{ cluster_infra_name }}"
   register: _existing_cluster_agents
 
-- name: Record already allocated agent names
+- name: Set already-allocated agent names
   ansible.builtin.set_fact:
     _existing_agent_names: "{{ _existing_cluster_agents.resources | map(attribute='metadata.name') | list }}"
 
-- name: Select and label new Agent resources
-  ansible.builtin.include_role:
-    name: osac.service.manage_agents
-    tasks_from: select_and_label_new_agents
-  vars:
-    manage_agents_cluster_order_name: "{{ cluster_infra_name }}"
-    manage_agents_desired_count: "{{ item.numberOfNodes | int }}"
-    manage_agents_resource_class: "{{ item.resourceClass }}"
-  loop: "{{ cluster_infra_node_requests }}"
-
-- name: List agents allocated to this cluster
+- name: Wait for the operator to bind worker agents to this cluster
   kubernetes.core.k8s_info:
     kind: Agent
     api_version: agent-install.openshift.io/v1beta1
     namespace: "{{ default_agent_namespace }}"
-    label_selectors:
-      - "{{ cluster_order_label }}={{ cluster_infra_name }}"
-  register: cluster_agents_for_netris
+  register: _all_agents
+  until: >-
+    (_all_agents.resources | default([])
+      | selectattr('spec.clusterDeploymentName', 'defined')
+      | selectattr('spec.clusterDeploymentName.name', 'equalto', cluster_infra_name)
+      | list | length) >= (_cluster_infra_expected_agents | int)
+  retries: 60
+  delay: 10
+  when: (_cluster_infra_expected_agents | int) > 0
+
+- name: Select the agents the operator bound to this cluster
+  ansible.builtin.set_fact:
+    cluster_agents_for_netris:
+      resources: >-
+        {{ _all_agents.resources | default([])
+           | selectattr('spec.clusterDeploymentName', 'defined')
+           | selectattr('spec.clusterDeploymentName.name', 'equalto', cluster_infra_name)
+           | list }}
+
+- name: Label operator-bound agents with the cluster order label (fabric + nmstate selector)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: agent-install.openshift.io/v1beta1
+      kind: Agent
+      metadata:
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ item.metadata.namespace }}"
+        labels: "{{ {cluster_order_label: cluster_infra_name} }}"
+  loop: "{{ cluster_agents_for_netris.resources }}"
 
 - name: Initialize server names list
   ansible.builtin.set_fact:
@@ -258,11 +229,3 @@
       spec:
         nmStateConfigLabelSelector:
           matchLabels: "{{ {cluster_order_label: cluster_infra_name} }}"
-
-- name: Attach and approve agents assigned to the cluster
-  ansible.builtin.include_role:
-    name: osac.service.manage_agents
-    tasks_from: attach_and_approve_all_new_agents
-  vars:
-    manage_agents_cluster_order_name: "{{ cluster_infra_name }}"
-    manage_agents_cluster_network: "{{ cluster_infra_network_name | default(omit) }}"
