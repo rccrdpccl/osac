@@ -119,6 +119,23 @@ var _ = Describe("Bare metal instances server", func() {
 			Expect(s.Code()).To(Equal(codes.InvalidArgument))
 		})
 
+		It("Creates object without a catalog item", func() {
+			// The catalog item is optional on the public/tenant API too: a tenant may
+			// create an instance directly against the full instance type, without
+			// selecting a curated catalog item.
+			response, err := server.Create(ctx, publicv1.BareMetalInstancesCreateRequest_builder{
+				Object: publicv1.BareMetalInstance_builder{
+					Metadata: publicv1.Metadata_builder{
+						Name: "test-baremetal-instance-no-catalog",
+					}.Build(),
+					Spec: publicv1.BareMetalInstanceSpec_builder{}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetId()).ToNot(BeEmpty())
+			Expect(response.GetObject().GetSpec().GetCatalogItem()).To(BeNil())
+		})
+
 		It("Lists objects", func() {
 			const count = 3
 			for i := range count {

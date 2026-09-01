@@ -298,127 +298,6 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 	})
 })
 
-var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
-	var (
-		fc  *fake.FulfillmentClient
-		ign *fake.IgnitionServer
-		rec *events.FakeRecorder
-		r   *baremetalworker.Reconciler
-	)
-
-	BeforeEach(func() {
-		fc = fake.NewFulfillmentClient()
-		ign = fake.NewIgnitionServer()
-		rec = events.NewFakeRecorder(10)
-		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
-			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-	})
-
-	AfterEach(func() { ign.Close() })
-
-	newBareMetalClusterOrder := func(name string) *osacv1alpha1.ClusterOrder {
-		return &osacv1alpha1.ClusterOrder{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: testNamespace,
-				Labels:    map[string]string{"osac.openshift.io/clusterorder-uuid": "ci-cluster"},
-			},
-			Spec: osacv1alpha1.ClusterOrderSpec{
-				TemplateID: "test",
-				NodeRequests: []osacv1alpha1.NodeRequest{{
-					ResourceClass: "bm-standard",
-					NumberOfNodes: 1,
-					BareMetal: &osacv1alpha1.BareMetalNodeSpec{
-						InstanceType: "bm-standard",
-					},
-				}},
-			},
-		}
-	}
-
-	runReconcile := func(name string) (reconcile.Result, error) {
-		return r.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
-		})
-	}
-
-	create := func(co *osacv1alpha1.ClusterOrder) {
-		GinkgoHelper()
-		Expect(k8sClient.Create(ctx, co)).To(Succeed())
-		DeferCleanup(func() {
-			latest := &osacv1alpha1.ClusterOrder{}
-			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
-				return
-			}
-			if latest.DeletionTimestamp.IsZero() {
-				_ = k8sClient.Delete(ctx, latest)
-			}
-			fc.SetDeleteError(nil)
-			for range 3 {
-				_, _ = r.Reconcile(ctx, reconcile.Request{
-					NamespacedName: client.ObjectKeyFromObject(co),
-				})
-			}
-			ie := newInfraEnv(co.Name + "-infraenv")
-			_ = k8sClient.Delete(ctx, ie)
-		})
-	}
-
-	It("creates the system catalog item when absent", func() {
-		co := newBareMetalClusterOrder("bmw-ci-create")
-		create(co)
-
-		_, err := runReconcile("bmw-ci-create")
-		Expect(err).ToNot(HaveOccurred())
-
-		calls := fc.CreateCatalogItemCalls()
-		Expect(calls).To(HaveLen(1))
-		ci := calls[0]
-		Expect(ci.GetMetadata().GetName()).To(Equal("system-bmi-passthrough"))
-		Expect(ci.GetMetadata().GetTenant()).To(Equal("system"))
-		Expect(ci.GetTitle()).To(Equal("System BMI Pass-through"))
-		Expect(ci.GetPublished()).To(BeTrue())
-		Expect(ci.GetFieldDefinitions()).To(BeEmpty())
-		Expect(ci.GetTemplate()).To(BeNil())
-	})
-
-	It("is a no-op when the system catalog item already exists", func() {
-		co := newBareMetalClusterOrder("bmw-ci-noop")
-		create(co)
-
-		// Pre-create the catalog item.
-		_, err := fc.CreateBareMetalInstanceCatalogItem(ctx, privatev1.BareMetalInstanceCatalogItem_builder{
-			Metadata: privatev1.Metadata_builder{Name: "system-bmi-passthrough"}.Build(),
-		}.Build())
-		Expect(err).ToNot(HaveOccurred())
-
-		_, err = runReconcile("bmw-ci-noop")
-		Expect(err).ToNot(HaveOccurred())
-
-		// Only the pre-create call, no additional create from the reconciler.
-		Expect(fc.CreateCatalogItemCalls()).To(HaveLen(1))
-		Expect(fc.ListCatalogItemCalls()).To(HaveLen(1))
-	})
-
-	It("handles AlreadyExists gracefully (concurrent create race)", func() {
-		co := newBareMetalClusterOrder("bmw-ci-race")
-		create(co)
-
-		// First reconcile creates the catalog item.
-		_, err := runReconcile("bmw-ci-race")
-		Expect(err).ToNot(HaveOccurred())
-		Expect(fc.CreateCatalogItemCalls()).To(HaveLen(1))
-
-		// Remove it from list but leave it stored (simulates race: list returns empty,
-		// but Create returns AlreadyExists). We achieve this by running a second reconcile —
-		// list will find it and skip create.
-		_, err = runReconcile("bmw-ci-race")
-		Expect(err).ToNot(HaveOccurred())
-		// No additional create call — list found it.
-		Expect(fc.CreateCatalogItemCalls()).To(HaveLen(1))
-	})
-})
-
 var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 	const (
 		clusterUUID    = "resolve-cluster-uuid"
@@ -765,7 +644,9 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(bmi.GetMetadata().GetLabels()).To(HaveKeyWithValue("osac.openshift.io/cluster-order", "bmw-create"))
 		Expect(bmi.GetMetadata().GetAnnotations()).To(HaveKeyWithValue(
 			"osac.openshift.io/owner-reference", "ClusterOrder/bmw-create"))
-		Expect(bmi.GetSpec().GetCatalogItem().GetName()).To(Equal("system-bmi-passthrough"))
+		// No catalog item: the controller sets every provisioning parameter explicitly
+		// and the private API no longer requires one.
+		Expect(bmi.GetSpec().GetCatalogItem()).To(BeNil())
 		Expect(bmi.GetSpec().GetImage().GetSourceType()).To(Equal("disk_image"))
 		Expect(bmi.GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageID))
 		Expect(bmi.GetSpec().GetInstanceType()).To(Equal("bm-standard"))

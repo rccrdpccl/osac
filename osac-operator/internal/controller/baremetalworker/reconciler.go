@@ -70,7 +70,6 @@ const (
 	reasonDiskImageResolved        = "DiskImageResolved"
 
 	systemTenant                 = "system"
-	systemCatalogItemName        = "system-bmi-passthrough"
 	clusterOrderLabel            = "osac.openshift.io/cluster-order"
 	ownerReferenceAnnotation     = "osac.openshift.io/owner-reference"
 	reasonFulfillmentUnavailable = "FulfillmentServiceUnavailable"
@@ -187,10 +186,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
 			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after rebuild: %w", err)
 		}
-	}
-
-	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
-		return res, err
 	}
 
 	ignition, infraEnvUID, res, err := r.ensureInfraEnv(ctx, co)
@@ -482,50 +477,6 @@ func (r *Reconciler) detectStaleIgnitionWorkers(
 		}
 	}
 	return marked
-}
-
-// ensureSystemCatalogItem creates the system-owned BareMetalInstanceCatalogItem
-// ("system-bmi-passthrough") if it doesn't already exist. Empty field_definitions means all
-// fields are unlocked — hardware profile is determined by BareMetalInstanceType, not by this
-// catalog item. AlreadyExists is handled gracefully for concurrent reconcile races.
-func (r *Reconciler) ensureSystemCatalogItem(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
-	log := ctrllog.FromContext(ctx)
-
-	filter := fmt.Sprintf(`metadata.name == "%s"`, systemCatalogItemName)
-	items, err := r.fulfillment.ListBareMetalInstanceCatalogItems(ctx, filter)
-	if res, handled := r.handleUnavailable(ctx, co, err); handled {
-		return res, nil
-	}
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("listing catalog items: %w", err)
-	}
-	if len(items) > 0 {
-		return ctrl.Result{}, nil
-	}
-
-	ci := privatev1.BareMetalInstanceCatalogItem_builder{
-		Metadata: privatev1.Metadata_builder{
-			Tenant: systemTenant,
-			Name:   systemCatalogItemName,
-		}.Build(),
-	}.Build()
-	ci.SetTitle("System BMI Pass-through")
-	ci.SetPublished(true)
-
-	_, err = r.fulfillment.CreateBareMetalInstanceCatalogItem(ctx, ci)
-	if err != nil {
-		if res, handled := r.handleUnavailable(ctx, co, err); handled {
-			return res, nil
-		}
-		if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
-			log.Info("system catalog item created concurrently, continuing")
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, fmt.Errorf("creating system catalog item: %w", err)
-	}
-
-	log.Info("created system catalog item", "name", systemCatalogItemName)
-	return ctrl.Result{}, nil
 }
 
 // resolveDiskImage reads the Cluster's ClusterVersion reference via the fulfillment-service
@@ -956,9 +907,9 @@ func (r *Reconciler) buildBMICreateRequest(
 			Annotations: annotations,
 		}.Build(),
 		Spec: privatev1.BareMetalInstanceSpec_builder{
-			CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
-				Name: systemCatalogItemName,
-			}.Build(),
+			// No catalog item: the private API allows BMIs without one, and this
+			// controller sets every provisioning parameter explicitly. Hardware
+			// profile comes from InstanceType (BareMetalInstanceType), not a catalog item.
 			Image: privatev1.BareMetalInstanceImage_builder{
 				SourceType: "disk_image",
 				SourceRef:  diskImageID,

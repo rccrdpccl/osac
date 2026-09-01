@@ -169,6 +169,25 @@ var _ = Describe("Private bare metal instances server", func() {
 			Expect(response.GetObject().GetSpec().GetCatalogItem().GetId()).To(Equal(catalogItemID))
 		})
 
+		It("Creates object without a catalog item", func() {
+			// The private API is used by controllers (e.g. the CaaS bare-metal worker
+			// reconciler) that set every provisioning parameter explicitly and do not
+			// reference a catalog item. Such a create must succeed.
+			response, err := server.Create(ctx, privatev1.BareMetalInstancesCreateRequest_builder{
+				Object: privatev1.BareMetalInstance_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+					}.Build(),
+					Spec: privatev1.BareMetalInstanceSpec_builder{
+						InstanceType: "bm-standard",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetId()).ToNot(BeEmpty())
+			Expect(response.GetObject().GetSpec().GetCatalogItem()).To(BeNil())
+		})
+
 		It("Creates object with valid SSH key", func() {
 			response, err := server.Create(ctx, privatev1.BareMetalInstancesCreateRequest_builder{
 				Object: privatev1.BareMetalInstance_builder{

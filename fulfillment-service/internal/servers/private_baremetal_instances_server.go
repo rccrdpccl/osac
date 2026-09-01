@@ -463,7 +463,12 @@ func (s *PrivateBareMetalInstancesServer) validateAndApplyCatalogItem(ctx contex
 	}
 	ref := bmi.GetSpec().GetCatalogItem()
 	if ref == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "spec.catalog_item is mandatory")
+		// The catalog item is optional. Controllers (e.g. the CaaS bare-metal worker
+		// reconciler) and tenants may create BMIs with every provisioning parameter
+		// set explicitly and no catalog item to gate or default them. When absent,
+		// there is nothing to look up, validate, or apply — the instance is created
+		// against the full instance type.
+		return nil
 	}
 	refStr := refKey(ref)
 

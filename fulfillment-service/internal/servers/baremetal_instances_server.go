@@ -192,6 +192,13 @@ func (s *BareMetalInstancesServer) Create(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
+	// The catalog item is optional on both the public and private APIs. Without
+	// one, the instance is created against the full instance type; with one, the
+	// catalog item's field definitions restrict the spec to an allowed subset and
+	// apply defaults (see PrivateBareMetalInstancesServer.validateAndApplyCatalogItem
+	// and applyFieldDefinitions). This lets tenants create instances directly or
+	// through a curated offering, and lets controllers create them with every
+	// field set explicitly.
 	privateBMI := &privatev1.BareMetalInstance{}
 	err = s.inMapper.Copy(ctx, publicBMI, privateBMI)
 	if err != nil {
