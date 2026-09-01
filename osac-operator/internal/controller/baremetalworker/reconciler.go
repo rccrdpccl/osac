@@ -564,7 +564,8 @@ func (r *Reconciler) resolveDiskImage(
 	}
 
 	diskImage := cv.GetSpec().GetDiskImage()
-	if diskImage == nil || diskImage.GetId() == "" {
+	diskImageKey := refKeyStr(diskImage)
+	if diskImageKey == "" {
 		log.Info("ClusterVersion has no disk_image, setting RHCOSImageNotFound", "clusterVersion", versionID)
 		if condErr := r.setRHCOSImageNotFound(ctx, co, metav1.ConditionTrue, reasonDiskImageNotFound,
 			fmt.Sprintf("ClusterVersion %s has no disk_image reference", versionID)); condErr != nil {
@@ -573,9 +574,9 @@ func (r *Reconciler) resolveDiskImage(
 		return nil, ctrl.Result{}, nil
 	}
 
-	di, err := r.fulfillment.GetDiskImage(ctx, diskImage.GetId())
+	di, err := r.fulfillment.GetDiskImage(ctx, diskImageKey)
 	if err != nil {
-		return nil, ctrl.Result{}, fmt.Errorf("getting disk image %s: %w", diskImage.GetId(), err)
+		return nil, ctrl.Result{}, fmt.Errorf("getting disk image %s: %w", diskImageKey, err)
 	}
 	diSpec := di.GetSpec()
 	image := privatev1.BareMetalInstanceImage_builder{
@@ -591,6 +592,19 @@ func (r *Reconciler) resolveDiskImage(
 	}
 
 	return image, ctrl.Result{}, nil
+}
+
+// refKeyStr derives the lookup key for a DiskImage reference, mirroring the ComputeInstance
+// reconciler's RefKeyStr (OSAC-3724): prefer the id, fall back to the name. The fulfillment-service
+// ClusterVersion validation backfills the id on write, so the id branch is the usual path, but a
+// name-only reference must still resolve identically to keep the two paths consistent. Kept as a
+// local helper because the canonical RefKeyStr lives in the separate fulfillment-service Go module
+// and cannot be imported here.
+func refKeyStr(ref *privatev1.DiskImageReference) string {
+	if ref.GetId() != "" {
+		return ref.GetId()
+	}
+	return ref.GetName()
 }
 
 // mapDiskImageSourceType converts the fulfillment-service DiskImage source-type enum into the

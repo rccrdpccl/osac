@@ -816,6 +816,45 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(netAttachments[0].GetSecurityGroups()[0].GetName()).To(Equal("sg-default"))
 	})
 
+	It("resolves a name-only DiskImage reference by name (id-or-name, mirroring ComputeInstance)", func() {
+		// The ClusterVersion's disk_image reference carries only a name (no id). The reconciler
+		// must resolve it the same way the ComputeInstance path does (OSAC-3724 / RefKeyStr:
+		// prefer id, fall back to name), so the BMI still lands the resolved OCI ref.
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Name: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
+		addInstanceType("bm-standard", "data-0")
+
+		co := newBareMetalClusterOrder("bmw-nameref", 1)
+		create(co)
+		makeInfraEnvReady("bmw-nameref")
+
+		_, err := runReconcile("bmw-nameref")
+		Expect(err).ToNot(HaveOccurred())
+
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(1))
+		Expect(calls[0].GetSpec().GetImage().GetSourceType()).To(Equal("registry"))
+		Expect(calls[0].GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageSourceRef))
+		Expect(fc.GetDiskImageCalls()).To(ContainElement(diskImageID))
+	})
+
 	It("emits a WorkerCreated event when a new worker BMI is created", func() {
 		preloadDiskImageChain()
 		co := newBareMetalClusterOrder("bmw-event", 1)
