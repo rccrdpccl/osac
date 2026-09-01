@@ -1044,7 +1044,6 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 	})
 
 	AfterEach(func() { ign.Close() })
@@ -1341,7 +1340,6 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		rec = events.NewFakeRecorder(20)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 	})
 
 	AfterEach(func() { ign.Close() })
@@ -1613,7 +1611,6 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 		rec = events.NewFakeRecorder(20)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 	})
 
 	AfterEach(func() { ign.Close() })
@@ -1881,7 +1878,6 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 		rec = events.NewFakeRecorder(20)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 	})
 
 	AfterEach(func() { ign.Close() })
@@ -2112,7 +2108,6 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		rec = events.NewFakeRecorder(20)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 	})
 
 	AfterEach(func() { ign.Close() })
@@ -2522,7 +2517,6 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 		rec = events.NewFakeRecorder(20)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
 			fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
-		r.SetMACResolver(fc.HostMAC)
 	})
 
 	AfterEach(func() { ign.Close() })

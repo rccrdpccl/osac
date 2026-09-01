@@ -14,6 +14,8 @@ language governing permissions and limitations under the License.
 package baremetalworker
 
 import (
+	"context"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,13 +42,13 @@ var _ = Describe("findAgentForWorker", func() {
 			makeAgent("agent-0", "aa:bb:cc:00:00:00", nil),
 			makeAgent("agent-1", "aa:bb:cc:11:11:11", nil),
 		}}
-		resolver := func(id string) string {
+		resolver := func(_ context.Context, id string) []string {
 			if id == "bmi-1" {
-				return "aa:bb:cc:11:11:11"
+				return []string{"aa:bb:cc:11:11:11"}
 			}
-			return ""
+			return nil
 		}
-		got := findAgentForWorker(agents, "bmi-1", "w-1", resolver)
+		got := findAgentForWorker(context.Background(), agents, "bmi-1", "w-1", resolver)
 		Expect(got).ToNot(BeNil())
 		Expect(got.GetName()).To(Equal("agent-1"))
 	})
@@ -55,8 +57,8 @@ var _ = Describe("findAgentForWorker", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-0", "aa:bb:cc:00:00:00", nil),
 		}}
-		resolver := func(string) string { return "ff:ff:ff:ff:ff:ff" }
-		got := findAgentForWorker(agents, "bmi-0", "w-0", resolver)
+		resolver := func(context.Context, string) []string { return []string{"ff:ff:ff:ff:ff:ff"} }
+		got := findAgentForWorker(context.Background(), agents, "bmi-0", "w-0", resolver)
 		Expect(got).To(BeNil())
 	})
 
@@ -64,8 +66,8 @@ var _ = Describe("findAgentForWorker", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-0", "AA:BB:CC:DD:EE:FF", nil),
 		}}
-		resolver := func(string) string { return "aa:bb:cc:dd:ee:ff" }
-		got := findAgentForWorker(agents, "bmi-0", "w-0", resolver)
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:dd:ee:ff"} }
+		got := findAgentForWorker(context.Background(), agents, "bmi-0", "w-0", resolver)
 		Expect(got).ToNot(BeNil())
 	})
 
@@ -73,8 +75,8 @@ var _ = Describe("findAgentForWorker", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}),
 		}}
-		resolver := func(string) string { return "" }
-		got := findAgentForWorker(agents, "bmi-0", "w-0", resolver)
+		resolver := func(context.Context, string) []string { return nil }
+		got := findAgentForWorker(context.Background(), agents, "bmi-0", "w-0", resolver)
 		Expect(got).ToNot(BeNil())
 		Expect(got.GetName()).To(Equal("agent-0"))
 	})
@@ -135,10 +137,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-0", Kind: workerKindBMI, ResourceID: "bmi-0", Phase: workerPhaseReady},
 		}
 		agents := &unstructured.UnstructuredList{}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(BeEmpty())
 		Expect(result).To(HaveLen(1))
 		Expect(result[0].Phase).To(Equal(workerPhaseWaitingForAgent))
@@ -151,10 +153,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true),
 		}}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(BeEmpty())
 		Expect(result).To(HaveLen(1))
 		Expect(result[0].Phase).To(Equal(workerPhaseReady))
@@ -167,10 +169,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, false),
 		}}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(BeEmpty())
 		Expect(result).To(HaveLen(1))
 		Expect(result[0].Phase).To(Equal(workerPhaseBinding))
@@ -182,10 +184,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-1", Kind: workerKindBMI, ResourceID: "bmi-1", Phase: workerPhaseWaitingForAgent},
 		}
 		agents := &unstructured.UnstructuredList{}
-		resolver := func(string) string { return "" }
+		resolver := func(context.Context, string) []string { return nil }
 		bmiExists := func(id string) bool { return id != "bmi-0" }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(ConsistOf("w-0"))
 		Expect(result).To(HaveLen(1))
 		Expect(result[0].Name).To(Equal("w-1"))
@@ -203,10 +205,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			},
 		}
 		agents := &unstructured.UnstructuredList{}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(BeEmpty())
 		Expect(result).To(HaveLen(1))
 		Expect(result[0].Phase).To(Equal(workerPhaseWaitingForAgent))
@@ -227,10 +229,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true),
 		}}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, _ := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, _ := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(result[0].ReadySince).To(Equal(&readySince))
 	})
 
@@ -240,10 +242,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-0", Kind: workerKindBMI, ResourceID: "bmi-0", Phase: workerPhaseReady},
 		}
 		agents := &unstructured.UnstructuredList{}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, _ := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, _ := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(result).To(HaveLen(2))
 		Expect(result[0].Kind).To(Equal("VirtualMachine"))
 		Expect(result[0].Phase).To(Equal("Running"))
@@ -251,10 +253,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 
 	It("handles empty workers list as a no-op", func() {
 		agents := &unstructured.UnstructuredList{}
-		resolver := func(string) string { return "" }
+		resolver := func(context.Context, string) []string { return nil }
 		bmiExists := func(string) bool { return true }
 
-		result, removed := rebuildWorkerPhases(nil, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), nil, agents, resolver, bmiExists)
 		Expect(result).To(BeNil())
 		Expect(removed).To(BeEmpty())
 	})
@@ -268,13 +270,15 @@ var _ = Describe("rebuildWorkerPhases", func() {
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
 			makeAgent("agent-1", "bb:bb:bb:11:11:11", map[string]string{workerNameLabel: "w-1"}, true),
 		}}
-		resolver := func(id string) string {
-			m := map[string]string{"bmi-0": "aa:aa:aa:00:00:00", "bmi-1": "bb:bb:bb:11:11:11", "bmi-2": "cc:cc:cc:22:22:22"}
+		resolver := func(_ context.Context, id string) []string {
+			m := map[string][]string{
+				"bmi-0": {"aa:aa:aa:00:00:00"}, "bmi-1": {"bb:bb:bb:11:11:11"}, "bmi-2": {"cc:cc:cc:22:22:22"},
+			}
 			return m[id]
 		}
 		bmiExists := func(id string) bool { return id != "bmi-2" }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(ConsistOf("w-2"))
 		Expect(result).To(HaveLen(2))
 		Expect(result[0].Name).To(Equal("w-0"))
@@ -290,10 +294,10 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-2", Kind: workerKindBMI, ResourceID: "bmi-2", Phase: workerPhaseFailed, AttemptCount: 1},
 		}
 		agents := &unstructured.UnstructuredList{}
-		resolver := func(string) string { return "aa:bb:cc:00:00:00" }
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
 
-		result, removed := rebuildWorkerPhases(workers, agents, resolver, bmiExists)
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
 		Expect(removed).To(BeEmpty())
 		Expect(result).To(HaveLen(3))
 		Expect(result[0].Phase).To(Equal(workerPhaseUnbinding))

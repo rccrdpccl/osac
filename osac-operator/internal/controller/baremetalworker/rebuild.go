@@ -16,7 +16,6 @@ package baremetalworker
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -68,7 +67,7 @@ func (r *Reconciler) rebuildWorkerState(ctx context.Context, co *v1alpha1.Cluste
 		return false, fmt.Errorf("listing agents during rebuild: %w", err)
 	}
 
-	rebuilt, removed := rebuildWorkerPhases(co.Status.Workers, agents, r.macResolver, bmiExists)
+	rebuilt, removed := rebuildWorkerPhases(ctx, co.Status.Workers, agents, r.macResolver, bmiExists)
 
 	if len(removed) == 0 && workerPhasesUnchanged(co.Status.Workers, rebuilt) {
 		return false, nil
@@ -96,9 +95,10 @@ func (r *Reconciler) rebuildWorkerState(ctx context.Context, co *v1alpha1.Cluste
 // Deleting) are left untouched. Non-BMI workers pass through unchanged.
 // Returns the rebuilt worker list and names of removed stale entries.
 func rebuildWorkerPhases(
+	ctx context.Context,
 	workers []v1alpha1.WorkerStatus,
 	agents *unstructured.UnstructuredList,
-	hostMAC MACResolver,
+	hostMACs MACResolver,
 	bmiExists func(resourceID string) bool,
 ) ([]v1alpha1.WorkerStatus, []string) {
 	if workers == nil {
@@ -125,7 +125,7 @@ func rebuildWorkerPhases(
 			continue
 		}
 
-		agent := findAgentForWorker(agents, w.ResourceID, w.Name, hostMAC)
+		agent := findAgentForWorker(ctx, agents, w.ResourceID, w.Name, hostMACs)
 		newPhase := deriveWorkerPhase(agent, w.Name)
 		w.Phase = newPhase
 		result = append(result, w)
@@ -139,10 +139,11 @@ func rebuildWorkerPhases(
 // back to MAC-based lookup via MACResolver. Unlike matchAgentToBMI, this does not filter
 // by worker phase — it matches any worker.
 func findAgentForWorker(
+	ctx context.Context,
 	agents *unstructured.UnstructuredList,
 	bmiID string,
 	workerName string,
-	hostMAC MACResolver,
+	hostMACs MACResolver,
 ) *unstructured.Unstructured {
 	for idx := range agents.Items {
 		agent := &agents.Items[idx]
@@ -151,17 +152,15 @@ func findAgentForWorker(
 		}
 	}
 
-	bmiMAC := hostMAC(bmiID)
-	if bmiMAC == "" {
+	bmiMACs := hostMACs(ctx, bmiID)
+	if len(bmiMACs) == 0 {
 		return nil
 	}
 
 	for idx := range agents.Items {
 		agent := &agents.Items[idx]
-		for _, aMAC := range extractAgentMACs(agent) {
-			if strings.EqualFold(aMAC, bmiMAC) {
-				return agent
-			}
+		if macsIntersect(extractAgentMACs(agent), bmiMACs) {
+			return agent
 		}
 	}
 	return nil
