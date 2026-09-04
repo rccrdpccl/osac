@@ -15,7 +15,8 @@ package baremetalworker
 
 import (
 	"context"
-	"encoding/base64"
+	"encoding/json"
+
 	"errors"
 	"fmt"
 	"time"
@@ -151,6 +152,7 @@ func (r *Reconciler) SetMACResolver(resolver MACResolver) {
 
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders,verbs=get;list;watch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=hypershift.openshift.io,resources=nodepools,verbs=get;list;watch;patch
@@ -192,6 +194,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
 		return res, err
+	}
+
+	if err := r.ensurePullSecret(ctx, co); err != nil {
+		return ctrl.Result{}, fmt.Errorf("ensuring pull secret: %w", err)
 	}
 
 	ignition, infraEnvUID, res, err := r.ensureInfraEnv(ctx, co)
@@ -389,6 +395,56 @@ func (r *Reconciler) fetchDiscoveryIgnition(
 	return ignition, ctrl.Result{}, nil
 }
 
+// ensurePullSecret ensures the pull secret K8s Secret referenced by the InfraEnv exists.
+// It checks co.Spec.PullSecret first, then falls back to extracting the pull_secret key
+// from co.Spec.TemplateParameters (a JSON-encoded map).
+func (r *Reconciler) ensurePullSecret(ctx context.Context, co *v1alpha1.ClusterOrder) error {
+	secretName := co.Name + pullSecretNameSuffix
+	key := client.ObjectKey{Name: secretName, Namespace: co.Namespace}
+
+	existing := &corev1.Secret{}
+	if err := r.Get(ctx, key, existing); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("checking pull secret %s: %w", key, err)
+	}
+
+	pullSecret := co.Spec.PullSecret
+	if pullSecret == "" && co.Spec.TemplateParameters != "" {
+		var params map[string]interface{}
+		if err := json.Unmarshal([]byte(co.Spec.TemplateParameters), &params); err == nil {
+			if ps, ok := params["pull_secret"].(string); ok {
+				pullSecret = ps
+			}
+		}
+	}
+	if pullSecret == "" {
+		return fmt.Errorf("no pull secret available on ClusterOrder %s (neither spec.pullSecret nor templateParameters.pull_secret)", co.Name)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: co.Namespace,
+		},
+		Type: corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{
+			corev1.DockerConfigJsonKey: []byte(pullSecret),
+		},
+	}
+	if err := controllerutil.SetControllerReference(co, secret, r.scheme); err != nil {
+		return fmt.Errorf("setting pull secret owner reference: %w", err)
+	}
+	if err := r.Create(ctx, secret); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("creating pull secret %s: %w", key, err)
+	}
+	ctrllog.FromContext(ctx).Info("created pull secret for InfraEnv", "secret", key.String())
+	return nil
+}
+
 // buildInfraEnv constructs the (unstructured) InfraEnv object: late binding (no clusterRef),
 // owned by the ClusterOrder, referencing the cluster pull secret and SSH key.
 func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name string) (*unstructured.Unstructured, error) {
@@ -397,8 +453,8 @@ func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name string) (*uns
 	infraEnv.SetName(name)
 	infraEnv.SetNamespace(co.Namespace)
 
-	// The pull-secret Secret is provisioned by the cluster provisioning flow; the InfraEnv
-	// references it by the conventional name. No clusterRef is set (late binding): agents
+	// The pull-secret Secret is ensured by ensurePullSecret before InfraEnv creation.
+	// No clusterRef is set (late binding): agents
 	// register unbound and are bound explicitly after MAC correlation (OSAC-4160).
 	spec := map[string]interface{}{
 		"pullSecretRef": map[string]interface{}{"name": co.Name + pullSecretNameSuffix},
@@ -492,7 +548,7 @@ func (r *Reconciler) detectStaleIgnitionWorkers(
 func (r *Reconciler) ensureSystemCatalogItem(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 
-	filter := fmt.Sprintf(`metadata.name == "%s"`, systemCatalogItemName)
+	filter := fmt.Sprintf(`this.metadata.name == "%s"`, systemCatalogItemName)
 	items, err := r.fulfillment.ListBareMetalInstanceCatalogItems(ctx, filter)
 	if res, handled := r.handleUnavailable(ctx, co, err); handled {
 		return res, nil
@@ -637,7 +693,7 @@ func (r *Reconciler) setRHCOSImageNotFound(
 func (r *Reconciler) reconcileWorkers(
 	ctx context.Context, co *v1alpha1.ClusterOrder, image *privatev1.BareMetalInstanceImage, ignition []byte,
 ) (ctrl.Result, error) {
-	filter := fmt.Sprintf(`metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
+	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	existing, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
 	if res, handled := r.handleUnavailable(ctx, co, err); handled {
 		return res, nil
@@ -647,11 +703,11 @@ func (r *Reconciler) reconcileWorkers(
 	}
 
 	existingByName := bmisByName(existing)
-	ignitionB64 := base64.StdEncoding.EncodeToString(ignition)
+	ignitionRaw := string(ignition)
 
 	r.handleFailedWorkers(ctx, co, existingByName)
 
-	workers, res, err := r.reconcileNodeSets(ctx, co, existingByName, image, ignitionB64, filter)
+	workers, res, err := r.reconcileNodeSets(ctx, co, existingByName, image, ignitionRaw, filter)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
@@ -678,7 +734,7 @@ func (r *Reconciler) reconcileWorkers(
 func (r *Reconciler) reconcileNodeSets(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	existingByName map[string]*privatev1.BareMetalInstance,
-	image *privatev1.BareMetalInstanceImage, ignitionB64, filter string,
+	image *privatev1.BareMetalInstanceImage, ignitionRaw, filter string,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
 	existingWorkers := workersByName(co.Status.Workers)
 	var workers []v1alpha1.WorkerStatus
@@ -707,7 +763,7 @@ func (r *Reconciler) reconcileNodeSets(
 			globalIndex++
 
 			if prev, ok := existingWorkers[workerName]; ok {
-				res, err := r.retryFailedWorker(ctx, co, nr, &prev, image, ignitionB64, filter, fabricInterface)
+				res, err := r.retryFailedWorker(ctx, co, nr, &prev, image, ignitionRaw, filter, fabricInterface)
 				if err != nil {
 					return nil, ctrl.Result{}, err
 				}
@@ -718,7 +774,7 @@ func (r *Reconciler) reconcileNodeSets(
 				continue
 			}
 
-			ws, res, err := r.ensureWorkerBMI(ctx, co, nr, workerName, existingByName, image, ignitionB64, filter, fabricInterface)
+			ws, res, err := r.ensureWorkerBMI(ctx, co, nr, workerName, existingByName, image, ignitionRaw, filter, fabricInterface)
 			if err != nil {
 				return nil, ctrl.Result{}, err
 			}
@@ -743,13 +799,13 @@ func (r *Reconciler) reconcileNodeSets(
 func (r *Reconciler) retryFailedWorker(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
-	image *privatev1.BareMetalInstanceImage, ignitionB64, filter, fabricInterface string,
+	image *privatev1.BareMetalInstanceImage, ignitionRaw, filter, fabricInterface string,
 ) (ctrl.Result, error) {
 	if prev.Phase != workerPhaseFailed || prev.ResourceID != "" || !isRetryDue(*prev) {
 		return ctrl.Result{}, nil
 	}
 	log := ctrllog.FromContext(ctx)
-	bmi, res, err := r.ensureBMI(ctx, co, *nr, prev.Name, image, ignitionB64, filter, fabricInterface)
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, prev.Name, image, ignitionRaw, filter, fabricInterface)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -771,7 +827,7 @@ func (r *Reconciler) ensureWorkerBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	nr *v1alpha1.NodeRequest, workerName string,
 	existingByName map[string]*privatev1.BareMetalInstance,
-	image *privatev1.BareMetalInstanceImage, ignitionB64, filter, fabricInterface string,
+	image *privatev1.BareMetalInstanceImage, ignitionRaw, filter, fabricInterface string,
 ) (v1alpha1.WorkerStatus, ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
 	if bmi, ok := existingByName[workerName]; ok {
@@ -779,7 +835,7 @@ func (r *Reconciler) ensureWorkerBMI(
 		return newWorkerStatus(nr.ResourceClass, nr.BareMetal.InstanceType, workerName, bmi.GetId()), ctrl.Result{}, nil
 	}
 
-	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, image, ignitionB64, filter, fabricInterface)
+	bmi, res, err := r.ensureBMI(ctx, co, *nr, workerName, image, ignitionRaw, filter, fabricInterface)
 	if err != nil {
 		return v1alpha1.WorkerStatus{}, ctrl.Result{}, err
 	}
@@ -890,9 +946,9 @@ func (r *Reconciler) resolveFabricInterfaceForNodeSet(
 // Returns the BMI, a non-zero result on unavailability backoff, or an error.
 func (r *Reconciler) ensureBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest,
-	workerName string, image *privatev1.BareMetalInstanceImage, ignitionB64, filter, fabricInterface string,
+	workerName string, image *privatev1.BareMetalInstanceImage, ignitionRaw, filter, fabricInterface string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
-	req := r.buildBMICreateRequest(co, nodeSet, workerName, image, ignitionB64, fabricInterface)
+	req := r.buildBMICreateRequest(co, nodeSet, workerName, image, ignitionRaw, fabricInterface)
 	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
 	if err == nil {
 		return created, ctrl.Result{}, nil
@@ -975,7 +1031,7 @@ func bmisByName(bmis []*privatev1.BareMetalInstance) map[string]*privatev1.BareM
 
 func (r *Reconciler) buildBMICreateRequest(
 	co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest, workerName string,
-	image *privatev1.BareMetalInstanceImage, ignitionB64, fabricInterface string,
+	image *privatev1.BareMetalInstanceImage, ignitionRaw, fabricInterface string,
 ) *privatev1.BareMetalInstance {
 	labels := map[string]string{clusterOrderLabel: co.Name}
 	annotations := map[string]string{ownerReferenceAnnotation: fmt.Sprintf("ClusterOrder/%s", co.Name)}
@@ -1007,7 +1063,7 @@ func (r *Reconciler) buildBMICreateRequest(
 				Name: systemCatalogItemName,
 			}.Build(),
 			Image:              image,
-			UserData:           &ignitionB64,
+			UserData:           &ignitionRaw,
 			InstanceType:       nodeSet.BareMetal.InstanceType,
 			NetworkAttachments: netAttachments,
 		}.Build(),
