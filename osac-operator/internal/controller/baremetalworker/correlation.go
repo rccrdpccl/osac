@@ -161,11 +161,20 @@ func (r *Reconciler) listAgents(ctx context.Context, co *v1alpha1.ClusterOrder) 
 	agentList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: agentGVK.Group, Version: agentGVK.Version, Kind: agentGVK.Kind + "List",
 	})
+	infraEnvName := co.Name + infraEnvNameSuffix
 	if err := r.List(ctx, agentList,
 		client.InNamespace(co.Namespace),
-		client.MatchingLabels{clusterOrderLabel: co.Name},
+		client.MatchingLabels{infraEnvAgentLabel: infraEnvName},
 	); err != nil {
-		return nil, fmt.Errorf("listing agents for %s: %w", co.Name, err)
+		return nil, fmt.Errorf("listing agents for %s by infraenv: %w", co.Name, err)
+	}
+	if len(agentList.Items) == 0 {
+		if err := r.List(ctx, agentList,
+			client.InNamespace(co.Namespace),
+			client.MatchingLabels{clusterOrderLabel: co.Name},
+		); err != nil {
+			return nil, fmt.Errorf("listing agents for %s by clusterOrderLabel: %w", co.Name, err)
+		}
 	}
 	return agentList, nil
 }
@@ -266,6 +275,7 @@ func (r *Reconciler) bindAgent(
 	}
 	labels[workerNameLabel] = workerName
 	labels[agentBareMetalRoleLabel] = "true"
+	labels[clusterOrderLabel] = co.Name
 	agent.SetLabels(labels)
 
 	return r.Patch(ctx, agent, client.MergeFrom(base))
