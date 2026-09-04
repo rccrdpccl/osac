@@ -43,7 +43,6 @@ def test_cluster_create(
     ssh_public_key_path: str,
     metering: MeteringCollector,
 ) -> None:
-    private_grpc.ensure_host_type(name="ci-worker")
     private_grpc.ensure_bare_metal_instance_type(
         name="ci-worker-bm",
         host_label_selector={"osac.openshift.io/host-type": "default"},
@@ -60,6 +59,12 @@ def test_cluster_create(
         name=name,
         template=cluster_template,
         version=version["name"],
+        node_sets={
+            "workers": {
+                "size": 1,
+                "baremetal_instance_type": {"name": "ci-worker-bm"},
+            }
+        },
         template_parameter_files={"pull_secret": pull_secret_path},
         template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
     )
@@ -178,6 +183,10 @@ def test_cluster_create_with_version(
     and the ClusterOrder CR's releaseImage is resolved from the matching
     ClusterVersion. Does not wait for full provisioning — the HostedCluster
     image propagation is covered by test_cluster_create."""
+    private_grpc.ensure_bare_metal_instance_type(
+        name="ci-worker-bm",
+        host_label_selector={"osac.openshift.io/host-type": "default"},
+    )
     version = private_grpc.ensure_cluster_version(version="4.20.0-e2e", image=TEST_RELEASE_IMAGE)
 
     name = unique_name("e2e-cluster-version")
@@ -185,6 +194,12 @@ def test_cluster_create_with_version(
         name=name,
         template=cluster_template,
         version=version["name"],
+        node_sets={
+            "workers": {
+                "size": 1,
+                "baremetal_instance_type": {"name": "ci-worker-bm"},
+            }
+        },
         template_parameter_files={"pull_secret": pull_secret_path},
         template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
     )
