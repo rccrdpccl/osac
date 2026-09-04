@@ -14,7 +14,7 @@ language governing permissions and limitations under the License.
 package acceptance
 
 import (
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -123,6 +123,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -338,6 +339,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID: "test",
+				PullSecret: "{\"auths\":{}}",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
 					NumberOfNodes: 1,
@@ -392,7 +394,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		Expect(ci.GetTitle()).To(Equal("System BMI Pass-through"))
 		Expect(ci.GetPublished()).To(BeTrue())
 		Expect(ci.GetFieldDefinitions()).To(BeEmpty())
-		Expect(ci.GetTemplate()).To(BeNil())
+		Expect(ci.GetTemplate().GetId()).To(Equal("osac.templates.bm_host_provisioning"))
 	})
 
 	It("is a no-op when the system catalog item already exists", func() {
@@ -468,6 +470,7 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -718,6 +721,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -805,9 +809,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(bmi.GetSpec().GetInstanceType()).To(Equal("bm-standard"))
 
 		userData := bmi.GetSpec().GetUserData()
-		decoded, decErr := base64.StdEncoding.DecodeString(userData)
-		Expect(decErr).ToNot(HaveOccurred())
-		Expect(decoded).ToNot(BeEmpty())
+		Expect(userData).ToNot(BeEmpty())
+		Expect(json.Valid([]byte(userData))).To(BeTrue())
 
 		netAttachments := bmi.GetSpec().GetNetworkAttachments()
 		Expect(netAttachments).To(HaveLen(1))
@@ -1031,6 +1034,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{
 					{
@@ -1072,6 +1076,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -1153,6 +1158,7 @@ var _ = Describe("BareMetalWorkerReconciler correlateAgents", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -1456,6 +1462,7 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -1734,6 +1741,7 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -2008,6 +2016,7 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -2245,6 +2254,7 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -2661,6 +2671,7 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
