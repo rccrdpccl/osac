@@ -97,7 +97,7 @@
 - name: Resolve resource class configuration
   ansible.builtin.set_fact:
     _netris_resource_class: "{{ cluster_infra_node_requests[0].resourceClass }}"
-    _netris_rc_config: "{{ netris_resource_class_map[cluster_infra_node_requests[0].resourceClass] }}"
+    _netris_rc_config: "{{ netris_resource_class_map[cluster_infra_node_requests[0].resourceClass] | default(netris_resource_class_map['ci-worker'] | default(netris_resource_class_map.values() | first, true), true) }}"
 
 - name: Set resource class derived values
   ansible.builtin.set_fact:
