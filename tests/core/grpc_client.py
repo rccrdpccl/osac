@@ -498,6 +498,107 @@ class GRPCClient:
                 return item["id"]
         raise RuntimeError(f"DiskImage '{name}' reported AlreadyExists but not found in list")
 
+    # HostType and BareMetalInstanceType operations (private API)
+
+    def create_host_type(
+        self,
+        *,
+        name: str,
+        title: str = "CI Worker",
+        description: str = "Worker nodes for CI testing",
+        tenant: str = "shared",
+    ) -> str:
+        """Create a HostType via the private API."""
+        obj: dict[str, Any] = {
+            "metadata": {"name": name, "tenant": tenant},
+            "title": title,
+            "description": description,
+        }
+        response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.HostTypes/Create", data={"object": obj})
+        return response["object"]["id"]
+
+    def ensure_host_type(
+        self,
+        *,
+        name: str,
+        title: str = "CI Worker",
+        description: str = "Worker nodes for CI testing",
+        tenant: str = "shared",
+    ) -> str:
+        """Create a HostType, tolerating AlreadyExists left behind by a prior run."""
+        try:
+            return self.create_host_type(name=name, title=title, description=description, tenant=tenant)
+        except subprocess.CalledProcessError as e:
+            output = (e.stdout or "") + (e.stderr or "")
+            if not re.search(r"Code:\s*AlreadyExists", output):
+                raise RuntimeError(f"Failed to create host type '{name}': {output}") from e
+        response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.HostTypes/List")
+        for item in response.get("items", []):
+            if item.get("metadata", {}).get("name") == name:
+                return item["id"]
+        raise RuntimeError(f"HostType '{name}' reported AlreadyExists but not found in list")
+
+    def create_bare_metal_instance_type(
+        self,
+        *,
+        name: str,
+        cores: int = 4,
+        memory_gb: int = 16,
+        architecture: str = "ARCHITECTURE_AMD64",
+        host_label_selector: dict[str, str] | None = None,
+        description: str = "CI bare-metal worker profile",
+        tenant: str = "shared",
+    ) -> str:
+        """Create a BareMetalInstanceType via the private API."""
+        selector = host_label_selector or {"osac.openshift.io/host-type": "default"}
+        obj: dict[str, Any] = {
+            "metadata": {"name": name, "tenant": tenant},
+            "spec": {
+                "hardware": {
+                    "cpu": {"cores": cores, "architecture": architecture},
+                    "memory": {"total_gb": memory_gb},
+                },
+                "description": description,
+                "host_label_selector": {"match_labels": selector},
+            },
+        }
+        response: dict[str, Any] = self.call(
+            service=f"{PRIVATE_API}.BareMetalInstanceTypes/Create", data={"object": obj}
+        )
+        return response["object"]["id"]
+
+    def ensure_bare_metal_instance_type(
+        self,
+        *,
+        name: str,
+        cores: int = 4,
+        memory_gb: int = 16,
+        architecture: str = "ARCHITECTURE_AMD64",
+        host_label_selector: dict[str, str] | None = None,
+        description: str = "CI bare-metal worker profile",
+        tenant: str = "shared",
+    ) -> str:
+        """Create a BareMetalInstanceType, tolerating AlreadyExists left behind by a prior run."""
+        try:
+            return self.create_bare_metal_instance_type(
+                name=name,
+                cores=cores,
+                memory_gb=memory_gb,
+                architecture=architecture,
+                host_label_selector=host_label_selector,
+                description=description,
+                tenant=tenant,
+            )
+        except subprocess.CalledProcessError as e:
+            output = (e.stdout or "") + (e.stderr or "")
+            if not re.search(r"Code:\s*AlreadyExists", output):
+                raise RuntimeError(f"Failed to create bare metal instance type '{name}': {output}") from e
+        response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.BareMetalInstanceTypes/List")
+        for item in response.get("items", []):
+            if item.get("metadata", {}).get("name") == name:
+                return item["id"]
+        raise RuntimeError(f"BareMetalInstanceType '{name}' reported AlreadyExists but not found in list")
+
     # BareMetalInstance operations (public API)
 
     def list_baremetal_instance_ids(self) -> list[str]:
