@@ -72,6 +72,7 @@ const (
 
 	systemTenant                 = "system"
 	systemCatalogItemName        = "system-bmi-passthrough"
+	systemBMITemplateID          = "osac.templates.bm_host_provisioning"
 	clusterOrderLabel            = "osac.openshift.io/cluster-order"
 	ownerReferenceAnnotation     = "osac.openshift.io/owner-reference"
 	reasonFulfillmentUnavailable = "FulfillmentServiceUnavailable"
@@ -564,6 +565,9 @@ func (r *Reconciler) ensureSystemCatalogItem(ctx context.Context, co *v1alpha1.C
 		Metadata: privatev1.Metadata_builder{
 			Tenant: systemTenant,
 			Name:   systemCatalogItemName,
+		}.Build(),
+		Template: privatev1.BareMetalInstanceTemplateReference_builder{
+			Id: systemBMITemplateID,
 		}.Build(),
 	}.Build()
 	ci.SetTitle("System BMI Pass-through")
