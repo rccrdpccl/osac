@@ -311,6 +311,14 @@ var _ = Describe("Clusters server", func() {
 								Default:     makeAny(wrapperspb.String("my value")),
 							}.Build(),
 						},
+						NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
+							"workers": privatev1.ClusterTemplateNodeSet_builder{
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+									Id: "bmit_standard",
+								}.Build(),
+								Size: 1,
+							}.Build(),
+						},
 					}.Build(),
 				).
 				Do(ctx)
@@ -415,7 +423,7 @@ var _ = Describe("Clusters server", func() {
 			Expect(gpuNodeSet.GetSize()).To(BeNumerically("==", 1))
 		})
 
-		It("Rejects node set that isn't in the template", func() {
+		It("Accepts custom node set that isn't in the template", func() {
 			response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 				Object: publicv1.Cluster_builder{
 					Metadata: publicv1.Metadata_builder{
@@ -432,43 +440,8 @@ var _ = Describe("Clusters server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(response).To(BeNil())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal(
-				"node set 'junk' doesn't exist, valid values for template 'my_template' are " +
-					"'compute' and 'gpu'",
-			))
-		})
-
-		It("Rejects node set with host type that isn't in the template", func() {
-			response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
-				Object: publicv1.Cluster_builder{
-					Metadata: publicv1.Metadata_builder{
-						Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
-					Spec: publicv1.ClusterSpec_builder{
-						Template: publicv1.ClusterTemplateReference_builder{Id: "my_template"}.Build(),
-						NodeSets: map[string]*publicv1.ClusterNodeSet{
-							"compute": publicv1.ClusterNodeSet_builder{
-								HostType: publicv1.HostTypeReference_builder{Id: "hal_9000"}.Build(),
-								Size:     1000,
-							}.Build(),
-						},
-					}.Build(),
-				}.Build(),
-			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(response).To(BeNil())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal(
-				"host type for node set 'compute' should be empty, 'test-host-type-1tib' or 'acme_1tib', like in " +
-					"template 'my_template', but it is 'hal_9000'",
-			))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetNodeSets()).To(HaveKey("junk"))
 		})
 
 		It("Rejects node set with zero size", func() {
@@ -1742,7 +1715,54 @@ var _ = Describe("Clusters server", func() {
 				Expect(workersNodeSet.GetSize()).To(BeNumerically("==", 5))
 			})
 
-			It("Rejects node set with baremetal_instance_type that isn't in the template", func() {
+			It("Succeeds with template referencing baremetal_instance_type even if host_type does not exist", func() {
+				templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
+					SetLogger(logger).
+					SetTenancyLogic(tenancy).
+					Build()
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = templatesDao.Create().
+					SetObject(
+						privatev1.ClusterTemplate_builder{
+							Id:          "template_with_missing_host_type",
+							Title:       "Template with missing host type",
+							Description: "Template where HostType is missing but BMIT is present",
+							Metadata: privatev1.Metadata_builder{
+								Name:   "test-bmit-missing-ht-template",
+								Tenant: auth.SharedTenant,
+							}.Build(),
+							NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
+								"workers": privatev1.ClusterTemplateNodeSet_builder{
+									HostType: privatev1.HostTypeReference_builder{
+										Id: "nonexistent_host_type_id",
+									}.Build(),
+									BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+										Id: "bmit_standard",
+									}.Build(),
+									Size: 2,
+								}.Build(),
+							},
+						}.Build(),
+					).
+					Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+
+				response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
+					Object: publicv1.Cluster_builder{
+						Metadata: publicv1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Spec: publicv1.ClusterSpec_builder{
+							Template: publicv1.ClusterTemplateReference_builder{Id: "template_with_missing_host_type"}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetNodeSets()["workers"].GetBaremetalInstanceType().GetId()).To(Equal("bmit_standard"))
+			})
+
+			It("Accepts node set with baremetal_instance_type that differs from template", func() {
 				response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 					Object: publicv1.Cluster_builder{
 						Metadata: publicv1.Metadata_builder{
@@ -1761,17 +1781,11 @@ var _ = Describe("Clusters server", func() {
 						}.Build(),
 					}.Build(),
 				}.Build())
-				Expect(err).To(HaveOccurred())
-				Expect(response).To(BeNil())
-				status, ok := grpcstatus.FromError(err)
-				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(ContainSubstring(
-					"baremetal_instance_type for node set 'workers'",
-				))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetNodeSets()["workers"].GetBaremetalInstanceType().GetId()).To(Equal("bmit_no_fabric"))
 			})
 
-			It("Rejects node set with baremetal_instance_type when template has none", func() {
+			It("Accepts node set with baremetal_instance_type when template has none", func() {
 				response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 					Object: publicv1.Cluster_builder{
 						Metadata: publicv1.Metadata_builder{
@@ -1790,15 +1804,35 @@ var _ = Describe("Clusters server", func() {
 						}.Build(),
 					}.Build(),
 				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetNodeSets()["compute"].GetBaremetalInstanceType().GetId()).To(Equal("bmit_standard"))
+			})
+
+			It("Rejects node set when baremetal_instance_type does not exist", func() {
+				response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
+					Object: publicv1.Cluster_builder{
+						Metadata: publicv1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Spec: publicv1.ClusterSpec_builder{
+							Template: publicv1.ClusterTemplateReference_builder{Id: "my_template"}.Build(),
+							NodeSets: map[string]*publicv1.ClusterNodeSet{
+								"compute": publicv1.ClusterNodeSet_builder{
+									BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{
+										Id: "bmit_nonexistent",
+									}.Build(),
+									Size: 3,
+								}.Build(),
+							},
+						}.Build(),
+					}.Build(),
+				}.Build())
 				Expect(err).To(HaveOccurred())
 				Expect(response).To(BeNil())
 				status, ok := grpcstatus.FromError(err)
 				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(Equal(
-					"baremetal_instance_type for node set 'compute' should be empty, like in " +
-						"template 'my_template', but it is 'bmit_standard'",
-				))
+				Expect(status.Code()).To(Equal(grpccodes.NotFound))
+				Expect(status.Message()).To(ContainSubstring("there is no bare metal instance type with identifier or name 'bmit_nonexistent'"))
 			})
 
 			It("Rejects update that changes baremetal_instance_type", func() {

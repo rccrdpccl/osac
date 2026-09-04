@@ -18,12 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/bits-and-blooms/bitset"
-	"github.com/dustin/go-humanize/english"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/exp/maps"
 	grpccodes "google.golang.org/grpc/codes"
@@ -287,22 +285,6 @@ func (s *PrivateClustersServer) Create(ctx context.Context,
 
 	// Get the spec:
 	spec := request.GetObject().GetSpec()
-
-	// The user may have specified the host types of the node sets by name, but we want to save the
-	// identifiers, so we need to look them up:
-	for _, nodeSet := range spec.GetNodeSets() {
-		var hostType *privatev1.HostType
-		hostType, err = s.lookupHostType(ctx, refKey(nodeSet.GetHostType()))
-		if err != nil {
-			return
-		}
-		if hostType != nil {
-			hostTypeRef := &privatev1.HostTypeReference{}
-			hostTypeRef.SetId(hostType.GetId())
-			hostTypeRef.SetName(hostType.GetMetadata().GetName())
-			nodeSet.SetHostType(hostTypeRef)
-		}
-	}
 
 	// Look up bare metal instance types referenced in node sets:
 	for _, nodeSet := range spec.GetNodeSets() {
@@ -695,41 +677,6 @@ func (s *PrivateClustersServer) validatePullSecretSecret(ctx context.Context, sp
 	resolvedRef.SetName(resolved.Name)
 	spec.SetPullSecretSecret(resolvedRef)
 	return nil
-}
-
-func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
-	key string) (result *privatev1.HostType, err error) {
-	if key == "" {
-		return
-	}
-	response, err := s.hostTypesDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		return
-	}
-	switch response.GetTotal() {
-	case 0:
-		err = grpcstatus.Errorf(
-			grpccodes.NotFound,
-			"there is no host type with identifier or name '%s'",
-			key,
-		)
-	case 1:
-		result = response.GetItems()[0]
-	default:
-		err = grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"there are multiple host types with identifier or name '%s'",
-			key,
-		)
-	}
-	return
 }
 
 func (s *PrivateClustersServer) lookupBareMetalInstanceType(ctx context.Context,
@@ -1308,58 +1255,32 @@ func (s *PrivateClustersServer) validateAutoExternalIPImmutability(ctx context.C
 }
 
 // resolveFabricInterfaces populates fabric_interface on each node set by
-// looking up the HostType and selecting the first interface with role "fabric".
+// looking up the BareMetalInstanceType (or legacy HostType) and selecting the first interface with role "fabric".
 func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, spec *privatev1.ClusterSpec) error {
 	for name, nodeSet := range spec.GetNodeSets() {
-		hostTypeKey := refKey(nodeSet.GetHostType())
-		if hostTypeKey != "" {
-			hostType, err := s.lookupHostType(ctx, hostTypeKey)
+		bmitKey := refKey(nodeSet.GetBaremetalInstanceType())
+		if bmitKey != "" {
+			bmit, err := s.lookupBareMetalInstanceType(ctx, bmitKey)
 			if err != nil {
 				return err
 			}
-			if hostType == nil {
+			if bmit == nil {
 				continue
 			}
 			fabricInterface := ""
-			for _, ni := range hostType.GetInterfaces() {
-				if strings.EqualFold(ni.GetRole(), "fabric") {
-					fabricInterface = ni.GetName()
+			for _, port := range bmit.GetSpec().GetHardware().GetNetworkPorts() {
+				if strings.EqualFold(port.GetRole(), "fabric") {
+					fabricInterface = port.GetName()
 					break
 				}
 			}
 			if fabricInterface == "" {
 				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-					"node_sets[%s]: host type '%s' has no interface with role 'fabric'",
-					name, hostTypeKey)
+					"node_sets[%s]: bare metal instance type '%s' has no network port with role 'fabric'",
+					name, bmitKey)
 			}
 			nodeSet.SetFabricInterface(fabricInterface)
-			continue
 		}
-
-		bmitKey := refKey(nodeSet.GetBaremetalInstanceType())
-		if bmitKey == "" {
-			continue
-		}
-		bmit, err := s.lookupBareMetalInstanceType(ctx, bmitKey)
-		if err != nil {
-			return err
-		}
-		if bmit == nil {
-			continue
-		}
-		fabricInterface := ""
-		for _, port := range bmit.GetSpec().GetHardware().GetNetworkPorts() {
-			if strings.EqualFold(port.GetRole(), "fabric") {
-				fabricInterface = port.GetName()
-				break
-			}
-		}
-		if fabricInterface == "" {
-			return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-				"node_sets[%s]: bare metal instance type '%s' has no network port with role 'fabric'",
-				name, bmitKey)
-		}
-		nodeSet.SetFabricInterface(fabricInterface)
 	}
 	return nil
 }
@@ -1499,27 +1420,9 @@ func (s *PrivateClustersServer) validateAndTransformCluster(ctx context.Context,
 		return err
 	}
 
-	// Check that the host types given in the cluster and the template exist, and index them by identifier and
-	// name, so that it will be easier to look them up later.
-	hostTypes, err := s.lookupAndIndexHostTypes(ctx, template)
-	if err != nil {
+	if err := s.processAndValidateNodeSets(ctx, cluster, template); err != nil {
 		return err
 	}
-
-	bmits, err := s.lookupAndIndexBareMetalInstanceTypes(ctx, template)
-	if err != nil {
-		return err
-	}
-
-	// Validate node sets against the template:
-	templateNodeSets := template.GetNodeSets()
-	clusterNodeSets := cluster.GetSpec().GetNodeSets()
-	if err = s.validateNodeSets(clusterNodeSets, templateNodeSets, hostTypes, bmits, templateRefStr); err != nil {
-		return err
-	}
-
-	// Replace the node sets given in the cluster with those from the template, taking only the size from cluster:
-	mergeNodeSetsWithTemplate(cluster, templateNodeSets, clusterNodeSets)
 
 	// Validate template parameters:
 	clusterParameters := cluster.GetSpec().GetTemplateParameters()
@@ -1540,225 +1443,80 @@ func (s *PrivateClustersServer) validateAndTransformCluster(ctx context.Context,
 	resolvedTemplateRef.SetId(template.GetId())
 	resolvedTemplateRef.SetName(template.GetMetadata().GetName())
 	cluster.GetSpec().SetTemplate(resolvedTemplateRef)
-	for _, clusterNodeSet := range cluster.GetSpec().GetNodeSets() {
-		hostType := hostTypes[refKey(clusterNodeSet.GetHostType())]
-		if hostType != nil {
-			resolvedHostTypeRef := &privatev1.HostTypeReference{}
-			resolvedHostTypeRef.SetId(hostType.GetId())
-			resolvedHostTypeRef.SetName(hostType.GetMetadata().GetName())
-			clusterNodeSet.SetHostType(resolvedHostTypeRef)
-		}
-		bmit := bmits[refKey(clusterNodeSet.GetBaremetalInstanceType())]
-		if bmit != nil {
-			resolvedBmitRef := &privatev1.BareMetalInstanceTypeReference{}
-			resolvedBmitRef.SetId(bmit.GetId())
-			resolvedBmitRef.SetName(bmit.GetMetadata().GetName())
-			clusterNodeSet.SetBaremetalInstanceType(resolvedBmitRef)
-		}
-	}
 
 	return nil
 }
 
-// lookupAndIndexHostTypes fetches host types referenced by the template's node sets and indexes them
-// by both identifier and name.
-func (s *PrivateClustersServer) lookupAndIndexHostTypes(
-	ctx context.Context, template *privatev1.ClusterTemplate,
-) (map[string]*privatev1.HostType, error) {
-	hostTypes := map[string]*privatev1.HostType{}
-	for _, nodeSet := range template.GetNodeSets() {
-		hostTypeRef := nodeSet.GetHostType()
-		if hostTypeRef == nil {
-			continue
-		}
-		hostType, err := s.lookupHostType(ctx, refKey(hostTypeRef))
-		if err != nil {
-			return nil, err
-		}
-		hostTypeName := hostType.GetMetadata().GetName()
-		if hostTypeName != "" {
-			hostTypes[hostTypeName] = hostType
-		}
-		hostTypeId := hostType.GetId()
-		hostTypes[hostTypeId] = hostType
-	}
-	return hostTypes, nil
-}
-
-func (s *PrivateClustersServer) lookupAndIndexBareMetalInstanceTypes(
-	ctx context.Context, template *privatev1.ClusterTemplate,
-) (map[string]*privatev1.BareMetalInstanceType, error) {
-	bmits := map[string]*privatev1.BareMetalInstanceType{}
-	for _, nodeSet := range template.GetNodeSets() {
-		bmitRef := nodeSet.GetBaremetalInstanceType()
-		if bmitRef == nil {
-			continue
-		}
-		bmit, err := s.lookupBareMetalInstanceType(ctx, refKey(bmitRef))
-		if err != nil {
-			return nil, err
-		}
-		bmitName := bmit.GetMetadata().GetName()
-		if bmitName != "" {
-			bmits[bmitName] = bmit
-		}
-		bmitId := bmit.GetId()
-		bmits[bmitId] = bmit
-	}
-	return bmits, nil
-}
-
-func (s *PrivateClustersServer) validateNodeSets(
-	clusterNodeSets map[string]*privatev1.ClusterNodeSet,
-	templateNodeSets map[string]*privatev1.ClusterTemplateNodeSet,
-	hostTypes map[string]*privatev1.HostType,
-	bmits map[string]*privatev1.BareMetalInstanceType,
-	templateRef string,
+// processAndValidateNodeSets handles node set merging, validation, and BareMetalInstanceType resolution.
+// NodeSets belong to the Cluster/ClusterOrder, not the template. If user provides node sets, they are
+// validated directly by BareMetalInstanceType, not against the template.
+func (s *PrivateClustersServer) processAndValidateNodeSets(
+	ctx context.Context,
+	cluster *privatev1.Cluster,
+	template *privatev1.ClusterTemplate,
 ) error {
-	// Check that all the node sets given in the cluster correspond to node sets that exist in the template:
-	for clusterNodeSetKey := range clusterNodeSets {
-		templateNodeSet := templateNodeSets[clusterNodeSetKey]
-		if templateNodeSet == nil {
-			templateNodeSetKeys := maps.Keys(templateNodeSets)
-			sort.Strings(templateNodeSetKeys)
-			for i, templateNodeSetKey := range templateNodeSetKeys {
-				templateNodeSetKeys[i] = fmt.Sprintf("'%s'", templateNodeSetKey)
-			}
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"node set '%s' doesn't exist, valid values for template '%s' are %s",
-				clusterNodeSetKey, templateRef, english.WordSeries(templateNodeSetKeys, "and"),
-			)
+	templateNodeSets := template.GetNodeSets()
+	clusterNodeSets := cluster.GetSpec().GetNodeSets()
+
+	actualNodeSets := map[string]*privatev1.ClusterNodeSet{}
+	// 1. User-provided node sets take precedence:
+	for key, clusterNodeSet := range clusterNodeSets {
+		bmit := clusterNodeSet.GetBaremetalInstanceType()
+		ht := clusterNodeSet.GetHostType()
+		if bmit == nil && templateNodeSets[key] != nil {
+			bmit = templateNodeSets[key].GetBaremetalInstanceType()
+		}
+		if ht == nil && templateNodeSets[key] != nil {
+			ht = templateNodeSets[key].GetHostType()
+		}
+		actualNodeSets[key] = privatev1.ClusterNodeSet_builder{
+			HostType:              ht,
+			BaremetalInstanceType: bmit,
+			Size:                  clusterNodeSet.GetSize(),
+		}.Build()
+	}
+	// 2. For any template node sets not specified by user, inherit template defaults (if any):
+	for key, templateNodeSet := range templateNodeSets {
+		if _, exists := actualNodeSets[key]; !exists {
+			actualNodeSets[key] = privatev1.ClusterNodeSet_builder{
+				HostType:              templateNodeSet.GetHostType(),
+				BaremetalInstanceType: templateNodeSet.GetBaremetalInstanceType(),
+				Size:                  templateNodeSet.GetSize(),
+			}.Build()
 		}
 	}
+	cluster.GetSpec().SetNodeSets(actualNodeSets)
 
-	// Check that all the node sets given in the cluster specify the same host type that is specified in the
-	// template:
-	for clusterNodeSetKey, clusterNodeSet := range clusterNodeSets {
-		clusterHostTypeRef := clusterNodeSet.GetHostType()
-		clusterHostTypeKey := refKey(clusterHostTypeRef)
-		if clusterHostTypeKey == "" {
-			continue
-		}
-		templateNodeSet := templateNodeSets[clusterNodeSetKey]
-		templateHostTypeRef := templateNodeSet.GetHostType()
-		templateHostType := hostTypes[refKey(templateHostTypeRef)]
-		templateHostTypeId := templateHostType.GetId()
-		templateHostTypeName := templateHostType.GetMetadata().GetName()
-		if templateHostTypeName != "" {
-			if clusterHostTypeKey != templateHostTypeId && clusterHostTypeKey != templateHostTypeName {
-				return grpcstatus.Errorf(
-					grpccodes.InvalidArgument,
-					"host type for node set '%s' should be empty, '%s' or '%s', like in template '%s', "+
-						"but it is '%s'",
-					clusterNodeSetKey,
-					templateHostTypeName,
-					templateHostTypeId,
-					templateRef,
-					clusterHostTypeKey,
-				)
-			}
-		} else {
-			if clusterHostTypeKey != templateHostTypeId {
-				return grpcstatus.Errorf(
-					grpccodes.InvalidArgument,
-					"host type for node set '%s' should be empty or '%s', like in template '%s', "+
-						"but it is '%s'",
-					clusterNodeSetKey,
-					templateHostTypeId,
-					templateRef,
-					clusterHostTypeKey,
-				)
-			}
-		}
+	mergedNodeSets := cluster.GetSpec().GetNodeSets()
+	if len(mergedNodeSets) == 0 {
+		return grpcstatus.Errorf(
+			grpccodes.InvalidArgument,
+			"clusters must have at least one node set",
+		)
 	}
 
-	// Check BareMetalInstanceType consistency between cluster and template node sets:
-	for clusterNodeSetKey, clusterNodeSet := range clusterNodeSets {
-		clusterBmitRef := clusterNodeSet.GetBaremetalInstanceType()
-		clusterBmitKey := refKey(clusterBmitRef)
-		if clusterBmitKey == "" {
-			continue
-		}
-		templateNodeSet := templateNodeSets[clusterNodeSetKey]
-		templateBmitRef := templateNodeSet.GetBaremetalInstanceType()
-		templateBmit := bmits[refKey(templateBmitRef)]
-		if templateBmit == nil {
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"baremetal_instance_type for node set '%s' should be empty, like in template '%s', "+
-					"but it is '%s'",
-				clusterNodeSetKey, templateRef, clusterBmitKey,
-			)
-		}
-		templateBmitId := templateBmit.GetId()
-		templateBmitName := templateBmit.GetMetadata().GetName()
-		if templateBmitName != "" {
-			if clusterBmitKey != templateBmitId && clusterBmitKey != templateBmitName {
-				return grpcstatus.Errorf(
-					grpccodes.InvalidArgument,
-					"baremetal_instance_type for node set '%s' should be empty, '%s' or '%s', like in template '%s', "+
-						"but it is '%s'",
-					clusterNodeSetKey,
-					templateBmitName,
-					templateBmitId,
-					templateRef,
-					clusterBmitKey,
-				)
-			}
-		} else {
-			if clusterBmitKey != templateBmitId {
-				return grpcstatus.Errorf(
-					grpccodes.InvalidArgument,
-					"baremetal_instance_type for node set '%s' should be empty or '%s', like in template '%s', "+
-						"but it is '%s'",
-					clusterNodeSetKey,
-					templateBmitId,
-					templateRef,
-					clusterBmitKey,
-				)
-			}
-		}
-	}
-
-	// Check that all the node sets given in the cluster have a positive size:
-	for clusterNodeSetKey, clusterNodeSet := range clusterNodeSets {
-		clusterNodeSetSize := clusterNodeSet.GetSize()
-		if clusterNodeSetSize <= 0 {
+	// 3. Validate that each node set has size > 0 and resolve BareMetalInstanceType:
+	for name, nodeSet := range mergedNodeSets {
+		if nodeSet.GetSize() <= 0 {
 			return grpcstatus.Errorf(
 				grpccodes.InvalidArgument,
 				"size for node set '%s' should be greater than zero, but it is %d",
-				clusterNodeSetKey, clusterNodeSetSize,
+				name, nodeSet.GetSize(),
 			)
 		}
-	}
-
-	return nil
-}
-
-// mergeNodeSetsWithTemplate replaces the cluster's node sets with template-derived sets, keeping only
-// the size from the cluster.
-func mergeNodeSetsWithTemplate(
-	cluster *privatev1.Cluster,
-	templateNodeSets map[string]*privatev1.ClusterTemplateNodeSet,
-	clusterNodeSets map[string]*privatev1.ClusterNodeSet,
-) {
-	actualNodeSets := map[string]*privatev1.ClusterNodeSet{}
-	for templateNodeSetKey, templateNodeSet := range templateNodeSets {
-		var actualNodeSetSize int32
-		clusterNodeSet := clusterNodeSets[templateNodeSetKey]
-		if clusterNodeSet != nil {
-			actualNodeSetSize = clusterNodeSet.GetSize()
-		} else {
-			actualNodeSetSize = templateNodeSet.GetSize()
+		bmitKey := refKey(nodeSet.GetBaremetalInstanceType())
+		if bmitKey != "" {
+			bmit, err := s.lookupBareMetalInstanceType(ctx, bmitKey)
+			if err != nil {
+				return err
+			}
+			resolvedBmitRef := &privatev1.BareMetalInstanceTypeReference{}
+			resolvedBmitRef.SetId(bmit.GetId())
+			resolvedBmitRef.SetName(bmit.GetMetadata().GetName())
+			nodeSet.SetBaremetalInstanceType(resolvedBmitRef)
 		}
-		actualNodeSets[templateNodeSetKey] = privatev1.ClusterNodeSet_builder{
-			HostType:              templateNodeSet.GetHostType(),
-			BaremetalInstanceType: templateNodeSet.GetBaremetalInstanceType(),
-			Size:                  actualNodeSetSize,
-		}.Build()
 	}
-	cluster.GetSpec().SetNodeSets(actualNodeSets)
+	return nil
 }
 
 func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Context, cluster *privatev1.Cluster) error {
@@ -1825,23 +1583,9 @@ func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Cont
 		return err
 	}
 
-	hostTypes, err := s.lookupAndIndexHostTypes(ctx, template)
-	if err != nil {
+	if err := s.processAndValidateNodeSets(ctx, cluster, template); err != nil {
 		return err
 	}
-
-	bmits, err := s.lookupAndIndexBareMetalInstanceTypes(ctx, template)
-	if err != nil {
-		return err
-	}
-
-	templateNodeSets := template.GetNodeSets()
-	clusterNodeSets := cluster.GetSpec().GetNodeSets()
-	if err := s.validateNodeSets(clusterNodeSets, templateNodeSets, hostTypes, bmits, templateRefStr); err != nil {
-		return err
-	}
-
-	mergeNodeSetsWithTemplate(cluster, templateNodeSets, clusterNodeSets)
 
 	clusterParameters := cluster.GetSpec().GetTemplateParameters()
 	if err := utils.ValidateClusterTemplateParameters(template, clusterParameters); err != nil {
@@ -1853,23 +1597,6 @@ func (s *PrivateClustersServer) validateAndTransformCatalogItem(ctx context.Cont
 		clusterParameters,
 	)
 	cluster.GetSpec().SetTemplateParameters(actualClusterParameters)
-
-	for _, clusterNodeSet := range cluster.GetSpec().GetNodeSets() {
-		hostType := hostTypes[refKey(clusterNodeSet.GetHostType())]
-		if hostType != nil {
-			resolvedHostTypeRef := &privatev1.HostTypeReference{}
-			resolvedHostTypeRef.SetId(hostType.GetId())
-			resolvedHostTypeRef.SetName(hostType.GetMetadata().GetName())
-			clusterNodeSet.SetHostType(resolvedHostTypeRef)
-		}
-		bmit := bmits[refKey(clusterNodeSet.GetBaremetalInstanceType())]
-		if bmit != nil {
-			resolvedBmitRef := &privatev1.BareMetalInstanceTypeReference{}
-			resolvedBmitRef.SetId(bmit.GetId())
-			resolvedBmitRef.SetName(bmit.GetMetadata().GetName())
-			clusterNodeSet.SetBaremetalInstanceType(resolvedBmitRef)
-		}
-	}
 
 	return nil
 }
