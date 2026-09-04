@@ -773,7 +773,12 @@ func (s *PrivateClustersServer) lookupBareMetalInstanceType(ctx context.Context,
 func (s *PrivateClustersServer) ensureClusterVersion(ctx context.Context, cluster *privatev1.Cluster) error {
 	versionRef := cluster.GetSpec().GetVersion()
 	if versionRef != nil && versionRef.GetName() != "" {
-		return lookupAndValidateClusterVersion(ctx, s.logger, s.clusterVersionsDao, versionRef.GetName())
+		cv, err := lookupAndValidateClusterVersion(ctx, s.logger, s.clusterVersionsDao, versionRef.GetName())
+		if err != nil {
+			return err
+		}
+		cluster.GetSpec().SetVersion(buildClusterVersionReference(cv))
+		return nil
 	}
 	ref, err := resolveDefaultClusterVersion(ctx, s.logger, s.clusterVersionsDao)
 	if err != nil {

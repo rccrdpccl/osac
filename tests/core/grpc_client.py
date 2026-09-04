@@ -420,21 +420,25 @@ class GRPCClient:
         *,
         version: str,
         image: str,
+        disk_image: str | None = None,
         enabled: bool = True,
         is_default: bool = False,
         state: str = "CLUSTER_VERSION_STATE_ACTIVE",
     ) -> dict[str, str]:
+        spec: dict[str, Any] = {
+            "version": version,
+            "image": image,
+            "enabled": enabled,
+            "is_default": is_default,
+            "state": state,
+        }
+        if disk_image is not None:
+            spec["disk_image"] = {"id": disk_image}
         response: dict[str, Any] = self.call(
             service=f"{PRIVATE_API}.ClusterVersions/Create",
             data={
                 "object": {
-                    "spec": {
-                        "version": version,
-                        "image": image,
-                        "enabled": enabled,
-                        "is_default": is_default,
-                        "state": state,
-                    }
+                    "spec": spec
                 }
             },
         )
@@ -462,12 +466,14 @@ class GRPCClient:
     def delete_cluster_version(self, *, version_id: str) -> None:
         self.call(service=f"{PRIVATE_API}.ClusterVersions/Delete", data={"id": version_id})
 
-    def ensure_cluster_version(self, *, version: str, image: str) -> dict[str, str]:
+    def ensure_cluster_version(
+        self, *, version: str, image: str, disk_image: str | None = None
+    ) -> dict[str, str]:
         """Create a ClusterVersion, tolerating AlreadyExists left behind by a prior failed run.
 
         Returns {"id": ..., "name": ...} for the resolved ClusterVersion."""
         try:
-            return self.create_cluster_version(version=version, image=image)
+            return self.create_cluster_version(version=version, image=image, disk_image=disk_image)
         except subprocess.CalledProcessError as e:
             output = (e.stdout or "") + (e.stderr or "")
             if not re.search(r"Code:\s*AlreadyExists", output):
@@ -477,6 +483,20 @@ class GRPCClient:
             if item.get("spec", {}).get("version") == version:
                 return {"id": item["id"], "name": item["metadata"]["name"]}
         raise RuntimeError(f"Cluster version '{version}' reported AlreadyExists but not found in list")
+
+    def ensure_disk_image(self, *, name: str, source_ref: str) -> str:
+        """Create a DiskImage, tolerating AlreadyExists left behind by a prior run."""
+        try:
+            return self.create_disk_image(name=name, source_ref=source_ref)
+        except subprocess.CalledProcessError as e:
+            output = (e.stdout or "") + (e.stderr or "")
+            if not re.search(r"Code:\s*AlreadyExists", output):
+                raise RuntimeError(f"Failed to create disk image '{name}': {output}") from e
+        response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.DiskImages/List")
+        for item in response.get("items", []):
+            if item.get("metadata", {}).get("name") == name:
+                return item["id"]
+        raise RuntimeError(f"DiskImage '{name}' reported AlreadyExists but not found in list")
 
     # BareMetalInstance operations (public API)
 

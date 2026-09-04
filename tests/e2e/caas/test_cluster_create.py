@@ -20,29 +20,41 @@ from tests.core.helpers import (
 from tests.core.k8s_client import K8sClient
 from tests.core.metering import MeteringCollector
 from tests.core.osac_cli import OsacCLI
-from tests.core.runner import poll_until, run
+from tests.core.runner import env, poll_until, run
 
 # Real OCP release image used to provision the ClusterVersion(s) created by these
 # tests. Fixed (not randomly generated) so repeated runs reuse the same
 # ClusterVersion via GRPCClient.ensure_cluster_version instead of accumulating
 # duplicates on the shared cluster.
-TEST_RELEASE_IMAGE = "quay.io/openshift-release-dev/ocp-release:4.20.0-multi"
+TEST_RELEASE_IMAGE = env(
+    "OSAC_TEST_RELEASE_IMAGE", "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
+)
+RHCOS_IMAGE = env("OSAC_RHCOS_BMI_IMAGE", "quay.io/rh_ee_rpiccoli/rhcos-bmi:4.22.0")
 
 
 @pytest.mark.metering
 def test_cluster_create(
     cli: OsacCLI,
     grpc: GRPCClient,
+    private_grpc: GRPCClient,
     k8s_hub_client: K8sClient,
     cluster_template: str,
     pull_secret_path: str,
     ssh_public_key_path: str,
     metering: MeteringCollector,
 ) -> None:
+    disk_image_id = private_grpc.ensure_disk_image(name="rhcos-4-22", source_ref=RHCOS_IMAGE)
+    version = private_grpc.ensure_cluster_version(
+        version="4.22.0-rhcos",
+        image=TEST_RELEASE_IMAGE,
+        disk_image=disk_image_id,
+    )
+
     name = unique_name("e2e-cluster")
     uuid = cli.create_cluster(
         name=name,
         template=cluster_template,
+        version=version["name"],
         template_parameter_files={"pull_secret": pull_secret_path},
         template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
     )
@@ -59,10 +71,11 @@ def test_cluster_create(
         wait_for_cluster_ready(k8s=k8s_hub_client, name=co_name)
 
         # Verify version resolved and propagated end-to-end:
-        # fulfillment-service default resolution -> ClusterOrder releaseImage -> HostedCluster image
+        # fulfillment-service version resolution -> ClusterOrder releaseImage -> HostedCluster image
         cluster = grpc.get_cluster(cluster_id=uuid)
         version_name = cluster.get("object", {}).get("spec", {}).get("version", {}).get("name", "")
         assert version_name, "Cluster should have a resolved version name"
+        assert version_name == version["name"]
 
         co_release_image = k8s_hub_client.get_cluster_order_spec(name=co_name).get("releaseImage", "")
         assert co_release_image, "ClusterOrder should have a resolved releaseImage"
