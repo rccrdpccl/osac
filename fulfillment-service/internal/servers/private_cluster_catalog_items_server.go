@@ -201,7 +201,8 @@ func (s *PrivateClusterCatalogItemsServer) validateFieldDefinitionsVersion(
 	if versionName == "" {
 		return nil
 	}
-	return lookupAndValidateClusterVersion(ctx, s.logger, s.clusterVersionsDao, versionName)
+	_, err := lookupAndValidateClusterVersion(ctx, s.logger, s.clusterVersionsDao, versionName)
+	return err
 }
 
 func (s *PrivateClusterCatalogItemsServer) Delete(ctx context.Context,

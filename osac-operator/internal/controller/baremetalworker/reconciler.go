@@ -448,6 +448,23 @@ func (r *Reconciler) ensurePullSecret(ctx context.Context, co *v1alpha1.ClusterO
 	return nil
 }
 
+// resolveSSHPublicKey extracts the SSH public key from co.Spec.SSHPublicKey,
+// falling back to co.Spec.TemplateParameters["ssh_public_key"] if unset.
+func (r *Reconciler) resolveSSHPublicKey(co *v1alpha1.ClusterOrder) string {
+	if co.Spec.SSHPublicKey != "" {
+		return co.Spec.SSHPublicKey
+	}
+	if co.Spec.TemplateParameters != "" {
+		var params map[string]interface{}
+		if err := json.Unmarshal([]byte(co.Spec.TemplateParameters), &params); err == nil {
+			if key, ok := params["ssh_public_key"].(string); ok && key != "" {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
 // buildInfraEnv constructs the (unstructured) InfraEnv object: late binding (no clusterRef),
 // owned by the ClusterOrder, referencing the cluster pull secret and SSH key.
 func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name string) (*unstructured.Unstructured, error) {
@@ -462,8 +479,8 @@ func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name string) (*uns
 	spec := map[string]interface{}{
 		"pullSecretRef": map[string]interface{}{"name": co.Name + pullSecretNameSuffix},
 	}
-	if co.Spec.SSHPublicKey != "" {
-		spec["sshAuthorizedKey"] = co.Spec.SSHPublicKey
+	if sshKey := r.resolveSSHPublicKey(co); sshKey != "" {
+		spec["sshAuthorizedKey"] = sshKey
 	}
 	if err := unstructured.SetNestedMap(infraEnv.Object, spec, "spec"); err != nil {
 		return nil, fmt.Errorf("building infraenv spec: %w", err)
@@ -1057,6 +1074,19 @@ func (r *Reconciler) buildBMICreateRequest(
 		}.Build(),
 	}
 
+	specBuilder := privatev1.BareMetalInstanceSpec_builder{
+		CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
+			Name: systemCatalogItemName,
+		}.Build(),
+		Image:              image,
+		UserData:           &ignitionRaw,
+		InstanceType:       nodeSet.BareMetal.InstanceType,
+		NetworkAttachments: netAttachments,
+	}
+	if sshKey := r.resolveSSHPublicKey(co); sshKey != "" {
+		specBuilder.SshPublicKey = &sshKey
+	}
+
 	return privatev1.BareMetalInstance_builder{
 		Metadata: privatev1.Metadata_builder{
 			Tenant:      systemTenant,
@@ -1064,15 +1094,7 @@ func (r *Reconciler) buildBMICreateRequest(
 			Labels:      labels,
 			Annotations: annotations,
 		}.Build(),
-		Spec: privatev1.BareMetalInstanceSpec_builder{
-			CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
-				Name: systemCatalogItemName,
-			}.Build(),
-			Image:              image,
-			UserData:           &ignitionRaw,
-			InstanceType:       nodeSet.BareMetal.InstanceType,
-			NetworkAttachments: netAttachments,
-		}.Build(),
+		Spec: specBuilder.Build(),
 	}.Build()
 }
 
