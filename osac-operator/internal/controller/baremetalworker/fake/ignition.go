@@ -61,7 +61,14 @@ func (s *IgnitionServer) SetContent(b []byte) {
 func (s *IgnitionServer) SetSize(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.content = bytes.Repeat([]byte("a"), n)
+	prefix := []byte(`{"ignition":{"version":"3.2.0"},"padding":"`)
+	suffix := []byte(`"}`)
+	if n <= len(prefix)+len(suffix) {
+		s.content = bytes.Repeat([]byte("a"), n)
+		return
+	}
+	paddingLen := n - len(prefix) - len(suffix)
+	s.content = append(prefix, append(bytes.Repeat([]byte("a"), paddingLen), suffix...)...)
 }
 
 // Close shuts down the endpoint.
