@@ -14,12 +14,16 @@ language governing permissions and limitations under the License.
 package baremetalworker
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
-
 	"errors"
 	"fmt"
+	"io"
 	"time"
+	"unicode/utf8"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -707,7 +711,7 @@ func (r *Reconciler) reconcileWorkers(
 	}
 
 	existingByName := bmisByName(existing)
-	ignitionRaw := string(ignition)
+	ignitionRaw := formatIgnitionUserData(ignition)
 
 	r.handleFailedWorkers(ctx, co, existingByName)
 
@@ -1185,4 +1189,21 @@ func (r *Reconciler) labelToClusterOrderMapper(labelKey string) handler.MapFunc 
 			NamespacedName: client.ObjectKey{Name: coName, Namespace: r.clusterOrderNamespace},
 		}}
 	}
+}
+
+// formatIgnitionUserData ensures discovery ignition bytes are safe for protobuf string fields.
+// If gzipped, it decompresses to raw JSON; otherwise base64-encodes if binary to ensure valid UTF-8.
+func formatIgnitionUserData(ignition []byte) string {
+	if len(ignition) >= 2 && ignition[0] == 0x1f && ignition[1] == 0x8b {
+		if gr, err := gzip.NewReader(bytes.NewReader(ignition)); err == nil {
+			if decompressed, err := io.ReadAll(gr); err == nil && utf8.Valid(decompressed) {
+				return string(decompressed)
+			}
+			_ = gr.Close()
+		}
+	}
+	if utf8.Valid(ignition) {
+		return string(ignition)
+	}
+	return base64.StdEncoding.EncodeToString(ignition)
 }
