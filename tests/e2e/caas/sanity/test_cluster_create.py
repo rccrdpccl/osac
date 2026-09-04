@@ -31,7 +31,7 @@ pytestmark = pytest.mark.sanity
 TEST_RELEASE_IMAGE = env(
     "OSAC_TEST_RELEASE_IMAGE", "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
 )
-RHCOS_IMAGE = env("OSAC_RHCOS_BMI_IMAGE", "quay.io/rh_ee_rpiccoli/rhcos-bmi:4.22.0")
+RHCOS_IMAGE = env("OSAC_RHCOS_BMI_IMAGE", "oci://quay.io/rh_ee_rpiccoli/rhcos-bmi:4.22.0")
 
 
 @pytest.mark.metering
