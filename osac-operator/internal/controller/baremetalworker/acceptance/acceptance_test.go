@@ -169,6 +169,7 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
@@ -378,6 +379,7 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 			},
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID:   "test",
+				PullSecret:   "{\"auths\":{}}",
 				SSHPublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5",
 				NodeRequests: []osacv1alpha1.NodeRequest{{
 					ResourceClass: "bm-standard",
