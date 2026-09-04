@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -370,7 +371,11 @@ func setupClusterControllers(
 	if err := baremetalworker.NewReconciler(
 		localMgr.GetClient(), localMgr.GetAPIReader(), localMgr.GetScheme(),
 		bmwFulfillment,
-		baremetalworker.NewIgnitionFetcher(nil),
+		baremetalworker.NewIgnitionFetcher(&http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // test-only: hub CA not yet mounted
+			},
+		}),
 		localMgr.GetEventRecorder("baremetalworker"),
 		os.Getenv(envClusterOrderNamespace),
 	).SetupWithManager(mgr); err != nil {
