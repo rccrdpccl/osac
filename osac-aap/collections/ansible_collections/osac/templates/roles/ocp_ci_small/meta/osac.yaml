@@ -9,6 +9,7 @@ template_type: cluster
 default_node_request:
 - resourceClass: ci-worker
   numberOfNodes: 1
+  baremetalInstanceType: ci-worker-bm
 
 allowed_resource_classes: []
 

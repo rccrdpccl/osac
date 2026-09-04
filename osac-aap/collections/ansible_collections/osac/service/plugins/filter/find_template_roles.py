@@ -186,10 +186,19 @@ class NodeRequest(Base):
     resource_class: str = pydantic.Field(..., validation_alias="resourceClass")
     number_of_nodes: int = pydantic.Field(...,
                                           validation_alias="numberOfNodes")
+    baremetal_instance_type: str | None = pydantic.Field(
+        None, validation_alias="baremetalInstanceType"
+    )
 
 
 class HostTypeReference(Base):
     """Typed reference to a HostType resource (matches the proto HostTypeReference message)."""
+
+    name: str
+
+
+class BareMetalInstanceTypeReference(Base):
+    """Typed reference to a BareMetalInstanceType resource."""
 
     name: str
 
@@ -199,6 +208,7 @@ class NodeSet(Base):
 
     host_type: HostTypeReference
     size: int
+    baremetal_instance_type: BareMetalInstanceTypeReference | None = None
 
 
 class DiskImageReference(Base):
@@ -350,13 +360,17 @@ class ClusterTemplate(BaseTemplate):
 
     @pydantic.computed_field
     def node_sets(self) -> dict[str, NodeSet] | None:
-        ret = {
-            nr.resource_class: NodeSet(
+        ret = {}
+        for nr in self.default_node_request:
+            ns = NodeSet(
                 host_type=HostTypeReference(name=nr.resource_class),
                 size=nr.number_of_nodes,
             )
-            for nr in self.default_node_request
-        }
+            if nr.baremetal_instance_type:
+                ns.baremetal_instance_type = BareMetalInstanceTypeReference(
+                    name=nr.baremetal_instance_type,
+                )
+            ret[nr.resource_class] = ns
         return ret if ret else None
 
 

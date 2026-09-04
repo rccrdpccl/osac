@@ -422,6 +422,19 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Cluster
 			spec.Network = network
 		}
 	}
+	if clusterSpec.HasNetworkAttachment() {
+		na := clusterSpec.GetNetworkAttachment()
+		cna := &osacv1alpha1.ClusterNetworkAttachment{}
+		if subnet := na.GetSubnet(); subnet != nil {
+			cna.SubnetRef = subnet.GetName()
+		}
+		for _, sg := range na.GetSecurityGroups() {
+			cna.SecurityGroupRefs = append(cna.SecurityGroupRefs, sg.GetName())
+		}
+		if cna.SubnetRef != "" {
+			spec.NetworkAttachment = cna
+		}
+	}
 	return nil
 }
 
