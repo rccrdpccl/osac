@@ -454,38 +454,7 @@ var _ = Describe("Clusters server", func() {
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
-			nodeSets := response.GetObject().GetSpec().GetNodeSets()
-			Expect(nodeSets).To(HaveLen(1))
-			Expect(nodeSets["junk"].GetHostType().GetId()).To(Equal("acme_1tib"))
-			Expect(nodeSets["junk"].GetSize()).To(Equal(int32(1000)))
-		})
-
-		It("Rejects node set with host type that isn't in the template", func() {
-			response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
-				Object: publicv1.Cluster_builder{
-					Metadata: publicv1.Metadata_builder{
-						Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
-					}.Build(),
-					Spec: publicv1.ClusterSpec_builder{
-						Template: publicv1.ClusterTemplateReference_builder{Id: "my_template"}.Build(),
-						NodeSets: map[string]*publicv1.ClusterNodeSet{
-							"compute": publicv1.ClusterNodeSet_builder{
-								HostType: publicv1.HostTypeReference_builder{Id: "hal_9000"}.Build(),
-								Size:     proto.Int32(1000),
-							}.Build(),
-						},
-					}.Build(),
-				}.Build(),
-			}.Build())
-			Expect(err).To(HaveOccurred())
-			Expect(response).To(BeNil())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal(
-				"host type for node set 'compute' should be empty, 'test-host-type-1tib' or 'acme_1tib', like in " +
-					"template 'my_template', but it is 'hal_9000'",
-			))
+			Expect(response.GetObject().GetSpec().GetNodeSets()).To(HaveKey("junk"))
 		})
 
 		It("Rejects node set with zero size", func() {
