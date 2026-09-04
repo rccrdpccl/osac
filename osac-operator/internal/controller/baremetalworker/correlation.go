@@ -239,14 +239,15 @@ func (r *Reconciler) tryCorrelateAgent(
 		return false
 	}
 
-	if err := r.bindAgent(ctx, co, agent, workerName); err != nil {
+	worker := workerByName(workers, workerName)
+	if err := r.bindAgent(ctx, co, agent, worker); err != nil {
 		log.Error(err, "binding agent failed", "agent", agent.GetName(), "worker", workerName)
 		return false
 	}
 
 	setWorkerPhase(workers, workerName, workerPhaseBinding)
-	if w := workerByName(workers, workerName); w != nil {
-		observeCorrelationDuration(tenantOf(co), *w)
+	if worker != nil {
+		observeCorrelationDuration(tenantOf(co), *worker)
 	}
 	log.Info("agent correlated", "agent", agent.GetName(), "worker", workerName)
 	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
@@ -254,11 +255,11 @@ func (r *Reconciler) tryCorrelateAgent(
 	return true
 }
 
-// bindAgent sets the Agent's clusterDeploymentName (late binding) and applies labels for
-// cached lookup and role identification.
+// bindAgent sets the Agent's clusterDeploymentName (late binding), marks it approved,
+// and applies labels for NodePool selection and role identification.
 func (r *Reconciler) bindAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
-	agent *unstructured.Unstructured, workerName string,
+	agent *unstructured.Unstructured, worker *v1alpha1.WorkerStatus,
 ) error {
 	base := agent.DeepCopy()
 
@@ -269,13 +270,25 @@ func (r *Reconciler) bindAgent(
 		return fmt.Errorf("setting agent clusterDeploymentName: %w", err)
 	}
 
+	if err := unstructured.SetNestedField(agent.Object, true, "spec", "approved"); err != nil {
+		return fmt.Errorf("setting agent approved: %w", err)
+	}
+
 	labels := agent.GetLabels()
 	if labels == nil {
 		labels = make(map[string]string)
 	}
+	workerName := ""
+	if worker != nil {
+		workerName = worker.Name
+		if worker.NodeSet != "" {
+			labels["osac.openshift.io/resource_class"] = worker.NodeSet
+		}
+	}
 	labels[workerNameLabel] = workerName
 	labels[agentBareMetalRoleLabel] = "true"
 	labels[clusterOrderLabel] = co.Name
+	labels["osac.openshift.io/clusterorder"] = co.Name
 	agent.SetLabels(labels)
 
 	return r.Patch(ctx, agent, client.MergeFrom(base))
