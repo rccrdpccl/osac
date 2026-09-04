@@ -65,6 +65,7 @@ type function struct {
 	hubCache                            controllers.HubCache
 	bareMetalInstancesClient            privatev1.BareMetalInstancesClient
 	bareMetalInstanceCatalogItemsClient privatev1.BareMetalInstanceCatalogItemsClient
+	bareMetalInstanceTypesClient        privatev1.BareMetalInstanceTypesClient
 	hubsClient                          privatev1.HubsClient
 	maskCalculator                      *masks.Calculator
 }
@@ -120,6 +121,7 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 		logger:                              b.logger,
 		bareMetalInstancesClient:            privatev1.NewBareMetalInstancesClient(b.connection),
 		bareMetalInstanceCatalogItemsClient: privatev1.NewBareMetalInstanceCatalogItemsClient(b.connection),
+		bareMetalInstanceTypesClient:        privatev1.NewBareMetalInstanceTypesClient(b.connection),
 		hubsClient:                          privatev1.NewHubsClient(b.connection),
 		hubCache:                            b.hubCache,
 		maskCalculator:                      masks.NewCalculator().Build(),
@@ -623,6 +625,24 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 	object.Spec.TemplateParameters = ""
 	object.Spec.RunStrategy = bmfov1alpha1.RunStrategyUnspecified
 	object.Spec.RestartTrigger = t.bareMetalInstance.GetSpec().GetRestartTrigger()
+
+	if object.Spec.Selector.HostSelector == nil {
+		object.Spec.Selector.HostSelector = make(map[string]string)
+	}
+	instanceTypeName := t.bareMetalInstance.GetSpec().GetInstanceType()
+	if instanceTypeName != "" {
+		instanceTypeResp, err := t.r.bareMetalInstanceTypesClient.Get(ctx, privatev1.BareMetalInstanceTypesGetRequest_builder{
+			Id: instanceTypeName,
+		}.Build())
+		if err == nil && instanceTypeResp.GetObject().GetSpec().HasHostLabelSelector() {
+			for key, value := range instanceTypeResp.GetObject().GetSpec().GetHostLabelSelector().GetMatchLabels() {
+				object.Spec.Selector.HostSelector[key] = value
+			}
+		}
+	}
+	if len(object.Spec.Selector.HostSelector) == 0 {
+		object.Spec.Selector.HostSelector["osac.openshift.io/host-type"] = "default"
+	}
 
 	params := map[string]any{}
 
