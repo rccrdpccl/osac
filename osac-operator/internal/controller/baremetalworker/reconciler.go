@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -73,6 +74,7 @@ const (
 	systemCatalogItemName        = "system-bmi-passthrough"
 	systemBMITemplateID          = "osac.templates.bm_host_provisioning"
 	clusterOrderLabel            = "osac.openshift.io/cluster-order"
+	infraEnvAgentLabel           = "infraenvs.agent-install.openshift.io"
 	ownerReferenceAnnotation     = "osac.openshift.io/owner-reference"
 	reasonFulfillmentUnavailable = "FulfillmentServiceUnavailable"
 	reasonFulfillmentAvailable   = "FulfillmentServiceAvailable"
@@ -1153,7 +1155,7 @@ func (r *Reconciler) SetupWithManager(mgr mcmanager.Manager) error {
 	if crdExists(mgr, agentGVK) {
 		agentObj := &unstructured.Unstructured{}
 		agentObj.SetGroupVersionKind(agentGVK)
-		bld = bld.Watches(agentObj, handler.EnqueueRequestsFromMapFunc(r.labelToClusterOrderMapper(clusterOrderLabel)))
+		bld = bld.Watches(agentObj, handler.EnqueueRequestsFromMapFunc(r.agentToClusterOrderMapper()))
 		log.Info("watching Agent CRs for MAC correlation")
 	} else {
 		log.Info("Agent CRD not found, skipping Agent watch")
@@ -1195,6 +1197,27 @@ func crdExists(mgr mcmanager.Manager, gvk schema.GroupVersionKind) bool {
 	mapper := localMgr.GetRESTMapper()
 	_, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	return err == nil
+}
+
+// agentToClusterOrderMapper maps Agent events to ClusterOrder reconcile requests.
+// Unbound agents carry infraenvs.agent-install.openshift.io: <order>-infraenv,
+// while bound agents carry clusterOrderLabel.
+func (r *Reconciler) agentToClusterOrderMapper() handler.MapFunc {
+	return func(_ context.Context, obj client.Object) []ctrl.Request {
+		labels := obj.GetLabels()
+		if coName := labels[clusterOrderLabel]; coName != "" {
+			return []ctrl.Request{{
+				NamespacedName: client.ObjectKey{Name: coName, Namespace: r.clusterOrderNamespace},
+			}}
+		}
+		if infraEnv := labels[infraEnvAgentLabel]; infraEnv != "" {
+			coName := strings.TrimSuffix(infraEnv, infraEnvNameSuffix)
+			return []ctrl.Request{{
+				NamespacedName: client.ObjectKey{Name: coName, Namespace: r.clusterOrderNamespace},
+			}}
+		}
+		return nil
+	}
 }
 
 // labelToClusterOrderMapper returns a MapFunc that maps events to ClusterOrder reconcile
