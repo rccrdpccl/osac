@@ -548,20 +548,27 @@ class GRPCClient:
         *,
         name: str,
         cores: int = 4,
+        threads_per_core: int = 1,
         memory_gb: int = 16,
         architecture: str = "ARCHITECTURE_AMD64",
+        network_ports: list[dict[str, Any]] | None = None,
         host_label_selector: dict[str, str] | None = None,
         description: str = "CI bare-metal worker profile",
         tenant: str = "shared",
     ) -> str:
         """Create a BareMetalInstanceType via the private API."""
         selector = host_label_selector or {"osac.openshift.io/host-type": "default"}
+        ports = network_ports or [
+            {"name": "ens5", "role": "fabric", "type": "Ethernet", "speed": "10Gbps"},
+            {"name": "ens4", "role": "management", "type": "Ethernet", "speed": "10Gbps"},
+        ]
         obj: dict[str, Any] = {
             "metadata": {"name": name, "tenant": tenant},
             "spec": {
                 "hardware": {
-                    "cpu": {"cores": cores, "architecture": architecture},
+                    "cpu": {"cores": cores, "threads_per_core": threads_per_core, "architecture": architecture},
                     "memory": {"total_gb": memory_gb},
+                    "network_ports": ports,
                 },
                 "description": description,
                 "host_label_selector": {"match_labels": selector},
@@ -577,8 +584,10 @@ class GRPCClient:
         *,
         name: str,
         cores: int = 4,
+        threads_per_core: int = 1,
         memory_gb: int = 16,
         architecture: str = "ARCHITECTURE_AMD64",
+        network_ports: list[dict[str, Any]] | None = None,
         host_label_selector: dict[str, str] | None = None,
         description: str = "CI bare-metal worker profile",
         tenant: str = "shared",
@@ -588,8 +597,10 @@ class GRPCClient:
             return self.create_bare_metal_instance_type(
                 name=name,
                 cores=cores,
+                threads_per_core=threads_per_core,
                 memory_gb=memory_gb,
                 architecture=architecture,
+                network_ports=network_ports,
                 host_label_selector=host_label_selector,
                 description=description,
                 tenant=tenant,
