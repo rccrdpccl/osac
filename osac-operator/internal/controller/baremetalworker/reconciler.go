@@ -229,16 +229,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder: %w", err)
 	}
 
-	teardownWorkers := co.Status.Workers
-	teardownWorkers = r.handleUnbindingWorkers(ctx, co, teardownWorkers)
-	teardownWorkers = r.handleDeletingWorkers(ctx, co, teardownWorkers)
-	if !workerSlicesEqual(co.Status.Workers, teardownWorkers) {
-		if err := r.updateWorkerStatus(ctx, co, teardownWorkers); err != nil {
-			return ctrl.Result{}, fmt.Errorf("updating worker status after teardown: %w", err)
-		}
-		if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
-			return ctrl.Result{}, fmt.Errorf("re-reading ClusterOrder after teardown: %w", err)
-		}
+	if err := r.processTeardownWorkers(ctx, co, req.NamespacedName); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	workers, res, err := r.correlateAgents(ctx, co, co.Status.Workers)
@@ -262,6 +254,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 	return npRes, nil
+}
+
+func (r *Reconciler) processTeardownWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, key client.ObjectKey) error {
+	teardownWorkers := co.Status.Workers
+	teardownWorkers = r.handleUnbindingWorkers(ctx, co, teardownWorkers)
+	teardownWorkers = r.handleDeletingWorkers(ctx, co, teardownWorkers)
+	if !workerSlicesEqual(co.Status.Workers, teardownWorkers) {
+		if err := r.updateWorkerStatus(ctx, co, teardownWorkers); err != nil {
+			return fmt.Errorf("updating worker status after teardown: %w", err)
+		}
+		if err := r.apiReader.Get(ctx, key, co); err != nil {
+			return fmt.Errorf("re-reading ClusterOrder after teardown: %w", err)
+		}
+	}
+	return nil
 }
 
 func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
@@ -765,22 +772,23 @@ func (r *Reconciler) reconcileNodeSets(
 	var workers []v1alpha1.WorkerStatus
 	globalIndex := 0
 
-	if co.Spec.NetworkAttachment == nil {
-		return nil, ctrl.Result{}, fmt.Errorf("ClusterOrder %s has no networkAttachment", co.Name)
-	}
-
 	for i := range co.Spec.NodeRequests {
 		nr := &co.Spec.NodeRequests[i]
 		if !nr.IsBareMetal() {
 			continue
 		}
 
-		fabricInterface, res, err := r.resolveFabricInterfaceForNodeSet(ctx, co, nr.BareMetal.InstanceType)
-		if err != nil {
-			return nil, ctrl.Result{}, err
-		}
-		if !res.IsZero() {
-			return nil, res, nil
+		var fabricInterface string
+		if co.Spec.NetworkAttachment != nil && co.Spec.NetworkAttachment.SubnetRef != "" {
+			var res ctrl.Result
+			var err error
+			fabricInterface, res, err = r.resolveFabricInterfaceForNodeSet(ctx, co, nr.BareMetal.InstanceType)
+			if err != nil {
+				return nil, ctrl.Result{}, err
+			}
+			if !res.IsZero() {
+				return nil, res, nil
+			}
 		}
 
 		for j := 0; j < nr.NumberOfNodes; j++ {
@@ -1061,19 +1069,21 @@ func (r *Reconciler) buildBMICreateRequest(
 	labels := map[string]string{clusterOrderLabel: co.Name}
 	annotations := map[string]string{ownerReferenceAnnotation: fmt.Sprintf("ClusterOrder/%s", co.Name)}
 
-	na := co.Spec.NetworkAttachment
-	sgRefs := make([]*privatev1.SecurityGroupLocalReference, 0, len(na.SecurityGroupRefs))
-	for _, sg := range na.SecurityGroupRefs {
-		sgRefs = append(sgRefs, privatev1.SecurityGroupLocalReference_builder{Name: sg}.Build())
-	}
-	primary := true
-	netAttachments := []*privatev1.BareMetalNetworkAttachment{
-		privatev1.BareMetalNetworkAttachment_builder{
-			Subnet:         privatev1.SubnetLocalReference_builder{Name: na.SubnetRef}.Build(),
-			SecurityGroups: sgRefs,
-			Interface:      &fabricInterface,
-			Primary:        &primary,
-		}.Build(),
+	var netAttachments []*privatev1.BareMetalNetworkAttachment
+	if na := co.Spec.NetworkAttachment; na != nil && na.SubnetRef != "" {
+		sgRefs := make([]*privatev1.SecurityGroupLocalReference, 0, len(na.SecurityGroupRefs))
+		for _, sg := range na.SecurityGroupRefs {
+			sgRefs = append(sgRefs, privatev1.SecurityGroupLocalReference_builder{Name: sg}.Build())
+		}
+		primary := true
+		netAttachments = []*privatev1.BareMetalNetworkAttachment{
+			privatev1.BareMetalNetworkAttachment_builder{
+				Subnet:         privatev1.SubnetLocalReference_builder{Name: na.SubnetRef}.Build(),
+				SecurityGroups: sgRefs,
+				Interface:      &fabricInterface,
+				Primary:        &primary,
+			}.Build(),
+		}
 	}
 
 	specBuilder := privatev1.BareMetalInstanceSpec_builder{
