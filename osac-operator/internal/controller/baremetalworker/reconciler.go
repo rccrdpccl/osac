@@ -157,7 +157,7 @@ func (r *Reconciler) SetMACResolver(resolver MACResolver) {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents,verbs=get;list;watch;patch;delete
-// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=nodepools,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=nodepools,verbs=get;list;watch;patch;update
 
 // Reconcile ensures the InfraEnv for a bare-metal ClusterOrder exists, creates BMIs, correlates
 // registered Agents by MAC, and converges NodePool replicas.
