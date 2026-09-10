@@ -121,9 +121,9 @@
         'apiVersion': 'hypershift.openshift.io/v1beta1',
         'kind': 'NodePool',
         'metadata': {
-          'name': nodepool_prefix + '-' + item.resourceClass,
+          'name': nodepool_prefix + '-' + (item.resourceClass | default(item.bareMetal.instanceType if (item.bareMetal is defined and item.bareMetal.instanceType is defined) else 'default')),
           'namespace': hosted_cluster_namespace,
-          'labels': {agent_resource_class_label: item.resourceClass} | combine(hosted_cluster_default_cluster_order_label)
+          'labels': {agent_resource_class_label: (item.resourceClass | default(item.bareMetal.instanceType if (item.bareMetal is defined and item.bareMetal.instanceType is defined) else 'default'))} | combine(hosted_cluster_default_cluster_order_label)
         },
         'spec': {
           'clusterName': hosted_cluster_name,
@@ -136,7 +136,7 @@
             'type': 'Agent',
             'agent': {
               'agentLabelSelector': {
-                'matchLabels': {agent_resource_class_label: item.resourceClass} | combine(hosted_cluster_default_cluster_order_label)
+                'matchLabels': {agent_resource_class_label: (item.resourceClass | default(item.bareMetal.instanceType if (item.bareMetal is defined and item.bareMetal.instanceType is defined) else 'default'))} | combine(hosted_cluster_default_cluster_order_label)
               }
             }
           },
@@ -165,7 +165,10 @@
   block:
     - name: Set requested resource classes
       ansible.builtin.set_fact:
-        hosted_cluster_requested_resource_classes: "{{ hosted_cluster_node_requests | map(attribute='resourceClass') }}"
+        hosted_cluster_requested_resource_classes: >-
+          {{ nodepool_definitions | default([])
+             | map(attribute='metadata.labels.' + agent_resource_class_label)
+             | list }}
 
     - name: Retrieve all currently allocated nodepools
       kubernetes.core.k8s_info:
