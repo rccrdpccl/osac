@@ -166,9 +166,13 @@
     - name: Set requested resource classes
       ansible.builtin.set_fact:
         hosted_cluster_requested_resource_classes: >-
-          {{ nodepool_definitions | default([])
-             | map(attribute='metadata.labels.' + agent_resource_class_label)
-             | list }}
+          {%- set classes = [] -%}
+          {%- for np in (nodepool_definitions | default([])) -%}
+            {%- if np.metadata.labels is defined and agent_resource_class_label in np.metadata.labels -%}
+              {%- set _ = classes.append(np.metadata.labels[agent_resource_class_label]) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ classes }}
 
     - name: Retrieve all currently allocated nodepools
       kubernetes.core.k8s_info:
