@@ -1066,7 +1066,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(calls[1].GetSpec().GetNetworkAttachments()[0].GetInterface()).To(Equal("gpu-data-0"))
 	})
 
-	It("returns an error when networkAttachment is missing from ClusterOrder", func() {
+	It("provisions BMI with empty network_attachments when networkAttachment is omitted from ClusterOrder", func() {
 		preloadDiskImageChain()
 		co := &osacv1alpha1.ClusterOrder{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1092,10 +1092,13 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(sim.MarkInfraEnvReady(ctx, "bmw-no-net-infraenv", testNamespace, ign.URL())).To(Succeed())
 
-		// Second reconcile reaches reconcileWorkers which fails on missing networkAttachment.
+		// Second reconcile provisions worker BMI without networkAttachment.
 		_, err = runReconcile("bmw-no-net")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("no networkAttachment"))
+		Expect(err).ToNot(HaveOccurred())
+
+		calls := fc.CreateCalls()
+		Expect(calls).To(HaveLen(1))
+		Expect(calls[0].GetSpec().GetNetworkAttachments()).To(BeEmpty())
 	})
 })
 
