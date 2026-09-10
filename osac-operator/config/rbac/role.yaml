@@ -100,6 +100,7 @@ rules:
   - get
   - list
   - patch
+  - update
   - watch
 - apiGroups:
   - k8s.ovn.org
