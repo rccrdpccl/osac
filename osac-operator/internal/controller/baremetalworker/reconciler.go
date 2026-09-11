@@ -1086,13 +1086,20 @@ func (r *Reconciler) buildBMICreateRequest(
 		}
 	}
 
+	var instanceType *privatev1.BareMetalInstanceTypeLocalReference
+	if nodeSet.BareMetal.InstanceType != "" {
+		instanceType = privatev1.BareMetalInstanceTypeLocalReference_builder{
+			Name: nodeSet.BareMetal.InstanceType,
+		}.Build()
+	}
+
 	specBuilder := privatev1.BareMetalInstanceSpec_builder{
 		CatalogItem: privatev1.BareMetalInstanceCatalogItemReference_builder{
 			Name: systemCatalogItemName,
 		}.Build(),
 		Image:              image,
 		UserData:           &ignitionRaw,
-		InstanceType:       nodeSet.BareMetal.InstanceType,
+		InstanceType:       instanceType,
 		NetworkAttachments: netAttachments,
 	}
 	if sshKey := r.resolveSSHPublicKey(co); sshKey != "" {

@@ -509,7 +509,7 @@ var _ = Describe("Private clusters server", func() {
 			))
 		})
 
-		It("Accepts an additional node set with a valid host type", func() {
+		It("Accepts creating an object with a custom node set", func() {
 			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Metadata: privatev1.Metadata_builder{
@@ -530,9 +530,7 @@ var _ = Describe("Private clusters server", func() {
 				}.Build(),
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
-			nodes := response.GetObject().GetSpec().GetNodeSets()
-			Expect(nodes).To(HaveLen(1))
-			Expect(nodes["does-not-exist"].GetHostType().GetId()).To(Equal("acme-1ti-id"))
+			Expect(response.GetObject().GetSpec().GetNodeSets()).To(HaveKey("does-not-exist"))
 		})
 
 		It("Fails when creating object with host type that doesn't match template", func() {

@@ -39,7 +39,7 @@ var _ = Describe("Bare-metal worker contract fields (OSAC-4148)", func() {
 				Project: "proj",
 				Shared:  true,
 			}.Build(),
-			Size: 3,
+			Size: proto.Int32(3),
 		}.Build()
 
 		decoded := roundTrip(original, &privatev1.ClusterNodeSet{}).(*privatev1.ClusterNodeSet)
@@ -54,7 +54,7 @@ var _ = Describe("Bare-metal worker contract fields (OSAC-4148)", func() {
 			BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{
 				Name: "bm-standard",
 			}.Build(),
-			Size: 2,
+			Size: proto.Int32(2),
 		}.Build()
 
 		decoded := roundTrip(original, &publicv1.ClusterNodeSet{}).(*publicv1.ClusterNodeSet)
@@ -65,13 +65,15 @@ var _ = Describe("Bare-metal worker contract fields (OSAC-4148)", func() {
 
 	It("round-trips BareMetalInstanceSpec.instance_type on the private API", func() {
 		original := privatev1.BareMetalInstanceSpec_builder{
-			InstanceType: "bm-standard",
+			InstanceType: privatev1.BareMetalInstanceTypeLocalReference_builder{
+				Name: "bm-standard",
+			}.Build(),
 		}.Build()
 
 		decoded := roundTrip(original, &privatev1.BareMetalInstanceSpec{}).(*privatev1.BareMetalInstanceSpec)
 
 		Expect(proto.Equal(original, decoded)).To(BeTrue())
-		Expect(decoded.GetInstanceType()).To(Equal("bm-standard"))
+		Expect(decoded.GetInstanceType().GetName()).To(Equal("bm-standard"))
 	})
 
 	It("round-trips ClusterVersionSpec.disk_image on the private API", func() {
