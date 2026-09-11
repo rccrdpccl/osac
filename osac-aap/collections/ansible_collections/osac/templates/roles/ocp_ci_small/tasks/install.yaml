@@ -27,6 +27,16 @@
     name: "{{ (install_step_pre_install_hook_override | default(install_step_pre_install_hook_default)).name }}"
     tasks_from: "{{ (install_step_pre_install_hook_override | default(install_step_pre_install_hook_default)).tasks_from }}"
 
+- name: Normalize node requests with resourceClass
+  ansible.builtin.set_fact:
+    normalized_node_requests: >-
+      {%- set requests = [] -%}
+      {%- for nr in (cluster_order.spec.nodeRequests | default([])) -%}
+        {%- set rc = nr.resourceClass | default(nr.bareMetal.instanceType if (nr.bareMetal is defined and nr.bareMetal.instanceType is defined) else 'default') -%}
+        {%- set _ = requests.append(nr | combine({'resourceClass': rc})) -%}
+      {%- endfor -%}
+      {{ requests | unique(attribute='resourceClass') }}
+
 - name: Step - Create hosted cluster
   ansible.builtin.include_role:
     name: "{{ (install_step_hosted_cluster_override | default(install_step_hosted_cluster_default)).name }}"
@@ -38,7 +48,7 @@
       ocp_release_image: "{{ ocp_release_image }}"
       pull_secret: "{{ template_parameters.pull_secret }}"
       ssh_public_key: "{{ template_parameters.ssh_public_key }}"
-    hosted_cluster_node_requests: "{{ cluster_order.spec.nodeRequests | unique(attribute='resourceClass') }}"
+    hosted_cluster_node_requests: "{{ normalized_node_requests }}"
     hosted_cluster_state: present
     hosted_cluster_infrastructure_availability_policy: "{{ lookup('env', 'HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY', default='SingleReplica') }}"
 
@@ -50,7 +60,7 @@
     cluster_infra_state: present
     cluster_infra_name: "{{ cluster_order.metadata.name }}"
     cluster_infra_namespace: "{{ cluster_working_namespace }}"
-    cluster_infra_node_requests: "{{ cluster_order.spec.nodeRequests | unique(attribute='resourceClass') }}"
+    cluster_infra_node_requests: "{{ normalized_node_requests }}"
 
 - name: Step - Configure port forwarding
   ansible.builtin.include_role:
