@@ -194,7 +194,12 @@ def test_cluster_create_with_version(
         name="ci-worker-bm",
         host_label_selector={"osac.openshift.io/host-type": "default"},
     )
-    version = private_grpc.ensure_cluster_version(version="4.20.0-e2e", image=TEST_RELEASE_IMAGE)
+    disk_image_id = private_grpc.ensure_disk_image(name="rhcos-4-22", source_ref=RHCOS_IMAGE)
+    version = private_grpc.ensure_cluster_version(
+        version="4.20.0-e2e",
+        image=TEST_RELEASE_IMAGE,
+        disk_image=disk_image_id,
+    )
 
     name = unique_name("e2e-cluster-version")
     uuid = cli.create_cluster(
