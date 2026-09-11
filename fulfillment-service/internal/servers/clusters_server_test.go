@@ -1677,7 +1677,7 @@ var _ = Describe("Clusters server", func() {
 							Template: publicv1.ClusterTemplateReference_builder{Id: "my_bmit_template"}.Build(),
 							NodeSets: map[string]*publicv1.ClusterNodeSet{
 								"workers": publicv1.ClusterNodeSet_builder{
-									Size: 5,
+									Size: proto.Int32(5),
 								}.Build(),
 							},
 						}.Build(),
@@ -1692,7 +1692,7 @@ var _ = Describe("Clusters server", func() {
 				Expect(workersNodeSet.GetSize()).To(BeNumerically("==", 5))
 			})
 
-			It("Rejects node set with baremetal_instance_type that isn't in the template", func() {
+			It("Accepts node set with baremetal_instance_type that isn't in the template", func() {
 				response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 					Object: publicv1.Cluster_builder{
 						Metadata: publicv1.Metadata_builder{
@@ -1705,23 +1705,17 @@ var _ = Describe("Clusters server", func() {
 									BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{
 										Id: "bmit_no_fabric",
 									}.Build(),
-									Size: 3,
+									Size: proto.Int32(3),
 								}.Build(),
 							},
 						}.Build(),
 					}.Build(),
 				}.Build())
-				Expect(err).To(HaveOccurred())
-				Expect(response).To(BeNil())
-				status, ok := grpcstatus.FromError(err)
-				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(ContainSubstring(
-					"baremetal_instance_type for node set 'workers'",
-				))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetNodeSets()["workers"].GetBaremetalInstanceType().GetId()).To(Equal("bmit_no_fabric"))
 			})
 
-			It("Rejects node set with baremetal_instance_type when template has none", func() {
+			It("Accepts node set with baremetal_instance_type when template has none", func() {
 				response, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
 					Object: publicv1.Cluster_builder{
 						Metadata: publicv1.Metadata_builder{
@@ -1734,21 +1728,14 @@ var _ = Describe("Clusters server", func() {
 									BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{
 										Id: "bmit_standard",
 									}.Build(),
-									Size: 3,
+									Size: proto.Int32(3),
 								}.Build(),
 							},
 						}.Build(),
 					}.Build(),
 				}.Build())
-				Expect(err).To(HaveOccurred())
-				Expect(response).To(BeNil())
-				status, ok := grpcstatus.FromError(err)
-				Expect(ok).To(BeTrue())
-				Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-				Expect(status.Message()).To(Equal(
-					"baremetal_instance_type for node set 'compute' should be empty, like in " +
-						"template 'my_template', but it is 'bmit_standard'",
-				))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response.GetObject().GetSpec().GetNodeSets()["compute"].GetBaremetalInstanceType().GetId()).To(Equal("bmit_standard"))
 			})
 
 			It("Rejects update that changes baremetal_instance_type", func() {
@@ -1774,7 +1761,7 @@ var _ = Describe("Clusters server", func() {
 									BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{
 										Id: "bmit_no_fabric",
 									}.Build(),
-									Size: 3,
+									Size: proto.Int32(3),
 								}.Build(),
 							},
 						}.Build(),
@@ -1813,7 +1800,7 @@ var _ = Describe("Clusters server", func() {
 									BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{
 										Id: "bmit_standard",
 									}.Build(),
-									Size: 5,
+									Size: proto.Int32(5),
 								}.Build(),
 							},
 						}.Build(),

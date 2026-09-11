@@ -2219,7 +2219,7 @@ var _ = Describe("ensureClusterSecrets", func() {
 		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING)
 		cluster.GetSpec().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
 			"workers": privatev1.ClusterNodeSet_builder{
-				Size: 1,
+				Size: proto.Int32(1),
 				BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
 					Name: "ci-worker-bm",
 				}.Build(),
