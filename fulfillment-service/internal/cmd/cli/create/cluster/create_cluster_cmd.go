@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -952,9 +953,9 @@ func parseClusterSubnetRef(s string) (string, error) {
 //   - Structured mapping: --node-set 'workers={size: 2, baremetal_instance_type: {name: ci-worker-bm}}'
 //   - Flat mapping:       --node-set 'workers={size: 2, baremetal_instance_type: ci-worker-bm}'
 //   - Key-value list:     --node-set name=workers,size=2,baremetal_instance_type=ci-worker-bm
-//                         --node-set workers,size=2,baremetal_instance_type=ci-worker-bm
+//     --node-set workers,size=2,baremetal_instance_type=ci-worker-bm
 //   - Future compute:     --node-set 'workers={size: 2, instance_type: compute-small}'
-//                         --node-set name=workers,size=2,instance_type=compute-small
+//     --node-set name=workers,size=2,instance_type=compute-small
 func parseClusterNodeSetFlag(s string) (string, *publicv1.ClusterNodeSet, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -979,13 +980,14 @@ func parseClusterNodeSetFlag(s string) (string, *publicv1.ClusterNodeSet, error)
 			if len(kv) == 2 {
 				k := strings.ToLower(strings.TrimSpace(kv[0]))
 				v := strings.TrimSpace(kv[1])
-				if k == "name" {
+				switch k {
+				case "name":
 					name = v
-				} else if k == "size" {
-					if n, err := strconv.Atoi(v); err == nil {
+				case "size":
+					if n, err := strconv.ParseInt(v, 10, 32); err == nil {
 						parsed["size"] = n
 					}
-				} else {
+				default:
 					parsed[k] = v
 				}
 			} else if i == 0 && len(kv) == 1 {
@@ -1020,17 +1022,37 @@ func buildNodeSetFromMap(name string, parsed map[string]any, original string) (s
 	}
 
 	builder := publicv1.ClusterNodeSet_builder{}
+	const (
+		minInt32 = int64(-1 << 31)
+		maxInt32 = int64(1<<31 - 1)
+	)
+	setSize := func(value any) error {
+		var size int64
+		switch v := value.(type) {
+		case int:
+			size = int64(v)
+		case int32:
+			size = int64(v)
+		case int64:
+			size = v
+		case float64:
+			if math.Trunc(v) != v || v < float64(minInt32) || v > float64(maxInt32) {
+				return fmt.Errorf("node set size must be a 32-bit integer in %q", original)
+			}
+			size = int64(v)
+		default:
+			return fmt.Errorf("node set size must be an integer in %q", original)
+		}
+		if size < minInt32 || size > maxInt32 {
+			return fmt.Errorf("node set size must be a 32-bit integer in %q", original)
+		}
+		builder.Size = proto.Int32(int32(size))
+		return nil
+	}
 
 	if sz, ok := parsed["size"]; ok {
-		switch v := sz.(type) {
-		case int:
-			builder.Size = int32(v)
-		case int32:
-			builder.Size = v
-		case int64:
-			builder.Size = int32(v)
-		case float64:
-			builder.Size = int32(v)
+		if err := setSize(sz); err != nil {
+			return "", nil, err
 		}
 	}
 

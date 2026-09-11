@@ -510,8 +510,8 @@ var _ = Describe("Private clusters server", func() {
 			))
 		})
 
-		It("Fails when creating object with non-existent node set", func() {
-			_, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
+		It("Accepts creating an object with a custom node set", func() {
+			response, err := server.Create(ctx, privatev1.ClustersCreateRequest_builder{
 				Object: privatev1.Cluster_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: fmt.Sprintf("test-%s", uuid.New()[24:32]),
@@ -530,14 +530,8 @@ var _ = Describe("Private clusters server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build())
-			Expect(err).To(HaveOccurred())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
-			Expect(status.Message()).To(Equal(
-				"node set 'does-not-exist' doesn't exist, valid values for template 'my-template-id' " +
-					"are 'compute' and 'gpu'",
-			))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(response.GetObject().GetSpec().GetNodeSets()).To(HaveKey("does-not-exist"))
 		})
 
 		It("Fails when creating object with host type that doesn't match template", func() {

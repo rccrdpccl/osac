@@ -393,6 +393,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		Expect(ci.GetMetadata().GetTenant()).To(Equal("system"))
 		Expect(ci.GetTitle()).To(Equal("System BMI Pass-through"))
 		Expect(ci.GetPublished()).To(BeTrue())
+		//nolint:staticcheck // field is retained for contract compatibility.
 		Expect(ci.GetFieldDefinitions()).To(BeEmpty())
 		Expect(ci.GetTemplate().GetId()).To(Equal("osac.templates.bm_host_provisioning"))
 	})
@@ -806,7 +807,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(bmi.GetSpec().GetCatalogItem().GetName()).To(Equal("system-bmi-passthrough"))
 		Expect(bmi.GetSpec().GetImage().GetSourceType()).To(Equal("registry"))
 		Expect(bmi.GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageSourceRef))
-		Expect(bmi.GetSpec().GetInstanceType()).To(Equal("bm-standard"))
+		Expect(bmi.GetSpec().GetInstanceType().GetName()).To(Equal("bm-standard"))
 
 		userData := bmi.GetSpec().GetUserData()
 		Expect(userData).ToNot(BeEmpty())

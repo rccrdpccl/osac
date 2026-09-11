@@ -379,6 +379,7 @@ func syncClusterConditionFromCR(remote *privatev1.Cluster, condType privatev1.Cl
 	clusterCondition.SetMessage(sanitizeFeedbackText(condition.Message))
 	if newStatus != oldStatus {
 		clusterCondition.SetLastTransitionTime(timestamppb.Now())
+	}
 }
 
 func setClusterCondition(remote *privatev1.Cluster, condType privatev1.ClusterConditionType, status privatev1.ConditionStatus, message string) {

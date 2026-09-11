@@ -677,6 +677,35 @@ func (s *PrivateClustersServer) lookupBareMetalInstanceType(ctx context.Context,
 	return
 }
 
+func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
+	key string) (result *privatev1.HostType, err error) {
+	if key == "" {
+		return
+	}
+	response, err := s.hostTypesDao.List().
+		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
+		SetLimit(1).
+		Do(ctx)
+	if err != nil {
+		var deniedErr *dao.ErrDenied
+		if errors.As(err, &deniedErr) {
+			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
+		}
+		return
+	}
+	switch response.GetTotal() {
+	case 0:
+		err = grpcstatus.Errorf(grpccodes.NotFound,
+			"there is no host type with identifier or name '%s'", key)
+	case 1:
+		result = response.GetItems()[0]
+	default:
+		err = grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"there are multiple host types with identifier or name '%s'", key)
+	}
+	return
+}
+
 // ensureClusterVersion makes sure the cluster spec has a usable version reference: if the user didn't provide one, it
 // resolves the system default. Either way, it validates that the resulting ClusterVersion isn't deleted, disabled,
 // or obsolete.
@@ -1436,7 +1465,7 @@ func (s *PrivateClustersServer) processAndValidateNodeSets(
 		actualNodeSets[key] = privatev1.ClusterNodeSet_builder{
 			HostType:              ht,
 			BaremetalInstanceType: bmit,
-			Size:                  clusterNodeSet.GetSize(),
+			Size:                  proto.Int32(clusterNodeSet.GetSize()),
 		}.Build()
 	}
 	// 2. For any template node sets not specified by user, inherit template defaults (if any):
@@ -1445,19 +1474,13 @@ func (s *PrivateClustersServer) processAndValidateNodeSets(
 			actualNodeSets[key] = privatev1.ClusterNodeSet_builder{
 				HostType:              templateNodeSet.GetHostType(),
 				BaremetalInstanceType: templateNodeSet.GetBaremetalInstanceType(),
-				Size:                  templateNodeSet.GetSize(),
+				Size:                  proto.Int32(templateNodeSet.GetSize()),
 			}.Build()
 		}
 	}
 	cluster.GetSpec().SetNodeSets(actualNodeSets)
 
 	mergedNodeSets := cluster.GetSpec().GetNodeSets()
-	if len(mergedNodeSets) == 0 {
-		return grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"clusters must have at least one node set",
-		)
-	}
 
 	// 3. Validate that each node set has size > 0 and resolve BareMetalInstanceType:
 	for name, nodeSet := range mergedNodeSets {
@@ -1474,6 +1497,32 @@ func (s *PrivateClustersServer) processAndValidateNodeSets(
 				"size for node set '%s' should be greater than zero, but it is %d",
 				name, nodeSet.GetSize(),
 			)
+		}
+		hostTypeKey := refKey(nodeSet.GetHostType())
+		if hostTypeKey != "" {
+			hostType, err := s.lookupHostType(ctx, hostTypeKey)
+			if err != nil {
+				return err
+			}
+			if templateNodeSet := templateNodeSets[name]; templateNodeSet != nil && templateNodeSet.GetHostType() != nil {
+				templateHostType, err := s.lookupHostType(ctx, refKey(templateNodeSet.GetHostType()))
+				if err != nil {
+					return err
+				}
+				templateID := templateHostType.GetId()
+				templateName := templateHostType.GetMetadata().GetName()
+				if hostTypeKey != templateID && hostTypeKey != templateName {
+					return grpcstatus.Errorf(
+						grpccodes.InvalidArgument,
+						"host type for node set '%s' should be empty, '%s' or '%s', like in template '%s', but it is '%s'",
+						name, templateName, templateID, refKey(cluster.GetSpec().GetTemplate()), hostTypeKey,
+					)
+				}
+			}
+			nodeSet.SetHostType(privatev1.HostTypeReference_builder{
+				Id:   hostType.GetId(),
+				Name: hostType.GetMetadata().GetName(),
+			}.Build())
 		}
 		bmitKey := refKey(nodeSet.GetBaremetalInstanceType())
 		if bmitKey != "" {
