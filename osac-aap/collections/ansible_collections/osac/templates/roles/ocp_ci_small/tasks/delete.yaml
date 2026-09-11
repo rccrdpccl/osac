@@ -36,6 +36,16 @@
     hosted_cluster_node_count: >-
       {{ cluster_order.spec.nodeRequests | map(attribute="numberOfNodes") | sum }}
 
+- name: Normalize node requests with resourceClass
+  ansible.builtin.set_fact:
+    normalized_node_requests: >-
+      {%- set requests = [] -%}
+      {%- for nr in (cluster_order.spec.nodeRequests | default([])) -%}
+        {%- set rc = nr.resourceClass | default(nr.bareMetal.instanceType if (nr.bareMetal is defined and nr.bareMetal.instanceType is defined) else 'default') -%}
+        {%- set _ = requests.append(nr | combine({'resourceClass': rc})) -%}
+      {%- endfor -%}
+      {{ requests | unique(attribute='resourceClass') }}
+
 - name: Step - Destroy cluster infrastructure
   ansible.builtin.include_role:
     name: "{{ (delete_step_cluster_infra_override | default(delete_step_cluster_infra_default)).name }}"
@@ -44,7 +54,7 @@
     cluster_infra_state: absent
     cluster_infra_name: "{{ cluster_order.metadata.name }}"
     cluster_infra_namespace: "{{ cluster_working_namespace }}"
-    cluster_infra_node_requests: "{{ cluster_order.spec.nodeRequests | unique(attribute='resourceClass') }}"
+    cluster_infra_node_requests: "{{ normalized_node_requests }}"
 
 - name: Step - Remove port forwarding
   ansible.builtin.include_role:
