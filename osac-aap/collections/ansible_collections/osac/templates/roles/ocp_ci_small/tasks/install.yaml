@@ -48,6 +48,9 @@
       ocp_release_image: "{{ ocp_release_image }}"
       pull_secret: "{{ template_parameters.pull_secret }}"
       ssh_public_key: "{{ template_parameters.ssh_public_key }}"
+      # Agent-platform CNO cannot probe guest-worker MTU. The CI BMaaS
+      # network has a 1500-byte uplink, so the OVN tunnel MTU is 1400.
+      ovn_kubernetes_mtu: 1400
     hosted_cluster_node_requests: "{{ normalized_node_requests }}"
     hosted_cluster_state: present
     hosted_cluster_infrastructure_availability_policy: "{{ lookup('env', 'HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY', default='SingleReplica') }}"
