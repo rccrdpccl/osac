@@ -21,6 +21,7 @@
     install_step_post_install_hook_default:
       name: osac.templates.ocp_ci_small
       tasks_from: noop.yaml
+    skip_cluster_operators_wait: true
 
 - name: Step - Pre-install hook
   ansible.builtin.include_role:
@@ -87,6 +88,7 @@
     retrieve_kubeconfig_namespace: "{{ cluster_working_namespace }}"
 
 - name: Step - Wait for cluster operators
+  when: not skip_cluster_operators_wait
   ansible.builtin.include_role:
     name: "{{ (install_step_wait_for_cluster_operators_override | default(install_step_wait_for_cluster_operators_default)).name }}"
     tasks_from: "{{ (install_step_wait_for_cluster_operators_override | default(install_step_wait_for_cluster_operators_default)).tasks_from }}"
