@@ -76,6 +76,22 @@
         infrastructureAvailabilityPolicy: "{{ hosted_cluster_infrastructure_availability_policy }}"
         olmCatalogPlacement: management
 
+- name: Configure HostedCluster definition
+  ansible.builtin.set_fact:
+    hosted_cluster_definition: >-
+      {{ hosted_cluster_definition | combine({
+        'spec': {
+          'operatorConfiguration': {
+            'clusterNetworkOperator': {
+              'ovnKubernetesConfig': {
+                'mtu': hosted_cluster_settings.ovn_kubernetes_mtu | int
+              }
+            }
+          }
+        }
+      }, recursive=true) }}
+  when: hosted_cluster_settings.ovn_kubernetes_mtu is defined
+
 - name: Hook - Modify HostedCluster definition
   ansible.builtin.include_role:
     name: "{{ hosted_cluster_modify_definition_hook.name }}"
