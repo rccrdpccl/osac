@@ -96,8 +96,16 @@ def test_cluster_create(
         co_release_image = k8s_hub_client.get_cluster_order_spec(name=co_name).get("releaseImage", "")
         assert co_release_image, "ClusterOrder should have a resolved releaseImage"
 
-        hosted_cluster_name = k8s_hub_client.get_cluster_order_hosted_cluster_name(name=co_name)
-        hosted_cluster_ns = k8s_hub_client.get_cluster_order_namespace(name=co_name)
+        hosted_cluster_name, hosted_cluster_ns = poll_until(
+            fn=lambda: (
+                k8s_hub_client.get_cluster_order_hosted_cluster_name(name=co_name),
+                k8s_hub_client.get_cluster_order_namespace(name=co_name),
+            ),
+            until=lambda reference: all(reference),
+            retries=30,
+            delay=5,
+            description=f"{co_name} HostedCluster reference",
+        )
         hosted_cluster_image = run(
             *k8s_hub_client._base(),
             "get",
