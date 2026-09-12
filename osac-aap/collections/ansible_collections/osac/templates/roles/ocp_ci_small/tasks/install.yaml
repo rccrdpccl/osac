@@ -74,6 +74,9 @@
     external_access_state: present
     external_access_namespace: "{{ cluster_working_namespace }}"
     external_access_ingress_internal_network: "network-{{ cluster_order.metadata.name }}"
+    # The guest network DaemonSets cannot schedule until the Agent NodePool
+    # installs its first worker, so waiting here would deadlock CI provisioning.
+    external_access_skip_network_operator_wait: true
 
 - name: Step - Retrieve kubeconfig
   ansible.builtin.include_role:
