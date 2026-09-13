@@ -331,6 +331,7 @@ spec:
                 description: |-
                   CurrentWorkers is the number of workers in a non-terminal phase
                   (Provisioning, WaitingForAgent, Binding, or Ready).
+                  Populated by the BareMetalWorkerReconciler.
                 format: int32
                 type: integer
               desiredConfigVersion:
@@ -341,7 +342,7 @@ spec:
               desiredWorkers:
                 description: |-
                   DesiredWorkers is the total number of workers requested across all node sets.
-                  Aggregated by the ClusterOrder controller from Workers (CAPI MachineDeployment convention).
+                  Populated by the BareMetalWorkerReconciler from Workers.
                 format: int32
                 type: integer
               ingressEndpoint:
@@ -526,14 +527,16 @@ spec:
                   type: object
                 type: array
               readyWorkers:
-                description: ReadyWorkers is the number of workers in the Ready phase.
+                description: |-
+                  ReadyWorkers is the number of workers in the Ready phase.
+                  Populated by the BareMetalWorkerReconciler.
                 format: int32
                 type: integer
               workers:
                 description: |-
                   Workers holds per-worker lifecycle state for CaaS-managed worker resources.
-                  Populated by the BareMetalWorkerReconciler; the ClusterOrder controller reads it to
-                  compute the aggregate counts above.
+                  Populated by and owned by the BareMetalWorkerReconciler, which also owns the
+                  aggregate counts above.
                 items:
                   description: WorkerStatus holds the lifecycle state of a single
                     CaaS-managed worker resource.
