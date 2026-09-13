@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import contextlib
 import subprocess
+import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,9 +15,11 @@ from tests.e2e.core.helpers import (
     wait_for_cluster_deletion,
     wait_for_cluster_grpc_deleting_or_archived,
     wait_for_cluster_grpc_removal,
+    wait_for_cluster_guest_readiness,
+    wait_for_cluster_order_condition,
     wait_for_cluster_order_cr,
     wait_for_cluster_progressing,
-    wait_for_cluster_ready,
+    wait_for_hosted_cluster_kubeconfig,
 )
 from tests.e2e.core.k8s_client import K8sClient
 from tests.e2e.core.metering import MeteringCollector
@@ -28,9 +32,7 @@ pytestmark = pytest.mark.sanity
 # tests. Fixed (not randomly generated) so repeated runs reuse the same
 # ClusterVersion via GRPCClient.ensure_cluster_version instead of accumulating
 # duplicates on the shared cluster.
-TEST_RELEASE_IMAGE = env(
-    "OSAC_TEST_RELEASE_IMAGE", "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
-)
+TEST_RELEASE_IMAGE = env("OSAC_TEST_RELEASE_IMAGE", "quay.io/openshift-release-dev/ocp-release:4.22.0-multi")
 RHCOS_IMAGE = env("OSAC_RHCOS_BMI_IMAGE", "oci://quay.io/rh_ee_rpiccoli/rhcos-bmi:4.22.0")
 
 
@@ -51,26 +53,18 @@ def test_cluster_create(
 
     private_grpc.ensure_host_type(name="ci-worker")
     private_grpc.ensure_bare_metal_instance_type(
-        name="ci-worker-bm",
-        host_label_selector={"osac.openshift.io/host-type": "default"},
+        name="ci-worker-bm", host_label_selector={"osac.openshift.io/host-type": "default"}
     )
     disk_image_id = private_grpc.ensure_disk_image(name="rhcos-4-22", source_ref=RHCOS_IMAGE)
     version = private_grpc.ensure_cluster_version(
-        version="4.22.0-rhcos",
-        image=TEST_RELEASE_IMAGE,
-        disk_image=disk_image_id,
+        version="4.22.0-rhcos", image=TEST_RELEASE_IMAGE, disk_image=disk_image_id
     )
     name = unique_name("e2e-cluster")
     uuid = cli.create_cluster(
         name=name,
         template=cluster_template,
         version=version["name"],
-        node_sets={
-            "workers": {
-                "size": 1,
-                "baremetal_instance_type": {"name": "ci-worker-bm"},
-            }
-        },
+        node_sets={"workers": {"size": 1, "baremetal_instance_type": {"name": "ci-worker-bm"}}},
         template_parameter_files={"pull_secret": pull_secret_path},
         template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
     )
@@ -84,7 +78,7 @@ def test_cluster_create(
         metering.expect("osac.resource.started.v1", resource_id=uuid)
         metering.verify()
 
-        wait_for_cluster_ready(k8s=k8s_hub_client, name=co_name)
+        wait_for_cluster_order_condition(k8s=k8s_hub_client, name=co_name, condition_type="ClusterAvailable")
 
         # Verify version resolved and propagated end-to-end:
         # fulfillment-service version resolution -> ClusterOrder releaseImage -> HostedCluster image
@@ -93,7 +87,8 @@ def test_cluster_create(
         assert version_name, "Cluster should have a resolved version name"
         assert version_name == version["name"]
 
-        co_release_image = k8s_hub_client.get_cluster_order_spec(name=co_name).get("releaseImage", "")
+        cluster_order_spec = k8s_hub_client.get_cluster_order_spec(name=co_name)
+        co_release_image = cluster_order_spec.get("releaseImage", "")
         assert co_release_image, "ClusterOrder should have a resolved releaseImage"
 
         hosted_cluster_name, hosted_cluster_ns = poll_until(
@@ -120,9 +115,49 @@ def test_cluster_create(
             f"HostedCluster image {hosted_cluster_image!r} != ClusterOrder releaseImage {co_release_image!r}"
         )
 
-        # Derive expected N+1 count from cluster spec
         node_sets = cluster.get("object", {}).get("spec", {}).get("nodeSets", {})
         assert node_sets, "Cluster spec should have at least one node set for the scaling test"
+        worker_node_set = next(iter(node_sets))
+        original_size = int(node_sets[worker_node_set].get("size", 1))
+        node_requests = cluster_order_spec.get("nodeRequests", [])
+        assert len(node_requests) == 1, "Expected one node request for the CaaS sanity scenario"
+        worker_resource_class = node_requests[0].get("resourceClass", "")
+
+        def _get_node_pool() -> dict[str, Any] | None:
+            node_pools = k8s_hub_client.list_json(
+                resource="nodepools.hypershift.openshift.io", namespace=hosted_cluster_ns
+            ).get("items", [])
+            return next(
+                (
+                    item
+                    for item in node_pools
+                    if item.get("metadata", {}).get("labels", {}).get("osac.openshift.io/resource_class")
+                    == worker_resource_class
+                ),
+                None,
+            )
+
+        workload_kubeconfig = wait_for_hosted_cluster_kubeconfig(
+            k8s=k8s_hub_client, hosted_cluster_namespace=hosted_cluster_ns, hosted_cluster_name=hosted_cluster_name
+        )
+        with tempfile.NamedTemporaryFile(prefix="osac-workload-", suffix=".kubeconfig") as kubeconfig_file:
+            kubeconfig_file.write(workload_kubeconfig)
+            kubeconfig_file.flush()
+            workload_k8s_client = K8sClient(
+                namespace=hosted_cluster_ns, kubeconfig=kubeconfig_file.name, as_system_admin=False
+            )
+            node_pool = wait_for_cluster_guest_readiness(
+                k8s=k8s_hub_client,
+                name=co_name,
+                workload_k8s=workload_k8s_client,
+                expected_workers=original_size,
+                get_node_pool=_get_node_pool,
+                expected_ready_nodes=original_size,
+                node_pool_description=f"{hosted_cluster_name} NodePool {worker_resource_class} ready nodes",
+            )
+        assert node_pool is not None, f"No NodePool found for resource class {worker_resource_class!r}"
+
+        # Derive expected N+1 count from cluster spec
         expected_components = 1 + len(node_sets)
 
         # Verify N+1 heartbeat decomposition
@@ -151,8 +186,6 @@ def test_cluster_create(
         )
 
         # Scale a worker node set and verify updated.v1
-        worker_node_set = next(iter(node_sets))
-        original_size = node_sets[worker_node_set].get("size", 1)
         scaled_size = original_size + 1
         cli.scale_cluster(uuid=uuid, node_set=worker_node_set, size=scaled_size)
         metering.expect("osac.resource.updated.v1", resource_id=uuid, timeout=120)
@@ -199,14 +232,11 @@ def test_cluster_create_with_version(
     ClusterVersion. Does not wait for full provisioning — the HostedCluster
     image propagation is covered by test_cluster_create."""
     private_grpc.ensure_bare_metal_instance_type(
-        name="ci-worker-bm",
-        host_label_selector={"osac.openshift.io/host-type": "default"},
+        name="ci-worker-bm", host_label_selector={"osac.openshift.io/host-type": "default"}
     )
     disk_image_id = private_grpc.ensure_disk_image(name="rhcos-4-22", source_ref=RHCOS_IMAGE)
     version = private_grpc.ensure_cluster_version(
-        version="4.20.0-e2e",
-        image=TEST_RELEASE_IMAGE,
-        disk_image=disk_image_id,
+        version="4.20.0-e2e", image=TEST_RELEASE_IMAGE, disk_image=disk_image_id
     )
 
     name = unique_name("e2e-cluster-version")
@@ -214,12 +244,7 @@ def test_cluster_create_with_version(
         name=name,
         template=cluster_template,
         version=version["name"],
-        node_sets={
-            "workers": {
-                "size": 1,
-                "baremetal_instance_type": {"name": "ci-worker-bm"},
-            }
-        },
+        node_sets={"workers": {"size": 1, "baremetal_instance_type": {"name": "ci-worker-bm"}}},
         template_parameter_files={"pull_secret": pull_secret_path},
         template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
     )

@@ -162,7 +162,8 @@ func syncClusterOrderDelete(ctx context.Context, clusterOrder *ckv1alpha1.Cluste
 // condition, so the derived status never depends on the order of the conditions. The
 // fulfillment API has a single PROGRESSING condition, and only "Progressing" drives its
 // status (True while the cluster is still being installed, False once it is ready or has
-// failed); "ClusterAvailable" drives READY.
+// failed); "ClusterAvailable" drives READY only when the overall ClusterOrder
+// phase is Ready.
 //
 // The PROGRESSING condition's *reason* and *message* are refined separately, from the
 // furthest-advanced installation stage, by applyProgressingStageDetail below.
@@ -208,6 +209,10 @@ func syncClusterOrderConditions(ctx context.Context, clusterOrder *ckv1alpha1.Cl
 	for i := range clusterOrder.Status.Conditions {
 		condition := clusterOrder.Status.Conditions[i]
 		if protoType, ok := clusterOrderConditionMappings[condition.Type]; ok {
+			if condition.Type == ckv1alpha1.ConditionClusterAvailable &&
+				clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
+				continue
+			}
 			syncClusterConditionFromCR(remote, protoType, condition)
 			continue
 		}
@@ -422,6 +427,18 @@ func syncClusterOrderPhase(ctx context.Context, clusterOrder *ckv1alpha1.Cluster
 		remote.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_DELETING)
 	default:
 		log.Info("Unknown phase, will ignore it", "phase", clusterOrder.Status.Phase)
+	}
+	if clusterOrder.Status.Phase != ckv1alpha1.ClusterOrderPhaseReady {
+		if ready := findExistingClusterCondition(remote,
+			privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY); ready != nil {
+			oldStatus := ready.GetStatus()
+			ready.SetStatus(privatev1.ConditionStatus_CONDITION_STATUS_FALSE)
+			ready.SetReason("")
+			ready.SetMessage("")
+			if oldStatus != privatev1.ConditionStatus_CONDITION_STATUS_FALSE {
+				ready.SetLastTransitionTime(timestamppb.Now())
+			}
+		}
 	}
 }
 

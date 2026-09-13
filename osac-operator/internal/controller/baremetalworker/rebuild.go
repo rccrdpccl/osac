@@ -181,8 +181,7 @@ func deriveWorkerPhase(agent *unstructured.Unstructured, workerName string) stri
 		return workerPhaseWaitingForAgent
 	}
 
-	state, _, _ := unstructured.NestedString(agent.Object, "status", "debugInfo", "state")
-	if state == "installed" {
+	if agentInstalled(agent) {
 		return workerPhaseReady
 	}
 	return workerPhaseBinding
