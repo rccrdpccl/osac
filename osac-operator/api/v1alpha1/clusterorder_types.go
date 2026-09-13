@@ -246,22 +246,24 @@ type ClusterOrderStatus struct {
 	NodeSets []NodeSetStatus `json:"nodeSets,omitempty"`
 
 	// DesiredWorkers is the total number of workers requested across all node sets.
-	// Aggregated by the ClusterOrder controller from Workers (CAPI MachineDeployment convention).
+	// Populated by the BareMetalWorkerReconciler from Workers.
 	// +kubebuilder:validation:Optional
 	DesiredWorkers *int32 `json:"desiredWorkers,omitempty"`
 
 	// CurrentWorkers is the number of workers in a non-terminal phase
 	// (Provisioning, WaitingForAgent, Binding, or Ready).
+	// Populated by the BareMetalWorkerReconciler.
 	// +kubebuilder:validation:Optional
 	CurrentWorkers *int32 `json:"currentWorkers,omitempty"`
 
 	// ReadyWorkers is the number of workers in the Ready phase.
+	// Populated by the BareMetalWorkerReconciler.
 	// +kubebuilder:validation:Optional
 	ReadyWorkers *int32 `json:"readyWorkers,omitempty"`
 
 	// Workers holds per-worker lifecycle state for CaaS-managed worker resources.
-	// Populated by the BareMetalWorkerReconciler; the ClusterOrder controller reads it to
-	// compute the aggregate counts above.
+	// Populated by and owned by the BareMetalWorkerReconciler, which also owns the
+	// aggregate counts above.
 	// +kubebuilder:validation:Optional
 	// +listType=map
 	// +listMapKey=name

@@ -849,6 +849,13 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 		}
 
+		setCRPhase := func(phase osacv1alpha1.ClusterOrderPhaseType) {
+			clusterOrder := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			clusterOrder.Status.Phase = phase
+			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
+		}
+
 		reconcileOnce := func() {
 			_, err := reconciler.Reconcile(testCtx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
@@ -884,6 +891,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 		})
 
 		It("should map ClusterAvailable to READY with reason preserved (latent bug 1)", func() {
+			setCRPhase(osacv1alpha1.ClusterOrderPhaseReady)
 			setCRCondition(osacv1alpha1.ConditionClusterAvailable, metav1.ConditionTrue,
 				osacv1alpha1.ReasonAsExpected, "cluster is available")
 
@@ -896,6 +904,25 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(ready.GetReason()).To(Equal(osacv1alpha1.ReasonAsExpected))
 			Expect(ready.GetMessage()).To(Equal("cluster is available"))
 			Expect(findRemoteCondition(privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_PROGRESSING)).To(BeNil())
+		})
+
+		It("should clear fulfillment READY when the ClusterOrder phase regresses", func() {
+			setCRPhase(osacv1alpha1.ClusterOrderPhaseProgressing)
+			setCRCondition(osacv1alpha1.ConditionClusterAvailable, metav1.ConditionTrue,
+				osacv1alpha1.ReasonAsExpected, "control plane available")
+
+			ready := findClusterCondition(mockClient.getResponse.Object,
+				privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY)
+			ready.SetStatus(privatev1.ConditionStatus_CONDITION_STATUS_TRUE)
+			ready.SetReason(osacv1alpha1.ReasonAsExpected)
+			ready.SetMessage("cluster was ready")
+
+			reconcileOnce()
+
+			Expect(mockClient.lastUpdate.GetStatus().GetState()).To(Equal(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING))
+			ready = findRemoteCondition(privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_READY)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
 		})
 
 		It("should take PROGRESSING status from Progressing and forward its sub-stage reason to proto", func() {
@@ -1100,6 +1127,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			setConditions := func(conditions []metav1.Condition) {
 				clusterOrder := &osacv1alpha1.ClusterOrder{}
 				Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+				clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseReady
 				clusterOrder.Status.Conditions = conditions
 				Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 			}
