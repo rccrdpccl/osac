@@ -18,7 +18,9 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/events"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
@@ -123,5 +125,44 @@ var _ = Describe("extractAgentMACs", func() {
 			},
 			[]string{},
 		),
+	)
+})
+
+var _ = Describe("advanceBindingWorkers", func() {
+	makeAgent := func(workerName, conditionStatus string, debugInstalled bool) unstructured.Unstructured {
+		agent := unstructured.Unstructured{Object: map[string]interface{}{}}
+		agent.SetGroupVersionKind(agentGVK)
+		agent.SetLabels(map[string]string{workerNameLabel: workerName})
+		if conditionStatus != "" {
+			_ = unstructured.SetNestedSlice(agent.Object, []interface{}{
+				map[string]interface{}{"type": "Installed", "status": conditionStatus},
+			}, "status", "conditions")
+		}
+		if debugInstalled {
+			_ = unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")
+		}
+		return agent
+	}
+
+	DescribeTable("advances only when the Agent is installed",
+		func(conditionStatus string, debugInstalled bool, wantPhase string) {
+			r := &Reconciler{recorder: events.NewFakeRecorder(1)}
+			workers := []v1alpha1.WorkerStatus{{
+				Name:              "w-0",
+				Phase:             workerPhaseBinding,
+				CreationTimestamp: metav1.Now(),
+			}}
+			agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
+				makeAgent("w-0", conditionStatus, debugInstalled),
+			}}
+
+			r.advanceBindingWorkers(context.Background(), &v1alpha1.ClusterOrder{}, agents, workers)
+
+			Expect(workers[0].Phase).To(Equal(wantPhase))
+		},
+		Entry("Installed=True without debug state", "True", false, workerPhaseReady),
+		Entry("Installed=False overrides stale debug state", "False", true, workerPhaseBinding),
+		Entry("Installed=Unknown overrides stale debug state", "Unknown", true, workerPhaseBinding),
+		Entry("legacy debug state when condition is absent", "", true, workerPhaseReady),
 	)
 })

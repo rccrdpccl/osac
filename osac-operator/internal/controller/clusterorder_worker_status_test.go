@@ -18,6 +18,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -95,7 +96,7 @@ var _ = Describe("ClusterOrder worker status contract (OSAC-4147)", func() {
 			Expect(got.Status.ReadyWorkers).To(BeNil())
 		})
 
-		It("patchStatusWithRetry applies aggregates without clobbering reconciler-owned Workers[]", func() {
+		It("patchStatusWithRetry preserves live worker aggregates and Workers[]", func() {
 			key = types.NamespacedName{Name: "ws-preserve", Namespace: "default"}
 			Expect(k8sClient.Create(ctx, newClusterOrder(key.Name))).To(Succeed())
 
@@ -111,15 +112,18 @@ var _ = Describe("ClusterOrder worker status contract (OSAC-4147)", func() {
 				AttemptCount:      1,
 				CreationTimestamp: now,
 			}}
+			co.Status.DesiredWorkers = p32(1)
+			co.Status.CurrentWorkers = p32(1)
+			co.Status.ReadyWorkers = p32(1)
 			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
 
-			// The ClusterOrder controller patches aggregates + a controller field, not Workers[].
+			// The ClusterOrder controller patches its own fields, not worker state.
 			r := &ClusterOrderReconciler{Client: k8sClient, apiReader: k8sClient, Scheme: k8sClient.Scheme()}
 			computed := v1alpha1.ClusterOrderStatus{
 				Phase:          v1alpha1.ClusterOrderPhaseProgressing,
 				DesiredWorkers: p32(1),
 				CurrentWorkers: p32(1),
-				ReadyWorkers:   p32(1),
+				ReadyWorkers:   p32(0),
 			}
 			Expect(r.patchStatusWithRetry(ctx, key, computed)).To(Succeed())
 
@@ -128,12 +132,83 @@ var _ = Describe("ClusterOrder worker status contract (OSAC-4147)", func() {
 			// Reconciler-owned Workers[] survived the controller's patch.
 			Expect(got.Status.Workers).To(HaveLen(1))
 			Expect(got.Status.Workers[0].Name).To(Equal("bm-cluster-a-worker-0"))
-			// Controller-owned aggregates + phase were applied.
+			// Live worker aggregates and the phase were preserved/applied respectively.
 			Expect(got.Status.DesiredWorkers).ToNot(BeNil())
 			Expect(*got.Status.DesiredWorkers).To(Equal(int32(1)))
 			Expect(*got.Status.CurrentWorkers).To(Equal(int32(1)))
 			Expect(*got.Status.ReadyWorkers).To(Equal(int32(1)))
 			Expect(got.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+		})
+
+		It("patchStatusWithRetry keeps a stale Ready phase progressing while workers are pending", func() {
+			key = types.NamespacedName{Name: "ws-stale-ready", Namespace: "default"}
+			Expect(k8sClient.Create(ctx, newClusterOrder(key.Name))).To(Succeed())
+
+			co := &v1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(ctx, key, co)).To(Succeed())
+			co.Spec.NodeRequests = []v1alpha1.NodeRequest{{
+				NumberOfNodes: 1,
+				BareMetal:     &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.large"},
+			}}
+			co.Status.Phase = v1alpha1.ClusterOrderPhaseProgressing
+			co.Status.DesiredWorkers = p32(1)
+			co.Status.CurrentWorkers = p32(1)
+			co.Status.ReadyWorkers = p32(0)
+			co.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"Workers Joining", v1alpha1.ReasonWorkersJoining)
+			Expect(k8sClient.Update(ctx, co)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+			r := &ClusterOrderReconciler{Client: k8sClient, apiReader: k8sClient, Scheme: k8sClient.Scheme()}
+			computed := v1alpha1.ClusterOrderStatus{
+				Phase: v1alpha1.ClusterOrderPhaseReady,
+				Conditions: []metav1.Condition{{
+					Type:   v1alpha1.ConditionProgressing,
+					Status: metav1.ConditionFalse,
+					Reason: v1alpha1.ReasonAsExpected,
+				}},
+			}
+			Expect(r.patchStatusWithRetry(ctx, key, computed)).To(Succeed())
+
+			got := &v1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+			Expect(got.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+			progressing := apimeta.FindStatusCondition(got.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonWorkersJoining))
+		})
+
+		It("patchStatusWithRetry preserves the fresh worker failure condition", func() {
+			key = types.NamespacedName{Name: "ws-worker-failure", Namespace: "default"}
+			Expect(k8sClient.Create(ctx, newClusterOrder(key.Name))).To(Succeed())
+
+			co := &v1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(ctx, key, co)).To(Succeed())
+			co.Status.Phase = v1alpha1.ClusterOrderPhaseProgressing
+			co.SetStatusCondition(v1alpha1.ConditionWorkersFailed, metav1.ConditionTrue,
+				"1 of 1 worker nodes failed to provision", "WorkersRetrying")
+			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+
+			r := &ClusterOrderReconciler{Client: k8sClient, apiReader: k8sClient, Scheme: k8sClient.Scheme()}
+			computed := v1alpha1.ClusterOrderStatus{
+				Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				Conditions: []metav1.Condition{{
+					Type:    v1alpha1.ConditionWorkersFailed,
+					Status:  metav1.ConditionFalse,
+					Reason:  "WorkersHealthy",
+					Message: "all workers healthy",
+				}},
+			}
+			Expect(r.patchStatusWithRetry(ctx, key, computed)).To(Succeed())
+
+			got := &v1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+			workersFailed := apimeta.FindStatusCondition(got.Status.Conditions, v1alpha1.ConditionWorkersFailed)
+			Expect(workersFailed).NotTo(BeNil())
+			Expect(workersFailed.Status).To(Equal(metav1.ConditionTrue))
+			Expect(workersFailed.Reason).To(Equal("WorkersRetrying"))
+			Expect(workersFailed.Message).To(Equal("1 of 1 worker nodes failed to provision"))
 		})
 	})
 })
