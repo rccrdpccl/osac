@@ -189,7 +189,7 @@ func (r *Reconciler) advanceBindingWorkers(
 		if workers[i].Phase != workerPhaseBinding {
 			continue
 		}
-		if r.isAgentInstalled(agents, workers[i].Name) {
+		if agentInstalled(findAgentByWorkerName(agents, workers[i].Name)) {
 			workers[i].Phase = workerPhaseReady
 			if workers[i].ReadySince == nil {
 				now := metav1.Now()
@@ -294,18 +294,29 @@ func (r *Reconciler) bindAgent(
 	return r.Patch(ctx, agent, client.MergeFrom(base))
 }
 
-// isAgentInstalled checks whether an Agent bound to the given worker is installed by looking
-// at its status.debugInfo.state field.
-func (r *Reconciler) isAgentInstalled(agentList *unstructured.UnstructuredList, workerName string) bool {
-	for idx := range agentList.Items {
-		agent := &agentList.Items[idx]
-		if agent.GetLabels()[workerNameLabel] != workerName {
+// agentInstalled reports whether an Agent is installed. The Installed condition is authoritative
+// when present; status.debugInfo.state is retained as a fallback for older Agent objects.
+func agentInstalled(agent *unstructured.Unstructured) bool {
+	if agent == nil {
+		return false
+	}
+
+	conditions, _, _ := unstructured.NestedSlice(agent.Object, "status", "conditions")
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]interface{})
+		if !ok {
 			continue
 		}
-		state, _, _ := unstructured.NestedString(agent.Object, "status", "debugInfo", "state")
-		return state == "installed"
+		typeName, _, _ := unstructured.NestedString(condition, "type")
+		if typeName != "Installed" {
+			continue
+		}
+		status, _, _ := unstructured.NestedString(condition, "status")
+		return status == "True"
 	}
-	return false
+
+	state, _, _ := unstructured.NestedString(agent.Object, "status", "debugInfo", "state")
+	return state == "installed"
 }
 
 // checkAgentRegistrationTimeout transitions workers stuck in WaitingForAgent past the timeout

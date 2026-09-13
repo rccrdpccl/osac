@@ -14,15 +14,17 @@ _CLUSTER_ORDER_NOT_FOUND_RE = re.compile(
 
 
 class K8sClient:
-    def __init__(self, *, namespace: str, kubeconfig: str | None = None) -> None:
+    def __init__(self, *, namespace: str, kubeconfig: str | None = None, as_system_admin: bool = True) -> None:
         self.namespace: str = namespace
         self.kubeconfig: str | None = kubeconfig
+        self.as_system_admin: bool = as_system_admin
 
     def _base(self) -> list[str]:
         args: list[str] = ["kubectl"]
         if self.kubeconfig is not None:
             args.extend(["--kubeconfig", self.kubeconfig])
-        args.extend(["--as", "system:admin"])
+        if self.as_system_admin:
+            args.extend(["--as", "system:admin"])
         return args
 
     def _get(self, *args: str, checked: bool = True) -> tuple[str, int]:
@@ -32,8 +34,16 @@ class K8sClient:
 
     # Generic kubectl operations
 
-    def get_json(self, *, resource: str, name: str) -> dict[str, Any]:
-        return json.loads(run(*self._base(), "get", resource, name, "-n", self.namespace, "-o", "json"))
+    def get_json(self, *, resource: str, name: str, namespace: str | None = None) -> dict[str, Any]:
+        target_namespace = self.namespace if namespace is None else namespace
+        return json.loads(run(*self._base(), "get", resource, name, "-n", target_namespace, "-o", "json"))
+
+    def list_json(self, *, resource: str, namespace: str | None = None) -> dict[str, Any]:
+        args = [*self._base(), "get", resource]
+        if namespace is not None:
+            args.extend(["-n", namespace])
+        args.extend(["-o", "json"])
+        return json.loads(run(*args))
 
     def get_jsonpath(self, *, resource: str, name: str, jsonpath: str) -> str:
         return run(*self._base(), "get", resource, name, "-n", self.namespace, "-o", f"jsonpath={jsonpath}")

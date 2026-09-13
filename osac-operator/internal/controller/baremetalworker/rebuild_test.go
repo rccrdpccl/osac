@@ -83,15 +83,20 @@ var _ = Describe("findAgentForWorker", func() {
 })
 
 var _ = Describe("deriveWorkerPhase", func() {
-	makeAgent := func(name string, labels map[string]string, installed bool) *unstructured.Unstructured {
+	makeAgent := func(name string, labels map[string]string, debugInstalled bool, conditionStatus string) *unstructured.Unstructured {
 		agent := &unstructured.Unstructured{Object: map[string]interface{}{}}
 		agent.SetGroupVersionKind(agentGVK)
 		agent.SetName(name)
 		if labels != nil {
 			agent.SetLabels(labels)
 		}
-		if installed {
+		if debugInstalled {
 			_ = unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")
+		}
+		if conditionStatus != "" {
+			_ = unstructured.SetNestedSlice(agent.Object, []interface{}{
+				map[string]interface{}{"type": "Installed", "status": conditionStatus},
+			}, "status", "conditions")
 		}
 		return agent
 	}
@@ -101,23 +106,37 @@ var _ = Describe("deriveWorkerPhase", func() {
 	})
 
 	It("returns Ready when agent is bound and installed", func() {
-		agent := makeAgent("a-0", map[string]string{workerNameLabel: "w-0"}, true)
+		agent := makeAgent("a-0", map[string]string{workerNameLabel: "w-0"}, true, "")
+		Expect(deriveWorkerPhase(agent, "w-0")).To(Equal(workerPhaseReady))
+	})
+
+	It("returns Ready when agent is bound and Installed is True", func() {
+		agent := makeAgent("a-0", map[string]string{workerNameLabel: "w-0"}, false, "True")
 		Expect(deriveWorkerPhase(agent, "w-0")).To(Equal(workerPhaseReady))
 	})
 
 	It("returns Binding when agent is bound but not installed", func() {
-		agent := makeAgent("a-0", map[string]string{workerNameLabel: "w-0"}, false)
+		agent := makeAgent("a-0", map[string]string{workerNameLabel: "w-0"}, false, "")
 		Expect(deriveWorkerPhase(agent, "w-0")).To(Equal(workerPhaseBinding))
 	})
 
+	DescribeTable("returns Binding when Installed is not True",
+		func(conditionStatus string) {
+			agent := makeAgent("a-0", map[string]string{workerNameLabel: "w-0"}, true, conditionStatus)
+			Expect(deriveWorkerPhase(agent, "w-0")).To(Equal(workerPhaseBinding))
+		},
+		Entry("False", "False"),
+		Entry("Unknown", "Unknown"),
+	)
+
 	It("returns WaitingForAgent when agent exists but is not bound to this worker", func() {
-		agent := makeAgent("a-0", nil, false)
+		agent := makeAgent("a-0", nil, false, "")
 		Expect(deriveWorkerPhase(agent, "w-0")).To(Equal(workerPhaseWaitingForAgent))
 	})
 })
 
 var _ = Describe("rebuildWorkerPhases", func() {
-	makeAgent := func(name, mac string, labels map[string]string, installed bool) unstructured.Unstructured {
+	makeAgent := func(name, mac string, labels map[string]string, debugInstalled bool, conditionStatus string) unstructured.Unstructured {
 		agent := unstructured.Unstructured{Object: map[string]interface{}{}}
 		agent.SetGroupVersionKind(agentGVK)
 		agent.SetName(name)
@@ -126,8 +145,13 @@ var _ = Describe("rebuildWorkerPhases", func() {
 		}
 		interfaces := []interface{}{map[string]interface{}{"macAddress": mac}}
 		_ = unstructured.SetNestedSlice(agent.Object, interfaces, "status", "inventory", "interfaces")
-		if installed {
+		if debugInstalled {
 			_ = unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")
+		}
+		if conditionStatus != "" {
+			_ = unstructured.SetNestedSlice(agent.Object, []interface{}{
+				map[string]interface{}{"type": "Installed", "status": conditionStatus},
+			}, "status", "conditions")
 		}
 		return agent
 	}
@@ -151,7 +175,23 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-0", Kind: workerKindBMI, ResourceID: "bmi-0", Phase: workerPhaseWaitingForAgent},
 		}
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
-			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true),
+			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true, ""),
+		}}
+		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
+		bmiExists := func(string) bool { return true }
+
+		result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
+		Expect(removed).To(BeEmpty())
+		Expect(result).To(HaveLen(1))
+		Expect(result[0].Phase).To(Equal(workerPhaseReady))
+	})
+
+	It("re-derives Ready when BMI exists and bound agent has Installed=True", func() {
+		workers := []v1alpha1.WorkerStatus{
+			{Name: "w-0", Kind: workerKindBMI, ResourceID: "bmi-0", Phase: workerPhaseWaitingForAgent},
+		}
+		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
+			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, false, "True"),
 		}}
 		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
@@ -167,7 +207,7 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-0", Kind: workerKindBMI, ResourceID: "bmi-0", Phase: workerPhaseWaitingForAgent},
 		}
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
-			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, false),
+			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, false, ""),
 		}}
 		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
@@ -177,6 +217,26 @@ var _ = Describe("rebuildWorkerPhases", func() {
 		Expect(result).To(HaveLen(1))
 		Expect(result[0].Phase).To(Equal(workerPhaseBinding))
 	})
+
+	DescribeTable("re-derives Binding for a bound agent whose Installed condition is not True",
+		func(conditionStatus string) {
+			workers := []v1alpha1.WorkerStatus{
+				{Name: "w-0", Kind: workerKindBMI, ResourceID: "bmi-0", Phase: workerPhaseWaitingForAgent},
+			}
+			agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
+				makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true, conditionStatus),
+			}}
+			resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
+			bmiExists := func(string) bool { return true }
+
+			result, removed := rebuildWorkerPhases(context.Background(), workers, agents, resolver, bmiExists)
+			Expect(removed).To(BeEmpty())
+			Expect(result).To(HaveLen(1))
+			Expect(result[0].Phase).To(Equal(workerPhaseBinding))
+		},
+		Entry("False", "False"),
+		Entry("Unknown", "Unknown"),
+	)
 
 	It("removes stale entries when BMI is gone", func() {
 		workers := []v1alpha1.WorkerStatus{
@@ -227,7 +287,7 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			},
 		}
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
-			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true),
+			makeAgent("agent-0", "aa:bb:cc:00:00:00", map[string]string{workerNameLabel: "w-0"}, true, ""),
 		}}
 		resolver := func(context.Context, string) []string { return []string{"aa:bb:cc:00:00:00"} }
 		bmiExists := func(string) bool { return true }
@@ -268,7 +328,7 @@ var _ = Describe("rebuildWorkerPhases", func() {
 			{Name: "w-2", Kind: workerKindBMI, ResourceID: "bmi-2", Phase: workerPhaseReady},
 		}
 		agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{
-			makeAgent("agent-1", "bb:bb:bb:11:11:11", map[string]string{workerNameLabel: "w-1"}, true),
+			makeAgent("agent-1", "bb:bb:bb:11:11:11", map[string]string{workerNameLabel: "w-1"}, true, ""),
 		}}
 		resolver := func(_ context.Context, id string) []string {
 			m := map[string][]string{
