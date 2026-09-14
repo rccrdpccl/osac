@@ -19,7 +19,6 @@ from tests.e2e.core.helpers import (
     wait_for_cluster_order_condition,
     wait_for_cluster_order_cr,
     wait_for_cluster_progressing,
-    wait_for_cluster_ready,
     wait_for_hosted_cluster_kubeconfig,
 )
 from tests.e2e.core.k8s_client import K8sClient
@@ -262,8 +261,6 @@ def test_cluster_create_with_two_node_sets(
         wait_for_cluster_progressing(k8s=k8s_hub_client, name=co_name)
         metering.expect("osac.resource.started.v1", resource_id=uuid)
         metering.verify()
-        wait_for_cluster_order_condition(k8s=k8s_hub_client, name=co_name, condition_type="ClusterAvailable")
-        wait_for_cluster_ready(k8s=k8s_hub_client, name=co_name)
 
         cluster_order = k8s_hub_client.get_json(resource="clusterorder", name=co_name)
         node_requests = cluster_order.get("spec", {}).get("nodeRequests", [])
@@ -276,6 +273,49 @@ def test_cluster_create_with_two_node_sets(
 
         hosted_cluster_ns = k8s_hub_client.get_cluster_order_namespace(name=co_name)
         resource_class_label = "osac.openshift.io/resource_class"
+
+        def _get_worker_counts() -> tuple[int, int, int]:
+            status = k8s_hub_client.get_json(resource="clusterorder", name=co_name).get("status", {})
+            return tuple(int(status.get(key, -1)) for key in ("desiredWorkers", "currentWorkers", "readyWorkers"))
+
+        poll_until(
+            fn=_get_worker_counts,
+            until=lambda value: value == (2, 2, 2),
+            retries=120,
+            delay=10,
+            description=f"{co_name} worker aggregates before NodePool isolation check",
+        )
+
+        def _agent_is_installed(agent: dict[str, Any]) -> bool:
+            return any(
+                condition.get("type") == "Installed" and condition.get("status") == "True"
+                for condition in agent.get("status", {}).get("conditions", [])
+            )
+
+        def _get_agents_by_resource_class() -> dict[str, list[dict[str, Any]]]:
+            agents: dict[str, list[dict[str, Any]]] = {}
+            items = k8s_hub_client.list_json(
+                resource="agents.agent-install.openshift.io", namespace=k8s_hub_client.namespace
+            ).get("items", [])
+            for item in items:
+                labels = item.get("metadata", {}).get("labels", {})
+                if labels.get("osac.openshift.io/clusterorder") != co_name:
+                    continue
+                resource_class = labels.get(resource_class_label)
+                if resource_class in expected_replicas:
+                    agents.setdefault(resource_class, []).append(item)
+            return agents
+
+        agents_by_resource_class = poll_until(
+            fn=_get_agents_by_resource_class,
+            until=lambda agents: (
+                set(agents) == set(expected_replicas)
+                and all(len(items) == 1 and _agent_is_installed(items[0]) for items in agents.values())
+            ),
+            retries=120,
+            delay=10,
+            description=f"{co_name} installed Agents by resource class",
+        )
 
         def _get_node_pools() -> dict[str, dict[str, Any]]:
             items = k8s_hub_client.list_json(
@@ -307,15 +347,7 @@ def test_cluster_create_with_two_node_sets(
             selector = node_pool.get("spec", {}).get("platform", {}).get("agent", {}).get("agentLabelSelector", {})
             assert selector.get("matchLabels", {}).get(resource_class_label) == resource_class
 
-        agents_before = k8s_hub_client.list_json(
-            resource="agents.agent-install.openshift.io", namespace=k8s_hub_client.namespace
-        )
-        surviving_agents = {
-            item["metadata"]["name"]
-            for item in agents_before.get("items", [])
-            if item.get("metadata", {}).get("labels", {}).get("osac.openshift.io/clusterorder") == co_name
-            and item.get("metadata", {}).get("labels", {}).get(resource_class_label) == resource_classes["gpu"]
-        }
+        surviving_agents = {item["metadata"]["name"] for item in agents_by_resource_class[resource_classes["gpu"]]}
         assert len(surviving_agents) == 1, f"Expected one GPU Agent, got {surviving_agents}"
 
         before_updated_ids = {
@@ -341,12 +373,8 @@ def test_cluster_create_with_two_node_sets(
             description=f"{co_name} isolated NodePool scale-down",
         )
 
-        def _worker_counts() -> tuple[int, int, int]:
-            status = k8s_hub_client.get_json(resource="clusterorder", name=co_name).get("status", {})
-            return tuple(int(status.get(key, -1)) for key in ("desiredWorkers", "currentWorkers", "readyWorkers"))
-
         counts = poll_until(
-            fn=_worker_counts,
+            fn=_get_worker_counts,
             until=lambda value: value[0] == 1 and value[1] >= 1 and value[2] >= 1,
             retries=60,
             delay=10,
