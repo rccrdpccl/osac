@@ -282,7 +282,7 @@ func (r *Reconciler) bindAgent(
 	if worker != nil {
 		workerName = worker.Name
 		if worker.NodeSet != "" {
-			labels["osac.openshift.io/resource_class"] = worker.NodeSet
+			labels[nodePoolResourceClassLabel] = worker.NodeSet
 		}
 	}
 	labels[workerNameLabel] = workerName
@@ -367,11 +367,11 @@ func (r *Reconciler) workerPhaseStartTime(co *v1alpha1.ClusterOrder, workerName 
 	return time.Time{}
 }
 
-// reconcileNodePoolReplicas sets the NodePool's spec.replicas to the number of correlated
-// (Binding or Ready phase) agents. NodePools are discovered by the same label selector the
-// ClusterOrder controller uses.
+// reconcileNodePoolReplicas preserves the requested bare-metal capacity while Agents are
+// still provisioning. NodePools are discovered by the same label selector the ClusterOrder
+// controller uses.
 func (r *Reconciler) reconcileNodePoolReplicas(
-	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
+	ctx context.Context, co *v1alpha1.ClusterOrder,
 ) (ctrl.Result, error) {
 	clusterRef := co.Status.ClusterReference
 	if clusterRef == nil || clusterRef.Namespace == "" {
@@ -387,8 +387,20 @@ func (r *Reconciler) reconcileNodePoolReplicas(
 		return ctrl.Result{RequeueAfter: agentRequeueInterval}, nil
 	}
 
-	replicas := countCorrelatedWorkers(workers)
+	replicas := requestedBareMetalWorkersByResourceClass(co)
 	return ctrl.Result{}, r.patchNodePoolReplicas(ctx, nodePools, replicas)
+}
+
+// requestedBareMetalWorkersByResourceClass preserves each requested NodePool capacity while
+// BMaaS workers are still provisioning and their Agents have not registered yet.
+func requestedBareMetalWorkersByResourceClass(co *v1alpha1.ClusterOrder) map[string]int64 {
+	replicas := make(map[string]int64)
+	for _, request := range co.Spec.NodeRequests {
+		if request.IsBareMetal() {
+			replicas[request.ResourceClass] += int64(request.NumberOfNodes)
+		}
+	}
+	return replicas
 }
 
 func (r *Reconciler) listNodePools(ctx context.Context, namespace, clusterOrderName string) (*unstructured.UnstructuredList, error) {
@@ -405,10 +417,17 @@ func (r *Reconciler) listNodePools(ctx context.Context, namespace, clusterOrderN
 	return nodePoolList, nil
 }
 
-func (r *Reconciler) patchNodePoolReplicas(ctx context.Context, nodePools *unstructured.UnstructuredList, replicas int64) error {
+func (r *Reconciler) patchNodePoolReplicas(
+	ctx context.Context, nodePools *unstructured.UnstructuredList, replicasByResourceClass map[string]int64,
+) error {
 	log := ctrllog.FromContext(ctx)
 	for idx := range nodePools.Items {
 		np := &nodePools.Items[idx]
+		resourceClass := np.GetLabels()[nodePoolResourceClassLabel]
+		replicas, ok := replicasByResourceClass[resourceClass]
+		if !ok {
+			continue
+		}
 		currentReplicas, _, _ := unstructured.NestedInt64(np.Object, "spec", "replicas")
 		if currentReplicas == replicas {
 			continue
@@ -423,16 +442,6 @@ func (r *Reconciler) patchNodePoolReplicas(ctx context.Context, nodePools *unstr
 		log.Info("updated NodePool replicas", "nodepool", np.GetName(), "replicas", replicas)
 	}
 	return nil
-}
-
-func countCorrelatedWorkers(workers []v1alpha1.WorkerStatus) int64 {
-	var n int64
-	for _, w := range workers {
-		if w.Phase == workerPhaseBinding || w.Phase == workerPhaseReady {
-			n++
-		}
-	}
-	return n
 }
 
 // updateWorkerStatusWithCorrelation patches status.workers, aggregate counts, and the
