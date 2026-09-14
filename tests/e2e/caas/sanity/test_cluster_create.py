@@ -308,7 +308,7 @@ def test_cluster_create_with_two_node_sets(
             assert selector.get("matchLabels", {}).get(resource_class_label) == resource_class
 
         agents_before = k8s_hub_client.list_json(
-            resource="agents.agent-install.openshift.io", namespace="hardware-inventory"
+            resource="agents.agent-install.openshift.io", namespace=k8s_hub_client.namespace
         )
         surviving_agents = {
             item["metadata"]["name"]
@@ -355,7 +355,7 @@ def test_cluster_create_with_two_node_sets(
         assert counts == (1, 1, 1)
 
         agents_after = k8s_hub_client.list_json(
-            resource="agents.agent-install.openshift.io", namespace="hardware-inventory"
+            resource="agents.agent-install.openshift.io", namespace=k8s_hub_client.namespace
         )
         surviving_agents_after = {
             item["metadata"]["name"]
