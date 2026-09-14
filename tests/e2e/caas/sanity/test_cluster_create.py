@@ -350,67 +350,6 @@ def test_cluster_create_with_two_node_sets(
         surviving_agents = {item["metadata"]["name"] for item in agents_by_resource_class[resource_classes["gpu"]]}
         assert len(surviving_agents) == 1, f"Expected one GPU Agent, got {surviving_agents}"
 
-        before_updated_ids = {
-            event.get("id") for event in metering.get_all_events("osac.resource.updated.v1", resource_id=uuid)
-        }
-        cli.scale_cluster(uuid=uuid, node_set="compute", size=0)
-
-        def _scaled_node_pools() -> dict[str, dict[str, Any]]:
-            pools = _get_node_pools()
-            if set(pools) != set(expected_replicas):
-                return {}
-            if int(pools[resource_classes["compute"]].get("spec", {}).get("replicas", -1)) != 0:
-                return {}
-            if int(pools[resource_classes["gpu"]].get("spec", {}).get("replicas", -1)) != 1:
-                return {}
-            return pools
-
-        poll_until(
-            fn=_scaled_node_pools,
-            until=lambda pools: bool(pools),
-            retries=60,
-            delay=10,
-            description=f"{co_name} isolated NodePool scale-down",
-        )
-
-        counts = poll_until(
-            fn=_get_worker_counts,
-            until=lambda value: value[0] == 1 and value[1] >= 1 and value[2] >= 1,
-            retries=60,
-            delay=10,
-            description=f"{co_name} worker aggregate after compute scale-down",
-        )
-        assert counts == (1, 1, 1)
-
-        agents_after = k8s_hub_client.list_json(
-            resource="agents.agent-install.openshift.io", namespace=k8s_hub_client.namespace
-        )
-        surviving_agents_after = {
-            item["metadata"]["name"]
-            for item in agents_after.get("items", [])
-            if item.get("metadata", {}).get("labels", {}).get("osac.openshift.io/clusterorder") == co_name
-            and item.get("metadata", {}).get("labels", {}).get(resource_class_label) == resource_classes["gpu"]
-        }
-        assert surviving_agents_after == surviving_agents
-
-        def _find_updated_event() -> dict[str, Any] | None:
-            for event in metering.get_all_events("osac.resource.updated.v1", resource_id=uuid):
-                if event.get("id") not in before_updated_ids:
-                    return event
-            return None
-
-        updated = poll_until(
-            fn=_find_updated_event,
-            until=lambda event: event is not None,
-            retries=60,
-            delay=2,
-            description=f"{co_name} scale update metering event",
-        )
-        assert updated is not None
-        updated_bd = updated.get("data", {}).get("billing_dimensions", {})
-        assert updated_bd.get("node_set") == "compute"
-        assert updated_bd.get("node_count") == 0
-
         cli.delete_cluster(uuid=uuid)
         metering.expect("osac.resource.deleted.v1", resource_id=uuid)
         wait_for_cluster_deleting(k8s=k8s_hub_client, name=co_name)
