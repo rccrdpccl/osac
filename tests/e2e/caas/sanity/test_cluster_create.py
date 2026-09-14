@@ -19,6 +19,7 @@ from tests.e2e.core.helpers import (
     wait_for_cluster_order_condition,
     wait_for_cluster_order_cr,
     wait_for_cluster_progressing,
+    wait_for_cluster_ready,
     wait_for_hosted_cluster_kubeconfig,
 )
 from tests.e2e.core.k8s_client import K8sClient
@@ -209,6 +210,183 @@ def test_cluster_create(
         wait_for_cluster_deleting(k8s=k8s_hub_client, name=co_name)
         wait_for_cluster_grpc_deleting_or_archived(grpc=grpc, uuid=uuid)
 
+        wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
+        wait_for_cluster_grpc_removal(grpc=grpc, uuid=uuid)
+        metering.verify()
+    finally:
+        with contextlib.suppress(subprocess.SubprocessError):
+            cli.delete_cluster(uuid=uuid)
+
+
+@pytest.mark.metering
+def test_cluster_create_with_two_node_sets(
+    cli: OsacCLI,
+    grpc: GRPCClient,
+    private_grpc: GRPCClient,
+    k8s_hub_client: K8sClient,
+    cluster_template: str,
+    pull_secret_path: str,
+    ssh_public_key_path: str,
+    metering: MeteringCollector,
+) -> None:
+    """Verify NodePool replicas stay isolated when a cluster has two BMaaS node sets."""
+
+    resource_classes = {"compute": "ci-worker-bm", "gpu": "ci-worker-bm-gpu"}
+    for resource_class in resource_classes.values():
+        private_grpc.ensure_bare_metal_instance_type(
+            name=resource_class, host_label_selector={"osac.openshift.io/host-type": "default"}
+        )
+
+    version = private_grpc.ensure_cluster_version(
+        version="4.22.0-rhcos",
+        image=TEST_RELEASE_IMAGE,
+        disk_image=private_grpc.ensure_disk_image(name="rhcos-4-22", source_ref=RHCOS_IMAGE),
+    )
+    name = unique_name("e2e-cluster-two-node-sets")
+    uuid = cli.create_cluster(
+        name=name,
+        template=cluster_template,
+        version=version["name"],
+        node_sets={
+            node_set: {"size": 1, "baremetal_instance_type": {"name": resource_class}}
+            for node_set, resource_class in resource_classes.items()
+        },
+        template_parameter_files={"pull_secret": pull_secret_path},
+        template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
+    )
+    metering.expect("osac.resource.created.v1", resource_id=uuid)
+
+    try:
+        co_name = wait_for_cluster_order_cr(k8s=k8s_hub_client, uuid=uuid)
+        assert uuid in grpc.list_cluster_ids()
+        wait_for_cluster_progressing(k8s=k8s_hub_client, name=co_name)
+        metering.expect("osac.resource.started.v1", resource_id=uuid)
+        metering.verify()
+        wait_for_cluster_order_condition(k8s=k8s_hub_client, name=co_name, condition_type="ClusterAvailable")
+        wait_for_cluster_ready(k8s=k8s_hub_client, name=co_name)
+
+        cluster_order = k8s_hub_client.get_json(resource="clusterorder", name=co_name)
+        node_requests = cluster_order.get("spec", {}).get("nodeRequests", [])
+        expected_replicas = {
+            request["resourceClass"]: int(request["numberOfNodes"])
+            for request in node_requests
+            if request.get("resourceClass") in resource_classes.values()
+        }
+        assert expected_replicas == {resource_class: 1 for resource_class in resource_classes.values()}
+
+        hosted_cluster_ns = k8s_hub_client.get_cluster_order_namespace(name=co_name)
+        resource_class_label = "osac.openshift.io/resource_class"
+
+        def _get_node_pools() -> dict[str, dict[str, Any]]:
+            items = k8s_hub_client.list_json(
+                resource="nodepools.hypershift.openshift.io", namespace=hosted_cluster_ns
+            ).get("items", [])
+            return {
+                item.get("metadata", {}).get("labels", {}).get(resource_class_label, ""): item
+                for item in items
+                if item.get("metadata", {}).get("labels", {}).get(resource_class_label) in expected_replicas
+            }
+
+        node_pools = poll_until(
+            fn=_get_node_pools,
+            until=lambda pools: (
+                set(pools) == set(expected_replicas)
+                and all(
+                    int(pools[resource_class].get("spec", {}).get("replicas", -1)) == replicas
+                    for resource_class, replicas in expected_replicas.items()
+                )
+            ),
+            retries=60,
+            delay=10,
+            description=f"{co_name} per-resource-class NodePool replicas",
+        )
+
+        for resource_class, node_pool in node_pools.items():
+            labels = node_pool.get("metadata", {}).get("labels", {})
+            assert labels.get("osac.openshift.io/clusterorder") == co_name
+            selector = node_pool.get("spec", {}).get("platform", {}).get("agent", {}).get("agentLabelSelector", {})
+            assert selector.get("matchLabels", {}).get(resource_class_label) == resource_class
+
+        agents_before = k8s_hub_client.list_json(
+            resource="agents.agent-install.openshift.io", namespace="hardware-inventory"
+        )
+        surviving_agents = {
+            item["metadata"]["name"]
+            for item in agents_before.get("items", [])
+            if item.get("metadata", {}).get("labels", {}).get("osac.openshift.io/clusterorder") == co_name
+            and item.get("metadata", {}).get("labels", {}).get(resource_class_label) == resource_classes["gpu"]
+        }
+        assert len(surviving_agents) == 1, f"Expected one GPU Agent, got {surviving_agents}"
+
+        before_updated_ids = {
+            event.get("id") for event in metering.get_all_events("osac.resource.updated.v1", resource_id=uuid)
+        }
+        cli.scale_cluster(uuid=uuid, node_set="compute", size=0)
+
+        def _scaled_node_pools() -> dict[str, dict[str, Any]]:
+            pools = _get_node_pools()
+            if set(pools) != set(expected_replicas):
+                return {}
+            if int(pools[resource_classes["compute"]].get("spec", {}).get("replicas", -1)) != 0:
+                return {}
+            if int(pools[resource_classes["gpu"]].get("spec", {}).get("replicas", -1)) != 1:
+                return {}
+            return pools
+
+        poll_until(
+            fn=_scaled_node_pools,
+            until=lambda pools: bool(pools),
+            retries=60,
+            delay=10,
+            description=f"{co_name} isolated NodePool scale-down",
+        )
+
+        def _worker_counts() -> tuple[int, int, int]:
+            status = k8s_hub_client.get_json(resource="clusterorder", name=co_name).get("status", {})
+            return tuple(int(status.get(key, -1)) for key in ("desiredWorkers", "currentWorkers", "readyWorkers"))
+
+        counts = poll_until(
+            fn=_worker_counts,
+            until=lambda value: value[0] == 1 and value[1] >= 1 and value[2] >= 1,
+            retries=60,
+            delay=10,
+            description=f"{co_name} worker aggregate after compute scale-down",
+        )
+        assert counts == (1, 1, 1)
+
+        agents_after = k8s_hub_client.list_json(
+            resource="agents.agent-install.openshift.io", namespace="hardware-inventory"
+        )
+        surviving_agents_after = {
+            item["metadata"]["name"]
+            for item in agents_after.get("items", [])
+            if item.get("metadata", {}).get("labels", {}).get("osac.openshift.io/clusterorder") == co_name
+            and item.get("metadata", {}).get("labels", {}).get(resource_class_label) == resource_classes["gpu"]
+        }
+        assert surviving_agents_after == surviving_agents
+
+        def _find_updated_event() -> dict[str, Any] | None:
+            for event in metering.get_all_events("osac.resource.updated.v1", resource_id=uuid):
+                if event.get("id") not in before_updated_ids:
+                    return event
+            return None
+
+        updated = poll_until(
+            fn=_find_updated_event,
+            until=lambda event: event is not None,
+            retries=60,
+            delay=2,
+            description=f"{co_name} scale update metering event",
+        )
+        assert updated is not None
+        updated_bd = updated.get("data", {}).get("billing_dimensions", {})
+        assert updated_bd.get("node_set") == "compute"
+        assert updated_bd.get("node_count") == 0
+
+        cli.delete_cluster(uuid=uuid)
+        metering.expect("osac.resource.deleted.v1", resource_id=uuid)
+        wait_for_cluster_deleting(k8s=k8s_hub_client, name=co_name)
+        wait_for_cluster_grpc_deleting_or_archived(grpc=grpc, uuid=uuid)
         wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
         wait_for_cluster_grpc_removal(grpc=grpc, uuid=uuid)
         metering.verify()
