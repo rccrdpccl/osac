@@ -20,7 +20,11 @@ import (
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
@@ -165,4 +169,82 @@ var _ = Describe("advanceBindingWorkers", func() {
 		Entry("Installed=Unknown overrides stale debug state", "Unknown", true, workerPhaseBinding),
 		Entry("legacy debug state when condition is absent", "", true, workerPhaseReady),
 	)
+})
+
+var _ = Describe("requestedBareMetalWorkersByResourceClass", func() {
+	It("counts requested bare-metal workers before any Agent is correlated", func() {
+		co := &v1alpha1.ClusterOrder{}
+		co.Spec.NodeRequests = []v1alpha1.NodeRequest{
+			{ResourceClass: "bm-worker", NumberOfNodes: 2,
+				BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: "bm-worker"}},
+			{NumberOfNodes: 3},
+		}
+
+		Expect(requestedBareMetalWorkersByResourceClass(co)).To(Equal(map[string]int64{
+			"bm-worker": 2,
+		}))
+	})
+})
+
+var _ = Describe("reconcileNodePoolReplicas", func() {
+	It("keeps replica counts isolated by resource class", func() {
+		nodePoolGVK := schema.GroupVersionKind{
+			Group: "hypershift.openshift.io", Version: "v1beta1", Kind: "NodePool",
+		}
+		nodePoolListGVK := nodePoolGVK
+		nodePoolListGVK.Kind = "NodePoolList"
+		s := runtime.NewScheme()
+		Expect(v1alpha1.AddToScheme(s)).To(Succeed())
+		s.AddKnownTypeWithName(nodePoolGVK, &unstructured.Unstructured{})
+		s.AddKnownTypeWithName(nodePoolListGVK, &unstructured.UnstructuredList{})
+
+		co := &v1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{Name: "co-replicas", Namespace: "osac"},
+			Spec: v1alpha1.ClusterOrderSpec{
+				NodeRequests: []v1alpha1.NodeRequest{
+					{ResourceClass: "bm-standard", NumberOfNodes: 2,
+						BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: "bm-standard"}},
+					{ResourceClass: "bm-gpu", NumberOfNodes: 1,
+						BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: "bm-gpu"}},
+				},
+			},
+			Status: v1alpha1.ClusterOrderStatus{
+				ClusterReference: &v1alpha1.ClusterOrderClusterReferenceType{Namespace: "workload"},
+			},
+		}
+
+		makeNodePool := func(name, resourceClass string) *unstructured.Unstructured {
+			np := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			np.SetGroupVersionKind(nodePoolGVK)
+			np.SetName(name)
+			np.SetNamespace("workload")
+			np.SetLabels(map[string]string{
+				"osac.openshift.io/clusterorder": co.Name,
+				nodePoolResourceClassLabel:       resourceClass,
+			})
+			Expect(unstructured.SetNestedField(np.Object, int64(0), "spec", "replicas")).To(Succeed())
+			return np
+		}
+
+		k8sClient := clientfake.NewClientBuilder().
+			WithScheme(s).
+			WithObjects(co, makeNodePool("standard", "bm-standard"), makeNodePool("gpu", "bm-gpu")).
+			Build()
+		r := &Reconciler{Client: k8sClient}
+
+		_, err := r.reconcileNodePoolReplicas(context.Background(), co)
+		Expect(err).ToNot(HaveOccurred())
+
+		for name, want := range map[string]int64{"standard": 2, "gpu": 1} {
+			np := &unstructured.Unstructured{}
+			np.SetGroupVersionKind(nodePoolGVK)
+			Expect(k8sClient.Get(context.Background(), types.NamespacedName{
+				Name: name, Namespace: "workload",
+			}, np)).To(Succeed())
+			replicas, found, err := unstructured.NestedInt64(np.Object, "spec", "replicas")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(replicas).To(Equal(want), name)
+		}
+	})
 })

@@ -92,6 +92,7 @@ const (
 	eventReasonStaleIgnition         = "StaleIgnition"
 	reasonInfraEnvRecreated          = "InfraEnvRecreated"
 	reasonStaleIgnitionWorkersMarked = "StaleIgnitionWorkersMarked"
+	nodePoolResourceClassLabel       = "osac.openshift.io/resource_class"
 
 	bmWorkerFinalizer = "osac.openshift.io/baremetalworker-finalizer"
 
@@ -238,7 +239,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	npRes, npErr := r.reconcileNodePoolReplicas(ctx, co, workers)
+	npRes, npErr := r.reconcileNodePoolReplicas(ctx, co)
 	if npErr != nil {
 		return ctrl.Result{}, npErr
 	}
