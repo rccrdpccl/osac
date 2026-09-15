@@ -412,6 +412,7 @@ helm-validate: helm-lint helm-networking-test ## Validate all charts (lint + tem
 	@echo "Validating values/dev/kind-infra.yaml..."
 	helm template osac-infra $(INFRA_CHART) --values values/dev/kind-infra.yaml
 	./scripts/validate-keycloak-credentials.sh
+	./scripts/validate-hub-access-rbac.sh
 	@echo "Validation passed."
 
 .PHONY: helm-networking-test
