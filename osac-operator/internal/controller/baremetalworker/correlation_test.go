@@ -15,19 +15,41 @@ package baremetalworker
 
 import (
 	"context"
+	"errors"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
+
+type transientAgentConflictClient struct {
+	client.Client
+	conflictInjected bool
+}
+
+func (c *transientAgentConflictClient) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption,
+) error {
+	if !c.conflictInjected {
+		c.conflictInjected = true
+		return apierrors.NewConflict(
+			schema.GroupResource{Group: agentGVK.Group, Resource: "agents"},
+			obj.GetName(),
+			errors.New("transient test conflict"),
+		)
+	}
+	return c.Client.Patch(ctx, obj, patch, opts...)
+}
 
 var _ = Describe("matchAgentToBMI", func() {
 	makeAgent := func(macs ...string) *unstructured.Unstructured {
@@ -245,6 +267,115 @@ var _ = Describe("reconcileNodePoolReplicas", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(found).To(BeTrue())
 			Expect(replicas).To(Equal(want), name)
+		}
+	})
+})
+
+var _ = Describe("correlateAgents with transient Agent conflicts", func() {
+	It("eventually binds both resource classes and preserves the binding contract", func() {
+		const (
+			namespace        = "osac-e2e-ci"
+			clusterOrderName = "ci-cluster"
+			computeMAC       = "aa:bb:cc:dd:ee:01"
+			gpuMAC           = "aa:bb:cc:dd:ee:02"
+		)
+
+		makeAgent := func(name, mac string) *unstructured.Unstructured {
+			agent := &unstructured.Unstructured{Object: map[string]interface{}{}}
+			agent.SetGroupVersionKind(agentGVK)
+			agent.SetName(name)
+			agent.SetNamespace(namespace)
+			agent.SetLabels(map[string]string{clusterOrderLabel: clusterOrderName})
+			Expect(unstructured.SetNestedSlice(agent.Object, []interface{}{
+				map[string]interface{}{"macAddress": mac},
+			}, "status", "inventory", "interfaces")).To(Succeed())
+			return agent
+		}
+
+		co := &v1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterOrderName, Namespace: namespace},
+			Status: v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{
+				{
+					NodeSet:    "compute",
+					Name:       "ci-worker-bm",
+					Kind:       workerKindBMI,
+					ResourceID: "bmi-compute",
+					Phase:      workerPhaseWaitingForAgent,
+				},
+				{
+					NodeSet:    "gpu",
+					Name:       "ci-worker-bm-gpu",
+					Kind:       workerKindBMI,
+					ResourceID: "bmi-gpu",
+					Phase:      workerPhaseWaitingForAgent,
+				},
+			}},
+		}
+		computeAgent := makeAgent("agent-compute", computeMAC)
+		gpuAgent := makeAgent("agent-gpu", gpuMAC)
+
+		s := runtime.NewScheme()
+		Expect(v1alpha1.AddToScheme(s)).To(Succeed())
+		s.AddKnownTypeWithName(agentGVK, &unstructured.Unstructured{})
+		agentListGVK := agentGVK
+		agentListGVK.Kind += "List"
+		s.AddKnownTypeWithName(agentListGVK, &unstructured.UnstructuredList{})
+		baseClient := clientfake.NewClientBuilder().
+			WithScheme(s).
+			WithObjects(co, computeAgent, gpuAgent).
+			Build()
+		conflictClient := &transientAgentConflictClient{Client: baseClient}
+		r := &Reconciler{
+			Client:   conflictClient,
+			recorder: events.NewFakeRecorder(2),
+		}
+		r.SetMACResolver(func(_ context.Context, resourceID string) []string {
+			switch resourceID {
+			case "bmi-compute":
+				return []string{computeMAC}
+			case "bmi-gpu":
+				return []string{gpuMAC}
+			default:
+				return nil
+			}
+		})
+
+		workers, result, err := r.correlateAgents(context.Background(), co, co.Status.Workers)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(workers).To(HaveLen(2))
+		Expect(workers[0].Phase).To(Equal(workerPhaseBinding))
+		Expect(workers[1].Phase).To(Equal(workerPhaseBinding))
+		Expect(result).To(BeZero())
+
+		for _, expected := range []struct {
+			name, workerName, resourceClass string
+		}{
+			{name: "agent-compute", workerName: "ci-worker-bm", resourceClass: "compute"},
+			{name: "agent-gpu", workerName: "ci-worker-bm-gpu", resourceClass: "gpu"},
+		} {
+			agent := &unstructured.Unstructured{}
+			agent.SetGroupVersionKind(agentGVK)
+			Expect(baseClient.Get(context.Background(), types.NamespacedName{
+				Name: expected.name, Namespace: namespace,
+			}, agent)).To(Succeed())
+
+			clusterDeploymentName, found, err := unstructured.NestedString(
+				agent.Object, "spec", "clusterDeploymentName", "name")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(clusterDeploymentName).To(Equal(clusterOrderName))
+			clusterDeploymentNamespace, found, err := unstructured.NestedString(
+				agent.Object, "spec", "clusterDeploymentName", "namespace")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(clusterDeploymentNamespace).To(Equal(namespace))
+
+			approved, found, err := unstructured.NestedBool(agent.Object, "spec", "approved")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(found).To(BeTrue())
+			Expect(approved).To(BeTrue())
+			Expect(agent.GetLabels()).To(HaveKeyWithValue(workerNameLabel, expected.workerName))
+			Expect(agent.GetLabels()).To(HaveKeyWithValue(nodePoolResourceClassLabel, expected.resourceClass))
 		}
 	})
 })
