@@ -262,10 +262,14 @@ func (r *Reconciler) bindAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	agent *unstructured.Unstructured, worker *v1alpha1.WorkerStatus,
 ) error {
+	reader := r.apiReader
+	if reader == nil {
+		reader = r.Client
+	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &unstructured.Unstructured{}
 		latest.SetGroupVersionKind(agentGVK)
-		if err := r.Get(ctx, client.ObjectKeyFromObject(agent), latest); err != nil {
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(agent), latest); err != nil {
 			return err
 		}
 		base := latest.DeepCopy()

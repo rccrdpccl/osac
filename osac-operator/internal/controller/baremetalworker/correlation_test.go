@@ -35,6 +35,27 @@ import (
 type transientAgentConflictClient struct {
 	client.Client
 	conflictInjected bool
+	staleAgent       *unstructured.Unstructured
+}
+
+const (
+	assistedServiceLabel           = "infraenvs.agent-install.openshift.io"
+	assistedServiceLabelValue      = "ci-cluster-infraenv"
+	assistedServiceAnnotation      = "agent-install.openshift.io/assisted-service-update"
+	assistedServiceAnnotationValue = "registered"
+	assistedServiceStatus          = "registering"
+)
+
+func (c *transientAgentConflictClient) Get(
+	ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+) error {
+	if c.conflictInjected && c.staleAgent != nil && key == client.ObjectKeyFromObject(c.staleAgent) {
+		if stale, ok := obj.(*unstructured.Unstructured); ok {
+			*stale = *c.staleAgent.DeepCopy()
+			return nil
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
 }
 
 func (c *transientAgentConflictClient) Patch(
@@ -42,6 +63,29 @@ func (c *transientAgentConflictClient) Patch(
 ) error {
 	if !c.conflictInjected {
 		c.conflictInjected = true
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(agentGVK)
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(obj), current); err != nil {
+			return err
+		}
+		labels := current.GetLabels()
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		labels[assistedServiceLabel] = assistedServiceLabelValue
+		current.SetLabels(labels)
+		annotations := current.GetAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[assistedServiceAnnotation] = assistedServiceAnnotationValue
+		current.SetAnnotations(annotations)
+		if err := unstructured.SetNestedField(current.Object, assistedServiceStatus, "status", "debugInfo", "state"); err != nil {
+			return err
+		}
+		if err := c.Client.Update(ctx, current); err != nil {
+			return err
+		}
 		return apierrors.NewConflict(
 			schema.GroupResource{Group: agentGVK.Group, Resource: "agents"},
 			obj.GetName(),
@@ -324,10 +368,14 @@ var _ = Describe("correlateAgents with transient Agent conflicts", func() {
 			WithScheme(s).
 			WithObjects(co, computeAgent, gpuAgent).
 			Build()
-		conflictClient := &transientAgentConflictClient{Client: baseClient}
+		conflictClient := &transientAgentConflictClient{
+			Client:     baseClient,
+			staleAgent: computeAgent.DeepCopy(),
+		}
 		r := &Reconciler{
-			Client:   conflictClient,
-			recorder: events.NewFakeRecorder(2),
+			Client:    conflictClient,
+			apiReader: baseClient,
+			recorder:  events.NewFakeRecorder(2),
 		}
 		r.SetMACResolver(func(_ context.Context, resourceID string) []string {
 			switch resourceID {
@@ -376,6 +424,23 @@ var _ = Describe("correlateAgents with transient Agent conflicts", func() {
 			Expect(approved).To(BeTrue())
 			Expect(agent.GetLabels()).To(HaveKeyWithValue(workerNameLabel, expected.workerName))
 			Expect(agent.GetLabels()).To(HaveKeyWithValue(nodePoolResourceClassLabel, expected.resourceClass))
+			Expect(agent.GetLabels()).To(HaveKeyWithValue(agentBareMetalRoleLabel, "true"))
+			Expect(agent.GetLabels()).To(HaveKeyWithValue(clusterOrderLabel, clusterOrderName))
+			Expect(agent.GetLabels()).To(HaveKeyWithValue("osac.openshift.io/clusterorder", clusterOrderName))
 		}
+
+		assistedAgent := &unstructured.Unstructured{}
+		assistedAgent.SetGroupVersionKind(agentGVK)
+		Expect(baseClient.Get(context.Background(), types.NamespacedName{
+			Name: "agent-compute", Namespace: namespace,
+		}, assistedAgent)).To(Succeed())
+		Expect(assistedAgent.GetLabels()).To(HaveKeyWithValue(assistedServiceLabel, assistedServiceLabelValue))
+		Expect(assistedAgent.GetAnnotations()).To(HaveKeyWithValue(
+			assistedServiceAnnotation, assistedServiceAnnotationValue))
+		assistedState, found, err := unstructured.NestedString(
+			assistedAgent.Object, "status", "debugInfo", "state")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(assistedState).To(Equal(assistedServiceStatus))
 	})
 })
