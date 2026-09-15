@@ -151,6 +151,35 @@ def test_workload_cluster_health_ignores_control_plane_nodes() -> None:
     assert helpers.workload_cluster_health_ready(nodes=nodes, operators=operators, expected_workers=1) is True
 
 
+def test_workload_cluster_health_waits_for_worker_before_checking_operators() -> None:
+    operators = [{"metadata": {"name": "ingress"}, "status": {"conditions": [{"type": "Degraded", "status": "True"}]}}]
+
+    assert helpers.workload_cluster_health_ready(nodes=[], operators=operators, expected_workers=1) is False
+
+
+def test_workload_cluster_health_requires_worker_role_label() -> None:
+    nodes = [
+        {
+            "metadata": {"name": "infra-0", "labels": {"node-role.kubernetes.io/infra": ""}},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+        }
+    ]
+    operators = [
+        {
+            "metadata": {"name": "network"},
+            "status": {
+                "conditions": [
+                    {"type": "Available", "status": "True"},
+                    {"type": "Progressing", "status": "False"},
+                    {"type": "Degraded", "status": "False"},
+                ]
+            },
+        }
+    ]
+
+    assert helpers.workload_cluster_health_ready(nodes=nodes, operators=operators, expected_workers=1) is False
+
+
 def test_workload_cluster_health_rejects_worker_without_ready_true() -> None:
     nodes = [
         {
