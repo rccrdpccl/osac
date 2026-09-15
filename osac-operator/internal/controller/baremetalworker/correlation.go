@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -261,37 +262,44 @@ func (r *Reconciler) bindAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	agent *unstructured.Unstructured, worker *v1alpha1.WorkerStatus,
 ) error {
-	base := agent.DeepCopy()
-
-	if err := unstructured.SetNestedMap(agent.Object, map[string]interface{}{
-		"name":      co.Name,
-		"namespace": co.Namespace,
-	}, "spec", "clusterDeploymentName"); err != nil {
-		return fmt.Errorf("setting agent clusterDeploymentName: %w", err)
-	}
-
-	if err := unstructured.SetNestedField(agent.Object, true, "spec", "approved"); err != nil {
-		return fmt.Errorf("setting agent approved: %w", err)
-	}
-
-	labels := agent.GetLabels()
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-	workerName := ""
-	if worker != nil {
-		workerName = worker.Name
-		if worker.NodeSet != "" {
-			labels[nodePoolResourceClassLabel] = worker.NodeSet
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &unstructured.Unstructured{}
+		latest.SetGroupVersionKind(agentGVK)
+		if err := r.Get(ctx, client.ObjectKeyFromObject(agent), latest); err != nil {
+			return err
 		}
-	}
-	labels[workerNameLabel] = workerName
-	labels[agentBareMetalRoleLabel] = "true"
-	labels[clusterOrderLabel] = co.Name
-	labels["osac.openshift.io/clusterorder"] = co.Name
-	agent.SetLabels(labels)
+		base := latest.DeepCopy()
 
-	return r.Patch(ctx, agent, client.MergeFrom(base))
+		if err := unstructured.SetNestedMap(latest.Object, map[string]interface{}{
+			"name":      co.Name,
+			"namespace": co.Namespace,
+		}, "spec", "clusterDeploymentName"); err != nil {
+			return fmt.Errorf("setting agent clusterDeploymentName: %w", err)
+		}
+
+		if err := unstructured.SetNestedField(latest.Object, true, "spec", "approved"); err != nil {
+			return fmt.Errorf("setting agent approved: %w", err)
+		}
+
+		labels := latest.GetLabels()
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+		workerName := ""
+		if worker != nil {
+			workerName = worker.Name
+			if worker.NodeSet != "" {
+				labels[nodePoolResourceClassLabel] = worker.NodeSet
+			}
+		}
+		labels[workerNameLabel] = workerName
+		labels[agentBareMetalRoleLabel] = "true"
+		labels[clusterOrderLabel] = co.Name
+		labels["osac.openshift.io/clusterorder"] = co.Name
+		latest.SetLabels(labels)
+
+		return r.Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+	})
 }
 
 // agentInstalled reports whether an Agent is installed. The Installed condition is authoritative
