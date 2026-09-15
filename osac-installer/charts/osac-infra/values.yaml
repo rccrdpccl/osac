@@ -73,6 +73,7 @@ mce:
   enabled: false
   channel: "stable-2.17"
   osImages: []
+  imageOverrides: []
 
 kafka:
   enabled: false
