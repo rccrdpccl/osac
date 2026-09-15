@@ -589,8 +589,10 @@ var _ = Describe("BareMetalWorkerReconciler resolveDiskImage", func() {
 		create(co)
 		makeInfraEnvReady("bmw-nodisk")
 
-		_, err := runReconcile("bmw-nodisk")
+		res, err := runReconcile("bmw-nodisk")
 		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(fc.CreateCalls()).To(BeEmpty())
 
 		cond := apimeta.FindStatusCondition(
 			getClusterOrder("bmw-nodisk").Status.Conditions, osacv1alpha1.ConditionRHCOSImageNotFound)
