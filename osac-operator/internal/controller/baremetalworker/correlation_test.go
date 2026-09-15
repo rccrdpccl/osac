@@ -34,13 +34,14 @@ import (
 
 type transientAgentConflictClient struct {
 	client.Client
-	conflictInjected bool
-	staleAgent       *unstructured.Unstructured
+	conflictInjected  bool
+	conflictAgentName string
+	staleAgent        *unstructured.Unstructured
 }
 
 const (
 	assistedServiceLabel           = "infraenvs.agent-install.openshift.io"
-	assistedServiceLabelValue      = "ci-cluster-infraenv"
+	assistedServiceLabelValue      = "ci-cluster" + infraEnvNameSuffix
 	assistedServiceAnnotation      = "agent-install.openshift.io/assisted-service-update"
 	assistedServiceAnnotationValue = "registered"
 	assistedServiceStatus          = "registering"
@@ -61,7 +62,7 @@ func (c *transientAgentConflictClient) Get(
 func (c *transientAgentConflictClient) Patch(
 	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption,
 ) error {
-	if !c.conflictInjected {
+	if !c.conflictInjected && obj.GetName() == c.conflictAgentName {
 		c.conflictInjected = true
 		current := &unstructured.Unstructured{}
 		current.SetGroupVersionKind(agentGVK)
@@ -369,8 +370,9 @@ var _ = Describe("correlateAgents with transient Agent conflicts", func() {
 			WithObjects(co, computeAgent, gpuAgent).
 			Build()
 		conflictClient := &transientAgentConflictClient{
-			Client:     baseClient,
-			staleAgent: computeAgent.DeepCopy(),
+			Client:            baseClient,
+			conflictAgentName: computeAgent.GetName(),
+			staleAgent:        computeAgent.DeepCopy(),
 		}
 		r := &Reconciler{
 			Client:    conflictClient,
