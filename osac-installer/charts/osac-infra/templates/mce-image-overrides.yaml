@@ -14,6 +14,7 @@ metadata:
   annotations:
     osac.openshift.io/tenant: platform
     osac.openshift.io/owner-reference: MultiClusterEngine/multiclusterengine
+data:
   manifest.json: |
     {{ toJson .Values.mce.imageOverrides | indent 4 }}
 {{- end }}
