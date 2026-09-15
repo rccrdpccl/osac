@@ -624,8 +624,8 @@ func (r *Reconciler) ensureSystemCatalogItem(ctx context.Context, co *v1alpha1.C
 // same way the ComputeInstance reconciler does (OSAC-3724), so a bootable OCI URL lands on the
 // BMI rather than a raw DiskImage id. It re-resolves on every reconcile so a ClusterVersion
 // upgrade takes effect without controller restart. Returns a nil image (and no error) when the
-// ClusterVersion carries no disk_image reference, mirroring the pre-existing behavior of
-// continuing to reconcile workers while RHCOSImageNotFound is set.
+// ClusterVersion carries no disk_image reference; reconciliation is requeued so workers are not
+// created until a usable image is available.
 func (r *Reconciler) resolveDiskImage(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 ) (*privatev1.BareMetalInstanceImage, ctrl.Result, error) {
@@ -660,7 +660,7 @@ func (r *Reconciler) resolveDiskImage(
 			fmt.Sprintf("ClusterVersion %s has no disk_image reference", versionID)); condErr != nil {
 			return nil, ctrl.Result{}, condErr
 		}
-		return nil, ctrl.Result{}, nil
+		return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
 	}
 
 	di, err := r.fulfillment.GetDiskImage(ctx, diskImageKey)
