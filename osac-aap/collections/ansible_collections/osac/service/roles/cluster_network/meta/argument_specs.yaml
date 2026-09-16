@@ -30,9 +30,10 @@ argument_specs:
       default_agent_namespace:
         type: str
         required: true
-      hosted_cluster_default_infraenv:
+      cluster_network_infraenv_name:
         type: str
         required: true
+        description: "Operator-owned InfraEnv name for this ClusterOrder"
       network_steps_collection:
         type: str
         required: true

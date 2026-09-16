@@ -2,7 +2,7 @@
   ansible.builtin.set_fact:
     delete_step_pre_delete_hook_default:
       name: osac.templates.ocp_ci_small
-      tasks_from: pre_delete.yaml
+      tasks_from: noop.yaml
     delete_step_hosted_cluster_default:
       name: osac.service.hosted_cluster
       tasks_from: main.yaml
@@ -54,6 +54,7 @@
     cluster_network_state: absent
     cluster_network_name: "{{ cluster_order.metadata.name }}"
     cluster_network_namespace: "{{ cluster_working_namespace }}"
+    cluster_network_infraenv_name: "{{ cluster_order.metadata.name }}-infraenv"
     cluster_network_node_requests: "{{ normalized_node_requests }}"
 
 - name: Step - Remove port forwarding

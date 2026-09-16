@@ -222,7 +222,7 @@
       apiVersion: agent-install.openshift.io/v1beta1
       kind: InfraEnv
       metadata:
-        name: "{{ hosted_cluster_default_infraenv }}"
+        name: "{{ cluster_network_infraenv_name }}"
         namespace: "{{ default_agent_namespace }}"
       spec:
         nmStateConfigLabelSelector:
