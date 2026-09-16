@@ -1,15 +1,14 @@
 ---
-# OSAC-2135 (interim bridge until OSAC-1436): agent detach/unlabel is no longer
-# done here — the osac-operator owns agent binding/unbinding and NodePool scaling.
-# This role tears down ONLY the Netris fabric it created plus the NMStateConfig CRs
-# and the InfraEnv nmstate label selector.
-- name: List agents allocated to this cluster for nmstate revert
+# Agent binding and worker scaling are owned by osac-operator. This role tears
+# down only the Netris fabric it created plus the NMStateConfig resources and
+# the InfraEnv nmstate label selector.
+- name: List agents associated with this cluster for NMState revert
   kubernetes.core.k8s_info:
     kind: Agent
     api_version: agent-install.openshift.io/v1beta1
     namespace: "{{ default_agent_namespace }}"
     label_selectors:
-      - "{{ cluster_order_label }}={{ cluster_infra_name }}"
+      - "{{ cluster_order_label }}={{ cluster_network_name }}"
   register: cluster_agents_for_nmstate_revert
 
 - name: Delete NMStateConfig for cluster agents
@@ -17,7 +16,7 @@
     name: osac.service.nmstate_config
   vars:
     nmstate_config_state: absent
-    nmstate_config_cluster_name: "{{ cluster_infra_name }}"
+    nmstate_config_cluster_name: "{{ cluster_network_name }}"
     nmstate_config_agents: "{{ cluster_agents_for_nmstate_revert.resources }}"
 
 - name: Get InfraEnv to check nmStateConfigLabelSelector
@@ -46,7 +45,7 @@
   ansible.builtin.include_role:
     name: netris.controller.nat
   vars:
-    nat_name: "{{ cluster_infra_name }}-snat"
+    nat_name: "{{ cluster_network_name }}-snat"
     nat_state: absent
     nat_site_id: "{{ netris_site_id }}"
 
@@ -54,7 +53,7 @@
   ansible.builtin.include_role:
     name: netris.controller.server_cluster
   vars:
-    server_cluster_name: "{{ cluster_infra_name }}"
+    server_cluster_name: "{{ cluster_network_name }}"
     server_cluster_state: absent
     server_cluster_site_id: "{{ netris_site_id }}"
 
@@ -62,5 +61,5 @@
   ansible.builtin.include_role:
     name: netris.controller.vpc
   vars:
-    vpc_name: "{{ cluster_infra_name }}"
+    vpc_name: "{{ cluster_network_name }}"
     vpc_state: absent
