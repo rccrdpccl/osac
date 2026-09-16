@@ -23,7 +23,7 @@
   kubernetes.core.k8s_info:
     api_version: agent-install.openshift.io/v1beta1
     kind: InfraEnv
-    name: "{{ hosted_cluster_default_infraenv }}"
+    name: "{{ cluster_network_infraenv_name }}"
     namespace: "{{ default_agent_namespace }}"
   register: infraenv_info
 
@@ -31,7 +31,7 @@
   kubernetes.core.k8s_json_patch:
     api_version: agent-install.openshift.io/v1beta1
     kind: InfraEnv
-    name: "{{ hosted_cluster_default_infraenv }}"
+    name: "{{ cluster_network_infraenv_name }}"
     namespace: "{{ default_agent_namespace }}"
     patch:
       - op: remove

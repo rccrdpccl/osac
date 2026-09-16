@@ -11,7 +11,7 @@
       order_label: "{{ cluster_order_label }}"
       agent_resource_class_label: "{{ agent_resource_class_label }}"
       agent_namespace: "{{ default_agent_namespace }}"
-      infraenv: "{{ hosted_cluster_default_infraenv }}"
+      infraenv_name: "{{ cluster_network_infraenv_name }}"
       steps_collection: "{{ network_steps_collection }}"
 
 - name: Include network-class-specific create tasks
@@ -28,5 +28,5 @@
     cluster_order_label: "{{ _cluster_network_backend_inputs.order_label }}"
     agent_resource_class_label: "{{ _cluster_network_backend_inputs.agent_resource_class_label }}"
     default_agent_namespace: "{{ _cluster_network_backend_inputs.agent_namespace }}"
-    hosted_cluster_default_infraenv: "{{ _cluster_network_backend_inputs.infraenv }}"
+    cluster_network_infraenv_name: "{{ _cluster_network_backend_inputs.infraenv_name }}"
     network_steps_collection: "{{ _cluster_network_backend_inputs.steps_collection }}"
