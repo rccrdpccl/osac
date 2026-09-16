@@ -64,6 +64,7 @@
     cluster_network_state: present
     cluster_network_name: "{{ cluster_order.metadata.name }}"
     cluster_network_namespace: "{{ cluster_working_namespace }}"
+    cluster_network_infraenv_name: "{{ cluster_order.metadata.name }}-infraenv"
     cluster_network_node_requests: "{{ normalized_node_requests }}"
 
 - name: Step - Configure port forwarding
