@@ -31,16 +31,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker"
 	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker/fake"
 	"github.com/osac-project/osac/osac-operator/internal/testing/envsim"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
-// diskImageSourceRef is the resolved OCI image URL the fake DiskImage carries. The reconciler
-// resolves the ClusterVersion's DiskImage reference to concrete source_type/source_ref via
-// GetDiskImage (mirroring ComputeInstance, OSAC-3724), so BMIs land a bootable OCI URL rather
-// than a raw DiskImage id.
+// diskImageSourceRef is the source URL carried by the fake DiskImage. The reconciler validates
+// the ClusterVersion's DiskImage reference via GetDiskImage and passes the canonical reference
+// to fulfillment-service, which resolves the source URL when it creates the provider CR.
 const diskImageSourceRef = "oci://registry.example.com/rhcos:4.18"
 
 func newInstanceType(name string, fabricPort string, extraPorts ...*privatev1.BareMetalNetworkPortSpec) *privatev1.BareMetalInstanceType {
@@ -807,8 +806,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(bmi.GetMetadata().GetAnnotations()).To(HaveKeyWithValue(
 			"osac.openshift.io/owner-reference", "ClusterOrder/bmw-create"))
 		Expect(bmi.GetSpec().GetCatalogItem().GetName()).To(Equal("system-bmi-passthrough"))
-		Expect(bmi.GetSpec().GetImage().GetSourceType()).To(Equal("registry"))
-		Expect(bmi.GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageSourceRef))
+		Expect(bmi.GetSpec().GetDiskImage().GetId()).To(Equal(diskImageID))
 		Expect(bmi.GetSpec().GetInstanceType().GetName()).To(Equal("bm-standard"))
 
 		userData := bmi.GetSpec().GetUserData()
@@ -856,8 +854,7 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 
 		calls := fc.CreateCalls()
 		Expect(calls).To(HaveLen(1))
-		Expect(calls[0].GetSpec().GetImage().GetSourceType()).To(Equal("registry"))
-		Expect(calls[0].GetSpec().GetImage().GetSourceRef()).To(Equal(diskImageSourceRef))
+		Expect(calls[0].GetSpec().GetDiskImage().GetId()).To(Equal(diskImageID))
 		Expect(fc.GetDiskImageCalls()).To(ContainElement(diskImageID))
 	})
 

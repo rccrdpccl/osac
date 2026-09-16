@@ -25,7 +25,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var runID = strconv.FormatInt(time.Now().UnixMilli(), 36)
