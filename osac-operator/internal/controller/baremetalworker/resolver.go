@@ -16,7 +16,7 @@ package baremetalworker
 import (
 	"context"
 
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // nicMACs extracts the NIC MAC addresses from a BareMetalInstance's status.hardware.nics
