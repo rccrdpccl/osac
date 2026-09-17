@@ -1246,7 +1246,11 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
 			clusterOrder.Status.Phase = osacv1alpha1.ClusterOrderPhaseReady
 			clusterOrder.Status.NodeRequests = []osacv1alpha1.NodeRequest{
-				{ResourceClass: "m5.xlarge", NumberOfNodes: 3},
+				{
+					ResourceClass: "m5.xlarge",
+					NumberOfNodes: 3,
+					BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "m5.xlarge"},
+				},
 			}
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
 
@@ -1256,7 +1260,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 					Spec: &privatev1.ClusterSpec{
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"workers": {
-								HostType: privatev1.HostTypeReference_builder{Name: "m5.xlarge"}.Build(),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "m5.xlarge"}.Build(),
 							},
 						},
 					},
@@ -1273,6 +1277,9 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(result.IsZero()).To(BeTrue())
 			Expect(mockClient.updateCalled).To(BeTrue())
 			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetSize()).To(Equal(int32(3)))
+			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetBaremetalInstanceType().GetName()).To(
+				Equal("m5.xlarge"),
+			)
 
 			hasNodeSetsPath := false
 			for _, path := range mockClient.lastUpdateMask.GetPaths() {
