@@ -246,13 +246,6 @@ type ClusterOrderStatus struct {
 	// +kubebuilder:validation:Optional
 	IngressEndpoint string `json:"ingressEndpoint,omitempty"`
 
-	// NodeSets holds per-node-set networking status, populated by the
-	// operator during agent selection and networking reconciliation.
-	// +kubebuilder:validation:Optional
-	// +listType=map
-	// +listMapKey=name
-	NodeSets []NodeSetStatus `json:"nodeSets,omitempty"`
-
 	// DesiredWorkers is the total number of workers requested across all node sets.
 	// Populated by the BareMetalWorkerReconciler from Workers.
 	// +kubebuilder:validation:Optional
@@ -336,48 +329,6 @@ type WorkerStatus struct {
 	// Used to determine when attemptCount can be reset after MinHealthyDuration.
 	// +kubebuilder:validation:Optional
 	ReadySince *metav1.Time `json:"readySince,omitempty"`
-}
-
-// NodeSetStatus holds networking status for a single node set.
-type NodeSetStatus struct {
-	// Name is the node set identifier (matches the ClusterNodeSet key).
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
-
-	// FabricInterface is the host NIC used for tenant network traffic,
-	// resolved from the node set's HostType NetworkInterface list.
-	// +kubebuilder:validation:Optional
-	FabricInterface string `json:"fabricInterface,omitempty"`
-
-	// Agents holds per-agent networking status within this node set.
-	// +kubebuilder:validation:Optional
-	// +listType=map
-	// +listMapKey=agentName
-	Agents []AgentStatus `json:"agents,omitempty"`
-}
-
-// AgentStatus holds networking status for a single agent (bare-metal host)
-// within a node set.
-type AgentStatus struct {
-	// AgentName is the name of the Agent CR, used for NodePool targeting.
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	AgentName string `json:"agentName"`
-
-	// HostName is the bare-metal server name used by the network dispatcher.
-	// Absent when the agent does not carry the netris.server/name label (e.g. CI environments).
-	// +kubebuilder:validation:Optional
-	HostName string `json:"hostName,omitempty"`
-
-	// SubnetRef is the name of the Subnet CR the agent is connected to.
-	// +kubebuilder:validation:Optional
-	SubnetRef string `json:"subnetRef,omitempty"`
-
-	// IPAddress is the agent's IPv4 address on the tenant subnet,
-	// discovered from the Agent CR status after DHCP assignment.
-	// +kubebuilder:validation:Optional
-	IPAddress string `json:"ipAddress,omitempty"`
 }
 
 // +kubebuilder:object:root=true

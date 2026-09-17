@@ -471,16 +471,24 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 	log := ctrllog.FromContext(ctx)
 	for i := range len(clusterOrder.Status.NodeRequests) {
 		nodeRequest := &clusterOrder.Status.NodeRequests[i]
+		resourceClass := nodeRequest.ResourceClass
+		if nodeRequest.BareMetal != nil && nodeRequest.BareMetal.InstanceType != "" {
+			resourceClass = nodeRequest.BareMetal.InstanceType
+		}
 
 		var nodeSetID string
 		for candidateNodeSetID, candidateNodeSet := range remote.GetSpec().GetNodeSets() {
-			if candidateNodeSet.GetHostType().GetName() == nodeRequest.ResourceClass {
+			candidateResourceClass := candidateNodeSet.GetBaremetalInstanceType().GetName()
+			if candidateResourceClass == "" {
+				candidateResourceClass = candidateNodeSet.GetHostType().GetName()
+			}
+			if candidateResourceClass == resourceClass {
 				nodeSetID = candidateNodeSetID
 				break
 			}
 		}
 		if nodeSetID == "" {
-			log.Error(nil, "Failed to find a matching node set", "resource_class", nodeRequest.ResourceClass)
+			log.Error(nil, "Failed to find a matching node set", "resource_class", resourceClass)
 			continue
 		}
 
@@ -491,11 +499,15 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 		}
 		nodeSet := nodeSets[nodeSetID]
 		if nodeSet == nil {
-			nodeSet = privatev1.ClusterNodeSet_builder{
-				HostType: privatev1.HostTypeReference_builder{
-					Name: nodeRequest.ResourceClass,
-				}.Build(),
-			}.Build()
+			builder := privatev1.ClusterNodeSet_builder{}
+			if nodeRequest.BareMetal != nil && nodeRequest.BareMetal.InstanceType != "" {
+				builder.BaremetalInstanceType = privatev1.BareMetalInstanceTypeReference_builder{
+					Name: nodeRequest.BareMetal.InstanceType,
+				}.Build()
+			} else {
+				builder.HostType = privatev1.HostTypeReference_builder{Name: resourceClass}.Build()
+			}
+			nodeSet = builder.Build()
 			nodeSets[nodeSetID] = nodeSet
 		}
 
@@ -503,7 +515,7 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 		newValue := int32(nodeRequest.NumberOfNodes)
 		if newValue != oldValue {
 			log.Info("Updating node set size",
-				"resource_class", nodeRequest.ResourceClass,
+				"resource_class", resourceClass,
 				"old_value", oldValue,
 				"new_value", newValue,
 			)

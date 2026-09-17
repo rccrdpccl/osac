@@ -459,12 +459,7 @@ class GRPCClient:
         if disk_image is not None:
             spec["disk_image"] = {"id": disk_image}
         response: dict[str, Any] = self.call(
-            service=f"{PRIVATE_API}.ClusterVersions/Create",
-            data={
-                "object": {
-                    "spec": spec
-                }
-            },
+            service=f"{PRIVATE_API}.ClusterVersions/Create", data={"object": {"spec": spec}}
         )
         cluster_version: dict[str, Any] = response["object"]
         return {"id": cluster_version["id"], "name": cluster_version["metadata"]["name"]}
@@ -490,9 +485,7 @@ class GRPCClient:
     def delete_cluster_version(self, *, version_id: str) -> None:
         self.call(service=f"{PRIVATE_API}.ClusterVersions/Delete", data={"id": version_id})
 
-    def ensure_cluster_version(
-        self, *, version: str, image: str, disk_image: str | None = None
-    ) -> dict[str, str]:
+    def ensure_cluster_version(self, *, version: str, image: str, disk_image: str | None = None) -> dict[str, str]:
         """Create a ClusterVersion, tolerating AlreadyExists left behind by a prior failed run.
 
         Returns {"id": ..., "name": ...} for the resolved ClusterVersion."""
@@ -522,46 +515,7 @@ class GRPCClient:
                 return item["id"]
         raise RuntimeError(f"DiskImage '{name}' reported AlreadyExists but not found in list")
 
-    # HostType and BareMetalInstanceType operations (private API)
-
-    def create_host_type(
-        self,
-        *,
-        name: str,
-        title: str = "CI Worker",
-        description: str = "Worker nodes for CI testing",
-        tenant: str = "shared",
-    ) -> str:
-        """Create a HostType via the private API."""
-        obj: dict[str, Any] = {
-            "metadata": {"name": name, "tenant": tenant},
-            "title": title,
-            "description": description,
-        }
-        response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.HostTypes/Create", data={"object": obj})
-        return response["object"]["id"]
-
-    def ensure_host_type(
-        self,
-        *,
-        name: str,
-        title: str = "CI Worker",
-        description: str = "Worker nodes for CI testing",
-        tenant: str = "shared",
-    ) -> str:
-        """Create a HostType, tolerating AlreadyExists left behind by a prior run."""
-        try:
-            return self.create_host_type(name=name, title=title, description=description, tenant=tenant)
-        except subprocess.CalledProcessError as e:
-            output = (e.stdout or "") + (e.stderr or "")
-            if not re.search(r"Code:\s*AlreadyExists", output):
-                raise RuntimeError(f"Failed to create host type '{name}': {output}") from e
-        response: dict[str, Any] = self.call(service=f"{PRIVATE_API}.HostTypes/List")
-        for item in response.get("items", []):
-            if item.get("metadata", {}).get("name") == name:
-                return item["id"]
-        raise RuntimeError(f"HostType '{name}' reported AlreadyExists but not found in list")
-
+    # BareMetalInstanceType operations (private API)
     def create_bare_metal_instance_type(
         self,
         *,
