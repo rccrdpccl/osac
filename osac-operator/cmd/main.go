@@ -84,7 +84,6 @@ const (
 	envComputeInstanceNamespace   = "OSAC_COMPUTE_INSTANCE_NAMESPACE"
 	envNetworkingNamespace        = "OSAC_NETWORKING_NAMESPACE"
 	envClusterOrderNamespace      = "OSAC_CLUSTER_ORDER_NAMESPACE"
-	envAgentNamespace             = "OSAC_AGENT_NAMESPACE"
 	envBareMetalInstanceNamespace = "OSAC_BARE_METAL_INSTANCE_NAMESPACE"
 	envVolumeNamespace            = "OSAC_VOLUME_NAMESPACE"
 	// envStorageConfigNamespace is the namespace holding the per-tenant
@@ -408,7 +407,6 @@ func setupClusterControllers(
 			reconciler := controller.NewClusterOrderReconciler(
 				localMgr.GetClient(), localMgr.GetAPIReader(), localMgr.GetScheme(),
 				os.Getenv(envClusterOrderNamespace),
-				os.Getenv(envAgentNamespace),
 				os.Getenv(envNetworkingNamespace),
 				provider, pollInterval, maxJobHistory,
 			)

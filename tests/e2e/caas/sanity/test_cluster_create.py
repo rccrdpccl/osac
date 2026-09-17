@@ -51,7 +51,6 @@ def test_cluster_create(
     releaseImage propagation to the HostedCluster, N+1 metering heartbeat decomposition,
     worker scale-up reflected in updated.v1 metering, and deletion."""
 
-    private_grpc.ensure_host_type(name="ci-worker")
     private_grpc.ensure_bare_metal_instance_type(
         name="ci-worker-bm", host_label_selector={"osac.openshift.io/host-type": "default"}
     )

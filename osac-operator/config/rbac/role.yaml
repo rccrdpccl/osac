@@ -49,7 +49,6 @@ rules:
   - get
   - list
   - patch
-  - update
   - watch
 - apiGroups:
   - agent-install.openshift.io
