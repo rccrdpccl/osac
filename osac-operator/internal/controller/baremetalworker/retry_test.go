@@ -85,7 +85,7 @@ var _ = Describe("FormatWorkersFailed", func() {
 			{Name: "w-0", Phase: workerPhaseFailed, AttemptCount: 2, NextRetryTime: &retryTime},
 		}
 		Expect(FormatWorkersFailed(workers)).To(Equal(
-			"w-0: attempt 2, next retry " + retryTime.UTC().Format(time.RFC3339),
+			"retry 1: attempt 2, next retry " + retryTime.UTC().Format(time.RFC3339),
 		))
 	})
 
@@ -96,8 +96,8 @@ var _ = Describe("FormatWorkersFailed", func() {
 			{Name: "w-2", Phase: workerPhaseFailed, AttemptCount: 3, NextRetryTime: &retryTime},
 		}
 		Expect(FormatWorkersFailed(workers)).To(Equal(
-			"w-1: attempt 1, next retry " + retryTime.UTC().Format(time.RFC3339) +
-				"; w-2: attempt 3, next retry " + retryTime.UTC().Format(time.RFC3339),
+			"retry 1: attempt 1, next retry " + retryTime.UTC().Format(time.RFC3339) +
+				"; retry 2: attempt 3, next retry " + retryTime.UTC().Format(time.RFC3339),
 		))
 	})
 
@@ -105,6 +105,6 @@ var _ = Describe("FormatWorkersFailed", func() {
 		workers := []v1alpha1.WorkerStatus{
 			{Name: "w-0", Phase: workerPhaseFailed, AttemptCount: 1},
 		}
-		Expect(FormatWorkersFailed(workers)).To(Equal("w-0: attempt 1, next retry pending"))
+		Expect(FormatWorkersFailed(workers)).To(Equal("retry 1: attempt 1, next retry pending"))
 	})
 })
