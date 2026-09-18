@@ -38,7 +38,7 @@ def default_storage_tier() -> str:
 def _requires_serial_xdist(args: list[str]) -> bool:
     """True when CLI targets a suite that must run sequentially.
 
-    BMaaS serial/full and enablement suites require ``-n 0``.
+    CaaS, BMaaS serial/full, and enablement suites require ``-n 0``.
     Broader invocations like ``pytest tests/`` are not detected.
     """
     normalized = [str(a).replace("\\", "/").rstrip("/") for a in args]
@@ -50,6 +50,8 @@ def _requires_serial_xdist(args: list[str]) -> bool:
         or a.endswith("tests/e2e/bmaas")
         or a.endswith("/e2e/bmaas")
         or a == "e2e/bmaas"
+        or a.endswith("e2e/caas")
+        or "/e2e/caas/" in (a + "/")
         or a.endswith("e2e/enablement")
         or "/e2e/enablement/" in (a + "/")
         for a in normalized
