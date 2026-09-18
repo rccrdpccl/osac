@@ -34,6 +34,23 @@ pytestmark = pytest.mark.sanity
 # duplicates on the shared cluster.
 TEST_RELEASE_IMAGE = env("OSAC_TEST_RELEASE_IMAGE", "quay.io/openshift-release-dev/ocp-release:4.22.0-multi")
 RHCOS_IMAGE = env("OSAC_RHCOS_BMI_IMAGE", "oci://quay.io/rh_ee_rpiccoli/rhcos-bmi:4.22.0")
+_WORKER_METRICS = ("osac_caas_worker_desired", "osac_caas_worker_ready", "osac_caas_worker_provisioning_failures_total")
+_WORKER_METRIC_LABELS = {"tenant", "worker_type", "instance_type"}
+
+
+def _metric_samples(metrics: str, metric_name: str) -> list[str]:
+    return [line for line in metrics.splitlines() if line.startswith(f"{metric_name}{{")]
+
+
+def _assert_worker_metrics(metrics: str) -> None:
+    for metric_name in _WORKER_METRICS:
+        assert f"# TYPE {metric_name} " in metrics, f"Missing {metric_name} metric family"
+        for sample in _metric_samples(metrics, metric_name):
+            labels = sample.split("{", 1)[1].split("}", 1)[0]
+            label_names = {label.split("=", 1)[0] for label in labels.split(",")}
+            assert label_names == _WORKER_METRIC_LABELS, (
+                f"{metric_name} labels {sorted(label_names)} do not match {sorted(_WORKER_METRIC_LABELS)}"
+            )
 
 
 @pytest.mark.metering
@@ -58,6 +75,8 @@ def test_cluster_create(
     version = private_grpc.ensure_cluster_version(
         version="4.22.0-rhcos", image=TEST_RELEASE_IMAGE, disk_image=disk_image_id
     )
+    run_owned_bmi_ids: set[str] = set()
+    infra_env_name: str | None = None
     name = unique_name("e2e-cluster")
     uuid = cli.create_cluster(
         name=name,
@@ -93,6 +112,35 @@ def test_cluster_create(
             f"ClusterOrder {co_name} unexpectedly has BareMetalPool resources: "
             f"{[pool.get('metadata', {}).get('name', '<unnamed>') for pool in cluster_pools]}"
         )
+
+        try:
+            worker_metrics = poll_until(
+                fn=k8s_hub_client.get_operator_metrics,
+                until=lambda output: all(
+                    f"# TYPE {metric_name} " in output
+                    and (
+                        metric_name == "osac_caas_worker_provisioning_failures_total"
+                        or _metric_samples(output, metric_name)
+                    )
+                    for metric_name in _WORKER_METRICS
+                ),
+                retries=30,
+                delay=5,
+                description=f"{co_name} worker metrics",
+            )
+        except (subprocess.CalledProcessError, RuntimeError) as exc:
+            detail = (
+                (exc.stderr or exc.output or str(exc)).strip()
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            pytest.fail(
+                f"Cannot verify CaaS worker metrics for ClusterOrder {co_name}: "
+                f"the operator metrics endpoint is unavailable ({detail}); "
+                "this is an infrastructure/profile failure.",
+                pytrace=False,
+            )
+        _assert_worker_metrics(worker_metrics)
 
         metering.expect("osac.resource.started.v1", resource_id=uuid)
         metering.verify()
@@ -176,6 +224,23 @@ def test_cluster_create(
             )
         assert node_pool is not None, f"No NodePool found for resource class {worker_resource_class!r}"
 
+        bmi_filter = f'this.metadata.labels["osac.openshift.io/cluster-order"] == "{co_name}"'
+        run_owned_bmi_ids = set(private_grpc.list_baremetal_instance_ids(filter_expr=bmi_filter))
+        assert run_owned_bmi_ids, "Expected the primary CaaS lifecycle to create at least one worker BMI"
+        tenant_visible_bmi_ids = set(grpc.list_baremetal_instance_ids())
+        assert run_owned_bmi_ids.isdisjoint(tenant_visible_bmi_ids), (
+            f"Tenant-authenticated BMI list exposed CaaS worker IDs: "
+            f"{sorted(run_owned_bmi_ids & tenant_visible_bmi_ids)}"
+        )
+
+        infra_env_name = poll_until(
+            fn=lambda: k8s_hub_client.get_cluster_order_infra_env_name(name=co_name, checked=False),
+            until=lambda value: value != "",
+            retries=30,
+            delay=2,
+            description=f"{co_name} InfraEnv name",
+        )
+
         # Derive expected N+1 count from cluster spec
         expected_components = 1 + len(node_sets)
 
@@ -228,7 +293,28 @@ def test_cluster_create(
         wait_for_cluster_deleting(k8s=k8s_hub_client, name=co_name)
         wait_for_cluster_grpc_deleting_or_archived(grpc=grpc, uuid=uuid)
 
+        poll_until(
+            fn=lambda: run_owned_bmi_ids.isdisjoint(
+                set(private_grpc.list_baremetal_instance_ids(filter_expr=bmi_filter))
+            ),
+            until=lambda value: value is True,
+            retries=60,
+            delay=5,
+            description=f"{co_name} CaaS worker BMI removal",
+        )
+        assert infra_env_name is not None
+        poll_until(
+            fn=lambda: (
+                not k8s_hub_client.is_present(resource="infraenv.agent-install.openshift.io", name=infra_env_name)
+            ),
+            until=lambda value: value is True,
+            retries=60,
+            delay=5,
+            description=f"{infra_env_name} InfraEnv removal",
+        )
+
         wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
+        assert not k8s_hub_client.is_present(resource="clusterorder", name=co_name)
         wait_for_cluster_grpc_removal(grpc=grpc, uuid=uuid)
         metering.verify()
     finally:
