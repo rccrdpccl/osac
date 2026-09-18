@@ -16,7 +16,8 @@ cnv:
 mce:
   enabled: true
   imageService:
-    # Due to an assisted-service bug, this must be enabled for now; it will be disabled once the fix gets through.
+    # Keep enabled until the Assisted discovery-artifact fix is released and
+    # verified. Do not disable this setting in the CaaS profile yet.
     enabled: true
   # Temporary MCE 5.0 operand bridge until a stable MCE 5.0 catalog is available.
   imageOverrides:
