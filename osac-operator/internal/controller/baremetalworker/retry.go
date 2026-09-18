@@ -78,7 +78,7 @@ func ComputeBackoff(category FailureCategory, attemptCount int32) time.Duration 
 	return sched.cap
 }
 
-// FormatWorkersFailed builds the WorkersFailed condition message from retrying workers.
+// FormatWorkersFailed builds tenant-safe retry details from failed workers.
 func FormatWorkersFailed(workers []v1alpha1.WorkerStatus) string {
 	var parts []string
 	for i := range workers {
@@ -90,7 +90,7 @@ func FormatWorkersFailed(workers []v1alpha1.WorkerStatus) string {
 		if w.NextRetryTime != nil {
 			retry = w.NextRetryTime.UTC().Format(time.RFC3339)
 		}
-		parts = append(parts, fmt.Sprintf("%s: attempt %d, next retry %s", w.Name, w.AttemptCount, retry))
+		parts = append(parts, fmt.Sprintf("retry %d: attempt %d, next retry %s", len(parts)+1, w.AttemptCount, retry))
 	}
 	return strings.Join(parts, "; ")
 }

@@ -669,16 +669,19 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(cond.GetMessage()).NotTo(ContainSubstring("gRPC"))
 		})
 
-		It("should include retry info in WORKER_PROVISIONING_FAILED message for retrying workers", func() {
+		It("should include tenant-safe retry details in WORKER_PROVISIONING_FAILED message", func() {
 			co := &osacv1alpha1.ClusterOrder{}
 			Expect(k8sClient.Get(testCtx, typeNamespacedName, co)).To(Succeed())
 			co.Status.Phase = osacv1alpha1.ClusterOrderPhaseProgressing
 			co.Status.DesiredWorkers = ptr.To(int32(3))
-			retryTime := metav1.Now()
+			retryTimes := []metav1.Time{
+				metav1.NewTime(time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)),
+				metav1.NewTime(time.Date(2026, 9, 18, 12, 5, 0, 0, time.UTC)),
+			}
 			co.Status.Workers = []osacv1alpha1.WorkerStatus{
-				{NodeSet: "compute", Name: "bm-w-0", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
-				{NodeSet: "compute", Name: "bm-w-1", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 3, CreationTimestamp: metav1.Now(), NextRetryTime: &retryTime},
-				{NodeSet: "compute", Name: "bm-w-2", Kind: "BareMetalInstance", Phase: "Failed", AttemptCount: 2, CreationTimestamp: metav1.Now(), NextRetryTime: &retryTime},
+				{NodeSet: "compute", Name: "ready-worker", Kind: "BareMetalInstance", Phase: "Ready", AttemptCount: 1, CreationTimestamp: metav1.Now()},
+				{NodeSet: "compute", Name: "order-worker-0", Kind: "BareMetalInstance", ResourceID: "aa:bb:cc:dd:ee:ff", Phase: "Failed", AttemptCount: 3, CreationTimestamp: metav1.Now(), LastFailureMessage: "backend error text", NextRetryTime: &retryTimes[0]},
+				{NodeSet: "compute", Name: "order-worker-1", Kind: "BareMetalInstance", ResourceID: "11:22:33:44:55:66", Phase: "Failed", AttemptCount: 2, CreationTimestamp: metav1.Now(), LastFailureMessage: "backend error text", NextRetryTime: &retryTimes[1]},
 			}
 			apimeta.SetStatusCondition(&co.Status.Conditions, metav1.Condition{
 				Type: osacv1alpha1.ConditionWorkersFailed, Status: metav1.ConditionTrue,
@@ -693,7 +696,13 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			cond := findProtoCondition(mockClient.lastUpdate, privatev1.ClusterConditionType_CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_FAILED)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.GetMessage()).To(ContainSubstring("2 of 3"))
-			Expect(cond.GetMessage()).To(ContainSubstring("retrying"))
+			Expect(cond.GetMessage()).To(Equal(
+				"2 of 3 worker nodes failed to provision; retry 1: attempt 3, next retry 2026-09-18T12:00:00Z; retry 2: attempt 2, next retry 2026-09-18T12:05:00Z",
+			))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("order-worker-0"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("order-worker-1"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("aa:bb:cc:dd:ee:ff"))
+			Expect(cond.GetMessage()).NotTo(ContainSubstring("backend error text"))
 		})
 
 		It("should translate InfraEnvReady=False to WORKER_PROVISIONING_BLOCKED", func() {

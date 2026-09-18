@@ -35,6 +35,7 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	ckv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -376,7 +377,7 @@ func buildWorkerFailedMessage(workers []ckv1alpha1.WorkerStatus, desired int32) 
 	}
 	msg := fmt.Sprintf("%d of %d worker nodes failed to provision", failed, desired)
 	if retrying > 0 {
-		msg += fmt.Sprintf("; %d retrying", retrying)
+		msg += "; " + baremetalworker.FormatWorkersFailed(workers)
 	}
 	return msg
 }
