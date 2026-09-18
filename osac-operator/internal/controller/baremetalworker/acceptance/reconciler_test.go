@@ -314,6 +314,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 	var (
 		fc  *fake.FulfillmentClient
+		sim *envsim.Simulator
 		ign *fake.IgnitionServer
 		rec *events.FakeRecorder
 		r   *baremetalworker.Reconciler
@@ -321,6 +322,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 
 	BeforeEach(func() {
 		fc = fake.NewFulfillmentClient()
+		sim = envsim.New(k8sClient)
 		ign = fake.NewIgnitionServer()
 		rec = events.NewFakeRecorder(10)
 		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme,
@@ -350,6 +352,29 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		}
 	}
 
+	preloadDiskImageChain := func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: "ci-cluster",
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: "ci-version"}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: "ci-version",
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: "ci-disk-image"}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: "ci-disk-image",
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
+		fc.AddBareMetalInstanceType(newInstanceType("bm-standard", "data-0"))
+	}
+
 	runReconcile := func(name string) (reconcile.Result, error) {
 		return r.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: name, Namespace: testNamespace},
@@ -358,6 +383,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 
 	create := func(co *osacv1alpha1.ClusterOrder) {
 		GinkgoHelper()
+		preloadDiskImageChain()
 		Expect(k8sClient.Create(ctx, co)).To(Succeed())
 		DeferCleanup(func() {
 			latest := &osacv1alpha1.ClusterOrder{}
@@ -378,9 +404,17 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		})
 	}
 
+	makeInfraEnvReady := func(name string) {
+		GinkgoHelper()
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
+	}
+
 	It("creates the system catalog item when absent", func() {
 		co := newBareMetalClusterOrder("bmw-ci-create")
 		create(co)
+		makeInfraEnvReady("bmw-ci-create")
 
 		_, err := runReconcile("bmw-ci-create")
 		Expect(err).ToNot(HaveOccurred())
@@ -400,6 +434,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 	It("is a no-op when the system catalog item already exists", func() {
 		co := newBareMetalClusterOrder("bmw-ci-noop")
 		create(co)
+		makeInfraEnvReady("bmw-ci-noop")
 
 		// Pre-create the catalog item.
 		_, err := fc.CreateBareMetalInstanceCatalogItem(ctx, privatev1.BareMetalInstanceCatalogItem_builder{
@@ -418,6 +453,7 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 	It("handles AlreadyExists gracefully (concurrent create race)", func() {
 		co := newBareMetalClusterOrder("bmw-ci-race")
 		create(co)
+		makeInfraEnvReady("bmw-ci-race")
 
 		// First reconcile creates the catalog item.
 		_, err := runReconcile("bmw-ci-race")
@@ -818,6 +854,60 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(netAttachments[0].GetSubnet().GetName()).To(Equal("my-subnet"))
 		Expect(netAttachments[0].GetSecurityGroups()).To(HaveLen(1))
 		Expect(netAttachments[0].GetSecurityGroups()[0].GetName()).To(Equal("sg-default"))
+	})
+
+	It("does not create catalog item or BMI when the requested BMIT is not found", func() {
+		fc.AddCluster(privatev1.Cluster_builder{
+			Id: clusterUUID,
+			Spec: privatev1.ClusterSpec_builder{
+				Version: privatev1.ClusterVersionReference_builder{Id: cvID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: diskImageID}.Build(),
+			}.Build(),
+		}.Build())
+		fc.AddDiskImage(privatev1.DiskImage_builder{
+			Id: diskImageID,
+			Spec: privatev1.DiskImageSpec_builder{
+				SourceType: privatev1.SourceType_SOURCE_TYPE_REGISTRY,
+				SourceRef:  diskImageSourceRef,
+			}.Build(),
+		}.Build())
+
+		co := newBareMetalClusterOrder("bmw-bmit-missing", 1)
+		create(co)
+
+		// InfraEnv readiness must not create the system catalog item before BMIT resolution.
+		res, err := runReconcile("bmw-bmit-missing")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(fc.CreateCatalogItemCalls()).To(BeEmpty())
+
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-bmit-missing-infraenv", testNamespace, ign.URL())).To(Succeed())
+
+		// The missing requested BMIT keeps the order on the blocked/requeue path.
+		res, err = runReconcile("bmw-bmit-missing")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(fc.CreateCatalogItemCalls()).To(BeEmpty())
+		Expect(fc.CreateCalls()).To(BeEmpty())
+		Expect(getClusterOrder("bmw-bmit-missing").Status.Workers).To(BeEmpty())
+	})
+
+	It("creates the catalog item and BMI after resolving a usable BMIT", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-bmit-usable", 1)
+		create(co)
+		makeInfraEnvReady("bmw-bmit-usable")
+
+		_, err := runReconcile("bmw-bmit-usable")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fc.CreateCatalogItemCalls()).To(HaveLen(1))
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+		Expect(getClusterOrder("bmw-bmit-usable").Status.Workers).To(HaveLen(1))
 	})
 
 	It("resolves a name-only DiskImage reference by name (id-or-name, mirroring ComputeInstance)", func() {
