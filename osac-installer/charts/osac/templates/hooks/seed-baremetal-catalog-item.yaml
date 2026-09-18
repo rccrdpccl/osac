@@ -38,58 +38,52 @@ spec:
             API="https://fulfillment-internal-api:8001/api/private/v1"
             BMIT_RESPONSE=/tmp/bmit-response.json
 
-            echo "Listing BareMetalInstanceTemplates before seeding the system catalog item..."
+            echo "Listing BareMetalInstanceTypes before seeding the system catalog item..."
             BMIT_CODE=$(curl -skS \
               --connect-timeout 5 \
               --max-time 30 \
               -o "${BMIT_RESPONSE}" \
               -w '%{http_code}' \
               -H "Authorization: Bearer ${AUTH_TOKEN}" \
-              "${API}/baremetal_instance_templates")
+              "${API}/bare_metal_instance_types")
 
             case "${BMIT_CODE}" in
               2??)
                 ;;
               *)
-                echo "ERROR: Failed to list BareMetalInstanceTemplates (HTTP ${BMIT_CODE})" >&2
+                echo "ERROR: Failed to list BareMetalInstanceTypes (HTTP ${BMIT_CODE})" >&2
                 cat "${BMIT_RESPONSE}" >&2
                 exit 1
                 ;;
             esac
 
-            BMIT_ID=$(python3 -c '
+            USABLE_BMIT_COUNT=$(python3 -c '
             import json
             import sys
 
             response = json.load(sys.stdin)
-            for item in response.get("items", []):
-                template_id = item.get("id")
-                if template_id:
-                    print(template_id)
-                    break
+            print(sum(1 for item in response.get("items", []) if item.get("id")))
             ' < "${BMIT_RESPONSE}")
 
-            if [[ -z "${BMIT_ID}" ]]; then
-              echo "No usable BareMetalInstanceTemplate exists; catalog seed is a successful no-op."
+            if [[ "${USABLE_BMIT_COUNT}" -eq 0 ]]; then
+              echo "No usable BareMetalInstanceType exists; catalog seed is a successful no-op."
               exit 0
             fi
 
-            PAYLOAD=$(BMIT_ID="${BMIT_ID}" python3 -c '
+            PAYLOAD=$(python3 -c '
             import json
-            import os
 
-            template_id = os.environ["BMIT_ID"]
             print(json.dumps({
                 "metadata": {
                     "name": "system-bmi-passthrough",
                     "tenant": "system",
                     "annotations": {
                         "osac.openshift.io/tenant": "system",
-                        "osac.openshift.io/owner-reference": f"BareMetalInstanceTemplate/{template_id}",
+                        "osac.openshift.io/owner-reference": "BareMetalInstanceTemplate/osac.templates.bm_host_provisioning",
                     },
                 },
                 "title": "System BMI Pass-through",
-                "template": {"id": template_id, "shared": True},
+                "template": {"id": "osac.templates.bm_host_provisioning", "shared": True},
                 "published": True,
                 "field_definitions": [],
             }))
