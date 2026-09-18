@@ -45,6 +45,28 @@ class K8sClient:
         args.extend(["-o", "json"])
         return json.loads(run(*args))
 
+    def get_operator_metrics(self) -> str:
+        services = self.list_json(resource="services", namespace=self.namespace).get("items", [])
+        metrics_service = next(
+            (
+                service
+                for service in services
+                if any(
+                    port.get("name") == "https" and port.get("port") == 8443
+                    for port in service.get("spec", {}).get("ports", [])
+                )
+            ),
+            None,
+        )
+        if metrics_service is None:
+            raise RuntimeError(f"No operator metrics service on HTTPS port 8443 in namespace {self.namespace}")
+
+        service_name = metrics_service.get("metadata", {}).get("name", "")
+        if not service_name:
+            raise RuntimeError("Operator metrics service has no metadata.name")
+        proxy_path = f"/api/v1/namespaces/{self.namespace}/services/https:{service_name}:8443/proxy/metrics"
+        return run(*self._base(), "get", "--raw", proxy_path)
+
     def get_jsonpath(self, *, resource: str, name: str, jsonpath: str) -> str:
         return run(*self._base(), "get", resource, name, "-n", self.namespace, "-o", f"jsonpath={jsonpath}")
 
@@ -339,6 +361,24 @@ class K8sClient:
             checked=checked,
         )
         return output if rc == 0 else ""
+
+    def get_cluster_order_status(self, *, name: str, checked: bool = True) -> dict[str, Any]:
+        output, rc = self._get("get", "clusterorder", name, "-n", self.namespace, "-o", "json", checked=checked)
+        if rc != 0:
+            return {}
+        return json.loads(output).get("status", {})
+
+    def get_cluster_order_infra_env_name(self, *, name: str, checked: bool = True) -> str:
+        output, rc = self._get(
+            "get", "infraenv.agent-install.openshift.io", "-n", self.namespace, "-o", "json", checked=checked
+        )
+        if rc != 0:
+            return ""
+        for item in json.loads(output).get("items", []):
+            owner_references = item.get("metadata", {}).get("ownerReferences", [])
+            if any(owner.get("kind") == "ClusterOrder" and owner.get("name") == name for owner in owner_references):
+                return item.get("metadata", {}).get("name", "")
+        return ""
 
     def get_cluster_order_phase(self, *, name: str, checked: bool = True) -> str | None:
         # In unchecked mode, None means that this ClusterOrder is gone. Keep a
