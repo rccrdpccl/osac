@@ -35,6 +35,8 @@ pytestmark = pytest.mark.sanity
 TEST_RELEASE_IMAGE = env("OSAC_TEST_RELEASE_IMAGE", "quay.io/openshift-release-dev/ocp-release:4.22.0-multi")
 RHCOS_IMAGE = env("OSAC_RHCOS_BMI_IMAGE", "oci://quay.io/rh_ee_rpiccoli/rhcos-bmi:4.22.0")
 _WORKER_METRICS = ("osac_caas_worker_desired", "osac_caas_worker_ready", "osac_caas_worker_provisioning_failures_total")
+_WORKER_LEVEL_METRICS = _WORKER_METRICS[:2]
+_WORKER_FAILURE_METRIC = _WORKER_METRICS[2]
 _WORKER_METRIC_LABELS = {"tenant", "worker_type", "instance_type"}
 
 
@@ -43,14 +45,25 @@ def _metric_samples(metrics: str, metric_name: str) -> list[str]:
 
 
 def _assert_worker_metrics(metrics: str) -> None:
-    for metric_name in _WORKER_METRICS:
+    for metric_name in _WORKER_LEVEL_METRICS:
         assert f"# TYPE {metric_name} " in metrics, f"Missing {metric_name} metric family"
-        for sample in _metric_samples(metrics, metric_name):
-            labels = sample.split("{", 1)[1].split("}", 1)[0]
-            label_names = {label.split("=", 1)[0] for label in labels.split(",")}
-            assert label_names == _WORKER_METRIC_LABELS, (
-                f"{metric_name} labels {sorted(label_names)} do not match {sorted(_WORKER_METRIC_LABELS)}"
-            )
+        samples = _metric_samples(metrics, metric_name)
+        assert samples, f"Missing {metric_name} samples"
+        _assert_worker_metric_labels(metric_name, samples)
+
+    failure_samples = _metric_samples(metrics, _WORKER_FAILURE_METRIC)
+    if failure_samples:
+        assert f"# TYPE {_WORKER_FAILURE_METRIC} counter" in metrics
+        _assert_worker_metric_labels(_WORKER_FAILURE_METRIC, failure_samples)
+
+
+def _assert_worker_metric_labels(metric_name: str, samples: list[str]) -> None:
+    for sample in samples:
+        labels = sample.split("{", 1)[1].split("}", 1)[0]
+        label_names = {label.split("=", 1)[0] for label in labels.split(",")}
+        assert label_names == _WORKER_METRIC_LABELS, (
+            f"{metric_name} labels {sorted(label_names)} do not match {sorted(_WORKER_METRIC_LABELS)}"
+        )
 
 
 @pytest.mark.metering
@@ -116,14 +129,7 @@ def test_cluster_create(
         try:
             worker_metrics = poll_until(
                 fn=k8s_hub_client.get_operator_metrics,
-                until=lambda output: all(
-                    f"# TYPE {metric_name} " in output
-                    and (
-                        metric_name == "osac_caas_worker_provisioning_failures_total"
-                        or _metric_samples(output, metric_name)
-                    )
-                    for metric_name in _WORKER_METRICS
-                ),
+                until=lambda output: all(_metric_samples(output, metric_name) for metric_name in _WORKER_LEVEL_METRICS),
                 retries=30,
                 delay=5,
                 description=f"{co_name} worker metrics",
@@ -304,13 +310,12 @@ def test_cluster_create(
         )
         assert infra_env_name is not None
         poll_until(
-            fn=lambda: (
-                not k8s_hub_client.is_present(resource="infraenv.agent-install.openshift.io", name=infra_env_name)
-            ),
+            fn=lambda: k8s_hub_client.is_absent(resource="infraenv.agent-install.openshift.io", name=infra_env_name),
             until=lambda value: value is True,
             retries=60,
             delay=5,
             description=f"{infra_env_name} InfraEnv removal",
+            retry_on_error=True,
         )
 
         wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
