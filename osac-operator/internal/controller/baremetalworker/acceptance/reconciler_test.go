@@ -1023,6 +1023,27 @@ var _ = Describe("BareMetalWorkerReconciler reconcileWorkers", func() {
 		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
 	})
 
+	It("self-heals the catalog item when a BMI already exists", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-catalog-heal", 1)
+		create(co)
+
+		// Pre-create the BMI while leaving the system CatalogItem absent.
+		_, err := fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
+			Metadata: privatev1.Metadata_builder{
+				Tenant: "system",
+				Name:   "bmw-catalog-heal-worker-0",
+				Labels: map[string]string{"osac.openshift.io/cluster-order": "bmw-catalog-heal"},
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		makeInfraEnvReady("bmw-catalog-heal")
+
+		Expect(fc.CreateCatalogItemCalls()).To(HaveLen(1))
+		Expect(fc.CreateCalls()).To(HaveLen(1), "the existing BMI must not be recreated")
+	})
+
 	It("handles AlreadyExists by re-listing and recording the existing BMI", func() {
 		preloadDiskImageChain()
 		co := newBareMetalClusterOrder("bmw-exists", 1)
