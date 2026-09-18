@@ -195,10 +195,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
-		return res, err
-	}
-
 	if err := r.ensurePullSecret(ctx, co); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensuring pull secret: %w", err)
 	}
@@ -763,16 +759,19 @@ func (r *Reconciler) reconcileNodeSets(
 			continue
 		}
 
+		instanceType, res, err := r.resolveNodeSetInstanceType(ctx, co, nr.BareMetal.InstanceType)
+		if err != nil {
+			return nil, ctrl.Result{}, err
+		}
+		if !res.IsZero() {
+			return nil, res, nil
+		}
+
 		var fabricInterface string
 		if co.Spec.NetworkAttachment != nil && co.Spec.NetworkAttachment.SubnetRef != "" {
-			var res ctrl.Result
-			var err error
-			fabricInterface, res, err = r.resolveFabricInterfaceForNodeSet(ctx, co, nr.BareMetal.InstanceType)
+			fabricInterface, err = resolveFabricInterface(instanceType)
 			if err != nil {
 				return nil, ctrl.Result{}, err
-			}
-			if !res.IsZero() {
-				return nil, res, nil
 			}
 		}
 
@@ -940,24 +939,25 @@ func workersByName(workers []v1alpha1.WorkerStatus) map[string]v1alpha1.WorkerSt
 	return m
 }
 
-// resolveFabricInterfaceForNodeSet resolves the fabric interface name from the BareMetalInstanceType
-// referenced by the node set.
-func (r *Reconciler) resolveFabricInterfaceForNodeSet(
+func (r *Reconciler) resolveNodeSetInstanceType(
 	ctx context.Context, co *v1alpha1.ClusterOrder, instanceTypeName string,
-) (string, ctrl.Result, error) {
+) (*privatev1.BareMetalInstanceType, ctrl.Result, error) {
 	it, err := r.fulfillment.GetBareMetalInstanceType(ctx, instanceTypeName)
 	if res, handled := r.handleUnavailable(ctx, co, err); handled {
-		return "", res, nil
+		return nil, res, nil
 	}
 	if err != nil {
-		return "", ctrl.Result{}, fmt.Errorf("getting BareMetalInstanceType %s: %w", instanceTypeName, err)
+		if status.Code(err) == codes.NotFound {
+			ctrllog.FromContext(ctx).Info("BareMetalInstanceType not found, requeuing", "instanceType", instanceTypeName)
+			return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+		}
+		return nil, ctrl.Result{}, fmt.Errorf("getting BareMetalInstanceType %s: %w", instanceTypeName, err)
 	}
-
-	iface, err := resolveFabricInterface(it)
-	if err != nil {
-		return "", ctrl.Result{}, err
+	if it == nil {
+		ctrllog.FromContext(ctx).Info("BareMetalInstanceType is empty, requeuing", "instanceType", instanceTypeName)
+		return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
 	}
-	return iface, ctrl.Result{}, nil
+	return it, ctrl.Result{}, nil
 }
 
 // ensureBMI creates a single BareMetalInstance, handling the AlreadyExists race by re-listing.
@@ -966,6 +966,10 @@ func (r *Reconciler) ensureBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest,
 	workerName string, image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
+	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
+		return nil, res, err
+	}
+
 	req := r.buildBMICreateRequest(co, nodeSet, workerName, image, ignitionRaw, fabricInterface)
 	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
 	if err == nil {
