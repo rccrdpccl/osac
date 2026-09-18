@@ -775,6 +775,10 @@ func (r *Reconciler) reconcileNodeSets(
 			}
 		}
 
+		if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
+			return nil, res, err
+		}
+
 		for j := 0; j < nr.NumberOfNodes; j++ {
 			workerName := fmt.Sprintf("%s-worker-%d", co.Name, globalIndex)
 			globalIndex++
@@ -966,10 +970,6 @@ func (r *Reconciler) ensureBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, nodeSet v1alpha1.NodeRequest,
 	workerName string, image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
-	if res, err := r.ensureSystemCatalogItem(ctx, co); err != nil || !res.IsZero() {
-		return nil, res, err
-	}
-
 	req := r.buildBMICreateRequest(co, nodeSet, workerName, image, ignitionRaw, fabricInterface)
 	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
 	if err == nil {
