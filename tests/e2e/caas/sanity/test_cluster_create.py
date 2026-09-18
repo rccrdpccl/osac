@@ -74,6 +74,26 @@ def test_cluster_create(
         assert uuid in grpc.list_cluster_ids()
 
         wait_for_cluster_progressing(k8s=k8s_hub_client, name=co_name)
+        try:
+            baremetal_pools = k8s_hub_client.list_json(resource="baremetalpools").get("items", [])
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.output or str(exc)).strip()
+            pytest.fail(
+                f"Cannot verify BareMetalPool removal for ClusterOrder {co_name}: "
+                f"the baremetalpools API is unavailable ({detail}); this is an infrastructure/profile failure.",
+                pytrace=False,
+            )
+
+        cluster_pools = [
+            pool
+            for pool in baremetal_pools
+            if pool.get("metadata", {}).get("labels", {}).get("osac.openshift.io/clusterorder") == co_name
+        ]
+        assert not cluster_pools, (
+            f"ClusterOrder {co_name} unexpectedly has BareMetalPool resources: "
+            f"{[pool.get('metadata', {}).get('name', '<unnamed>') for pool in cluster_pools]}"
+        )
+
         metering.expect("osac.resource.started.v1", resource_id=uuid)
         metering.verify()
 
