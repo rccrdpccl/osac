@@ -147,6 +147,14 @@ class GRPCClient:
     def get_cluster(self, *, cluster_id: str) -> dict[str, Any]:
         return self.call(service=f"{PUBLIC_API}.Clusters/Get", data={"id": cluster_id})
 
+    def get_cluster_condition_status(self, *, cluster_id: str, condition_type: str) -> str:
+        cluster = self.get_cluster(cluster_id=cluster_id)
+        conditions: list[dict[str, Any]] = cluster.get("object", {}).get("status", {}).get("conditions", [])
+        for condition in conditions:
+            if condition.get("type") == condition_type:
+                return condition.get("status", "")
+        return ""
+
     # SecurityGroup operations
 
     def create_security_group(self, *, name: str, virtual_network: str) -> str:
@@ -574,8 +582,9 @@ class GRPCClient:
 
     # BareMetalInstance operations (public API)
 
-    def list_baremetal_instance_ids(self) -> list[str]:
-        response: dict[str, Any] = self.call(service=f"{PUBLIC_API}.BareMetalInstances/List")
+    def list_baremetal_instance_ids(self, *, filter_expr: str | None = None) -> list[str]:
+        data: dict[str, Any] | None = {"filter": filter_expr} if filter_expr else None
+        response: dict[str, Any] = self.call(service=f"{PUBLIC_API}.BareMetalInstances/List", data=data)
         return [item["id"] for item in response.get("items", [])]
 
     def get_baremetal_instance(self, *, bmi_id: str) -> dict[str, Any]:
