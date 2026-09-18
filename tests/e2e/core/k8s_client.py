@@ -11,6 +11,7 @@ _CLUSTER_ORDER_NOT_FOUND_RE = re.compile(
     r'Error from server \(NotFound\): clusterorders(?:\.osac\.openshift\.io)? "(?P<name>[^"]+)" not found',
     re.IGNORECASE,
 )
+_RESOURCE_NOT_FOUND_RE = re.compile(r'Error from server \(NotFound\): .* "(?P<name>[^"]+)" not found', re.IGNORECASE)
 
 
 class K8sClient:
@@ -51,7 +52,8 @@ class K8sClient:
             (
                 service
                 for service in services
-                if any(
+                if service.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name") == "osac-operator"
+                and any(
                     port.get("name") == "https" and port.get("port") == 8443
                     for port in service.get("spec", {}).get("ports", [])
                 )
@@ -89,6 +91,16 @@ class K8sClient:
     def is_present(self, *, resource: str, name: str) -> bool:
         _, rc = run_unchecked(*self._base(), "get", resource, name, "-n", self.namespace)
         return rc == 0
+
+    def is_absent(self, *, resource: str, name: str) -> bool:
+        args = ("get", resource, name, "-n", self.namespace)
+        output, rc = run_unchecked(*self._base(), *args)
+        if rc == 0:
+            return False
+        not_found = _RESOURCE_NOT_FOUND_RE.search(output.strip())
+        if not_found is not None and not_found.group("name") == name:
+            return True
+        raise subprocess.CalledProcessError(rc, [*self._base(), *args], output=output, stderr=output)
 
     def count_by_label_all_namespaces(self, *, resource: str, label: str) -> int:
         output: str = run(*self._base(), "get", resource, "-A", "-l", label, "--no-headers")
