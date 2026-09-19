@@ -57,14 +57,15 @@ rules:
   - patch
   - update
   - watch
-# hostedcontrolplanes: get only — storage controller reads the kubeconfig secret name,
-# no watch/list needed (looked up by name from the ClusterOrder).
+# HostedControlPlane access is cached by the storage controller.
 - apiGroups:
   - hypershift.openshift.io
   resources:
   - hostedcontrolplanes
   verbs:
   - get
+  - list
+  - watch
 - apiGroups:
   - k8s.ovn.org
   resources:

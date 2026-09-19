@@ -4,6 +4,10 @@ kind: ClusterRole
 metadata:
   name: manager-role
 rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
 - apiGroups:
   - ""
   resources:
@@ -81,16 +85,11 @@ rules:
   - hypershift.openshift.io
   resources:
   - hostedclusters
+  - hostedcontrolplanes
   verbs:
   - get
   - list
   - watch
-- apiGroups:
-  - hypershift.openshift.io
-  resources:
-  - hostedcontrolplanes
-  verbs:
-  - get
 - apiGroups:
   - hypershift.openshift.io
   resources:
