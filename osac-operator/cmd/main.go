@@ -1104,6 +1104,7 @@ func setupBareMetalInstanceControllers(
 }
 
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:urls=/metrics,verbs=get
 
 func main() {
 	var err error
