@@ -66,8 +66,31 @@ class K8sClient:
         service_name = metrics_service.get("metadata", {}).get("name", "")
         if not service_name:
             raise RuntimeError("Operator metrics service has no metadata.name")
-        proxy_path = f"/api/v1/namespaces/{self.namespace}/services/https:{service_name}:8443/proxy/metrics"
-        return run(*self._base(), "get", "--raw", proxy_path)
+        pod_name = run(
+            *self._base(),
+            "get",
+            "pods",
+            "-n",
+            self.namespace,
+            "-l",
+            "app.kubernetes.io/name=operator,control-plane=controller-manager",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        )
+        token = run(*self._base(), "create", "token", "osac-operator", "-n", self.namespace, "--duration=10m")
+        return run(
+            *self._base(),
+            "exec",
+            pod_name,
+            "-n",
+            self.namespace,
+            "--",
+            "curl",
+            "-sk",
+            "-H",
+            f"Authorization: Bearer {token}",
+            "https://127.0.0.1:8443/metrics",
+        )
 
     def get_jsonpath(self, *, resource: str, name: str, jsonpath: str) -> str:
         return run(*self._base(), "get", resource, name, "-n", self.namespace, "-o", f"jsonpath={jsonpath}")
