@@ -52,7 +52,7 @@ class K8sClient:
             (
                 service
                 for service in services
-                if service.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name") == "osac-operator"
+                if service.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/name") == "operator"
                 and any(
                     port.get("name") == "https" and port.get("port") == 8443
                     for port in service.get("spec", {}).get("ports", [])
