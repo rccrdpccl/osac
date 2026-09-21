@@ -20,18 +20,31 @@ import (
 
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
+	corev1 "k8s.io/api/core/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/gvks"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
+
+func verifyNotFound(g Gomega, err error) {
+	g.Expect(err).To(HaveOccurred())
+	st, ok := grpcstatus.FromError(err)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(st.Code()).To(Equal(grpccodes.NotFound))
+}
 
 var _ = Describe("Cluster reconciler", func() {
 	var (
@@ -245,7 +258,7 @@ var _ = Describe("Cluster reconciler", func() {
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"my_node_set": publicv1.ClusterNodeSet_builder{
 							HostType: publicv1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-							Size:     3,
+							Size:     proto.Int32(3),
 						}.Build(),
 					},
 				}.Build(),
@@ -297,7 +310,7 @@ var _ = Describe("Cluster reconciler", func() {
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"my_node_set": publicv1.ClusterNodeSet_builder{
 							HostType: publicv1.HostTypeReference_builder{Id: hostTypeId}.Build(),
-							Size:     5,
+							Size:     proto.Int32(5),
 						}.Build(),
 					},
 				}.Build(),
@@ -321,5 +334,171 @@ var _ = Describe("Cluster reconciler", func() {
 			time.Minute,
 			time.Second,
 		).Should(Succeed())
+	})
+	Describe("Manages secrets as part of the cluster lifecycle", func() {
+		var (
+			secretsClient publicv1.SecretsClient
+		)
+		BeforeEach(func() {
+			secretsClient = publicv1.NewSecretsClient(tool.ExternalView().UserConn())
+		})
+
+		It("Creates and deletes hub secrets when a cluster is created and deleted", func() {
+			// Create the cluster
+			response, err := clustersClient.Create(ctx, publicv1.ClustersCreateRequest_builder{
+				Object: publicv1.Cluster_builder{
+					Metadata: publicv1.Metadata_builder{
+						Name: fmt.Sprintf("test-cluster-%s", uuid.New()[24:32]),
+					}.Build(),
+					Spec: publicv1.ClusterSpec_builder{
+						Template: publicv1.ClusterTemplateReference_builder{Id: templateId}.Build(),
+						TemplateParameters: map[string]*anypb.Any{
+							"my": makeAny(wrapperspb.String("my_value")),
+						}}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			object := response.GetObject()
+			DeferCleanup(func() {
+				_, err := clustersClient.Delete(ctx, publicv1.ClustersDeleteRequest_builder{
+					Id: object.GetId(),
+				}.Build())
+				Expect(err == nil || grpcstatus.Code(err) == grpccodes.NotFound).To(BeTrue())
+			})
+
+			// Arrange the HyperShift resources that a real provisioner would create.
+			kubeClient := tool.KubeClient()
+			clusterOrderList := &osacv1alpha1.ClusterOrderList{}
+			var clusterOrderObj *osacv1alpha1.ClusterOrder
+			Eventually(func(g Gomega) {
+				err := kubeClient.List(ctx, clusterOrderList, crclient.MatchingLabels{
+					labels.ClusterOrderUuid: object.GetId(),
+				})
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(clusterOrderList.Items).To(HaveLen(1))
+				clusterOrderObj = &clusterOrderList.Items[0]
+			}, time.Minute, time.Second).Should(Succeed())
+
+			hostedClusterNamespace := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterOrderObj.GetName()},
+			}
+			err = kubeClient.Create(ctx, hostedClusterNamespace)
+			Expect(err).ToNot(HaveOccurred())
+			DeferCleanup(func() {
+				err := kubeClient.Delete(ctx, hostedClusterNamespace)
+				Expect(err == nil || kubeerrors.IsNotFound(err)).To(BeTrue())
+			})
+
+			kubeconfigSecretObj := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: hostedClusterNamespace.GetName(),
+					Name:      "kubeconfig",
+				},
+				Data: map[string][]byte{"kubeconfig": []byte("my-kubeconfig")},
+			}
+			passwordSecretObj := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: hostedClusterNamespace.GetName(),
+					Name:      "kubeadmin-password",
+				},
+				Data: map[string][]byte{"password": []byte("my-password")},
+			}
+			Expect(kubeClient.Create(ctx, kubeconfigSecretObj)).To(Succeed())
+			Expect(kubeClient.Create(ctx, passwordSecretObj)).To(Succeed())
+
+			hostedClusterObj := &unstructured.Unstructured{}
+			hostedClusterObj.SetGroupVersionKind(gvks.HostedCluster)
+			hostedClusterObj.SetNamespace(hostedClusterNamespace.GetName())
+			hostedClusterObj.SetName(clusterOrderObj.GetName())
+			Expect(kubeClient.Create(ctx, hostedClusterObj)).To(Succeed())
+
+			hostedClusterUpdate := hostedClusterObj.DeepCopy()
+			hostedClusterUpdate.Object["status"] = map[string]any{
+				"kubeconfig":        map[string]any{"name": kubeconfigSecretObj.GetName()},
+				"kubeadminPassword": map[string]any{"name": passwordSecretObj.GetName()},
+			}
+			Expect(kubeClient.Status().Patch(
+				ctx, hostedClusterUpdate, crclient.MergeFrom(hostedClusterObj),
+			)).To(Succeed())
+
+			clusterOrderUpdate := clusterOrderObj.DeepCopy()
+			clusterOrderUpdate.Status.Phase = osacv1alpha1.ClusterOrderPhaseReady
+			clusterOrderUpdate.Status.ClusterReference = &osacv1alpha1.ClusterOrderClusterReferenceType{
+				Namespace:         hostedClusterObj.GetNamespace(),
+				HostedClusterName: hostedClusterObj.GetName(),
+			}
+			Expect(kubeClient.Status().Patch(
+				ctx, clusterOrderUpdate, crclient.MergeFrom(clusterOrderObj),
+			)).To(Succeed())
+
+			privateClustersClient := privatev1.NewClustersClient(tool.InternalView().AdminConn())
+			privateClusterResponse, err := privateClustersClient.Get(ctx, privatev1.ClustersGetRequest_builder{
+				Id: object.GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			privateCluster := privateClusterResponse.GetObject()
+			privateCluster.GetStatus().SetState(privatev1.ClusterState_CLUSTER_STATE_READY)
+			_, err = privateClustersClient.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privateCluster,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			_, err = privateClustersClient.Signal(ctx, privatev1.ClustersSignalRequest_builder{
+				Id: object.GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			// The secret references should be populated in the cluster status:
+			var kubeconfigID, passwordID string
+			Eventually(func(g Gomega) {
+				cluster, err := clustersClient.Get(ctx, publicv1.ClustersGetRequest_builder{
+					Id: object.GetId(),
+				}.Build())
+				g.Expect(err).ToNot(HaveOccurred())
+				kubeconfigID = cluster.GetObject().GetStatus().GetKubeconfigSecret().GetId()
+				passwordID = cluster.GetObject().GetStatus().GetPasswordSecret().GetId()
+				g.Expect(kubeconfigID).ToNot(BeEmpty())
+				g.Expect(passwordID).ToNot(BeEmpty())
+			}, time.Minute, time.Second).Should(Succeed())
+
+			// Make sure the secrets exist:
+			configSecret, err := secretsClient.Get(ctx, publicv1.SecretsGetRequest_builder{
+				Id: kubeconfigID,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(configSecret.GetObject().GetData()).To(HaveKey("kubeconfig"))
+
+			passwordSecret, err := secretsClient.Get(ctx, publicv1.SecretsGetRequest_builder{
+				Id: passwordID,
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(passwordSecret.GetObject().GetData()).To(HaveKey("password"))
+
+			// Delete the cluster:
+			_, err = clustersClient.Delete(ctx, publicv1.ClustersDeleteRequest_builder{
+				Id: object.GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			err = kubeClient.Delete(ctx, clusterOrderObj)
+			Expect(err == nil || kubeerrors.IsNotFound(err)).To(BeTrue())
+
+			Eventually(func(g Gomega) {
+				_, err := privateClustersClient.Signal(ctx, privatev1.ClustersSignalRequest_builder{
+					Id: object.GetId(),
+				}.Build())
+				if err != nil {
+					g.Expect(grpcstatus.Code(err)).To(Equal(grpccodes.NotFound))
+				}
+
+				_, err = secretsClient.Get(ctx, publicv1.SecretsGetRequest_builder{
+					Id: kubeconfigID,
+				}.Build())
+				g.Expect(err).To(HaveOccurred())
+				verifyNotFound(g, err)
+				_, err = secretsClient.Get(ctx, publicv1.SecretsGetRequest_builder{
+					Id: passwordID,
+				}.Build())
+				verifyNotFound(g, err)
+			}, time.Minute, time.Second).Should(Succeed())
+		})
 	})
 })

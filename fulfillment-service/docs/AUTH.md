@@ -443,6 +443,10 @@ fulfillment service. Valid values are `default` and `guest`.
    and must be scoped to a specific tenant. Platform-scoped resources (such as roles, users, host
    types, instance types, templates, and catalog items) can be placed in the `shared` tenant.
 
+   Secrets used by shared templates are a special case: their metadata is visible so references can
+   be resolved, but decrypted data and mutations are restricted to platform administrators and
+   controllers.
+
 2. **System Tenant**: The `system` tenant is a special tenant used for objects that are only visible
    to the system itself. Resources assigned to the `system` tenant are not visible to regular users.
    This is used internally for system-level resources. As with the `shared` tenant, tenant-scoped
@@ -578,9 +582,7 @@ The authorization policy allows:
 
 2. **Client Users** (and tenant admins / IdP managers who inherit client permissions):
    - Specific gRPC methods for:
-     - Clusters: `Create`, `Delete`, `Get`, `GetKubeconfig`,
-       `GetKubeconfigViaHttp`, `GetPassword`,
-       `GetPasswordViaHttp`, `List`, `Update`
+     - Clusters: `Create`, `Delete`, `Get`, `List`, `Update`
      - Cluster Templates: `Get`, `List`
      - Cluster Catalog Items: `Get`, `List`
      - Compute Instances: `Create`, `Delete`, `Get`, `List`, `Update`
@@ -595,6 +597,7 @@ The authorization policy allows:
      - Role Bindings: `Get`, `List`
      - Roles: `Get`, `List`
      - Security Groups: `Create`, `Delete`, `Get`, `List`, `Update`
+     - Storage Tiers: `Get`, `List`
      - Subnets: `Create`, `Delete`, `Get`, `List`, `Update`
      - Virtual Networks: `Create`, `Delete`, `Get`, `List`, `Update`
 
@@ -953,9 +956,17 @@ osac login https://fulfillment-api.osac.svc.cluster.local:8000
 osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
   --user USERNAME --password PASSWORD
 
+# Login using password flow with credentials read from files (avoids shell history exposure)
+osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
+  --user-file /run/secrets/username --password-file /run/secrets/password
+
 # Login using client credentials flow (for service accounts)
 osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
   --client-id my-service --client-secret MY_SECRET
+
+# Login using client credentials with credentials read from files
+osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
+  --client-id-file /run/secrets/client-id --client-secret-file /run/secrets/client-secret
 
 # Login with a custom CA certificate
 osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
@@ -965,6 +976,11 @@ osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
 osac login https://fulfillment-api.osac.svc.cluster.local:8000 \
   --token-script 'kubectl create token -n osac client --duration 1h'
 ```
+
+> **Note — file-based credential flags**: `--password-file`, `--client-secret-file`, `--user-file`,
+> and `--client-id-file` read the respective value from a file and trim surrounding whitespace.
+> Each is mutually exclusive with its direct counterpart flag. This avoids exposing secrets in
+> shell history, `ps` output, and CI logs.
 
 After login, the configuration is saved to `~/.config/osac/` and subsequent `osac` commands use the
 stored credentials automatically.

@@ -19,10 +19,10 @@ OSAC CLI and API.
 
 ## Browse Cluster Catalog Items
 
-List all available catalog items:
+List published catalog items available for provisioning:
 
 ```bash
-osac get clustercatalogitems
+osac get clustercatalogitems --filter 'this.published'
 ```
 
 Inspect a specific catalog item to see its fields and defaults:
@@ -35,8 +35,8 @@ Key fields in a catalog item:
 
 - **`title`**: Human-friendly short description of the offering.
 - **`description`**: Detailed Markdown description of what the catalog item provides.
-- **`field_definitions`**: Definitions of the fields that users can set when creating a cluster,
-  including which fields are required, their types, and default values.
+- **`fields`**: Typed locked or editable policies for cluster fields, with optional defaults.
+- **`template_parameters`**: Typed policies for parameters declared by the referenced Template.
 
 ## Manage Cluster Versions
 
@@ -76,22 +76,26 @@ osac create cluster \
   --catalog-item hosted_cluster_offering
 ```
 
-To specify an OpenShift version explicitly:
+To specify an OpenShift version explicitly, the catalog's version policy must be editable or absent:
 
 ```bash
 osac create cluster \
   --catalog-item hosted_cluster_offering \
-  --version "4.17.0"
+  --version "4-17-0"
 ```
+
+If `fields.version` is locked, omit `--version`: the catalog supplies its fixed version and rejects
+any explicitly supplied version, including the same one.
 
 Optional flags:
 
 - `-n, --name <name>` - Human-readable name for the cluster
-- `--version <version>` - ClusterVersion `metadata.name` or `spec.version` string. Version is
-  resolved with the following precedence:
+- `--version <version>` - ClusterVersion `metadata.name` or `spec.version` string. For an editable
+  or ungoverned version, values are resolved with the following precedence:
   1. Explicit `--version` provided by the user.
-  2. Template or catalog item default (`spec_defaults.version_name` or field definition default).
-  3. System default ClusterVersion (`is_default = true`).
+  2. Catalog item editable default (`fields.version.editable.default_value`).
+  3. Template default (`spec_defaults.version`).
+  4. System default ClusterVersion (`is_default = true`).
 
 The command outputs the cluster ID upon successful creation.
 
@@ -137,12 +141,16 @@ A cluster in `READY` state may have additional conditions:
 
 ## Access the Cluster
 
-Once the cluster is in `READY` state, retrieve credentials:
+Once the cluster is in `READY` state, inspect its secret references and retrieve the secrets through
+the Secrets API:
 
 **Kubeconfig** (for `oc` / `kubectl`):
 
 ```bash
-osac get kubeconfig <cluster-id> > kubeconfig.yaml
+cluster=$(osac get cluster <cluster-id-or-name> -o json)
+kubeconfig_secret=$(printf '%s' "$cluster" | jq -r '.status.kubeconfig_secret.name')
+osac get secret "$kubeconfig_secret" -o json > kubeconfig-secret.json
+jq -r '.data.kubeconfig' kubeconfig-secret.json | base64 --decode > kubeconfig.yaml
 export KUBECONFIG=kubeconfig.yaml
 oc get nodes
 ```
@@ -150,7 +158,9 @@ oc get nodes
 **Admin password** (for the web console):
 
 ```bash
-osac get password <cluster-id>
+password_secret=$(printf '%s' "$cluster" | jq -r '.status.password_secret.name')
+osac get secret "$password_secret" -o yaml
+osac get secret "$password_secret" -o json | jq -r '.data.password' | base64 --decode
 ```
 
 The console URL is shown in `get clusters` output or in the cluster's `status.console_url` field.
@@ -227,7 +237,6 @@ All CLI operations correspond to REST API endpoints:
 | Create cluster | `POST` | `/api/fulfillment/v1/clusters` |
 | Update cluster | `PATCH` | `/api/fulfillment/v1/clusters/{id}` |
 | Delete cluster | `DELETE` | `/api/fulfillment/v1/clusters/{id}` |
-| Get kubeconfig | `GET` | `/api/fulfillment/v1/clusters/{id}/kubeconfig` |
-| Get password | `GET` | `/api/fulfillment/v1/clusters/{id}/password` |
+| Get secret | `GET` | `/api/fulfillment/v1/secrets/{id}` |
 
 See [Filter expressions](FILTER.md) for filtering and ordering list results.

@@ -28,10 +28,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Tenant onboarding to hub", func() {
@@ -112,7 +112,7 @@ var _ = Describe("Tenant onboarding to hub", func() {
 		).Should(Succeed())
 
 		By("Deleting the tenant")
-		deleteTenant(ctx, tenantsClient, projectsClient, id)
+		deleteTenant(ctx, tenantsClient, projectsClient, id, name)
 
 		By("Verifying Tenant CR is removed from the hub cluster")
 		Eventually(

@@ -35,11 +35,6 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/onsi/gomega/ghttp"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/jq"
-	"github.com/osac-project/osac/fulfillment-service/internal/network"
-	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
-	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
 	"google.golang.org/grpc"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -54,11 +49,18 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/jq"
+	"github.com/osac-project/osac/fulfillment-service/internal/network"
+	"github.com/osac-project/osac/fulfillment-service/internal/oauth"
+	"github.com/osac-project/osac/fulfillment-service/internal/tlsconfig"
+	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+
 	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/version"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var ServiceAccountTenants = map[string]string{
@@ -275,6 +277,14 @@ func (t *Tool) Setup(ctx context.Context) error {
 
 	// Load the CA bundle:
 	err = t.loadCaBundle(ctx)
+	if err != nil {
+		return err
+	}
+
+	// Ensure Keycloak trusts the cluster CA so that the OIDC broker can complete
+	// back-channel token exchanges with intra-cluster realm endpoints over TLS.
+	// The function is idempotent and is a no-op if KC is already patched.
+	err = t.EnsureKCTrustsClusterCA(ctx)
 	if err != nil {
 		return err
 	}
@@ -1155,6 +1165,87 @@ func (t *Tool) KeycloakAdminRequest(ctx context.Context, method, path string, in
 		err = fmt.Errorf("failed to create Keycloak admin token source: %w", err)
 		return
 	}
+	tlsConfig := tlsconfig.NewClientTLSConfig()
+	tlsConfig.RootCAs = t.caPool
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+	var body io.Reader
+	if input != nil {
+		var data []byte
+		data, err = json.Marshal(input)
+		if err != nil {
+			err = fmt.Errorf("failed to marshal request body: %w", err)
+			return
+		}
+		body = bytes.NewReader(data)
+	}
+	url := fmt.Sprintf("https://%s/admin/realms/osac%s", keycloakAddr, path)
+	request, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		err = fmt.Errorf("failed to create request: %w", err)
+		return
+	}
+	if input != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	token, err := tokenSource.Token(ctx)
+	if err != nil {
+		err = fmt.Errorf("failed to get token: %w", err)
+		return
+	}
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.Access))
+	response, err := httpClient.Do(request)
+	if err != nil {
+		err = fmt.Errorf("failed to send request: %w", err)
+		return
+	}
+	defer response.Body.Close()
+	output, err = io.ReadAll(response.Body)
+	if err != nil {
+		err = fmt.Errorf("failed to read response body: %w", err)
+		return
+	}
+	code = response.StatusCode
+	return
+}
+
+// KeycloakAdminRequestForRealm is the generalized form of KeycloakAdminRequest.
+// Pass an empty realm to target the root admin endpoint (e.g. for realm creation/deletion).
+func (t *Tool) KeycloakAdminRequestForRealm(ctx context.Context, realm, method, path string, input any) (
+	code int, output []byte, err error,
+) {
+	var fullURL string
+	if realm == "" {
+		fullURL = fmt.Sprintf("https://%s/admin%s", keycloakAddr, path)
+	} else {
+		fullURL = fmt.Sprintf("https://%s/admin/realms/%s%s", keycloakAddr, realm, path)
+	}
+
+	store, err := auth.NewMemoryTokenStore().
+		SetLogger(t.logger).
+		Build()
+	if err != nil {
+		err = fmt.Errorf("failed to create Keycloak admin token store: %w", err)
+		return
+	}
+	tokenSource, err := oauth.NewTokenSource().
+		SetLogger(t.logger).
+		SetStore(store).
+		SetCaPool(t.caPool).
+		SetIssuer(fmt.Sprintf("https://%s/realms/master", keycloakAddr)).
+		SetFlow(oauth.PasswordFlow).
+		SetClientId("admin-cli").
+		SetUsername("admin").
+		SetPassword("admin").
+		SetScopes("openid").
+		Build()
+	if err != nil {
+		err = fmt.Errorf("failed to create Keycloak admin token source: %w", err)
+		return
+	}
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
@@ -1173,8 +1264,7 @@ func (t *Tool) KeycloakAdminRequest(ctx context.Context, method, path string, in
 		}
 		body = bytes.NewReader(data)
 	}
-	url := fmt.Sprintf("https://%s/admin/realms/osac%s", keycloakAddr, path)
-	request, err := http.NewRequestWithContext(ctx, method, url, body)
+	request, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		err = fmt.Errorf("failed to create request: %w", err)
 		return
@@ -1219,10 +1309,10 @@ func (t *Tool) makeGrpcConn(addr string, tokenSource auth.TokenSource) (result *
 // makeHttpClient creates an HTTP client that automatically adds the scheme, host and token to the request. Users of the
 // client only need to provide the URL path, and other headers as needed.
 func (t *Tool) makeHttpClient(addr string, tokenSource auth.TokenSource) *http.Client {
+	tlsConfig := tlsconfig.NewClientTLSConfig()
+	tlsConfig.RootCAs = t.caPool
 	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			RootCAs: t.caPool,
-		},
+		TLSClientConfig: tlsConfig,
 	}
 	tripper := ghttp.RoundTripperFunc(
 		func(request *http.Request) (response *http.Response, err error) {

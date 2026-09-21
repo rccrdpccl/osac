@@ -23,11 +23,12 @@ import (
 	. "github.com/onsi/gomega"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Identity provider lifecycle", func() {
@@ -81,7 +82,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -136,7 +136,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -201,7 +200,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -230,7 +228,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -284,7 +281,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -341,7 +337,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -393,7 +388,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 							AuthorizationUrl: "https://oidc.example.com/authorize",
 							TokenUrl:         "https://oidc.example.com/token",
 							ClientId:         "test-client",
-							ClientSecret:     "test-secret",
 							Issuer:           "https://oidc.example.com",
 						}.Build(),
 					}.Build(),
@@ -424,7 +418,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "test-client",
-						ClientSecret:     "test-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -450,7 +443,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 						AuthorizationUrl: "https://oidc.example.com/authorize",
 						TokenUrl:         "https://oidc.example.com/token",
 						ClientId:         "other-client",
-						ClientSecret:     "other-secret",
 						Issuer:           "https://oidc.example.com",
 					}.Build(),
 				}.Build(),
@@ -508,7 +500,6 @@ var _ = Describe("Identity provider lifecycle", func() {
 							AuthorizationUrl: "https://oidc.example.com/authorize",
 							TokenUrl:         "https://oidc.example.com/token",
 							ClientId:         fmt.Sprintf("client-%d", i),
-							ClientSecret:     "test-secret",
 							Issuer:           "https://oidc.example.com",
 						}.Build(),
 					}.Build(),
@@ -550,5 +541,252 @@ var _ = Describe("Identity provider lifecycle", func() {
 			Expect(code).To(Equal(http.StatusOK),
 				"IdP with alias %q should exist in Keycloak", entry.alias)
 		}
+	})
+})
+
+var _ = Describe("Identity provider client_secret_secret", func() {
+	var (
+		ctx           context.Context
+		client        privatev1.IdentityProvidersClient
+		tenantsClient privatev1.TenantsClient
+		secretsClient privatev1.SecretsClient
+		tenantName    string
+		tenantID      string
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		client = privatev1.NewIdentityProvidersClient(tool.InternalView().AdminConn())
+		tenantsClient = privatev1.NewTenantsClient(tool.InternalView().AdminConn())
+		secretsClient = privatev1.NewSecretsClient(tool.InternalView().AdminConn())
+
+		tenantName = fmt.Sprintf("idp-sec-%s", uuid.New())
+		createResponse, err := tenantsClient.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: tenantName,
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		tenantID = createResponse.GetObject().GetId()
+		DeferCleanup(func() {
+			_, _ = tenantsClient.Delete(ctx, privatev1.TenantsDeleteRequest_builder{
+				Id: tenantID,
+			}.Build())
+		})
+
+		// The tenant must be SYNCED before its Vault namespace exists and secrets can be stored.
+		waitForTenantSynced(ctx, tenantsClient, tenantID)
+	})
+
+	// createClientSecret creates a Vault-backed secret owned by the IdP's tenant with the given
+	// data map, and returns its id and name.
+	createClientSecret := func(ctx context.Context, data map[string][]byte) (id, name string) {
+		name = fmt.Sprintf("idp-client-secret-%s", uuid.New()[24:32])
+		response, err := secretsClient.Create(ctx, privatev1.SecretsCreateRequest_builder{
+			Object: privatev1.Secret_builder{
+				Type: privatev1.SecretType_SECRET_TYPE_VALUE,
+				Metadata: privatev1.Metadata_builder{
+					Name:   name,
+					Tenant: tenantName,
+				}.Build(),
+				Data: data,
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		id = response.GetObject().GetId()
+		DeferCleanup(func() {
+			_, _ = secretsClient.Delete(ctx, privatev1.SecretsDeleteRequest_builder{Id: id}.Build())
+		})
+		return id, name
+	}
+
+	// createOpaqueSecret creates a valid secret which cannot be used as an OIDC client secret.
+	createOpaqueSecret := func(ctx context.Context) (id, name string) {
+		name = fmt.Sprintf("idp-opaque-secret-%s", uuid.New()[24:32])
+		response, err := secretsClient.Create(ctx, privatev1.SecretsCreateRequest_builder{
+			Object: privatev1.Secret_builder{
+				Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
+				Metadata: privatev1.Metadata_builder{
+					Name:   name,
+					Tenant: tenantName,
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		id = response.GetObject().GetId()
+		DeferCleanup(func() {
+			_, _ = secretsClient.Delete(ctx, privatev1.SecretsDeleteRequest_builder{Id: id}.Build())
+		})
+		return id, name
+	}
+
+	It("Creates an OIDC identity provider using client_secret_secret and reconciles to READY", func() {
+		secretId, _ := createClientSecret(ctx, map[string][]byte{"value": []byte("resolved-client-secret")})
+
+		idpName := fmt.Sprintf("test-oidc-sec-%s", uuid.New())
+		expectedAlias := fmt.Sprintf("%s-%s", tenantName, idpName)
+
+		createResponse, err := client.Create(ctx, privatev1.IdentityProvidersCreateRequest_builder{
+			Object: privatev1.IdentityProvider_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:   idpName,
+					Tenant: tenantName,
+				}.Build(),
+				Spec: privatev1.IdentityProviderSpec_builder{
+					Title:   "Test OIDC Provider (secret ref)",
+					Enabled: true,
+					Oidc: privatev1.OidcConfig_builder{
+						AuthorizationUrl:   "https://oidc.example.com/authorize",
+						TokenUrl:           "https://oidc.example.com/token",
+						ClientId:           "test-client",
+						ClientSecretSecret: privatev1.SecretLocalReference_builder{Id: secretId}.Build(),
+						Issuer:             "https://oidc.example.com",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		idpID := createResponse.GetObject().GetId()
+		DeferCleanup(func() {
+			_, _ = client.Delete(ctx, privatev1.IdentityProvidersDeleteRequest_builder{
+				Id: idpID,
+			}.Build())
+		})
+
+		// Reaching READY proves the reconciler resolved the client secret from the referenced
+		// Secret (a resolution failure would leave the provider un-synced).
+		Eventually(
+			func(g Gomega) {
+				getResponse, err := client.Get(ctx, privatev1.IdentityProvidersGetRequest_builder{
+					Id: idpID,
+				}.Build())
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(getResponse.GetObject().GetStatus().GetPhase()).To(
+					Equal(privatev1.IdentityProviderPhase_IDENTITY_PROVIDER_PHASE_READY),
+				)
+			},
+			2*time.Minute,
+			time.Second,
+		).Should(Succeed())
+
+		code, _, err := tool.KeycloakAdminRequest(ctx, http.MethodGet,
+			fmt.Sprintf("/identity-provider/instances/%s", expectedAlias), nil)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(code).To(Equal(http.StatusOK))
+	})
+
+	It("Rejects a nonexistent client_secret_secret reference", func() {
+		idpName := fmt.Sprintf("test-missing-%s", uuid.New())
+		_, err := client.Create(ctx, privatev1.IdentityProvidersCreateRequest_builder{
+			Object: privatev1.IdentityProvider_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:   idpName,
+					Tenant: tenantName,
+				}.Build(),
+				Spec: privatev1.IdentityProviderSpec_builder{
+					Title:   "Missing Secret Provider",
+					Enabled: true,
+					Oidc: privatev1.OidcConfig_builder{
+						AuthorizationUrl:   "https://oidc.example.com/authorize",
+						TokenUrl:           "https://oidc.example.com/token",
+						ClientId:           "test-client",
+						ClientSecretSecret: privatev1.SecretLocalReference_builder{Id: uuid.New()}.Build(),
+						Issuer:             "https://oidc.example.com",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).To(HaveOccurred())
+		status, ok := grpcstatus.FromError(err)
+		Expect(ok).To(BeTrue())
+		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+	})
+
+	It("Rejects a client_secret_secret with an incompatible secret type", func() {
+		// Typed-secret validation prevents malformed value secrets from being created. Use a
+		// valid opaque secret to exercise the consumer's type validation instead.
+		secretId, _ := createOpaqueSecret(ctx)
+
+		idpName := fmt.Sprintf("test-novalue-%s", uuid.New())
+		_, err := client.Create(ctx, privatev1.IdentityProvidersCreateRequest_builder{
+			Object: privatev1.IdentityProvider_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:   idpName,
+					Tenant: tenantName,
+				}.Build(),
+				Spec: privatev1.IdentityProviderSpec_builder{
+					Title:   "Empty Value Provider",
+					Enabled: true,
+					Oidc: privatev1.OidcConfig_builder{
+						AuthorizationUrl:   "https://oidc.example.com/authorize",
+						TokenUrl:           "https://oidc.example.com/token",
+						ClientId:           "test-client",
+						ClientSecretSecret: privatev1.SecretLocalReference_builder{Id: secretId}.Build(),
+						Issuer:             "https://oidc.example.com",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).To(HaveOccurred())
+		status, ok := grpcstatus.FromError(err)
+		Expect(ok).To(BeTrue())
+		Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+		Expect(status.Message()).To(ContainSubstring("SECRET_TYPE_OPAQUE"))
+		Expect(status.Message()).To(ContainSubstring("SECRET_TYPE_VALUE"))
+	})
+
+	It("Updates client_secret_secret to another Vault-backed secret", func() {
+		// Both secrets go through the real Secrets API, so their values live in Vault (not the
+		// database column). A successful update proves the update-path validation hydrates the
+		// value from the store, exactly as the create path does.
+		firstSecretId, _ := createClientSecret(ctx, map[string][]byte{"value": []byte("first-client-secret")})
+		secondSecretId, secondSecretName := createClientSecret(ctx,
+			map[string][]byte{"value": []byte("second-client-secret")})
+
+		idpName := fmt.Sprintf("test-update-ref-%s", uuid.New())
+		createResponse, err := client.Create(ctx, privatev1.IdentityProvidersCreateRequest_builder{
+			Object: privatev1.IdentityProvider_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:   idpName,
+					Tenant: tenantName,
+				}.Build(),
+				Spec: privatev1.IdentityProviderSpec_builder{
+					Title:   "Update Reference Provider",
+					Enabled: true,
+					Oidc: privatev1.OidcConfig_builder{
+						AuthorizationUrl:   "https://oidc.example.com/authorize",
+						TokenUrl:           "https://oidc.example.com/token",
+						ClientId:           "test-client",
+						ClientSecretSecret: privatev1.SecretLocalReference_builder{Id: firstSecretId}.Build(),
+						Issuer:             "https://oidc.example.com",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		idpID := createResponse.GetObject().GetId()
+		DeferCleanup(func() {
+			_, _ = client.Delete(ctx, privatev1.IdentityProvidersDeleteRequest_builder{
+				Id: idpID,
+			}.Build())
+		})
+
+		updateResponse, err := client.Update(ctx, privatev1.IdentityProvidersUpdateRequest_builder{
+			Object: privatev1.IdentityProvider_builder{
+				Id: idpID,
+				Spec: privatev1.IdentityProviderSpec_builder{
+					Oidc: privatev1.OidcConfig_builder{
+						ClientSecretSecret: privatev1.SecretLocalReference_builder{Id: secondSecretId}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.oidc.client_secret_secret"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		ref := updateResponse.GetObject().GetSpec().GetOidc().GetClientSecretSecret()
+		Expect(ref.GetId()).To(Equal(secondSecretId))
+		Expect(ref.GetName()).To(Equal(secondSecretName))
 	})
 })

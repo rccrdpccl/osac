@@ -24,9 +24,9 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("NATGateway lifecycle", func() {
@@ -233,12 +233,12 @@ var _ = Describe("NATGateway lifecycle", func() {
 		Expect(ng.GetSpec().GetExternalIp().GetId()).To(Equal(externalIPId))
 		Expect(ng.GetStatus().GetState()).To(Equal(publicv1.NATGatewayState_NAT_GATEWAY_STATE_PENDING))
 
-		// Verify ExternalIP attached flag is set
+		// NATGateway does not populate ExternalIPAttachment output fields.
 		ipResp, err := privateExternalIPsClient.Get(ctx, privatev1.ExternalIPsGetRequest_builder{
 			Id: externalIPId,
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
-		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeTrue())
+		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeFalse())
 
 		// Get
 		getResponse, err := natGatewaysClient.Get(ctx, publicv1.NATGatewaysGetRequest_builder{
@@ -386,6 +386,19 @@ var _ = Describe("NATGateway lifecycle", func() {
 	})
 
 	It("Rejects create when the VirtualNetwork's NetworkClass has no fabric_manager", func() {
+		// Only one NetworkClass may exist per deployment (OSAC-4073), so the fabric-manager
+		// NetworkClass and VirtualNetwork created by the outer BeforeEach must be torn down
+		// before creating the k8s-only NetworkClass this test needs. The outer AfterEach's
+		// cleanup of the same IDs is a no-op (errors ignored) once these are already deleted.
+		_, err := virtualNetworksClient.Delete(ctx, privatev1.VirtualNetworksDeleteRequest_builder{
+			Id: virtualNetworkId,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		_, err = networkClassesClient.Delete(ctx, privatev1.NetworkClassesDeleteRequest_builder{
+			Id: networkClassId,
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
 		// Create a k8s-only NetworkClass (no fabric_manager):
 		k8sOnlyNC, err := networkClassesClient.Create(ctx, privatev1.NetworkClassesCreateRequest_builder{
 			Object: privatev1.NetworkClass_builder{
@@ -512,7 +525,7 @@ var _ = Describe("NATGateway lifecycle", func() {
 		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 	})
 
-	It("Deleting NATGateway resets ExternalIP attached flag", func() {
+	It("Deleting NATGateway leaves ExternalIP attachment output unset", func() {
 		ngId := fmt.Sprintf("test-ng-%s", uuid.New())
 		_, err := natGatewaysClient.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
 			Object: publicv1.NATGateway_builder{
@@ -532,7 +545,7 @@ var _ = Describe("NATGateway lifecycle", func() {
 			Id: externalIPId,
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
-		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeTrue())
+		Expect(ipResp.GetObject().GetStatus().GetAttached()).To(BeFalse())
 
 		_, err = natGatewaysClient.Delete(ctx, publicv1.NATGatewaysDeleteRequest_builder{
 			Id: ngId,

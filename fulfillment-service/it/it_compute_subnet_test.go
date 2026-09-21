@@ -20,11 +20,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("ComputeInstance with Subnet attachment", func() {
@@ -93,6 +94,7 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 				}.Build(),
 				Spec: privatev1.StorageTierSpec_builder{
 					Description: "Test storage tier for subnet tests",
+					Protocol:    privatev1.StorageProtocol_STORAGE_PROTOCOL_BLOCK,
 					Backends: []*privatev1.BackendAssociation{
 						privatev1.BackendAssociation_builder{
 							BackendId: storageBackendId,
@@ -112,7 +114,7 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 					Name: instanceTypeId,
 				}.Build(),
 				Spec: privatev1.InstanceTypeSpec_builder{
-					Cores:     2,
+					Vcpus:     2,
 					MemoryGib: 4,
 				}.Build(),
 			}.Build(),
@@ -331,10 +333,10 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 				Spec: publicv1.ComputeInstanceSpec_builder{
 					Template:     publicv1.ComputeInstanceTemplateReference_builder{Id: computeInstanceTemplateId}.Build(),
 					InstanceType: publicv1.InstanceTypeReference_builder{Name: instanceTypeId}.Build(),
-					RunStrategy:  new("Always"),
+					RunStrategy:  publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 					BootDisk: publicv1.ComputeInstanceDisk_builder{
-						SizeGib:     20,
-						StorageTier: &storageTierId,
+						SizeGib:     proto.Int32(20),
+						StorageTier: publicv1.StorageTierReference_builder{Id: storageTierId}.Build(),
 					}.Build(),
 					DiskImage: &publicv1.DiskImageReference{Id: diskImageId},
 					NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
@@ -369,10 +371,10 @@ var _ = Describe("ComputeInstance with Subnet attachment", func() {
 				Spec: publicv1.ComputeInstanceSpec_builder{
 					Template:     publicv1.ComputeInstanceTemplateReference_builder{Id: computeInstanceTemplateId}.Build(),
 					InstanceType: publicv1.InstanceTypeReference_builder{Name: instanceTypeId}.Build(),
-					RunStrategy:  new("Always"),
+					RunStrategy:  publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 					BootDisk: publicv1.ComputeInstanceDisk_builder{
-						SizeGib:     20,
-						StorageTier: &storageTierId,
+						SizeGib:     proto.Int32(20),
+						StorageTier: publicv1.StorageTierReference_builder{Id: storageTierId}.Build(),
 					}.Build(),
 					DiskImage: &publicv1.DiskImageReference{Id: diskImageId},
 					NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
