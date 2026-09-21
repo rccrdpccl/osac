@@ -19,6 +19,23 @@ export POD_UID="00000000-0000-0000-0000-000000000000"
 export ANSIBLE_INVENTORY_UNPARSED_WARNING=False
 export ANSIBLE_LOCALHOST_WARNING=False
 
+# Run Ansible and its Kubernetes modules from the uv-managed project environment
+# rather than the system interpreter discovered by local-connection hosts.
+ANSIBLE_PYTHON_INTERPRETER="$(uv run python -c 'import sys; print(sys.executable)')"
+run_ansible_playbook() {
+  uv run ansible-playbook \
+    -e "ansible_python_interpreter=${ANSIBLE_PYTHON_INTERPRETER}" \
+    "$@"
+}
+
+run_config_as_code_playbook() {
+  ANSIBLE_CONFIG="${SCRIPT_DIR}/ansible.cfg" \
+  ANSIBLE_JINJA2_NATIVE=true \
+    uv run ansible-playbook \
+      -e "ansible_python_interpreter=${ANSIBLE_PYTHON_INTERPRETER}" \
+      "$@"
+}
+
 FAILED=()
 PASSED=()
 
@@ -26,6 +43,8 @@ PASSED=()
 WORKFLOWS=(
   "cluster_create"
   "cluster_delete"
+  "cluster_create_caas"
+  "cluster_delete_caas"
   "cluster_post_install"
   "compute_instance_create"
   "compute_instance_with_gpu_create"
@@ -62,7 +81,7 @@ for workflow in "${WORKFLOWS[@]}"; do
 
   # Baseline test
   echo "  [1/2] Running baseline test..."
-  if ansible-playbook "targets/${workflow}/tasks/baseline.yml" -e "@common_vars.yml" -v; then
+  if run_ansible_playbook "targets/${workflow}/tasks/baseline.yml" -e "@common_vars.yml" -v; then
     echo "  ✓ Baseline passed"
     PASSED+=("$workflow:baseline")
   else
@@ -76,7 +95,7 @@ for workflow in "${WORKFLOWS[@]}"; do
     # Clear override log
     > /tmp/osac_test_overrides.log
 
-    if ansible-playbook "targets/${workflow}/tasks/overrides.yml" -e "@common_vars.yml" -v; then
+    if run_ansible_playbook "targets/${workflow}/tasks/overrides.yml" -e "@common_vars.yml" -v; then
       # Verify override log has entries
       if [ -s /tmp/osac_test_overrides.log ]; then
         echo "  ✓ Override test passed"
@@ -100,8 +119,13 @@ echo "=== Running Role Integration Tests ==="
 echo ""
 
 # Create a real pod for lease ownerReference tests (prevents K8s GC).
-# Scoped to role tests only -- workflow tests use the placeholder UID
-# so leases get GC'd between baseline and override runs.
+# Scoped to role and storage tests -- workflow tests use the placeholder UID
+# so leases get GC'd between baseline and override runs. Kept alive through
+# the STORAGE_TESTS loop below because csi_driver_install has a lock-contention
+# scenario that needs a live owner pod matching POD_NAME/POD_UID.
+# Deleting it right after the role-tests loop would orphan a Lease those later tests
+# create, and Kubernetes would garbage-collect it almost immediately, which silently
+# defeats the whole point of the lock-contention scenario.
 echo "Creating test-runner pod for lease role tests..."
 kubectl run lease-test-pod --image=registry.k8s.io/pause:3.9 --restart=Never -n osac-system 2>/dev/null || true
 kubectl wait --for=condition=Ready pod/lease-test-pod -n osac-system --timeout=60s 2>/dev/null || true
@@ -119,7 +143,7 @@ for role in "${ROLE_TESTS[@]}"; do
   echo "Testing role: $role"
   echo "----------------------------------------"
 
-  if ansible-playbook "targets/${role}/tasks/baseline.yml" -e "@common_vars.yml" -v; then
+  if run_ansible_playbook "targets/${role}/tasks/baseline.yml" -e "@common_vars.yml" -v; then
     echo "  ✓ Passed"
     PASSED+=("$role:baseline")
   else
@@ -137,7 +161,7 @@ for entry in "${ROLE_SCENARIO_TESTS[@]}"; do
   echo "Testing role: $role ($scenario)"
   echo "----------------------------------------"
 
-  if ansible-playbook "targets/${role}/tasks/${scenario}.yml" -e "@common_vars.yml" -v; then
+  if run_ansible_playbook "targets/${role}/tasks/${scenario}.yml" -e "@common_vars.yml" -v; then
     echo "  ✓ Passed"
     PASSED+=("$role:$scenario")
   else
@@ -148,9 +172,29 @@ for entry in "${ROLE_SCENARIO_TESTS[@]}"; do
   echo ""
 done
 
-# Clean up lease test pod
-kubectl delete pod lease-test-pod -n osac-system --ignore-not-found 2>/dev/null || true
+echo "=== Running Config-as-Code Role Tests ==="
+echo ""
 
+ENUMERATE_TEMPLATES_TEST="${SCRIPT_DIR}/../../collections/ansible_collections/osac/service/roles/enumerate_templates/tests/test.yml"
+PUBLISH_TEMPLATES_TEST="${SCRIPT_DIR}/../../collections/ansible_collections/osac/service/roles/publish_templates/tests/test.yml"
+
+for scenario in test_discover_all test_nonexistent_collection test_invalid_collection_name test_mixed_collections; do
+  echo "Testing enumerate_templates: ${scenario}"
+  if run_config_as_code_playbook "${ENUMERATE_TEMPLATES_TEST}" -e "${scenario}=true"; then
+    PASSED+=("enumerate_templates:${scenario}")
+  else
+    FAILED+=("enumerate_templates:${scenario}")
+  fi
+done
+
+for scenario in test_empty test_populated test_no_items_key test_disabled test_not_found; do
+  echo "Testing publish_templates: ${scenario}"
+  if run_config_as_code_playbook "${PUBLISH_TEMPLATES_TEST}" -e "${scenario}=true"; then
+    PASSED+=("publish_templates:${scenario}")
+  else
+    FAILED+=("publish_templates:${scenario}")
+  fi
+done
 echo "=== Running Storage Provider Dispatcher Unit Tests ==="
 echo ""
 
@@ -163,7 +207,7 @@ echo ""
 # everything after it.
 STORAGE_PROVIDER_UNIT_TEST="${SCRIPT_DIR}/../../collections/ansible_collections/osac/service/roles/storage_provider/tests/test.yml"
 
-if ansible-playbook "${STORAGE_PROVIDER_UNIT_TEST}" -v -e storage_provider_csi_backends_enabled=false; then
+if run_ansible_playbook "${STORAGE_PROVIDER_UNIT_TEST}" -v -e storage_provider_csi_backends_enabled=false; then
   echo "  ✓ storage_provider unit tests (part 1) passed"
   PASSED+=("storage_provider_unit_tests:part1")
 else
@@ -172,7 +216,7 @@ else
 fi
 
 part2_log="${SCRIPT_DIR}/.storage_provider_unit_part2.log"
-if ansible-playbook --start-at-task "Attempt with invalid action 'destroy' (expected to fail)" \
+if run_ansible_playbook --start-at-task "Attempt with invalid action 'destroy' (expected to fail)" \
   "${STORAGE_PROVIDER_UNIT_TEST}" -v -e storage_provider_csi_backends_enabled=false > "${part2_log}" 2>&1 \
   && grep -q 'ok=[1-9]' "${part2_log}"; then
   echo "  ✓ storage_provider unit tests (part 2) passed"
@@ -208,12 +252,30 @@ if [ "${STORAGE_TESTS_ENABLED:-}" = "true" ]; then
     "storage_provider_ensure_sc"
     "storage_provider_onboarding"
     "storage_provider_setup_rollback"
+    # Playbook-level wiring tests for osac.service.csi_driver_install (stub the
+    # real Helm install via csi_driver_install_override, run the real
+    # storage_provider dispatch after it) -- share this gate/mock server since
+    # they need the same infrastructure. One target per hub-targeting dispatch
+    # point: tenant storage backend (setup) and tenant/cluster storage's
+    # Tenant-vs-ClusterOrder gate (ensure_storage_class).
+    "tenant_storage_backend_csi_driver_install_wiring"
+    "tenant_cluster_storage_csi_driver_install_gate"
+    # csi_driver_install's own role-level test. Runs unconditionally alongside the
+    # rest of STORAGE_TESTS -- setup_test_env.sh's "local TLS OCI registry" section
+    # (same STORAGE_TESTS_ENABLED gate) packages and pushes the real
+    # osac-csi-driver/charts/{csi-driver,csi-backends} charts at versions
+    # 0.1.0/0.1.1, so this no longer needs a real oci://ghcr.io/osac-project/charts
+    # release tag (none has been cut yet -- OSAC-3290 Risk Assessment item 1).
+    # Does not need the mock VMS server itself -- csi_driver_install never calls
+    # the VAST VMS API directly -- but shares this array/gate since it now shares
+    # the same local-registry setup step.
+    "csi_driver_install"
   )
 
   for storage_test in "${STORAGE_TESTS[@]}"; do
     echo "  Running: $storage_test"
     log_file="/tmp/osac_storage_test_${storage_test}.log"
-    if ansible-playbook "targets/${storage_test}/tasks/main.yml" -e "@common_vars.yml" -v > "${log_file}" 2>&1; then
+    if run_ansible_playbook "targets/${storage_test}/tasks/main.yml" -e "@common_vars.yml" -v > "${log_file}" 2>&1; then
       echo "  ✓ ${storage_test} passed"
       PASSED+=("$storage_test:baseline")
     else
@@ -225,6 +287,10 @@ if [ "${STORAGE_TESTS_ENABLED:-}" = "true" ]; then
     fi
   done
 fi
+
+# Clean up lease test pod -- kept alive through both the role-tests and
+# storage-tests loops above (see the creation comment for why).
+kubectl delete pod lease-test-pod -n osac-system --ignore-not-found 2>/dev/null || true
 
 echo "========================================"
 echo "Test Results"

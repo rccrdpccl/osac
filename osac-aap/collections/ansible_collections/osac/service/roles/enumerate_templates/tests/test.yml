@@ -23,7 +23,7 @@
 
 # ──────────────────────────────────────────────────────────────
 # Test 1: Discover all template types from osac.templates
-# Expected: finds cluster, compute_instance, and network templates
+# Expected: finds cluster and compute_instance templates
 # ──────────────────────────────────────────────────────────────
 - name: "Test enumerate_templates -- discover all template types"
   hosts: localhost
@@ -56,22 +56,9 @@
           - item.id is defined
           - item.title is defined
           - item.title | length > 0
-          - item.node_sets is defined
-          - item.node_sets | length > 0
         fail_msg: "Cluster template '{{ item.id }}' missing required fields"
         success_msg: "Cluster template '{{ item.id }}' has correct structure"
       loop: "{{ osac_cluster_templates }}"
-      loop_control:
-        label: "{{ item.id }}"
-      when: test_discover_all | default(false) | bool
-
-    - name: Verify known templates include fc430 node set
-      ansible.builtin.assert:
-        that:
-          - "'fc430' in item.node_sets"
-        fail_msg: "Template '{{ item.id }}' expected to have fc430 node set"
-        success_msg: "Template '{{ item.id }}' has fc430 node set"
-      loop: "{{ osac_cluster_templates | selectattr('id', 'in', ['osac.templates.ocp_small']) | list }}"
       loop_control:
         label: "{{ item.id }}"
       when: test_discover_all | default(false) | bool
@@ -88,37 +75,18 @@
         success_msg: "Found {{ osac_compute_instance_templates | length }} compute instance template(s)"
       when: test_discover_all | default(false) | bool
 
-    - name: Verify network classes discovered
+    - name: Verify add-on operator templates discovered
       ansible.builtin.assert:
         that:
-          - osac_network_classes is defined
-          - osac_network_classes | length >= 1
-          - osac_network_classes | map(attribute='metadata') | map(attribute='name') | list is superset(['cudn-net'])
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length >= 1
+          - osac_addon_operator_templates | map(attribute='id') | list is superset(['osac.templates.cert_manager'])
+          - osac_addon_operator_templates[0].min_ocp_version is defined
+          - osac_addon_operator_templates[0].dependencies is defined
         fail_msg: >-
-          Expected at least 1 network class (cudn-net).
-          Got: {{ osac_network_classes | default([]) | map(attribute='metadata') | map(attribute='name') | list }}
-        success_msg: "Found {{ osac_network_classes | length }} network class(es)"
-      when: test_discover_all | default(false) | bool
-
-    - name: Verify network class structure
-      ansible.builtin.assert:
-        that:
-          - item.title is defined
-          - item.metadata is defined
-          - item.metadata.name is defined
-          - item.metadata.name | length > 0
-          - (item.fabric_manager is defined and item.fabric_manager | length > 0) or (item.k8s_manager is defined and item.k8s_manager | length > 0)
-          - item.capabilities is defined
-        fail_msg: >-
-          Network class '{{ item.metadata.name | default('unknown') }}' missing required
-          fields, or has neither fabric_manager nor k8s_manager set
-        success_msg: >-
-          Network class '{{ item.metadata.name }}' has correct structure
-          (fabric_manager={{ item.fabric_manager | default('unset') }},
-          k8s_manager={{ item.k8s_manager | default('unset') }})
-      loop: "{{ osac_network_classes }}"
-      loop_control:
-        label: "{{ item.metadata.name }}"
+          Expected the cert_manager AddOnOperator template.
+          Got: {{ osac_addon_operator_templates | default([]) | map(attribute='id') | list }}
+        success_msg: "Found {{ osac_addon_operator_templates | length }} add-on operator template(s)"
       when: test_discover_all | default(false) | bool
 
 # ──────────────────────────────────────────────────────────────
@@ -145,13 +113,12 @@
           - osac_cluster_templates | length == 0
           - osac_compute_instance_templates is defined
           - osac_compute_instance_templates | length == 0
-          - osac_network_classes is defined
-          - osac_network_classes | length == 0
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length == 0
         fail_msg: >-
           Expected empty lists for nonexistent collection.
           Clusters: {{ osac_cluster_templates | default([]) | length }},
-          CIs: {{ osac_compute_instance_templates | default([]) | length }},
-          NCs: {{ osac_network_classes | default([]) | length }}
+          CIs: {{ osac_compute_instance_templates | default([]) | length }}
         success_msg: "Nonexistent collection returned empty lists as expected"
       when: test_nonexistent_collection | default(false) | bool
 
@@ -179,8 +146,8 @@
           - osac_cluster_templates | length == 0
           - osac_compute_instance_templates is defined
           - osac_compute_instance_templates | length == 0
-          - osac_network_classes is defined
-          - osac_network_classes | length == 0
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length == 0
         fail_msg: "Expected empty lists for invalid collection name"
         success_msg: "Invalid collection name handled gracefully"
       when: test_invalid_collection_name | default(false) | bool
@@ -211,12 +178,11 @@
           - osac_cluster_templates | length >= 2
           - osac_compute_instance_templates is defined
           - osac_compute_instance_templates | length >= 1
-          - osac_network_classes is defined
-          - osac_network_classes | length >= 1
+          - osac_addon_operator_templates is defined
+          - osac_addon_operator_templates | length >= 1
         fail_msg: >-
           Expected templates from osac.templates despite invalid entries.
           Clusters: {{ osac_cluster_templates | default([]) | length }},
-          CIs: {{ osac_compute_instance_templates | default([]) | length }},
-          NCs: {{ osac_network_classes | default([]) | length }}
+          CIs: {{ osac_compute_instance_templates | default([]) | length }}
         success_msg: "Mixed collections handled correctly: valid templates discovered, invalid entries ignored"
       when: test_mixed_collections | default(false) | bool

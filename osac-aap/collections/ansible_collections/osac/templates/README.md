@@ -49,8 +49,8 @@ Minimal OpenShift cluster configuration.
 - 2 nodes
 - Resource class: fc430
 
-**Required Parameters:**
-- `pull_secret`: Red Hat pull secret for OpenShift installation
+**Cluster credentials:**
+- `spec_defaults.pull_secret_secret`: Reference to a platform-managed pull Secret
 - `ssh_public_key`: SSH public key for node access
 
 ### VM Templates
@@ -69,7 +69,7 @@ The following are read from the `ComputeInstance` spec:
 
 | Spec Field | Description |
 |-----------|-------------|
-| `spec.cores` | Number of CPU cores |
+| `spec.vcpus` | Number of vCPUs |
 | `spec.memoryGiB` | Memory allocation in GiB |
 | `spec.bootDisk.sizeGiB` | Root disk size in GiB |
 | `spec.diskImage` | DiskImage reference (name or id) |
@@ -108,6 +108,8 @@ validation, and lifecycle management.
    allowed_resource_classes: []
 
    spec_defaults:
+     pull_secret_secret:
+       name: shared-pull-secret
      release_image: "quay.io/openshift-release-dev/ocp-release:4.17.0-multi"
 
    parameters:
@@ -120,6 +122,11 @@ validation, and lifecycle management.
 
 3. Implement provisioning tasks in `roles/my_cluster_template/tasks/install.yaml`
 4. Implement cleanup tasks in `roles/my_cluster_template/tasks/delete.yaml`
+
+The referenced Secret must be created by a platform administrator in the `shared` tenant before
+the template is published. Pull Secrets must store the registry credentials in the
+`.dockerconfigjson` data key. Tenant users can consume a shared pull Secret through a published
+cluster template, but only platform administrators and controllers can retrieve or mutate its data.
 
 ### Creating a New ComputeInstance Template
 
@@ -138,7 +145,7 @@ single file: `meta/osac.yaml`.
    template_type: compute_instance
 
    spec_defaults:
-     # cores/memory_gib are reserved (removed); instance_type is the sole,
+     # vcpus/memory_gib are reserved (removed); instance_type is the sole,
      # mandatory way to size a ComputeInstance. Set spec_defaults.instance_type
      # here to give the template a default, or omit it to require callers to
      # always pass instance_type explicitly.
@@ -232,7 +239,7 @@ extra_var, populated by osac-operator from the Tier API:
   {"name": "default", "protocol": "nfs", "provider": "vast", "backend_id": "be-001",
    "qos_limits": {"static_limits": {"max_reads_bw_mbps": 100, "max_writes_bw_mbps": 100}}},
   {"name": "high-performance", "protocol": "block", "provider": "vast", "backend_id": "be-001",
-   "qos_limits": {"static_limits": {"max_reads_bw_mbps": 500, "max_writes_bw_mbps": 500}}, "quota_bytes": 500}
+   "qos_limits": {"static_limits": {"max_reads_bw_mbps": 500, "max_writes_bw_mbps": 500}}}
 ]
 ```
 
@@ -249,7 +256,6 @@ passed via the `storage_provider_backend_connections` extra_var, keyed by `backe
 | `backend_id` | provider-dependent | Key into `storage_provider_backend_connections` for this tier's backend credentials (required by providers that resolve credentials this way, e.g. VAST) |
 | `qos_policy` | n/a — derived, ignored if set by the caller | QoS policy name (creates STATIC mode policy on VMS), always derived from the tier name (`<name>-qos`). Any caller-supplied value is discarded, never used |
 | `qos_limits` | no | Dict merged into QoS POST body (e.g., `static_limits`, `static_total_limits`). A tier opts out of `qos_policy` derivation unless `qos_limits.static_limits` sets a positive `max_reads_bw_mbps` or `max_writes_bw_mbps` |
-| `quota_bytes` | no | Hard quota in bytes for the tier's view |
 
 **QoS limits:** When a tier has a derived `qos_policy` (see above), the role creates a QoS
 policy via REST API (`POST /api/qospolicies/`). The `qos_limits` dict is merged directly into
@@ -303,7 +309,7 @@ Templates integrate with OSAC through a well-defined interface:
 
 ### Storage Provider Lifecycle
 1. Operator creates Org CR, triggering `{{ aap_prefix }}-create-org` AAP job
-2. `setup` provisions VAST resources per tier (tenant, views, quotas)
+2. `setup` provisions VAST resources per tier (tenant, views)
 3. Per-tenant VAST user created with random password (admin creds never leave AAP)
 4. Tenant config + per-tenant credentials persisted to hub-cluster K8s Secret
 5. VIP pool is pre-configured globally by infra admins (not provisioned per-tenant)

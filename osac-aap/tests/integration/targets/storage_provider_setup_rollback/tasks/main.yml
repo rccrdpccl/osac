@@ -20,6 +20,18 @@
         namespace: "osac-system"
       failed_when: false
 
+    - name: Record call log mark (isolate this target's traffic from prior tests)
+      ansible.builtin.uri:
+        url: "https://127.0.0.1:18443/_calls"
+        validate_certs: false
+        method: GET
+        return_content: true
+      register: _pre_calls
+
+    - name: Save call log offset
+      ansible.builtin.set_fact:
+        _call_log_mark: "{{ _pre_calls.json | length }}"
+
     - name: Inject failure on manager creation (triggers rescue block)
       ansible.builtin.uri:
         url: "https://127.0.0.1:18443/_inject_failure"
@@ -98,20 +110,50 @@
         return_content: true
       register: _mock_calls
 
+    - name: Slice call log to this target's traffic only
+      ansible.builtin.set_fact:
+        _call_log: "{{ _mock_calls.json[_call_log_mark | int:] }}"
+
     - name: Assert rollback queried VMS resources for cleanup
       ansible.builtin.assert:
         that:
-          - _mock_calls.json | selectattr('path', 'search', 'views.*tenant_id=') | selectattr('method', 'equalto', 'GET') | list | length > 0
-            or _mock_calls.json | selectattr('path', 'search', 'qospolicies.*tenant_id=') | selectattr('method', 'equalto', 'GET') | list | length > 0
+          - _call_log | selectattr('path', 'search', 'views.*tenant_id=') | selectattr('method', 'equalto', 'GET') | list | length > 0
+            or _call_log | selectattr('path', 'search', 'qospolicies.*tenant_id=') | selectattr('method', 'equalto', 'GET') | list | length > 0
         fail_msg: "Rollback did not query VMS resources by tenant_id for cleanup"
         success_msg: "Rollback queried VMS resources by tenant_id"
 
     - name: Assert rollback attempted tenant deletion
       ansible.builtin.assert:
         that:
-          - _mock_calls.json | selectattr('path', 'search', 'tenants') | selectattr('method', 'equalto', 'DELETE') | list | length > 0
+          - _call_log | selectattr('path', 'search', 'tenants') | selectattr('method', 'equalto', 'DELETE') | list | length > 0
         fail_msg: "Rollback did not attempt tenant deletion"
         success_msg: "Rollback attempted tenant deletion"
+
+    - name: Assert rollback deletes tenant before local provider (correct ordering)
+      vars:
+        _delete_paths: "{{ _call_log | selectattr('method', 'equalto', 'DELETE') | map(attribute='path') | list }}"
+        _tenant_del_paths: "{{ _delete_paths | select('search', 'tenants/') | list }}"
+        _lp_del_paths: "{{ _delete_paths | select('search', 'localproviders/') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _tenant_del_paths | length > 0
+          - _lp_del_paths | length > 0
+          - _delete_paths.index(_tenant_del_paths[0]) < _delete_paths.index(_lp_del_paths[0])
+        fail_msg: >-
+          Rollback must delete the tenant before the local provider (OSAC-4854).
+          DELETE call order: {{ _delete_paths }}
+        success_msg: "Correct order: rollback deleted tenant before local provider"
+
+    - name: Assert rollback tenant deletion uses force_remove
+      vars:
+        _tenant_del_paths: "{{ _call_log | selectattr('method', 'equalto', 'DELETE') | map(attribute='path') | select('search', 'tenants/') | list }}"
+      ansible.builtin.assert:
+        that:
+          - _tenant_del_paths | select('search', 'force_remove') | list | length > 0
+        fail_msg: >-
+          Rollback tenant DELETE must include force_remove query parameter.
+          Tenant DELETE paths: {{ _tenant_del_paths }}
+        success_msg: "Correct: rollback tenant deletion uses force_remove"
 
     - name: Verify hub Secret was NOT persisted (rollback should prevent it)
       kubernetes.core.k8s_info:

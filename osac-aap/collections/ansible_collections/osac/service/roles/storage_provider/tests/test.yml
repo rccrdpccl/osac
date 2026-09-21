@@ -922,15 +922,14 @@
             success_msg: "Structured failure artifact correctly recorded the unsupported protocol via ensure_storage_class"
 
 # ──────────────────────────────────────────────────────────────
-# Test 22: Empty-string protocol (the real UNSPECIFIED shape from osac-operator) -- error path
+# Test 22: Empty-string protocol (the UNSPECIFIED-derived shape) -- error path, defense in depth
 # Expected: role fails at the dispatcher-level required-fields check (main.yaml), NOT at the
-# unsupported_protocol structured-failure check -- proving the one bad-protocol value that can
-# actually reach AAP in production today (fulfillment-service silently accepts
-# STORAGE_PROTOCOL_UNSPECIFIED at Create and Update; osac-operator maps it to protocol: "" and
-# passes it through unconditionally) is caught cleanly before dispatch ever reaches
-# action-specific protocol validation. Dispatched via ensure_storage_class -- the action Test 21
-# proves now enforces the closed-set check -- to confirm the empty-string case is intercepted
-# even earlier than that, at the dispatcher level.
+# unsupported_protocol structured-failure check. fulfillment-service now rejects
+# STORAGE_PROTOCOL_UNSPECIFIED at Create and Update (proto not_in:[0]), so an empty-string protocol
+# should no longer originate from a validly-created tier; this keeps the AAP-side guard honest
+# however an empty/missing protocol arrives. Dispatched via ensure_storage_class -- the action
+# Test 21 proves now enforces the closed-set check -- to confirm the empty-string case is
+# intercepted even earlier than that, at the dispatcher level.
 # ──────────────────────────────────────────────────────────────
 - name: Test storage_provider -- empty-string protocol from UNSPECIFIED (should fail)
   hosts: localhost
@@ -948,7 +947,6 @@
                 protocol: ""
                 provider: vast
                 backend_id: be-001
-                quota_bytes: 536870912000
             storage_provider_action: ensure_storage_class
             tenant_name: "tenant-acme"
             tenant_namespace: "osac-tenants"
@@ -967,3 +965,288 @@
               - "'unsupported protocol' not in (ansible_failed_result.msg | default('') | lower)"
             fail_msg: "Role failed but with unexpected message: {{ ansible_failed_result.msg | default('unknown') }}"
             success_msg: "Role correctly rejected the empty-string protocol at the dispatcher level, not the unsupported_protocol check"
+
+# ──────────────────────────────────────────────────────────────
+# Test 23: Integer-coerced credentials pass validation (OSAC-4254)
+# Expected: credential validation in read_credentials.yaml passes
+#   despite password, username, and endpoint being native integers.
+#   AWX round-trips extra_vars through YAML, coercing all-digit
+#   strings like "123456" to integers. Under ansible-core 2.20+
+#   (Jinja2 native mode), | length on an int raises TypeError.
+#   The | string filter added in OSAC-4254 prevents this.
+#   Role should pass validation and fail only at dispatch (no
+#   mock VMS server), proving credential checks are type-safe.
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- integer-coerced credentials pass validation (OSAC-4254)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run integer-coerced credentials test
+      block:
+        - name: Attempt with all-numeric credential values (simulating AWX YAML round-trip coercion)
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: vast
+                backend_id: be-int-test
+            storage_provider_backend_connections:
+              be-int-test:
+                endpoint: 10000
+                username: 12345
+                password: 123456
+            storage_provider_action: setup
+            tenant_name: "tenant-acme"
+            tenant_namespace: "osac-tenants"
+
+        - name: Validation passed (dispatch outcome is not under test)
+          ansible.builtin.debug:
+            msg: "Credential validation passed with integer-coerced values"
+
+      rescue:
+        - name: Verify failure is from dispatch (VMS API), not a type error on credential validation
+          ansible.builtin.assert:
+            that:
+              # TypeError from | length on an int would contain "has no len()"
+              - "'has no len' not in (ansible_failed_result.msg | default('') | lower)"
+              # Credential validation errors contain these specific phrases
+              - "'is missing one or more of' not in (ansible_failed_result.msg | default(''))"
+              - "'has no backend_id' not in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              Credential validation failed with integer-coerced values (OSAC-4254 regression):
+              {{ ansible_failed_result.msg | default('unknown error') }}
+            success_msg: "Credential validation passed with integer-coerced values -- dispatch failed as expected"
+
+# ──────────────────────────────────────────────────────────────
+# Test 24: Integer-coerced backend_id passes validation (OSAC-4254)
+# Expected: the backend_id presence check (| string | length == 0)
+#   handles a purely numeric backend_id without TypeError. YAML
+#   round-trip coercion can turn backend_id: "42" into backend_id: 42
+#   (native int). Without the | string guard, | length raises
+#   "object of type 'int' has no len()".
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- integer-coerced backend_id passes validation (OSAC-4254)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run integer-coerced backend_id test
+      block:
+        - name: Attempt with a numeric backend_id (simulating YAML round-trip coercion)
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: vast
+                backend_id: 42
+            storage_provider_backend_connections:
+              42:
+                endpoint: "vast.example.com"
+                username: "admin"
+                password: "mock-admin-password"
+            storage_provider_action: setup
+            tenant_name: "tenant-acme"
+            tenant_namespace: "osac-tenants"
+
+        - name: Validation passed (dispatch outcome is not under test)
+          ansible.builtin.debug:
+            msg: "Credential validation passed with integer backend_id"
+
+      rescue:
+        - name: Verify failure is from dispatch (VMS API), not a type error on backend_id check
+          ansible.builtin.assert:
+            that:
+              - "'has no len' not in (ansible_failed_result.msg | default('') | lower)"
+              - "'has no backend_id' not in (ansible_failed_result.msg | default(''))"
+              - "'is missing one or more of' not in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              Backend ID validation failed with integer-coerced value (OSAC-4254 regression):
+              {{ ansible_failed_result.msg | default('unknown error') }}
+            success_msg: "Backend ID validation passed with integer value -- dispatch failed as expected"
+
+# ──────────────────────────────────────────────────────────────
+# Test 25: Explicit YAML null endpoint is rejected (OSAC-4956)
+# Expected: credential validation in read_credentials.yaml rejects
+#   an explicit null endpoint while username and password are valid.
+#   `null | default('') | string` produces "None" (length 4), bypassing
+#   the original `| default('') | string | length == 0` guard.
+#   The `is none` guard added in OSAC-4956 prevents this.
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- explicit null endpoint is rejected (OSAC-4956)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run null endpoint test
+      block:
+        - name: Attempt with explicit null endpoint (username and password valid)
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: vast
+                backend_id: be-null-ep
+            storage_provider_backend_connections:
+              be-null-ep:
+                endpoint: null
+                username: "admin"
+                password: "not-a-real-credential"
+            storage_provider_action: setup
+            tenant_name: "tenant-null-ep"
+            tenant_namespace: "osac-tenants"
+
+        - name: Fail test if null endpoint was not rejected
+          ansible.builtin.fail:
+            msg: "Null endpoint should have been rejected by validation"
+
+      rescue:
+        - name: Verify failure is from credential validation, not a downstream error
+          ansible.builtin.assert:
+            that:
+              - "'is missing one or more of' in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              Null endpoint was not caught by validation (OSAC-4956 regression):
+              {{ ansible_failed_result.msg | default('unknown error') }}
+            success_msg: "Null endpoint correctly rejected by validation"
+
+# ──────────────────────────────────────────────────────────────
+# Test 26: Explicit YAML null username is rejected (OSAC-4956)
+# Expected: credential validation rejects a null username while
+#   endpoint and password are valid.
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- explicit null username is rejected (OSAC-4956)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run null username test
+      block:
+        - name: Attempt with explicit null username (endpoint and password valid)
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: vast
+                backend_id: be-null-user
+            storage_provider_backend_connections:
+              be-null-user:
+                endpoint: "vast.example.com"
+                username: null
+                password: "not-a-real-credential"
+            storage_provider_action: setup
+            tenant_name: "tenant-null-user"
+            tenant_namespace: "osac-tenants"
+
+        - name: Fail test if null username was not rejected
+          ansible.builtin.fail:
+            msg: "Null username should have been rejected by validation"
+
+      rescue:
+        - name: Verify failure is from credential validation, not a downstream error
+          ansible.builtin.assert:
+            that:
+              - "'is missing one or more of' in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              Null username was not caught by validation (OSAC-4956 regression):
+              {{ ansible_failed_result.msg | default('unknown error') }}
+            success_msg: "Null username correctly rejected by validation"
+
+# ──────────────────────────────────────────────────────────────
+# Test 27: Explicit YAML null password is rejected (OSAC-4956)
+# Expected: credential validation rejects a null password while
+#   endpoint and username are valid.
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- explicit null password is rejected (OSAC-4956)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run null password test
+      block:
+        - name: Attempt with explicit null password (endpoint and username valid)
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: vast
+                backend_id: be-null-pw
+            storage_provider_backend_connections:
+              be-null-pw:
+                endpoint: "vast.example.com"
+                username: "admin"
+                password: null
+            storage_provider_action: setup
+            tenant_name: "tenant-null-pw"
+            tenant_namespace: "osac-tenants"
+
+        - name: Fail test if null password was not rejected
+          ansible.builtin.fail:
+            msg: "Null password should have been rejected by validation"
+
+      rescue:
+        - name: Verify failure is from credential validation, not a downstream error
+          ansible.builtin.assert:
+            that:
+              - "'is missing one or more of' in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              Null password was not caught by validation (OSAC-4956 regression):
+              {{ ansible_failed_result.msg | default('unknown error') }}
+            success_msg: "Null password correctly rejected by validation"
+
+# ──────────────────────────────────────────────────────────────
+# Test 28: Explicit YAML null backend_id is rejected (OSAC-4956)
+# Expected: the backend_id presence check rejects explicit null.
+#   `null | string` produces "None" (length 4), bypassing the original
+#   `| string | length == 0` guard. The `is none` guard prevents this.
+#   Connection details use nulls because validation rejects the null
+#   backend_id before inspecting connection fields.
+# ──────────────────────────────────────────────────────────────
+- name: Test storage_provider -- explicit null backend_id is rejected (OSAC-4956)
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Run null backend_id test
+      block:
+        - name: Attempt with explicit null backend_id
+          ansible.builtin.include_role:
+            name: osac.service.storage_provider
+          vars:
+            storage_provider_tiers:
+              - name: default
+                protocol: nfs
+                provider: vast
+                backend_id: null
+            storage_provider_backend_connections:
+              placeholder:
+                endpoint: null
+                username: null
+                password: null
+            storage_provider_action: setup
+            tenant_name: "tenant-null-bid"
+            tenant_namespace: "osac-tenants"
+
+        - name: Fail test if null backend_id was not rejected
+          ansible.builtin.fail:
+            msg: "Null backend_id should have been rejected by validation"
+
+      rescue:
+        - name: Verify failure is from backend_id validation, not a downstream error
+          ansible.builtin.assert:
+            that:
+              - "'has no backend_id' in (ansible_failed_result.msg | default(''))"
+            fail_msg: >-
+              Null backend_id was not caught by validation (OSAC-4956 regression):
+              {{ ansible_failed_result.msg | default('unknown error') }}
+            success_msg: "Null backend_id correctly rejected by validation"

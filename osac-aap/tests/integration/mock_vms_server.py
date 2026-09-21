@@ -301,7 +301,7 @@ class MockVmsHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = self.path.split("?")[0]
-        _log({"method": "DELETE", "path": path, "headers": _strip_sensitive(dict(self.headers))})
+        _log({"method": "DELETE", "path": self.path, "headers": _strip_sensitive(dict(self.headers))})
 
         resource, resource_id = self._parse_path()
         if resource is None or resource_id is None:

@@ -3,20 +3,22 @@ from pathlib import Path
 import pydantic
 import pytest
 import yaml
+from ansible.errors import AnsibleFilterError
+import find_template_roles as filter_plugin
 
 from find_template_roles import (
+    AddOnOperatorTemplate,
+    ClusterTemplate,
+    ClusterTemplateSpecDefaults,
+    Collection,
+    FilterModule,
     Metadata,
-    NetworkClassCapabilities,
-    NetworkClassTemplate,
-    NetworkDefaults,
     ProtobufAnyValue,
     ProtobufType,
-    SecurityRule,
     TemplateParameter,
     TemplateParameterDefinition,
     TemplateTypeEnum,
     TypeMapping,
-    find_network_class_roles_filter,
 )
 
 
@@ -257,6 +259,7 @@ class TestMetadataTemplateTypes:
             ("cudn_net", TemplateTypeEnum.network),
             ("bm_host_agent_provisioning", TemplateTypeEnum.bare_metal_instance),
             ("vast_storage", TemplateTypeEnum.storage_provider),
+            ("cert_manager", TemplateTypeEnum.addon_operator),
         ],
     )
     def test_template_type_parsed_correctly(
@@ -270,103 +273,32 @@ class TestMetadataTemplateTypes:
         assert metadata.spec_defaults is not None
         assert metadata.spec_defaults["boot_disk"] is not None
 
-    def test_network_has_capabilities(self, roles_dir):
-        metadata = _load_metadata(roles_dir, "cudn_net")
-        assert metadata.capabilities is not None
-        assert metadata.capabilities.supports_ipv4 is True
+    def test_addon_operator_has_role_local_olm_metadata(self, roles_dir):
+        metadata = _load_metadata(roles_dir, "cert_manager")
 
-    def test_network_has_defaults(self, roles_dir):
-        metadata = _load_metadata(roles_dir, "cudn_net")
-        assert metadata.defaults is not None
-        assert metadata.defaults.virtual_network_ipv4_cidr == "10.200.0.0/16"
-        assert metadata.defaults.subnet_ipv4_cidr == "10.200.0.0/20"
-        assert metadata.defaults.enable_nat_gateway is False
-        assert metadata.defaults.egress_rules is not None
-        assert len(metadata.defaults.egress_rules) == 1
-        assert metadata.defaults.egress_rules[0].protocol == "PROTOCOL_ALL"
-        assert metadata.defaults.egress_rules[0].ipv4_cidr == "0.0.0.0/0"
+        assert metadata.package_name == "cert-manager"
+        assert metadata.channel == "stable"
+        assert metadata.catalog_source == "community-operators"
+        assert metadata.catalog_source_namespace == "openshift-marketplace"
 
-    def test_network_defaults_serialized_in_spec(self):
-        template = NetworkClassTemplate(
-            collection="test",
-            path=Path("/tmp/test"),
-            name="test_net",
-            title="Test Network",
-            fabric_manager="test_net",
-            capabilities=NetworkClassCapabilities(supports_ipv4=True),
-            defaults=NetworkDefaults(
-                virtual_network_ipv4_cidr="10.200.0.0/16",
-                subnet_ipv4_cidr="10.200.0.0/20",
-                egress_rules=[SecurityRule(protocol="PROTOCOL_ALL", ipv4_cidr="0.0.0.0/0")],
-            ),
+    def test_cluster_pull_secret_reference_serialization(self):
+        defaults = ClusterTemplateSpecDefaults.model_validate(
+            {"pull_secret_secret": {"name": "shared-pull-secret"}}
         )
-        payload = template.model_dump(by_alias=True, exclude_none=True)
-        assert "defaults" not in payload
-        assert "spec" in payload
-        assert payload["spec"]["defaults"]["virtual_network_ipv4_cidr"] == "10.200.0.0/16"
-        assert payload["spec"]["defaults"]["subnet_ipv4_cidr"] == "10.200.0.0/20"
-        assert payload["spec"]["defaults"]["egress_rules"][0]["protocol"] == "PROTOCOL_ALL"
-        assert payload["spec"]["defaults"]["egress_rules"][0]["ipv4_cidr"] == "0.0.0.0/0"
 
-    def test_network_without_defaults_has_no_spec(self):
-        template = NetworkClassTemplate(
-            collection="test",
-            path=Path("/tmp/test"),
-            name="test_net",
-            title="Test Network",
-            fabric_manager="test_net",
-            capabilities=NetworkClassCapabilities(supports_ipv4=True),
+        template = ClusterTemplate(
+            collection="osac.service",
+            path=Path("roles/ocp_small"),
+            name="ocp_small",
+            parameters=[],
+            spec_defaults=defaults,
         )
-        payload = template.model_dump(by_alias=True, exclude_none=True)
-        assert "defaults" not in payload
-        assert "spec" not in payload
+        dumped = template.model_dump(mode="json", exclude_none=True)
 
-    def test_network_payload_has_no_implementation_strategy(self):
-        """implementation_strategy is reserved on the NetworkClass proto and must
-        no longer be forwarded in the API payload — fabric_manager/k8s_manager and
-        metadata.name are the identity source now. `name` is deliberately distinct
-        from `fabric_manager` here so the metadata.name assertion actually proves
-        derivation from fabric_manager, not from `name`."""
-        template = NetworkClassTemplate(
-            collection="test",
-            path=Path("/tmp/test"),
-            name="role_name",
-            title="Test Network",
-            fabric_manager="fabric_net",
-            capabilities=NetworkClassCapabilities(supports_ipv4=True),
-        )
-        payload = template.model_dump(by_alias=True, exclude_none=True)
-        assert "implementation_strategy" not in payload
-        assert payload["fabric_manager"] == "fabric_net"
-        assert payload["metadata"]["name"] == "fabric-net"
-
-    def test_network_metadata_name_falls_back_to_k8s_manager(self):
-        """A network role that registers only a k8s_manager (no fabric_manager) must
-        still derive a non-empty metadata.name — from k8s_manager, not fabric_manager.
-        `name` is deliberately distinct from `k8s_manager` here so the metadata.name
-        assertion actually proves derivation from k8s_manager, not from `name`."""
-        template = NetworkClassTemplate(
-            collection="test",
-            path=Path("/tmp/test"),
-            name="role_name",
-            title="Test K8s-Only Network",
-            k8s_manager="k8s_net",
-            capabilities=NetworkClassCapabilities(supports_ipv4=True),
-        )
-        payload = template.model_dump(by_alias=True, exclude_none=True)
-        assert "fabric_manager" not in payload
-        assert payload["k8s_manager"] == "k8s_net"
-        assert payload["metadata"]["name"] == "k8s-net"
-
-    def test_network_defaults_propagate_through_discovery(self):
-        payloads = find_network_class_roles_filter(["osac.templates"])
-        cudn = next((p for p in payloads if p["metadata"]["name"] == "cudn-net"), None)
-        assert cudn is not None
-        assert "spec" in cudn
-        assert cudn["spec"]["defaults"]["virtual_network_ipv4_cidr"] == "10.200.0.0/16"
-        assert cudn["spec"]["defaults"]["subnet_ipv4_cidr"] == "10.200.0.0/20"
-        assert cudn["spec"]["defaults"]["egress_rules"][0]["protocol"] == "PROTOCOL_ALL"
-        assert cudn["spec"]["defaults"]["egress_rules"][0]["ipv4_cidr"] == "0.0.0.0/0"
+        assert dumped["metadata"] == {"name": "ocp-small", "tenant": "shared"}
+        assert dumped["spec_defaults"] == {
+            "pull_secret_secret": {"name": "shared-pull-secret"}
+        }
 
     def test_cluster_with_parameters(self, roles_dir):
         metadata = _load_metadata(roles_dir, "ocp_4_20_ai_maas")
@@ -383,6 +315,186 @@ class TestMetadataTemplateTypes:
                 description="Bad param",
                 default=object(),
             )
+
+
+# ---------------------------------------------------------------------------
+# TestAddOnOperatorTemplate
+# ---------------------------------------------------------------------------
+
+
+def _make_addon_operator_template(**overrides: object) -> AddOnOperatorTemplate:
+    defaults = {
+        "collection": "osac.templates",
+        "path": Path("roles/cert_manager"),
+        "name": "cert_manager",
+        "title": "cert-manager Operator",
+        "description": "Installs cert-manager.",
+        "parameters": [],
+        "min_ocp_version": "4.14.0",
+        "max_ocp_version": "4.16.0",
+        "exclusions": ["other_operator"],
+        "dependencies": ["dependency_operator"],
+        "package_name": "cert-manager",
+        "channel": "stable",
+        "catalog_source": "community-operators",
+        "catalog_source_namespace": "openshift-marketplace",
+    }
+    defaults.update(overrides)
+    return AddOnOperatorTemplate(**defaults)
+
+
+class TestAddOnOperatorTemplate:
+
+    def test_filter_module_exposes_addon_operator_filter(self):
+        filters = FilterModule().filters()
+
+        assert "find_addon_operator_template_roles" in filters
+
+    def test_registered_filter_returns_only_addon_operator_api_payload(
+        self, monkeypatch
+    ):
+        addon_operator = _make_addon_operator_template()
+        cluster = ClusterTemplate(
+            collection="osac.templates",
+            path=Path("roles/ocp_small"),
+            name="ocp_small",
+            title="OpenShift Small Cluster",
+            description="A cluster.",
+            parameters=[],
+        )
+        monkeypatch.setattr(
+            filter_plugin,
+            "find_template_roles",
+            lambda requested: iter([cluster, addon_operator]),
+        )
+
+        result = FilterModule().filters()["find_addon_operator_template_roles"](
+            ["osac.templates"]
+        )
+
+        assert len(result) == 1
+        assert result[0]["id"] == "osac.templates.cert_manager"
+        assert "package_name" not in result[0]
+
+    def test_serializes_api_fields_and_local_references(self):
+        template = _make_addon_operator_template()
+        dumped = template.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+        assert template.template_type == TemplateTypeEnum.addon_operator
+        assert dumped["id"] == "osac.templates.cert_manager"
+        assert dumped["metadata"] == {"name": "cert-manager", "tenant": "shared"}
+        assert dumped["min_ocp_version"] == "4.14.0"
+        assert dumped["max_ocp_version"] == "4.16.0"
+        assert dumped["exclusions"] == [{"name": "other_operator"}]
+        assert dumped["dependencies"] == [{"name": "dependency_operator"}]
+        assert "package_name" not in dumped
+        assert "channel" not in dumped
+        assert "catalog_source" not in dumped
+        assert "catalog_source_namespace" not in dumped
+        assert "parameters" not in dumped
+        assert "template_type" not in dumped
+
+    def test_collection_templates_builds_addon_operator_from_metadata(self, tmp_path):
+        role_path = tmp_path / "osac" / "templates" / "roles" / "cert_manager"
+        metadata_path = role_path / "meta" / "osac.yaml"
+        metadata_path.parent.mkdir(parents=True)
+        metadata_path.write_text(
+            yaml.safe_dump(
+                {
+                    "name": "cert-manager",
+                    "title": "cert-manager Operator",
+                    "description": "Installs cert-manager.",
+                    "template_type": "addon_operator",
+                    "min_ocp_version": "4.14.0",
+                    "max_ocp_version": "4.16.0",
+                    "exclusions": ["other_operator"],
+                    "dependencies": ["dependency_operator"],
+                    "package_name": "cert-manager",
+                    "channel": "stable",
+                    "catalog_source": "community-operators",
+                    "catalog_source_namespace": "openshift-marketplace",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        templates = list(
+            Collection(parent_path=tmp_path, name="osac.templates").templates()
+        )
+
+        assert len(templates) == 1
+        assert templates[0].model_dump(mode="json", exclude_none=True)["id"] == (
+            "osac.templates.cert_manager"
+        )
+        assert templates[0].dependencies[0].name == "dependency_operator"
+
+    def test_empty_version_bounds_are_allowed(self):
+        template = _make_addon_operator_template(
+            min_ocp_version="",
+            max_ocp_version="",
+            exclusions=[],
+            dependencies=[],
+        )
+
+        assert template.min_ocp_version == ""
+        assert template.max_ocp_version == ""
+        assert template.exclusions == []
+        assert template.dependencies == []
+
+    @pytest.mark.parametrize(
+        "field",
+        ["package_name", "channel", "catalog_source", "catalog_source_namespace"],
+    )
+    def test_blank_olm_metadata_is_rejected(self, field):
+        with pytest.raises(pydantic.ValidationError, match="must not be blank"):
+            _make_addon_operator_template(**{field: " "})
+
+    @pytest.mark.parametrize("title", ["", "   "])
+    def test_blank_title_is_rejected(self, title):
+        with pytest.raises(pydantic.ValidationError, match="title must not be blank"):
+            _make_addon_operator_template(title=title)
+
+    def test_title_is_trimmed(self):
+        template = _make_addon_operator_template(title=" cert-manager Operator ")
+
+        assert template.title == "cert-manager Operator"
+
+    @pytest.mark.parametrize("field", ["exclusions", "dependencies"])
+    def test_blank_operator_reference_is_rejected(self, field):
+        with pytest.raises(pydantic.ValidationError, match="must not be blank"):
+            _make_addon_operator_template(**{field: [" "]})
+
+    @pytest.mark.parametrize("field", ["exclusions", "dependencies"])
+    @pytest.mark.parametrize(
+        "reference",
+        [
+            "cert_manager",
+            " cert_manager ",
+            "cert-manager",
+            "osac.templates.cert_manager",
+        ],
+    )
+    def test_self_reference_is_rejected(self, field, reference):
+        with pytest.raises(pydantic.ValidationError, match="must not reference"):
+            _make_addon_operator_template(**{field: [reference]})
+
+    @pytest.mark.parametrize("field", ["exclusions", "dependencies"])
+    def test_operator_references_must_be_lists(self, field):
+        with pytest.raises(pydantic.ValidationError, match="must be a list"):
+            _make_addon_operator_template(**{field: "dependency_operator"})
+
+        with pytest.raises(pydantic.ValidationError, match="must be a list"):
+            _make_addon_operator_template(**{field: None})
+
+    def test_version_bounds_are_passed_through_without_local_validation(self):
+        """Fulfillment-service owns OCP version validation."""
+        template = _make_addon_operator_template(
+            min_ocp_version="not-a-version",
+            max_ocp_version="4.14.0-rc.01",
+        )
+
+        assert template.min_ocp_version == "not-a-version"
+        assert template.max_ocp_version == "4.14.0-rc.01"
 
 
 # ---------------------------------------------------------------------------
