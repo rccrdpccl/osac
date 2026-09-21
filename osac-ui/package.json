@@ -1,0 +1,40 @@
+{
+  "name": "osac",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "gen-types": "pnpm --filter @osac/types run gen-types",
+    "i18n": "pnpm --filter @osac/i18n run i18n",
+    "dev": "concurrently \"pnpm dev:proxy\" \"pnpm dev:frontend\"",
+    "dev:proxy": "cd proxy && BASE_UI_URL=http://localhost:5173 nodemon --watch 'proxy/**/*' --exec 'go run' main.go --signal SIGTERM",
+    "dev:frontend": "pnpm --filter @osac/app-frontend run dev",
+    "build": "pnpm --filter @osac/app-frontend run build && cd proxy && go build -o osac-proxy .",
+    "lint": "eslint \"{apps,libs}/*/src/**\" && prettier --check \"{apps,libs}/*/src/**/*.{js,jsx,ts,tsx}\" && pnpm run i18n",
+    "format": "eslint --fix \"{apps,libs}/*/src/**/*.{ts,tsx}\" && prettier --write \"{apps,libs}/*/src/**/*.{js,jsx,ts,tsx}\"",
+    "test": "pnpm -r run test",
+    "typecheck": "pnpm -r run typecheck",
+    "playwright": "pnpm --filter @osac/playwright run playwright",
+    "playwright:setup": "pnpm --filter @osac/playwright run playwright:setup",
+    "playwright:run": "pnpm --filter @osac/playwright run playwright:run",
+    "playwright:report": "pnpm --filter @osac/playwright exec playwright show-report"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "concurrently": "^10.0.3",
+    "eslint": "^9.39.4",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "^17.4.0",
+    "nodemon": "^3.1.14",
+    "prettier": "^3.0.0",
+    "typescript-eslint": "^8.57.0",
+    "yaml": "^2.7.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=20",
+    "pnpm": ">=9"
+  }
+}

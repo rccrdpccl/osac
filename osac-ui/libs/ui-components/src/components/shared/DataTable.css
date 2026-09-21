@@ -1,0 +1,12 @@
+.osac-data-table__primary-cell {
+  font-weight: 600;
+}
+
+.osac-data-table__muted-cell {
+  color: var(--pf-t--global--text--color--subtle);
+}
+
+.osac-data-table__description-cell {
+  color: var(--pf-t--global--text--color--subtle);
+  max-width: 320px;
+}

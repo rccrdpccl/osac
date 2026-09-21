@@ -1,0 +1,6 @@
+packages:
+  - apps/*
+  - libs/*
+allowBuilds:
+  "@bufbuild/buf": true
+  esbuild: true

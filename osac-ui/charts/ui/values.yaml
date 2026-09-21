@@ -1,0 +1,34 @@
+# This defines the hostname for the OpenShift Route. When not set, the hostname is automatically assigned by OpenShift.
+externalHostname:
+
+api:
+  fulfillment:
+    url: https://fulfillment-api:8000
+    # Certificate configuration for Fulfillment API
+    certs:
+      # This defines the trusted CA certificates bundle. It must be the name of a configmap in the release namespace
+      # that contains trusted CA certificates in PEM format.
+      caBundle:
+        configMap:
+
+# Authentication and authorization configuration:
+auth:
+  oidcClientId: osac-ui
+  # Certificate configuration for Auth
+  certs:
+    # This defines the trusted CA certificates bundle. It must be the name of a configmap in the release namespace
+    # that contains trusted CA certificates in PEM format.
+    caBundle:
+      configMap:
+
+# Logging configuration:
+log:
+
+  # This defines the log level for all components. Valid values are 'debug', 'info', 'warn', and 'error'.
+  #
+  # Note that setting this to 'debug' will significantly increase the size of logs and may impact service performance.
+  level: info
+
+# Image configuration:
+images:
+  ui: ghcr.io/osac-project/osac-ui:main  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml

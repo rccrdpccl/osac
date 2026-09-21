@@ -1,0 +1,32 @@
+/* Guest OS icons — Windows, RHEL, generic Linux mascot. */
+.osac-guest-os-icon {
+  display: block;
+  flex-shrink: 0;
+}
+
+.osac-guest-os-icon--sm {
+  width: 16px;
+  height: 16px;
+}
+
+.osac-guest-os-icon--md {
+  width: 24px;
+  height: 24px;
+}
+
+.osac-guest-os-icon--lg {
+  width: 28px;
+  height: 28px;
+}
+
+.osac-guest-os-icon--windows {
+  color: #0078d4;
+}
+
+.osac-guest-os-icon--rhel {
+  color: #ee0000;
+}
+
+.osac-guest-os-icon--linux {
+  object-fit: contain;
+}

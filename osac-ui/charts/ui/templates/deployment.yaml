@@ -1,0 +1,60 @@
+{{- $apiCaBundleCM := required "api.fulfillment.certs.caBundle.configMap is required" .Values.api.fulfillment.certs.caBundle.configMap }}
+{{- $authCaBundleCM := required "auth.certs.caBundle.configMap is required" .Values.auth.certs.caBundle.configMap }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: osac-ui
+  labels:
+    {{- include "osac.standardLabels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: osac-ui
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: osac-ui
+    spec:
+      volumes:
+      - name: api-ca-bundle
+        configMap:
+          name: {{ $apiCaBundleCM }}
+      - name: auth-ca-bundle
+        configMap:
+          name: {{ $authCaBundleCM }}
+      containers:
+      - name: osac-ui
+        image: {{ .Values.images.ui }}
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        volumeMounts:
+        - name: api-ca-bundle
+          mountPath: /etc/osac-ui/tls/api
+        - name: auth-ca-bundle
+          mountPath: /etc/osac-ui/tls/auth
+        envFrom:
+        - configMapRef:
+            name: osac-ui
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi

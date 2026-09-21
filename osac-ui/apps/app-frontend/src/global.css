@@ -1,0 +1,27 @@
+/* OSAC global styles — augments PatternFly 6 tokens */
+
+/* ---------------------------------------------------------------------------
+ * Single app scrollport on #root — vertical bar only when content exceeds the
+ * viewport. html/body stay fixed height so the window does not double-scroll
+ * with PatternFly Page (100dvh) inner regions.
+ * --------------------------------------------------------------------------- */
+html {
+  height: 100%;
+  overflow: hidden;
+  overflow-x: clip;
+}
+
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  overflow-x: clip;
+}
+
+#root {
+  height: 100%;
+  max-height: 100vh;
+  max-height: 100dvh;
+  overflow-x: clip;
+  overflow-y: auto;
+}

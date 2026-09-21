@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: osac-ui
+  labels:
+    {{- include "osac.standardLabels" . | nindent 4 }}
+spec:
+  selector:
+    app: osac-ui
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: osac-ui
+  labels:
+    {{- include "osac.standardLabels" . | nindent 4 }}
+spec:
+  {{- if .Values.externalHostname }}
+  host: {{ .Values.externalHostname }}
+  {{- end }}
+  to:
+    kind: Service
+    name: osac-ui
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

@@ -1,0 +1,9 @@
+/* xterm renders into a child .xterm element; stretch it to fill the sized
+   viewport (.vm-console-viewport gives the container its height) and give the
+   terminal a dark background matching the graphical console. */
+.vm-console-viewport .xterm {
+  height: 100%;
+  padding: 4px;
+  box-sizing: border-box;
+  background-color: rgb(40, 40, 40);
+}

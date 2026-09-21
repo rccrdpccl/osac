@@ -1,0 +1,68 @@
+# Monorepo — sibling prototype checkout (nested .git); do not commit as part of osac
+osac-demo/
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+apps/app-backend/public/
+
+# TypeScript
+*.tsbuildinfo
+
+# Vite
+.vite/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+*.swp
+*.swo
+.vscode/
+
+# Storybook
+storybook-static/
+
+# Coverage
+coverage/
+
+# Go proxy build artifact
+proxy/osac-proxy
+
+.cursor/
+
+# AI workflow artifacts
+.artifacts/
+/.claude/
+
+# apps/playwright — manual browser verification against a live cluster, not
+# an e2e test suite. Live session state and run output, never committed.
+apps/playwright/.auth/
+apps/playwright/test-results/
+apps/playwright/playwright-report/
+apps/playwright/blob-report/
+
+# apps/playwright — ad hoc specs are written here for manual verification and
+# are never committed; only the harness itself is.
+apps/playwright/scratch/
+
+# apps/playwright — ad hoc specs sometimes call page.screenshot() with a bare
+# filename, which lands in apps/playwright/ instead of a gitignored output dir.
+apps/playwright/*.png
+apps/playwright/*.jpg

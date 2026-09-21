@@ -1,0 +1,61 @@
+.tenant-vm-template-card {
+  overflow: hidden;
+}
+
+/* PF v6 removes the default card ::before border for clickable/selectable cards.
+   Apply an explicit border on catalog cards (wizard + catalog page). */
+.tenant-vm-template-card.pf-v6-c-card {
+  border: 1px solid var(--pf-t--global--border--color--default);
+  border-radius: var(--pf-t--global--border--radius--medium);
+}
+
+.tenant-vm-template-card.pf-v6-c-card.pf-m-selected,
+.tenant-vm-template-card.pf-v6-c-card.pf-m-current {
+  border-color: var(--pf-t--global--color--brand--default);
+}
+
+.tenant-vm-template-card__title-band {
+  background: var(--pf-t--global--background--color--secondary--default);
+  padding: var(--pf-t--global--spacer--sm) var(--pf-t--global--spacer--md);
+}
+
+.tenant-vm-template-card__title {
+  margin: 0;
+  font-size: var(--pf-t--global--font--size--body--default);
+  font-weight: var(--pf-t--global--font--weight--heading--heading);
+}
+
+.tenant-vm-template-card__subtitle {
+  color: var(--pf-t--global--text--color--subtle);
+  line-height: 1.35;
+  margin: 0;
+}
+
+.tenant-vm-template-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pf-t--global--spacer--md);
+}
+
+.tenant-vm-template-card__intro {
+  display: flex;
+  flex-direction: column;
+  gap: var(--pf-t--global--spacer--xs);
+  padding-top: var(--pf-t--global--spacer--md);
+}
+
+.tenant-vm-template-card__section-divider {
+  margin: 0;
+}
+
+.tenant-vm-template-card__resource-row {
+  font-size: var(--pf-t--global--font--size--body--sm);
+}
+
+.tenant-vm-template-card__metadata-labels {
+  margin: 0;
+}
+
+.tenant-vm-template-card__metadata-label-key {
+  font-weight: var(--pf-t--global--font--weight--body--bold);
+}

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: {{ .Release.Namespace }}
+  name: osac-ui
+  labels:
+    {{- include "osac.standardLabels" . | nindent 4 }}
+data:
+  LOG_LEVEL: {{ .Values.log.level | quote }}
+  FULFILLMENT_API_URL: {{ .Values.api.fulfillment.url | quote }}
+  FULFILLMENT_TLS_CA_FILE: "/etc/osac-ui/tls/api/bundle.pem"
+  OIDC_TLS_CA_FILE: "/etc/osac-ui/tls/auth/bundle.pem"
+  OIDC_CLIENT_ID: {{ .Values.auth.oidcClientId | quote }}
