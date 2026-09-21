@@ -22,11 +22,11 @@ import (
 
 var _ = DescribeMigration("Protect disk images referenced by cluster versions", func() {
 	BeforeEach(func(ctx context.Context) {
-		Expect(tool.Migrate(ctx, 112)).To(Succeed())
+		Expect(tool.Migrate(ctx, 113)).To(Succeed())
 	})
 
 	It("creates the cluster version disk image index", func(ctx context.Context) {
-		Expect(tool.Migrate(ctx, 113)).To(Succeed())
+		Expect(tool.Migrate(ctx, 114)).To(Succeed())
 
 		var indexDefinition string
 		err := conn.QueryRow(ctx, `
