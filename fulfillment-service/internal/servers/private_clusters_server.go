@@ -388,17 +388,18 @@ func (s *PrivateClustersServer) prepareCreate(ctx context.Context, candidate *pr
 		}
 	}
 
-	if err = s.validateNetworkAttachmentState(ctx, candidate); err != nil {
-		return
-	}
-
 	// Resolve fabric_interface for each node set when the cluster has a
-	// network attachment. The HostType's interfaces list is searched for
-	// the first interface with role "fabric".
+	// network attachment. The BareMetalInstanceType's network ports are
+	// searched for the first port with role "fabric". This runs before
+	// network attachment validation so a missing fabric port surfaces first.
 	if spec.GetNetworkAttachment() != nil {
 		if err = s.resolveFabricInterfaces(ctx, spec); err != nil {
 			return
 		}
+	}
+
+	if err = s.validateNetworkAttachmentState(ctx, candidate); err != nil {
+		return
 	}
 
 	return
@@ -680,7 +681,7 @@ func (s *PrivateClustersServer) lookupHostType(ctx context.Context,
 	switch response.GetTotal() {
 	case 0:
 		err = grpcstatus.Errorf(grpccodes.NotFound,
-			"there is no host type with identifier or name '%s'", key)
+			"host type '%s' not found", key)
 	case 1:
 		result = response.GetItems()[0]
 	default:
@@ -1452,9 +1453,9 @@ func (s *PrivateClustersServer) processAndValidateNodeSets(
 			Size:                  proto.Int32(clusterNodeSet.GetSize()),
 		}.Build()
 	}
-	// 2. For any template node sets not specified by user, inherit template defaults (if any):
-	for key, templateNodeSet := range templateNodeSets {
-		if _, exists := actualNodeSets[key]; !exists {
+	// 2. If the user supplied no node sets at all, inherit the template's node sets as defaults:
+	if len(actualNodeSets) == 0 {
+		for key, templateNodeSet := range templateNodeSets {
 			actualNodeSets[key] = privatev1.ClusterNodeSet_builder{
 				HostType:              templateNodeSet.GetHostType(),
 				BaremetalInstanceType: templateNodeSet.GetBaremetalInstanceType(),

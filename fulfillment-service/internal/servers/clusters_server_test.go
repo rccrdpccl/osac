@@ -1934,7 +1934,8 @@ var _ = Describe("Clusters server", func() {
 						}.Build(),
 						Spec: publicv1.ClusterSpec_builder{
 							Template: publicv1.ClusterTemplateReference_builder{
-								Name: "test-bmit-template",
+								Name:   "test-bmit-template",
+								Shared: true,
 							}.Build(),
 						}.Build(),
 					}.Build(),
