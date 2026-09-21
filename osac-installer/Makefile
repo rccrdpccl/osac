@@ -232,7 +232,7 @@ endif
 	|| { echo "=== osac-infra hook jobs ==="; kubectl get jobs,pods,cm -n osac-infra || true; kubectl logs -n osac-infra -l job-name=osac-infra-apply-ca-bundle --tail=200 || true; kubectl get deploy,endpoints,certificate -n cert-manager || true; exit 1; }
 	@for f in ../osac-operator/config/crd/fakes/*.yaml; do \
 		case "$$(basename "$$f")" in \
-			*osac.openshift.io*) continue ;; \
+			*osac.openshift.io*|kustomization.*) continue ;; \
 		esac; \
 		kubectl apply --server-side --force-conflicts -f "$$f"; \
 	done
