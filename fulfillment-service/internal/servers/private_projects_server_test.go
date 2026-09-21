@@ -24,10 +24,10 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private projects server", func() {
@@ -281,6 +281,123 @@ var _ = Describe("Private projects server", func() {
 		Expect(project.GetMetadata().GetProject()).To(BeEmpty())
 	})
 
+	Describe("Default networking deprovisioning on delete", func() {
+		var provisioner *DefaultNetworkingProvisioner
+
+		BeforeEach(func() {
+			var err error
+			provisioner, err = NewDefaultNetworkingProvisioner().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			networkClass := privatev1.NetworkClass_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:   "test-network-class",
+					Tenant: "system",
+				}.Build(),
+				IsDefault:     new(true),
+				FabricManager: new("netris"),
+				Spec: privatev1.NetworkClassSpec_builder{
+					Defaults: privatev1.NetworkDefaults_builder{
+						VirtualNetworkIpv4Cidr: "10.0.0.0/16",
+						SubnetIpv4Cidr:         "10.0.1.0/24",
+					}.Build(),
+				}.Build(),
+				Status: privatev1.NetworkClassStatus_builder{
+					State: privatev1.NetworkClassState_NETWORK_CLASS_STATE_READY,
+				}.Build(),
+			}.Build()
+			_, err = provisioner.networkClassDao.Create().SetObject(networkClass).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		findRootProject := func(tenant string) *privatev1.Project {
+			listResponse, err := privateServer.List(ctx, privatev1.ProjectsListRequest_builder{
+				Filter: new(fmt.Sprintf("this.metadata.tenant == '%s' && this.metadata.name == ''", tenant)),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			projects := listResponse.GetItems()
+			Expect(projects).To(HaveLen(1))
+			return projects[0]
+		}
+
+		It("does not deprovision when deleting a non-root project", func() {
+			serverWithProvisioner, err := NewPrivateProjectsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				SetDefaultNetworkingProvisioner(provisioner).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(provisioner.Provision(ctx, "my-tenant")).To(Succeed())
+
+			createResp, err := serverWithProvisioner.Create(ctx, privatev1.ProjectsCreateRequest_builder{
+				Object: privatev1.Project_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name:   "my-project",
+						Tenant: "my-tenant",
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = serverWithProvisioner.Delete(ctx, privatev1.ProjectsDeleteRequest_builder{
+				Id: createResp.GetObject().GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			vnList, err := provisioner.virtualNetworkDao.List().
+				SetFilter("this.metadata.tenant == 'my-tenant'").
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(vnList.GetItems()).To(HaveLen(1))
+		})
+
+		It("deprovisions default networking before deleting the root project", func() {
+			serverWithProvisioner, err := NewPrivateProjectsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				SetDefaultNetworkingProvisioner(provisioner).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(provisioner.Provision(ctx, "my-tenant")).To(Succeed())
+			rootProject := findRootProject("my-tenant")
+
+			_, err = serverWithProvisioner.Delete(ctx, privatev1.ProjectsDeleteRequest_builder{
+				Id: rootProject.GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			vnList, err := provisioner.virtualNetworkDao.List().
+				SetFilter("this.metadata.tenant == 'my-tenant'").
+				Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(vnList.GetItems()).To(BeEmpty())
+		})
+
+		It("still deletes the root project when there is no default networking to deprovision", func() {
+			serverWithProvisioner, err := NewPrivateProjectsServer().
+				SetLogger(logger).
+				SetAttributionLogic(attribution).
+				SetTenancyLogic(tenancy).
+				SetDefaultNetworkingProvisioner(provisioner).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+
+			rootProject := findRootProject("your-tenant")
+
+			_, err = serverWithProvisioner.Delete(ctx, privatev1.ProjectsDeleteRequest_builder{
+				Id: rootProject.GetId(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
 	Describe("Tenant Validation", func() {
 		It("Rejects creation when tenant is explicitly set to 'shared'", func() {
 			_, err := privateServer.Create(ctx, privatev1.ProjectsCreateRequest_builder{
@@ -330,8 +447,8 @@ var _ = Describe("Private projects server", func() {
 			localTenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 				Return(auth.SystemTenant, nil).
 				AnyTimes()
-			localTenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-				Return(auth.AllTenants, nil).
+			localTenancy.EXPECT().DetermineVisibility(gomock.Any()).
+				Return(auth.TotalVisibility(), nil).
 				AnyTimes()
 			localServer, err := NewPrivateProjectsServer().
 				SetLogger(logger).

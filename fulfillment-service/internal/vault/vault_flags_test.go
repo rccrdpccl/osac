@@ -30,6 +30,7 @@ var _ = Describe("Vault flags", func() {
 			Expect(cfg.Endpoint).To(Equal(""))
 			Expect(cfg.Namespace).To(Equal("osac"))
 			Expect(cfg.KVMountPath).To(Equal("secret"))
+			Expect(cfg.KeycloakAudience).To(Equal("osac-api"))
 		})
 
 		It("reads overridden flag values", func() {
@@ -53,7 +54,6 @@ var _ = Describe("Vault flags", func() {
 			cfg, err := LifecycleConfigFromFlags(flags)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(cfg.MountPath).To(Equal("jwt"))
-			Expect(cfg.KeycloakAudience).To(Equal("osac-api"))
 			Expect(cfg.Role).To(Equal(""))
 		})
 	})

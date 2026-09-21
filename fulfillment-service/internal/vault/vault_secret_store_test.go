@@ -280,9 +280,22 @@ var _ = Describe("VaultSecretStore", func() {
 
 	Describe("Error mapping", func() {
 		It("maps 403 to PermissionDenied", func() {
+			ctrl := gomock.NewController(GinkgoT())
+			DeferCleanup(ctrl.Finish)
+			mockTokenSource := NewMockTenantTokenSource(ctrl)
+
+			// Expect the first call to VaultToken, then InvalidateTenantToken, then a retry VaultToken
+			gomock.InOrder(
+				mockTokenSource.EXPECT().VaultToken(gomock.Any(), "tenant-a").Return("token1", nil),
+				mockTokenSource.EXPECT().InvalidateTenantToken("tenant-a"),
+				mockTokenSource.EXPECT().VaultToken(gomock.Any(), "tenant-a").Return("token2", nil),
+			)
+
 			store, _ := newTestStore(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusForbidden)
 				w.Write([]byte(`{"errors":["permission denied"]}`))
+			}, func(b *VaultSecretStoreBuilder) {
+				b.SetTokenSource(mockTokenSource)
 			})
 
 			err := store.Store(ctx, "tenant-a", "", "s", map[string][]byte{"k": []byte("v")})

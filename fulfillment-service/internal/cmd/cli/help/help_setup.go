@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -35,6 +36,26 @@ import (
 //go:embed templates
 var templatesFS embed.FS
 
+const colorFlag = "color"
+
+func colorEnabled(c *cobra.Command) bool {
+	// NO_COLOR always wins (https://no-color.org/), including over FORCE_COLOR and --color.
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+
+	flags := c.Root().PersistentFlags()
+	if flags.Changed(colorFlag) {
+		enabled, err := flags.GetBool(colorFlag)
+		if err == nil {
+			return enabled
+		}
+	}
+
+	// FORCE_COLOR enables color for environment-based callers when the flag is not set.
+	return os.Getenv("FORCE_COLOR") != ""
+}
+
 // Setup configures the given command and all its subcommands to render their help output as styled Markdown.
 func Setup(cmd *cobra.Command) {
 	// Create a silent logger for the templating engine, as help rendering happens before the persistent pre-run
@@ -52,19 +73,22 @@ func Setup(cmd *cobra.Command) {
 		return
 	}
 
+	cmd.PersistentFlags().Bool(
+		colorFlag,
+		false,
+		"Enable colored help output. NO_COLOR and --color=false override FORCE_COLOR.",
+	)
+
 	// Set the help function for the command and all its subcommands. The renderer is created each time the
 	// help is displayed, so that it can adapt to the current terminal width and color capabilities.
 	cmd.SetHelpFunc(func(c *cobra.Command, args []string) {
+		// If the output is a terminal, we want to adjust the width of the terminal, but never more than the
+		// maximun width that we consider readable:
 		out := c.OutOrStdout()
-
-		// Determine if the output is a terminal and get its size:
 		var width int
-		isTTY := false
-		file, ok := out.(*os.File)
-		if ok {
+		if file, ok := out.(*os.File); ok {
 			fd := int(file.Fd())
 			if term.IsTerminal(fd) {
-				isTTY = true
 				width, _, err = term.GetSize(fd)
 				if err != nil {
 					c.PrintErrln("Error getting terminal size:", err)
@@ -74,35 +98,34 @@ func Setup(cmd *cobra.Command) {
 		}
 		width = min(width, maxReadableWidth)
 
-		// Select the style based on terminal capabilities. Use colored styles only when the output is
-		// a terminal and the NO_COLOR environment variable is not set (https://no-color.org/).
-		_, noColor := os.LookupEnv("NO_COLOR")
+		// Color is opt-in by default. Enable with --color, FORCE_COLOR, or both; NO_COLOR always wins.
+		useColor := colorEnabled(c)
+
+		// Select the style: detect terminal background and use a colored style only when color is requested,
+		// otherwise use a plain ASCII style that still renders Markdown structure (headings, code spans, etc.)
+		// without ANSI color codes.
 		var style ansi.StyleConfig
-		if isTTY && !noColor {
+		if useColor {
 			if lipgloss.HasDarkBackground(os.Stdin, os.Stdout) {
 				style = styles.DarkStyleConfig
 			} else {
 				style = styles.LightStyleConfig
 			}
 		} else {
-			style = styles.NoTTYStyleConfig
+			style = styles.ASCIIStyleConfig
 		}
 
-		// Regardless of the style, we want to remove the default document margin and leading newline,
-		// so the output is flush with the left edge of the terminal.
+		// Remove the default document margin and leading newline, so the output is flush with the left edge
+		// of the terminal. Also remove heading prefixes and code background/prefix/suffix styling.
 		zero := new(uint)
 		style.Document.Margin = zero
 		style.Document.BlockPrefix = ""
-
-		// We don't want to display the heading prefixes:
+		style.H1.Prefix = ""
 		style.H2.Prefix = ""
 		style.H3.Prefix = ""
 		style.H4.Prefix = ""
 		style.H5.Prefix = ""
 		style.H6.Prefix = ""
-
-		// For code inside paragraphs, we don't want to change the background color or add prefixes
-		// and suffixes:
 		style.Code.BackgroundColor = nil
 		style.Code.Prefix = ""
 		style.Code.Suffix = ""
@@ -130,7 +153,11 @@ func Setup(cmd *cobra.Command) {
 			c.Print(buffer.String())
 			return
 		}
-		_, err = lipgloss.Fprint(out, text)
+		if useColor {
+			_, err = fmt.Fprint(out, text)
+		} else {
+			_, err = lipgloss.Fprint(out, text)
+		}
 		if err != nil {
 			c.PrintErrln("Error writing help output:", err)
 			return

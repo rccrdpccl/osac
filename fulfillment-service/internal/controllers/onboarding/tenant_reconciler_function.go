@@ -14,8 +14,8 @@ language governing permissions and limitations under the License.
 // Package onboarding reconciles Tenant objects into Tenant CRDs on all hub clusters.
 package onboarding
 
-//go:generate mockgen -source=../../api/osac/private/v1/tenants_service_grpc.pb.go -destination=tenants_client_mock.go -package=onboarding TenantsClient
-//go:generate mockgen -source=../../api/osac/private/v1/projects_service_grpc.pb.go -destination=projects_client_mock.go -package=onboarding ProjectsClient
+//go:generate mockgen -destination=tenants_client_mock.go -package=onboarding github.com/osac-project/osac/proto/gen/osac/private/v1 TenantsClient
+//go:generate mockgen -destination=projects_client_mock.go -package=onboarding github.com/osac-project/osac/proto/gen/osac/private/v1 ProjectsClient
 
 import (
 	"context"
@@ -34,11 +34,11 @@ import (
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type FunctionBuilder struct {
@@ -246,6 +246,7 @@ func (t *task) delete(ctx context.Context) error {
 		return err
 	}
 
+	crStillPresent := false
 	for _, hub := range hubs {
 		hubEntry, err := t.r.hubCache.Get(ctx, hub.GetId())
 		if err != nil {
@@ -288,13 +289,18 @@ func (t *task) delete(ctx context.Context) error {
 		if err := t.deleteNamespaceOnHub(ctx, hub.GetId(), hubEntry); err != nil {
 			return err
 		}
-
-		return nil
+		crStillPresent = true
+	}
+	if crStillPresent {
+		return fmt.Errorf("tenant CR still present on one or more hubs")
 	}
 
 	// Wait for all projects to be archived before removing the finalizer —
 	// otherwise the DAO archive hits FK violations from the projects table.
-	listFilter := fmt.Sprintf("this.metadata.tenant == %q", t.tenant.GetMetadata().GetName())
+	listFilter := fmt.Sprintf(
+		"this.metadata.tenant == %q && !has(this.metadata.deletion_timestamp)",
+		t.tenant.GetMetadata().GetName(),
+	)
 	listResp, err := t.r.projectsClient.List(ctx, privatev1.ProjectsListRequest_builder{
 		Filter: new(listFilter),
 		Limit:  new(int32(0)),

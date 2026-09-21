@@ -30,14 +30,13 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 	"github.com/osac-project/osac/fulfillment-service/internal/util"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // EventsServerBuilder contains the data and logic needed to create an EventsServer.
@@ -64,7 +63,7 @@ type EventsServer struct {
 
 type eventsServerSubInfo struct {
 	stream     grpc.ServerStreamingServer[publicv1.EventsWatchResponse]
-	tenants    collections.Set[string]
+	visibility *auth.Visibility
 	filterSrc  string
 	filterPrg  cel.Program
 	eventsChan chan *publicv1.Event
@@ -217,15 +216,15 @@ func (s *EventsServer) Watch(request *publicv1.EventsWatchRequest,
 	// Get the context:
 	ctx := stream.Context()
 
-	// Determine the visible tenants:
-	tenants, err := s.tenancyLogic.DetermineVisibleTenants(ctx)
+	// Determine the visibility:
+	visibility, err := s.tenancyLogic.DetermineVisibility(ctx)
 	if err != nil {
 		s.logger.ErrorContext(
 			ctx,
-			"Failed to determine visible tenants",
+			"Failed to determine visibility",
 			slog.Any("error", err),
 		)
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to determine visible tenants")
+		return grpcstatus.Errorf(grpccodes.Internal, "failed to determine visibility")
 	}
 
 	// Compile the filter expression:
@@ -260,7 +259,7 @@ func (s *EventsServer) Watch(request *publicv1.EventsWatchRequest,
 	)
 	subInfo := eventsServerSubInfo{
 		stream:     stream,
-		tenants:    tenants,
+		visibility: visibility,
 		filterSrc:  filterSrc,
 		filterPrg:  filterPrg,
 		eventsChan: make(chan *publicv1.Event),
@@ -417,8 +416,8 @@ func (s *EventsServer) processEvent(ctx context.Context, public *publicv1.Event,
 			continue
 		}
 		tenant := metadata.GetTenant()
-		visible := sub.tenants.Contains(tenant)
-		if !visible {
+		project := metadata.GetProject()
+		if !sub.visibility.IsProjectVisible(tenant, project) {
 			continue
 		}
 

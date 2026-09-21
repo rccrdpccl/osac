@@ -19,10 +19,10 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/references"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 func registerReferenceLookups(
@@ -155,6 +155,17 @@ func registerReferenceLookups(
 	references.RegisterDAOLookup(validator, "osac.private.v1.DiskImageReference", diskImagesDAO)
 	references.RegisterDAOLookup(validator, "osac.public.v1.DiskImageReference", diskImagesDAO)
 
+	storageTiersDAO, err := dao.NewGenericDAO[*privatev1.StorageTier]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancyLogic).
+		SetMetricsRegisterer(metricsRegisterer).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create StorageTier DAO for reference lookups: %w", err)
+	}
+	references.RegisterDAOLookup(validator, "osac.private.v1.StorageTierReference", storageTiersDAO)
+	references.RegisterDAOLookup(validator, "osac.public.v1.StorageTierReference", storageTiersDAO)
+
 	// Cluster and bare metal references
 	clustersDAO, err := dao.NewGenericDAO[*privatev1.Cluster]().
 		SetLogger(logger).
@@ -177,6 +188,19 @@ func registerReferenceLookups(
 	}
 	references.RegisterDAOLookup(validator, "osac.private.v1.ClusterTemplateReference", clusterTemplatesDAO)
 	references.RegisterDAOLookup(validator, "osac.public.v1.ClusterTemplateReference", clusterTemplatesDAO)
+
+	addOnOperatorsDAO, err := dao.NewGenericDAO[*privatev1.AddOnOperator]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancyLogic).
+		SetMetricsRegisterer(metricsRegisterer).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create AddOnOperator DAO for reference lookups: %w", err)
+	}
+	references.RegisterDAOLookup(validator, "osac.private.v1.AddOnOperatorReference", addOnOperatorsDAO)
+	references.RegisterDAOLookup(validator, "osac.public.v1.AddOnOperatorReference", addOnOperatorsDAO)
+	references.RegisterDAOLookup(validator, "osac.private.v1.AddOnOperatorLocalReference", addOnOperatorsDAO)
+	references.RegisterDAOLookup(validator, "osac.public.v1.AddOnOperatorLocalReference", addOnOperatorsDAO)
 
 	clusterCatalogItemsDAO, err := dao.NewGenericDAO[*privatev1.ClusterCatalogItem]().
 		SetLogger(logger).
@@ -233,6 +257,17 @@ func registerReferenceLookups(
 	references.RegisterDAOLookup(validator, "osac.private.v1.BareMetalInstanceTemplateReference", bareMetalInstanceTemplatesDAO)
 	references.RegisterDAOLookup(validator, "osac.public.v1.BareMetalInstanceTemplateReference", bareMetalInstanceTemplatesDAO)
 
+	bareMetalInstanceTypesDAO, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancyLogic).
+		SetMetricsRegisterer(metricsRegisterer).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create BareMetalInstanceType DAO for reference lookups: %w", err)
+	}
+	references.RegisterDAOLookup(validator, "osac.private.v1.BareMetalInstanceTypeLocalReference", bareMetalInstanceTypesDAO)
+	references.RegisterDAOLookup(validator, "osac.public.v1.BareMetalInstanceTypeLocalReference", bareMetalInstanceTypesDAO)
+
 	// IAM references
 	rolesDAO, err := dao.NewGenericDAO[*privatev1.Role]().
 		SetLogger(logger).
@@ -267,6 +302,27 @@ func registerReferenceLookups(
 	}
 	references.RegisterDAOLookup(validator, "osac.private.v1.ClusterVersionReference", clusterVersionsDAO)
 	references.RegisterDAOLookup(validator, "osac.public.v1.ClusterVersionReference", clusterVersionsDAO)
+
+	// Secret references. One registration covers every SecretLocalReference field (cluster
+	// pull_secret_secret, hub kubeconfig_secret, cluster template defaults, and identity
+	// provider client_secret_secret). Without this, the interceptor returns Internal
+	// ("no lookup registered") on Create/Update before handlers run.
+	secretsDAO, err := dao.NewGenericDAO[*privatev1.Secret]().
+		SetLogger(logger).
+		SetTenancyLogic(tenancyLogic).
+		SetMetricsRegisterer(metricsRegisterer).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create Secret DAO for reference lookups: %w", err)
+	}
+	validator.Register(
+		"osac.private.v1.SecretLocalReference",
+		references.NewScopedDAOLookupFunc(secretsDAO),
+	)
+	validator.Register(
+		"osac.public.v1.SecretLocalReference",
+		references.NewScopedDAOLookupFunc(secretsDAO),
+	)
 
 	return nil
 }

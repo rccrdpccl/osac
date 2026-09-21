@@ -28,8 +28,8 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Table renderer", func() {
@@ -187,7 +187,7 @@ var _ = Describe("Table renderer", func() {
 							Name: "standard-4-16",
 						}.Build(),
 						Spec: publicv1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 16,
 							State:     publicv1.InstanceTypeState_INSTANCE_TYPE_STATE_ACTIVE,
 						}.Build(),
@@ -210,7 +210,7 @@ var _ = Describe("Table renderer", func() {
 							Name: "gpu-a100-8core",
 						}.Build(),
 						Spec: publicv1.InstanceTypeSpec_builder{
-							Cores:     8,
+							Vcpus:     8,
 							MemoryGib: 64,
 							State:     publicv1.InstanceTypeState_INSTANCE_TYPE_STATE_ACTIVE,
 							Gpu: publicv1.GpuSpec_builder{
@@ -236,7 +236,7 @@ var _ = Describe("Table renderer", func() {
 							Name: "standard-4-16",
 						}.Build(),
 						Spec: publicv1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 16,
 							State:     publicv1.InstanceTypeState_INSTANCE_TYPE_STATE_ACTIVE,
 						}.Build(),

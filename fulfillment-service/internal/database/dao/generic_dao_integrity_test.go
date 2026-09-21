@@ -21,9 +21,9 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Referential integrity", func() {
@@ -71,8 +71,8 @@ var _ = Describe("Referential integrity", func() {
 
 		// Create a tenancy logic without restrictions:
 		tenancy = auth.NewMockTenancyLogic(ctrl)
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.AllTenants, nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(auth.TotalVisibility(), nil).
 			AnyTimes()
 
 		// Create the DAO:

@@ -37,6 +37,7 @@ type ServiceTenantTokenSourceBuilder struct {
 	keycloakIssuerURL    string
 	keycloakClientID     string
 	keycloakClientSecret string
+	keycloakAudience     string
 	caPool               *x509.CertPool
 }
 
@@ -92,6 +93,11 @@ func (b *ServiceTenantTokenSourceBuilder) SetKeycloakClientSecret(value string) 
 	return b
 }
 
+func (b *ServiceTenantTokenSourceBuilder) SetKeycloakAudience(value string) *ServiceTenantTokenSourceBuilder {
+	b.keycloakAudience = value
+	return b
+}
+
 func (b *ServiceTenantTokenSourceBuilder) SetCaPool(value *x509.CertPool) *ServiceTenantTokenSourceBuilder {
 	b.caPool = value
 	return b
@@ -137,6 +143,7 @@ func (b *ServiceTenantTokenSourceBuilder) Build() (result *ServiceTenantTokenSou
 		SetIssuer(b.keycloakIssuerURL).
 		SetClientId(b.keycloakClientID).
 		SetClientSecret(b.keycloakClientSecret).
+		SetAudience(b.keycloakAudience).
 		SetCaPool(b.caPool).
 		SetStore(tokenStore).
 		Build()
@@ -217,4 +224,10 @@ func (s *ServiceTenantTokenSource) VaultToken(ctx context.Context, tenant string
 		return "", err
 	}
 	return result.(string), nil
+}
+
+func (s *ServiceTenantTokenSource) InvalidateTenantToken(tenant string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tenantTokens, tenant)
 }

@@ -32,13 +32,14 @@ import (
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/protobuf/encoding/protojson"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
 	"github.com/osac-project/osac/fulfillment-service/internal/network"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
 	shtdwn "github.com/osac-project/osac/fulfillment-service/internal/shutdown"
 	"github.com/osac-project/osac/fulfillment-service/internal/version"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // Cmd creates and returns the `start rest-gateway` command.
@@ -63,6 +64,7 @@ func Cmd() *cobra.Command {
 		[]string{},
 		caFileFlagHelp,
 	)
+	runner.args.services = services.RegisterFlags(flags)
 	return command
 }
 
@@ -75,16 +77,26 @@ type runnerContext struct {
 	args         struct {
 		caFiles   []string
 		tokenFile string
+		services  *services.Flags
 	}
 }
 
 // run runs the `start rest-gateway` command.
 func (c *runnerContext) run(cmd *cobra.Command, argv []string) error {
+	// Apply service flag defaults and validate (before context creation to avoid cancel leak):
+	c.args.services.EnableAllIfNoneSet()
+	if err := c.args.services.Validate(); err != nil {
+		return fmt.Errorf("invalid service flags: %w", err)
+	}
+
 	// Get the context:
 	ctx, cancel := context.WithCancel(cmd.Context())
 
 	// Get the dependencies from the context:
 	c.logger = logging.LoggerFromContext(ctx)
+	c.logger.InfoContext(ctx, "Service enablement",
+		slog.Any("enabled", c.args.services.EnabledServices()),
+	)
 
 	// Save the flags:
 	c.flags = cmd.Flags()
@@ -232,7 +244,6 @@ func (c *runnerContext) run(cmd *cobra.Command, argv []string) error {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
 	protocols.SetHTTP2(true)
-	protocols.SetUnencryptedHTTP2(true)
 	http1Server := &http.Server{
 		Addr:              gwListener.Addr().String(),
 		Handler:           handler,
@@ -285,21 +296,22 @@ type handlerRegistrar func(context.Context, *runtime.ServeMux, *grpc.ClientConn)
 
 // registerHandlers registers all public and private API service handlers on the gateway mux.
 func (c *runnerContext) registerHandlers(ctx context.Context, mux *runtime.ServeMux) error {
-	handlers := []handlerRegistrar{
-		// Public API:
+	for _, register := range buildHandlerList() {
+		if err := register(ctx, mux, c.grpcClient); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildHandlerList returns the complete set of grpc-gateway handler registrars.
+// All handlers are always registered; disabled services are rejected by the gRPC
+// server's tap handler, which grpc-gateway translates to HTTP 503.
+func buildHandlerList() []handlerRegistrar {
+	return []handlerRegistrar{
+		// Shared public API:
 		publicv1.RegisterCapabilitiesHandler,
-		publicv1.RegisterClusterTemplatesHandler,
-		publicv1.RegisterClusterCatalogItemsHandler,
-		publicv1.RegisterClustersHandler,
-		publicv1.RegisterClusterVersionsHandler,
 		publicv1.RegisterHostTypesHandler,
-		publicv1.RegisterComputeInstanceTemplatesHandler,
-		publicv1.RegisterComputeInstanceCatalogItemsHandler,
-		publicv1.RegisterComputeInstancesHandler,
-		publicv1.RegisterDiskImagesHandler,
-		publicv1.RegisterBareMetalInstanceTemplatesHandler,
-		publicv1.RegisterBareMetalInstanceCatalogItemsHandler,
-		publicv1.RegisterBareMetalInstancesHandler,
 		publicv1.RegisterVirtualNetworksHandler,
 		publicv1.RegisterSubnetsHandler,
 		publicv1.RegisterSecurityGroupsHandler,
@@ -309,32 +321,18 @@ func (c *runnerContext) registerHandlers(ctx context.Context, mux *runtime.Serve
 		publicv1.RegisterExternalIPAttachmentsHandler,
 		publicv1.RegisterRolesHandler,
 		publicv1.RegisterRoleBindingsHandler,
-		publicv1.RegisterConsoleSessionsHandler,
 		publicv1.RegisterJsonWebKeySetHandler,
-		publicv1.RegisterInstanceTypesHandler,
-		publicv1.RegisterBareMetalInstanceTypesHandler,
-
-		// Private API:
+		publicv1.RegisterStorageTiersHandler,
+		publicv1.RegisterVolumesHandler,
+		// Shared private API:
 		privatev1.RegisterCapabilitiesHandler,
-		privatev1.RegisterClusterTemplatesHandler,
-		privatev1.RegisterClusterCatalogItemsHandler,
-		privatev1.RegisterClustersHandler,
-		privatev1.RegisterClusterVersionsHandler,
 		privatev1.RegisterEventsHandler,
 		privatev1.RegisterHostTypesHandler,
 		privatev1.RegisterHubsHandler,
-		privatev1.RegisterComputeInstanceTemplatesHandler,
-		privatev1.RegisterComputeInstanceCatalogItemsHandler,
-		privatev1.RegisterComputeInstancesHandler,
-		privatev1.RegisterDiskImagesHandler,
-		privatev1.RegisterBareMetalInstanceTemplatesHandler,
-		privatev1.RegisterBareMetalInstanceCatalogItemsHandler,
-		privatev1.RegisterBareMetalInstancesHandler,
 		privatev1.RegisterNetworkClassesHandler,
 		privatev1.RegisterSecretsHandler,
 		privatev1.RegisterStorageBackendsHandler,
 		privatev1.RegisterStorageTiersHandler,
-		privatev1.RegisterVolumesHandler,
 		privatev1.RegisterVirtualNetworksHandler,
 		privatev1.RegisterSubnetsHandler,
 		privatev1.RegisterSecurityGroupsHandler,
@@ -344,15 +342,40 @@ func (c *runnerContext) registerHandlers(ctx context.Context, mux *runtime.Serve
 		privatev1.RegisterExternalIPAttachmentsHandler,
 		privatev1.RegisterRolesHandler,
 		privatev1.RegisterRoleBindingsHandler,
+		privatev1.RegisterVolumesHandler,
+		// CaaS:
+		publicv1.RegisterClusterTemplatesHandler,
+		publicv1.RegisterAddOnOperatorsHandler,
+		publicv1.RegisterClusterCatalogItemsHandler,
+		publicv1.RegisterClustersHandler,
+		publicv1.RegisterClusterVersionsHandler,
+		privatev1.RegisterClusterTemplatesHandler,
+		privatev1.RegisterAddOnOperatorsHandler,
+		privatev1.RegisterClusterCatalogItemsHandler,
+		privatev1.RegisterClustersHandler,
+		privatev1.RegisterClusterVersionsHandler,
+		// VMaaS:
+		publicv1.RegisterComputeInstanceTemplatesHandler,
+		publicv1.RegisterComputeInstanceCatalogItemsHandler,
+		publicv1.RegisterComputeInstancesHandler,
+		publicv1.RegisterDiskImagesHandler,
+		publicv1.RegisterConsoleSessionsHandler,
+		publicv1.RegisterInstanceTypesHandler,
+		privatev1.RegisterComputeInstanceTemplatesHandler,
+		privatev1.RegisterComputeInstanceCatalogItemsHandler,
+		privatev1.RegisterComputeInstancesHandler,
+		privatev1.RegisterDiskImagesHandler,
 		privatev1.RegisterInstanceTypesHandler,
+		// BMaaS:
+		publicv1.RegisterBareMetalInstanceTemplatesHandler,
+		publicv1.RegisterBareMetalInstanceCatalogItemsHandler,
+		publicv1.RegisterBareMetalInstancesHandler,
+		publicv1.RegisterBareMetalInstanceTypesHandler,
+		privatev1.RegisterBareMetalInstanceTemplatesHandler,
+		privatev1.RegisterBareMetalInstanceCatalogItemsHandler,
+		privatev1.RegisterBareMetalInstancesHandler,
 		privatev1.RegisterBareMetalInstanceTypesHandler,
 	}
-	for _, register := range handlers {
-		if err := register(ctx, mux, c.grpcClient); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // userAgent is the user agent string for the REST gateway.

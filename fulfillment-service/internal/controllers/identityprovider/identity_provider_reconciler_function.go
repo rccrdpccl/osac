@@ -24,12 +24,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/apiclient"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/idp"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // FunctionBuilder contains the data needed to build instances of the reconciler function.
@@ -80,6 +80,7 @@ func (b *FunctionBuilder) Build() (result *function, err error) {
 	result = &function{
 		logger:                  b.logger,
 		identityProvidersClient: privatev1.NewIdentityProvidersClient(b.connection),
+		secretsClient:           privatev1.NewSecretsClient(b.connection),
 		idpClient:               b.idpClient,
 		maskCalculator:          masks.NewCalculator().Build(),
 	}
@@ -90,6 +91,7 @@ func (b *FunctionBuilder) Build() (result *function, err error) {
 type function struct {
 	logger                  *slog.Logger
 	identityProvidersClient privatev1.IdentityProvidersClient
+	secretsClient           privatev1.SecretsClient
 	idpClient               idp.ClientInterface
 	maskCalculator          *masks.Calculator
 }
@@ -177,12 +179,18 @@ func (t *task) syncToIDP(ctx context.Context) error {
 	// Build the IDP provider object from the spec
 	// Use tenant-prefixed alias to ensure uniqueness across tenants in Keycloak
 	alias := fmt.Sprintf("%s-%s", fullIdp.GetMetadata().GetTenant(), fullIdp.GetMetadata().GetName())
+	clientSecret, err := t.resolveClientSecret(ctx, fullIdp)
+	if err != nil {
+		t.identityProvider.GetStatus().SetPhase(privatev1.IdentityProviderPhase_IDENTITY_PROVIDER_PHASE_ERROR)
+		t.identityProvider.GetStatus().SetMessage(fmt.Sprintf("Failed to resolve client secret: %v", err))
+		return nil
+	}
 	idpProvider := &idp.IdentityProvider{
 		Alias:       alias,
 		DisplayName: fullIdp.GetSpec().GetTitle(),
 		Type:        t.determineProviderTypeFromIdp(fullIdp),
 		Enabled:     fullIdp.GetSpec().GetEnabled(),
-		Config:      t.buildConfigFromIdp(fullIdp),
+		Config:      t.buildConfigFromIdp(fullIdp, clientSecret),
 	}
 
 	tenantName := t.identityProvider.GetMetadata().GetTenant()
@@ -204,6 +212,37 @@ func (t *task) syncToIDP(ctx context.Context) error {
 	return nil
 }
 
+// resolveClientSecret fetches the referenced OIDC client secret via the Secrets API using
+// controller auth and extracts data["value"].
+func (t *task) resolveClientSecret(ctx context.Context, identityProvider *privatev1.IdentityProvider) (string, error) {
+	oidc := identityProvider.GetSpec().GetOidc()
+	if oidc == nil {
+		return "", nil
+	}
+	ref := oidc.GetClientSecretSecret()
+	if ref == nil {
+		return "", nil
+	}
+	if t.r.secretsClient == nil {
+		return "", fmt.Errorf("secrets client is required to resolve client_secret_secret")
+	}
+	id := ref.GetId()
+	if id == "" {
+		return "", fmt.Errorf("client_secret_secret must have an id")
+	}
+	response, err := t.r.secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{
+		Id: id,
+	}.Build())
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch client secret: %w", err)
+	}
+	value, ok := response.GetObject().GetData()["value"]
+	if !ok || len(value) == 0 {
+		return "", fmt.Errorf("secret %q is missing data[\"value\"]", id)
+	}
+	return string(value), nil
+}
+
 // determineProviderTypeFromIdp returns the provider type based on which config is set.
 func (t *task) determineProviderTypeFromIdp(idp *privatev1.IdentityProvider) string {
 	spec := idp.GetSpec()
@@ -214,7 +253,7 @@ func (t *task) determineProviderTypeFromIdp(idp *privatev1.IdentityProvider) str
 }
 
 // buildConfigFromIdp builds the provider-specific configuration map from any identity provider object.
-func (t *task) buildConfigFromIdp(idp *privatev1.IdentityProvider) map[string]string {
+func (t *task) buildConfigFromIdp(idp *privatev1.IdentityProvider, clientSecret string) map[string]string {
 	config := make(map[string]string)
 	spec := idp.GetSpec()
 
@@ -222,7 +261,7 @@ func (t *task) buildConfigFromIdp(idp *privatev1.IdentityProvider) map[string]st
 		config["authorizationUrl"] = oidc.GetAuthorizationUrl()
 		config["tokenUrl"] = oidc.GetTokenUrl()
 		config["clientId"] = oidc.GetClientId()
-		config["clientSecret"] = oidc.GetClientSecret()
+		config["clientSecret"] = clientSecret
 		config["issuer"] = oidc.GetIssuer()
 		// Keycloak requires clientAuthMethod to be set for OIDC providers
 		config["clientAuthMethod"] = "client_secret_post"

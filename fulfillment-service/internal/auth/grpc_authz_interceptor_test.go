@@ -28,9 +28,9 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/testing"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Rego authorization interceptor", func() {
@@ -696,6 +696,27 @@ var _ = Describe("Rego authorization interceptor", func() {
 			),
 		)
 
+		It("Allows regular users to browse add-on operators", func(ctx context.Context) {
+			ctx = ContextWithToken(ctx, createKeycloakUserToken("my-tenant", "my-user", nil))
+			for _, method := range []string{
+				"/osac.public.v1.AddOnOperators/List",
+				"/osac.public.v1.AddOnOperators/Get",
+			} {
+				handled := false
+				_, err := interceptor.UnaryServer(
+					ctx,
+					nil,
+					&grpc.UnaryServerInfo{FullMethod: method},
+					func(ctx context.Context, req any) (any, error) {
+						handled = true
+						return nil, nil
+					},
+				)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(handled).To(BeTrue())
+			}
+		})
+
 		DescribeTable(
 			"Denies Keycloak users on the private API",
 			func(ctx context.Context, tenant, name string) {
@@ -755,6 +776,37 @@ var _ = Describe("Rego authorization interceptor", func() {
 			Entry("Create", "/osac.public.v1.Secrets/Create"),
 			Entry("Update", "/osac.public.v1.Secrets/Update"),
 			Entry("Delete", "/osac.public.v1.Secrets/Delete"),
+		)
+
+		DescribeTable(
+			"Allows Keycloak users on the public Volumes API",
+			func(ctx context.Context, method string) {
+				token := createKeycloakUserToken("my-tenant", "my-user", nil)
+				ctx = ContextWithToken(ctx, token)
+				handled := false
+				_, err := interceptor.UnaryServer(
+					ctx,
+					nil,
+					&grpc.UnaryServerInfo{
+						FullMethod: method,
+					},
+					func(ctx context.Context, req any) (any, error) {
+						subject := SubjectFromContext(ctx)
+						Expect(subject.User).To(Equal("my-user"))
+						Expect(subject.Tenants.Finite()).To(BeTrue())
+						Expect(subject.Tenants.Inclusions()).To(ConsistOf("my-tenant"))
+						handled = true
+						return nil, nil
+					},
+				)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(handled).To(BeTrue())
+			},
+			Entry("List", "/osac.public.v1.Volumes/List"),
+			Entry("Get", "/osac.public.v1.Volumes/Get"),
+			Entry("Create", "/osac.public.v1.Volumes/Create"),
+			Entry("Update", "/osac.public.v1.Volumes/Update"),
+			Entry("Delete", "/osac.public.v1.Volumes/Delete"),
 		)
 
 		DescribeTable(

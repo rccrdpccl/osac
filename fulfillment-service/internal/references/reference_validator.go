@@ -53,8 +53,9 @@ type ReferenceLookupFunc func(
 // ReferenceValidatorBuilder configures and creates a ReferenceValidator. Don't create instances
 // of this type directly, use the NewReferenceValidator function instead.
 type ReferenceValidatorBuilder struct {
-	logger     *slog.Logger
-	registerer prometheus.Registerer
+	logger                         *slog.Logger
+	registerer                     prometheus.Registerer
+	excludedReferencePathsByMethod map[string]map[string]struct{}
 }
 
 // ReferenceValidator is a gRPC interceptor that validates resource references in Create and Update
@@ -62,11 +63,12 @@ type ReferenceValidatorBuilder struct {
 // types ending with "Reference" or "LocalReference"), validates them against registered lookup
 // functions, and mutates the request to auto-populate missing id or name fields.
 type ReferenceValidator struct {
-	logger             *slog.Logger
-	registry           map[protoreflect.FullName]ReferenceLookupFunc
-	sealed             atomic.Bool
-	validationTotal    *prometheus.CounterVec
-	validationDuration *prometheus.HistogramVec
+	logger                         *slog.Logger
+	registry                       map[protoreflect.FullName]ReferenceLookupFunc
+	excludedReferencePathsByMethod map[string]map[string]struct{}
+	sealed                         atomic.Bool
+	validationTotal                *prometheus.CounterVec
+	validationDuration             *prometheus.HistogramVec
 }
 
 // NewReferenceValidator creates a builder that can then be used to configure and create a new
@@ -84,6 +86,28 @@ func (b *ReferenceValidatorBuilder) SetLogger(value *slog.Logger) *ReferenceVali
 // SetMetricsRegisterer sets the Prometheus registerer for metrics. This is optional.
 func (b *ReferenceValidatorBuilder) SetMetricsRegisterer(value prometheus.Registerer) *ReferenceValidatorBuilder {
 	b.registerer = value
+	return b
+}
+
+// SetExcludedReferencePaths skips the given request fields for the specified methods.
+// Paths are relative to the request message, such as "object.spec.target"; skipping a
+// message also skips references nested inside it. Other paths use registered lookups.
+func (b *ReferenceValidatorBuilder) SetExcludedReferencePaths(
+	methods []string, paths ...string,
+) *ReferenceValidatorBuilder {
+	if b.excludedReferencePathsByMethod == nil {
+		b.excludedReferencePathsByMethod = make(map[string]map[string]struct{})
+	}
+	for _, method := range methods {
+		excluded := b.excludedReferencePathsByMethod[method]
+		if excluded == nil {
+			excluded = make(map[string]struct{}, len(paths))
+			b.excludedReferencePathsByMethod[method] = excluded
+		}
+		for _, path := range paths {
+			excluded[path] = struct{}{}
+		}
+	}
 	return b
 }
 
@@ -123,10 +147,11 @@ func (b *ReferenceValidatorBuilder) Build() (result *ReferenceValidator, err err
 	}
 
 	result = &ReferenceValidator{
-		logger:             b.logger,
-		registry:           make(map[protoreflect.FullName]ReferenceLookupFunc),
-		validationTotal:    validationTotal,
-		validationDuration: validationDuration,
+		logger:                         b.logger,
+		registry:                       make(map[protoreflect.FullName]ReferenceLookupFunc),
+		excludedReferencePathsByMethod: b.excludedReferencePathsByMethod,
+		validationTotal:                validationTotal,
+		validationDuration:             validationDuration,
 	}
 	return
 }
@@ -140,6 +165,12 @@ func (v *ReferenceValidator) Register(fullName protoreflect.FullName, lookupFunc
 	v.registry[fullName] = lookupFunc
 }
 
+// HasLookup reports whether a lookup function is registered for the given reference message type.
+func (v *ReferenceValidator) HasLookup(fullName protoreflect.FullName) bool {
+	_, ok := v.registry[fullName]
+	return ok
+}
+
 // UnaryServer is the unary server interceptor function.
 func (v *ReferenceValidator) UnaryServer(ctx context.Context, request any, info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler) (response any, err error) {
@@ -148,7 +179,11 @@ func (v *ReferenceValidator) UnaryServer(ctx context.Context, request any, info 
 		return handler(ctx, request)
 	}
 
-	err = v.validate(ctx, request)
+	if isObjectBeingDeleted(request) {
+		return handler(ctx, request)
+	}
+
+	err = v.validate(ctx, request, v.excludedReferencePathsByMethod[info.FullMethod])
 	if err != nil {
 		return
 	}
@@ -164,7 +199,7 @@ func (v *ReferenceValidator) StreamServer(srv any, stream grpc.ServerStream,
 }
 
 // validate walks the request message and validates all reference-typed fields.
-func (v *ReferenceValidator) validate(ctx context.Context, request any) error {
+func (v *ReferenceValidator) validate(ctx context.Context, request any, excluded map[string]struct{}) error {
 	message, ok := request.(proto.Message)
 	if !ok {
 		return nil
@@ -173,7 +208,7 @@ func (v *ReferenceValidator) validate(ctx context.Context, request any) error {
 	tenant, project := extractTenantProject(message)
 
 	var violations []*errdetails.BadRequest_FieldViolation
-	err := v.walkMessage(ctx, message.ProtoReflect(), nil, &violations, tenant, project)
+	err := v.walkMessage(ctx, message.ProtoReflect(), nil, &violations, tenant, project, excluded)
 	if err != nil {
 		return err
 	}
@@ -205,7 +240,8 @@ func (v *ReferenceValidator) validate(ctx context.Context, request any) error {
 // fields. Appends FieldViolation entries for invalid references. Mutates the message to fill in
 // missing reference fields.
 func (v *ReferenceValidator) walkMessage(ctx context.Context, msg protoreflect.Message, path []string,
-	violations *[]*errdetails.BadRequest_FieldViolation, tenant, project string) error {
+	violations *[]*errdetails.BadRequest_FieldViolation, tenant, project string,
+	excluded map[string]struct{}) error {
 	var internalErr error
 
 	msg.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
@@ -214,6 +250,9 @@ func (v *ReferenceValidator) walkMessage(ctx context.Context, msg protoreflect.M
 		}
 
 		fieldPath := append(append([]string{}, path...), string(fd.Name()))
+		if _, ok := excluded[strings.Join(fieldPath, ".")]; ok {
+			return true
+		}
 
 		if fd.IsMap() {
 			if fd.MapValue().Kind() == protoreflect.MessageKind {
@@ -241,7 +280,7 @@ func (v *ReferenceValidator) walkMessage(ctx context.Context, msg protoreflect.M
 					}
 					continue
 				}
-				err := v.walkMessage(ctx, elemMsg, indexedPath, violations, tenant, project)
+				err := v.walkMessage(ctx, elemMsg, indexedPath, violations, tenant, project, excluded)
 				if err != nil {
 					internalErr = err
 					return false
@@ -262,7 +301,7 @@ func (v *ReferenceValidator) walkMessage(ctx context.Context, msg protoreflect.M
 			}
 			return true
 		}
-		err := v.walkMessage(ctx, subMsg, fieldPath, violations, tenant, project)
+		err := v.walkMessage(ctx, subMsg, fieldPath, violations, tenant, project, excluded)
 		if err != nil {
 			internalErr = err
 			return false
@@ -455,6 +494,26 @@ func isLocalReference(fullName protoreflect.FullName) bool {
 // isCreateOrUpdate checks if the gRPC method is a Create or Update operation.
 func isCreateOrUpdate(method string) bool {
 	return strings.HasSuffix(method, "/Create") || strings.HasSuffix(method, "/Update")
+}
+
+func isObjectBeingDeleted(request any) bool {
+	message, ok := request.(proto.Message)
+	if !ok {
+		return false
+	}
+	msg := message.ProtoReflect()
+	for _, name := range []protoreflect.Name{"object", "metadata"} {
+		fd := msg.Descriptor().Fields().ByName(name)
+		if fd == nil || fd.Kind() != protoreflect.MessageKind {
+			return false
+		}
+		msg = msg.Get(fd).Message()
+	}
+	fd := msg.Descriptor().Fields().ByName("deletion_timestamp")
+	if fd == nil {
+		return false
+	}
+	return msg.Has(fd)
 }
 
 // isNotFoundErr checks whether an error represents a "not found" condition.

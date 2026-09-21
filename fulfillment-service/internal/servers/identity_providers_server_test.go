@@ -18,8 +18,8 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Identity Providers Server", func() {
@@ -105,7 +105,6 @@ var _ = Describe("Identity Providers Server", func() {
 							TokenUrl:         "https://example.com/token",
 							Issuer:           "https://example.com",
 							ClientId:         "test-client-id",
-							ClientSecret:     "test-secret",
 						}.Build(),
 					}.Build(),
 				}.Build(),
@@ -139,7 +138,6 @@ var _ = Describe("Identity Providers Server", func() {
 								TokenUrl:         "https://example.com/token",
 								Issuer:           "https://example.com",
 								ClientId:         "client-id",
-								ClientSecret:     "secret",
 							}.Build(),
 						}.Build(),
 					}.Build(),
@@ -167,7 +165,6 @@ var _ = Describe("Identity Providers Server", func() {
 							TokenUrl:         "https://example.com/token",
 							Issuer:           "https://example.com",
 							ClientId:         "client-id",
-							ClientSecret:     "secret",
 						}.Build(),
 					}.Build(),
 				}.Build(),
@@ -198,7 +195,6 @@ var _ = Describe("Identity Providers Server", func() {
 							TokenUrl:         "https://example.com/token",
 							Issuer:           "https://example.com",
 							ClientId:         "client-id",
-							ClientSecret:     "secret",
 						}.Build(),
 					}.Build(),
 				}.Build(),

@@ -21,10 +21,10 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 
-	testsv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/tests/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	. "github.com/osac-project/osac/fulfillment-service/internal/testing"
+	testsv1 "github.com/osac-project/osac/proto/gen/osac/tests/v1"
 )
 
 var _ = Describe("Metrics", func() {
@@ -76,8 +76,8 @@ var _ = Describe("Metrics", func() {
 
 		// Create a tenancy logic without restrictions:
 		tenancy = auth.NewMockTenancyLogic(ctrl)
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.AllTenants, nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(auth.TotalVisibility(), nil).
 			AnyTimes()
 
 		// Create the tenant used in the tests:

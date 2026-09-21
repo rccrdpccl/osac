@@ -14,13 +14,16 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
+	"errors"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private tenants server (Tenant API)", func() {
@@ -566,5 +569,279 @@ var _ = Describe("Private tenants server (Tenant API)", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(vnList.GetItems()).To(BeEmpty())
 		})
+	})
+})
+
+var _ = Describe("Break-glass credentials secret reference", func() {
+	var tenantsServer *PrivateTenantsServer
+
+	BeforeEach(func() {
+		var err error
+		tenantsServer, err = NewPrivateTenantsServer().
+			SetLogger(logger).
+			SetAttributionLogic(attribution).
+			SetTenancyLogic(tenancy).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("Returns generated break-glass credentials on Create", func() {
+		response, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: "secret-tenant",
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		creds := response.GetObject().GetStatus().GetBreakGlassCredentials()
+		Expect(creds).ToNot(BeNil())
+		Expect(creds.GetUsername()).To(Equal("secret-tenant-osac-break-glass"))
+		Expect(creds.GetPassword()).ToNot(BeEmpty())
+		Expect(response.GetObject().GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
+	})
+
+	It("Rejects a nonexistent break_glass_credentials_secret", func() {
+		_, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: "missing-secret-tenant",
+				}.Build(),
+				Spec: privatev1.TenantSpec_builder{
+					BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+						Id: "nonexistent-secret",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).To(HaveOccurred())
+		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("there is no secret"))
+	})
+
+	It("Rejects an empty break_glass_credentials_secret reference", func() {
+		_, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: "empty-secret-tenant",
+				}.Build(),
+				Spec: privatev1.TenantSpec_builder{
+					BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).To(HaveOccurred())
+		Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("must specify id or name"))
+	})
+
+	It("Accepts a pre-existing break_glass_credentials_secret by id", func() {
+		secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+			SetLogger(logger).
+			SetTenancyLogic(tenancy).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
+			Id:   "existing-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
+			Metadata: privatev1.Metadata_builder{
+				Name:   "existing-bg",
+				Tenant: testTenant,
+			}.Build(),
+		}.Build()).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		response, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: "preexisting-secret-tenant",
+				}.Build(),
+				Spec: privatev1.TenantSpec_builder{
+					BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+						Id: "existing-bg-secret",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		ref := response.GetObject().GetSpec().GetBreakGlassCredentialsSecret()
+		Expect(ref.GetId()).To(Equal("existing-bg-secret"))
+		Expect(ref.GetName()).To(Equal("existing-bg"))
+		Expect(response.GetObject().GetStatus().GetBreakGlassCredentials()).To(BeNil())
+	})
+
+	It("Deletes the break-glass secret on soft-delete even when projects remain", func() {
+		// A finalizer makes Delete a soft-delete so the secret removal commits.
+		// Without one, hard-delete hits projects_tenant_fk, aborts the shared
+		// test transaction, and rolls the secret delete back.
+		createResponse, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:       "secret-blocked-tenant",
+					Finalizers: []string{"test-finalizer"},
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+			SetLogger(logger).
+			SetTenancyLogic(tenancy).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
+			Id:   "tenant-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
+			Metadata: privatev1.Metadata_builder{
+				Name:   breakGlassCredentialsSecretName,
+				Tenant: "secret-blocked-tenant",
+			}.Build(),
+		}.Build()).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Id: createResponse.GetObject().GetId(),
+				Spec: privatev1.TenantSpec_builder{
+					BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+						Id: "tenant-bg-secret",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.break_glass_credentials_secret"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = tenantsServer.Delete(ctx, privatev1.TenantsDeleteRequest_builder{
+			Id: createResponse.GetObject().GetId(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = secretsDao.Get().SetId("tenant-bg-secret").Do(ctx)
+		Expect(err).To(HaveOccurred())
+		var notFound *dao.ErrNotFound
+		Expect(errors.As(err, &notFound)).To(BeTrue())
+
+		getResponse, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+			Id: createResponse.GetObject().GetId(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getResponse.GetObject().GetMetadata().GetDeletionTimestamp()).ToNot(BeNil())
+		Expect(getResponse.GetObject().GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
+	})
+
+	It("Can soft-delete a tenant when the break-glass secret was already deleted", func() {
+		createResponse, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name:       "predeleted-secret-tenant",
+					Finalizers: []string{"test-finalizer"},
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+			SetLogger(logger).
+			SetTenancyLogic(tenancy).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
+			Id:   "predeleted-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
+			Metadata: privatev1.Metadata_builder{
+				Name:   breakGlassCredentialsSecretName,
+				Tenant: "predeleted-secret-tenant",
+			}.Build(),
+		}.Build()).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Id: createResponse.GetObject().GetId(),
+				Spec: privatev1.TenantSpec_builder{
+					BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+						Id: "predeleted-bg-secret",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.break_glass_credentials_secret"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = secretsDao.Delete().SetId("predeleted-bg-secret").Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = tenantsServer.Delete(ctx, privatev1.TenantsDeleteRequest_builder{
+			Id: createResponse.GetObject().GetId(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		getResponse, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+			Id: createResponse.GetObject().GetId(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getResponse.GetObject().GetMetadata().GetDeletionTimestamp()).ToNot(BeNil())
+		Expect(getResponse.GetObject().GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
+	})
+
+	It("Allows Update to clear a stale break-glass secret reference after the secret was deleted", func() {
+		createResponse, err := tenantsServer.Create(ctx, privatev1.TenantsCreateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Metadata: privatev1.Metadata_builder{
+					Name: "stale-ref-tenant",
+				}.Build(),
+			}.Build(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
+			SetLogger(logger).
+			SetTenancyLogic(tenancy).
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
+			Id:   "stale-bg-secret",
+			Type: privatev1.SecretType_SECRET_TYPE_OPAQUE,
+			Metadata: privatev1.Metadata_builder{
+				Name:   breakGlassCredentialsSecretName,
+				Tenant: "stale-ref-tenant",
+			}.Build(),
+		}.Build()).Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Id: createResponse.GetObject().GetId(),
+				Spec: privatev1.TenantSpec_builder{
+					BreakGlassCredentialsSecret: privatev1.SecretLocalReference_builder{
+						Id: "stale-bg-secret",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.break_glass_credentials_secret"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = secretsDao.Delete().SetId("stale-bg-secret").Do(ctx)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = tenantsServer.Update(ctx, privatev1.TenantsUpdateRequest_builder{
+			Object: privatev1.Tenant_builder{
+				Id: createResponse.GetObject().GetId(),
+				Metadata: privatev1.Metadata_builder{
+					Finalizers: []string{},
+				}.Build(),
+			}.Build(),
+			UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"metadata.finalizers"}},
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+
+		getResponse, err := tenantsServer.Get(ctx, privatev1.TenantsGetRequest_builder{
+			Id: createResponse.GetObject().GetId(),
+		}.Build())
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getResponse.GetObject().GetSpec().GetBreakGlassCredentialsSecret()).To(BeNil())
 	})
 })

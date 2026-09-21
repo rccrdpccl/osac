@@ -15,7 +15,6 @@ package utils
 
 import (
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 
@@ -23,12 +22,8 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
-
-// validRunStrategies contains the run strategy values accepted by the Kubernetes ComputeInstance CRD.
-// Note: these values are case-sensitive as currently no normalization is performed.
-var validRunStrategies = []string{"Always", "Halted"}
 
 // ApplySpecDefaults applies default values from a template's spec_defaults to a compute instance spec.
 //
@@ -62,7 +57,7 @@ func mergeBootDiskDefaults(spec *privatev1.ComputeInstanceSpec, defaults *privat
 	}
 	disk := spec.GetBootDisk()
 	defDisk := defaults.GetBootDisk()
-	if disk.GetSizeGib() <= 0 && defDisk.GetSizeGib() > 0 {
+	if !disk.HasSizeGib() && defDisk.HasSizeGib() {
 		disk.SetSizeGib(defDisk.GetSizeGib())
 	}
 	if !disk.HasStorageTier() && defDisk.HasStorageTier() {
@@ -117,23 +112,33 @@ func ValidateRequiredSpecFields(spec *privatev1.ComputeInstanceSpec) error {
 	return nil
 }
 
-func validateRunStrategy(value string) error {
-	if slices.Contains(validRunStrategies, value) {
+func validateRunStrategy(value privatev1.ComputeInstanceRunStrategy) error {
+	switch value {
+	case privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS,
+		privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_HALTED:
 		return nil
+	default:
+		return grpcstatus.Errorf(
+			grpccodes.InvalidArgument,
+			"invalid run_strategy %q: must be one of COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS, COMPUTE_INSTANCE_RUN_STRATEGY_HALTED",
+			value,
+		)
 	}
-	return grpcstatus.Errorf(
-		grpccodes.InvalidArgument,
-		"invalid run_strategy %q: must be one of %s",
-		value, strings.Join(validRunStrategies, ", "),
-	)
 }
 
 func validateDisk(disk *privatev1.ComputeInstanceDisk) error {
 	if disk == nil {
 		return nil
 	}
+	if !disk.HasSizeGib() {
+		return fmt.Errorf("size_gib is required")
+	}
 	if disk.GetSizeGib() <= 0 {
 		return fmt.Errorf("size_gib must be greater than 0")
+	}
+	tier := disk.GetStorageTier()
+	if tier == nil || (strings.TrimSpace(tier.GetId()) == "" && strings.TrimSpace(tier.GetName()) == "") {
+		return fmt.Errorf("storage_tier is required")
 	}
 	return nil
 }

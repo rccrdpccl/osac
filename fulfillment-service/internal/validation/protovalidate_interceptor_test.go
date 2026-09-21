@@ -25,9 +25,12 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
+
+// testPassword is a fixture credential; the test* prefix marks it as non-production.
+const testPassword = "secret"
 
 var _ = Describe("Protovalidate interceptor", func() {
 	var interceptor *ProtovalidateInterceptor
@@ -216,38 +219,6 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(ok).To(BeTrue())
 			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 			Expect(status.Message()).To(ContainSubstring("validation failed"))
-		})
-
-		It("Rejects requests with label keys that are too long", func() {
-			// Create Metadata with label key > 316 chars:
-			longKey := ""
-			for i := 0; i < 320; i++ {
-				longKey = longKey + "a"
-			}
-			invalidMetadata := &publicv1.Metadata{
-				Name: "valid-name",
-				Labels: map[string]string{
-					longKey: "value",
-				},
-			}
-
-			mockHandler := func(ctx context.Context, req any) (any, error) {
-				Fail("Handler should not be called for invalid request")
-				return nil, nil
-			}
-
-			response, err := interceptor.UnaryServer(
-				context.Background(),
-				invalidMetadata,
-				&grpc.UnaryServerInfo{FullMethod: "/test.Service/Method"},
-				mockHandler,
-			)
-
-			Expect(err).To(HaveOccurred())
-			Expect(response).To(BeNil())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
 		})
 
 		It("Rejects empty name (mandatory field)", func() {
@@ -462,16 +433,17 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("Rejects project with empty name", func() {
+		It("Accepts project with empty name (default project)", func() {
 			project := privatev1.Project_builder{
 				Metadata: privatev1.Metadata_builder{
 					Name: "",
 				}.Build(),
 			}.Build()
 
+			handlerCalled := false
 			mockHandler := func(ctx context.Context, req any) (any, error) {
-				Fail("Handler should not be called for invalid request")
-				return nil, nil
+				handlerCalled = true
+				return "response", nil
 			}
 
 			response, err := interceptor.UnaryServer(
@@ -481,11 +453,9 @@ var _ = Describe("Protovalidate interceptor", func() {
 				mockHandler,
 			)
 
-			Expect(err).To(HaveOccurred())
-			Expect(response).To(BeNil())
-			status, ok := grpcstatus.FromError(err)
-			Expect(ok).To(BeTrue())
-			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(handlerCalled).To(BeTrue())
+			Expect(response).To(Equal("response"))
 		})
 
 		It("Accepts project with single DNS label name", func() {
@@ -588,7 +558,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
-							Password: "secret",
+							Password: testPassword,
 						}.Build(),
 					}.Build(),
 				}.Build(),
@@ -625,7 +595,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Endpoint: "",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
-							Password: "secret",
+							Password: testPassword,
 						}.Build(),
 					}.Build(),
 				}.Build(),
@@ -695,7 +665,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "",
-							Password: "secret",
+							Password: testPassword,
 						}.Build(),
 					}.Build(),
 				}.Build(),
@@ -758,6 +728,83 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(status.Message()).To(ContainSubstring("validation failed"))
 		})
 
+		It("Accepts create request with password_secret and empty password", func() {
+			request := privatev1.StorageBackendsCreateRequest_builder{
+				Object: privatev1.StorageBackend_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name: "my-backend",
+					}.Build(),
+					Spec: privatev1.StorageBackendSpec_builder{
+						Provider: "ceph",
+						Endpoint: "https://storage.example.com",
+						Credentials: privatev1.StorageBackendCredentials_builder{
+							Username: "admin",
+							PasswordSecret: privatev1.SecretLocalReference_builder{
+								Id: "secret-id",
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			handlerCalled := false
+			validHandler := func(ctx context.Context, req any) (any, error) {
+				handlerCalled = true
+				return "response", nil
+			}
+
+			response, err := interceptor.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.StorageBackendsService/Create"},
+				validHandler,
+			)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(handlerCalled).To(BeTrue())
+			Expect(response).To(Equal("response"))
+		})
+
+		It("Rejects create request with both password and password_secret", func() {
+			request := privatev1.StorageBackendsCreateRequest_builder{
+				Object: privatev1.StorageBackend_builder{
+					Metadata: privatev1.Metadata_builder{
+						Name: "my-backend",
+					}.Build(),
+					Spec: privatev1.StorageBackendSpec_builder{
+						Provider: "ceph",
+						Endpoint: "https://storage.example.com",
+						Credentials: privatev1.StorageBackendCredentials_builder{
+							Username: "admin",
+							Password: testPassword,
+							PasswordSecret: privatev1.SecretLocalReference_builder{
+								Id: "secret-id",
+							}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build()
+
+			mockHandler := func(ctx context.Context, req any) (any, error) {
+				Fail("Handler should not be called for invalid request")
+				return nil, nil
+			}
+
+			response, err := interceptor.UnaryServer(
+				context.Background(),
+				request,
+				&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.StorageBackendsService/Create"},
+				mockHandler,
+			)
+
+			Expect(err).To(HaveOccurred())
+			Expect(response).To(BeNil())
+			status, ok := grpcstatus.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(status.Code()).To(Equal(grpccodes.InvalidArgument))
+			Expect(status.Message()).To(ContainSubstring("validation failed"))
+		})
+
 		It("Accepts valid create request", func() {
 			request := privatev1.StorageBackendsCreateRequest_builder{
 				Object: privatev1.StorageBackend_builder{
@@ -769,7 +816,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Endpoint: "https://storage.example.com",
 						Credentials: privatev1.StorageBackendCredentials_builder{
 							Username: "admin",
-							Password: "secret",
+							Password: testPassword,
 						}.Build(),
 					}.Build(),
 				}.Build(),
@@ -803,14 +850,14 @@ var _ = Describe("Protovalidate interceptor", func() {
 			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("Rejects create request with zero cores", func() {
+		It("Rejects create request with zero vCPUs", func() {
 			request := privatev1.InstanceTypesCreateRequest_builder{
 				Object: privatev1.InstanceType_builder{
 					Metadata: privatev1.Metadata_builder{
 						Name: "my-type",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     0,
+						Vcpus:     0,
 						MemoryGib: 16,
 					}.Build(),
 				}.Build(),
@@ -843,7 +890,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-type",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 0,
 					}.Build(),
 				}.Build(),
@@ -876,7 +923,7 @@ var _ = Describe("Protovalidate interceptor", func() {
 						Name: "my-type",
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 16,
 					}.Build(),
 				}.Build(),

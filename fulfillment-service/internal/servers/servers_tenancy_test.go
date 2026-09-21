@@ -21,11 +21,11 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Tenancy logic", func() {
@@ -73,6 +73,10 @@ var _ = Describe("Tenancy logic", func() {
 
 	It("Returns tenant in metadata when object is created", func() {
 		// Create a mock tenancy logic that returns a specific tenant:
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		assignable := collections.NewSet("my-tenant")
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
@@ -81,8 +85,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("my-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(assignable), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		// Create the template using the DAO directly (this is setup for the test):
@@ -111,7 +115,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -163,6 +166,10 @@ var _ = Describe("Tenancy logic", func() {
 		Expect(err).ToNot(HaveOccurred())
 
 		// Create a tenancy logic that doesn't return assignable tenants:
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
 			Return(collections.NewSet[string](), nil).
@@ -170,8 +177,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("my-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(collections.NewSet("my-tenant")), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		// Create the clusters server with the empty tenancy logic:
@@ -179,7 +186,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -204,6 +210,10 @@ var _ = Describe("Tenancy logic", func() {
 
 	It("Uses default tenant when tenant is explicitly empty", func() {
 		// Create a tenancy logic that returns a valid tenant:
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		assignable := collections.NewSet("my-tenant")
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
@@ -212,8 +222,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("my-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(assignable), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		// Create the template using the DAO:
@@ -242,7 +252,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -269,6 +278,10 @@ var _ = Describe("Tenancy logic", func() {
 
 	It("Respects explicitly specified tenant over default", func() {
 		// Create a tenancy logic where the default tenant differs from the one the user will specify:
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant", "your-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		assignable := collections.NewSet("my-tenant", "your-tenant")
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
@@ -277,8 +290,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("your-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(assignable), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		// Create the template using the DAO:
@@ -305,7 +318,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -331,6 +343,10 @@ var _ = Describe("Tenancy logic", func() {
 	})
 
 	It("Rejects changing tenant on update", func() {
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant", "your-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		assignable := collections.NewSet("my-tenant", "your-tenant")
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
@@ -339,8 +355,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("my-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(assignable), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
@@ -365,7 +381,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -399,6 +414,10 @@ var _ = Describe("Tenancy logic", func() {
 	})
 
 	It("Preserves tenant when update does not specify it", func() {
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		assignable := collections.NewSet("my-tenant")
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
@@ -407,8 +426,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("my-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(assignable), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
@@ -433,7 +452,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -458,7 +476,7 @@ var _ = Describe("Tenancy logic", func() {
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"compute": publicv1.ClusterNodeSet_builder{
 							HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-							Size:     4,
+							Size:     proto.Int32(4),
 						}.Build(),
 					},
 				}.Build(),
@@ -470,6 +488,10 @@ var _ = Describe("Tenancy logic", func() {
 
 	It("Rejects object creation when assigned tenant is invisible to the user", func() {
 		// Create a tenancy logic that returns visible tenants:
+		visibility, err := auth.NewVisibility().
+			AddVisibleTenants(auth.SharedTenant, "my-tenant").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
 		assignable := collections.NewSet("my-tenant")
 		tenancy := auth.NewMockTenancyLogic(ctrl)
 		tenancy.EXPECT().DetermineAssignableTenants(gomock.Any()).
@@ -478,8 +500,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return("my-tenant", nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.SharedTenants.Union(assignable), nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 
 		// Create the template:
@@ -504,7 +526,6 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
@@ -537,8 +558,8 @@ var _ = Describe("Tenancy logic", func() {
 		tenancy.EXPECT().DetermineDefaultTenant(gomock.Any()).
 			Return(auth.SharedTenant, nil).
 			AnyTimes()
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.AllTenants, nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(auth.TotalVisibility(), nil).
 			AnyTimes()
 
 		// Create the server:
@@ -546,11 +567,10 @@ var _ = Describe("Tenancy logic", func() {
 			SetLogger(logger).
 			SetAttributionLogic(attribution).
 			SetTenancyLogic(tenancy).
-			SetScheme(testScheme).
 			Build()
 		Expect(err).ToNot(HaveOccurred())
 
-		// Create the template using the DAO:
+		// Use a shared Template so dependency scope is valid and creation reaches the nonexistent-tenant check.
 		templatesDao, err := dao.NewGenericDAO[*privatev1.ClusterTemplate]().
 			SetLogger(logger).
 			SetTenancyLogic(tenancy).
@@ -564,7 +584,7 @@ var _ = Describe("Tenancy logic", func() {
 					Description: "My template",
 					Metadata: privatev1.Metadata_builder{
 						Name:   "test-template",
-						Tenant: "my-tenant",
+						Tenant: auth.SharedTenant,
 					}.Build(),
 				}.Build(),
 			).

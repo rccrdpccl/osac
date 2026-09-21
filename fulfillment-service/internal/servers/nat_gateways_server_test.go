@@ -19,11 +19,14 @@ import (
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Public NAT gateways server", func() {
@@ -74,10 +77,16 @@ var _ = Describe("Public NAT gateways server", func() {
 			externalIPDao     *dao.GenericDAO[*privatev1.ExternalIP]
 			networkClassDao   *dao.GenericDAO[*privatev1.NetworkClass]
 			sharedPool        *privatev1.ExternalIPPool
+			// sharedNetworkClass memoizes the NetworkClass fixture across multiple
+			// createVirtualNetwork calls within a single It: the one-NetworkClass-per-deployment
+			// invariant (OSAC-4073) means only one non-deleted NetworkClass can exist in the
+			// (per-It) test database at a time.
+			sharedNetworkClass *privatev1.NetworkClass
 		)
 
 		BeforeEach(func() {
 			var err error
+			sharedNetworkClass = nil
 
 			publicServer, err = NewNATGatewaysServer().
 				SetLogger(logger).
@@ -131,16 +140,19 @@ var _ = Describe("Public NAT gateways server", func() {
 		})
 
 		createVirtualNetwork := func() string {
-			ncResp, err := networkClassDao.Create().SetObject(
-				privatev1.NetworkClass_builder{
-					FabricManager: new("netris"),
-					Metadata: privatev1.Metadata_builder{
-						Tenant: auth.SharedTenant,
-						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+			if sharedNetworkClass == nil {
+				ncResp, err := networkClassDao.Create().SetObject(
+					privatev1.NetworkClass_builder{
+						FabricManager: new("netris"),
+						Metadata: privatev1.Metadata_builder{
+							Tenant: auth.SharedTenant,
+							Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
 					}.Build(),
-				}.Build(),
-			).Do(ctx)
-			Expect(err).ToNot(HaveOccurred())
+				).Do(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				sharedNetworkClass = ncResp.GetObject()
+			}
 
 			resp, err := vnDao.Create().SetObject(
 				privatev1.VirtualNetwork_builder{
@@ -149,7 +161,7 @@ var _ = Describe("Public NAT gateways server", func() {
 						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
 					}.Build(),
 					Spec: privatev1.VirtualNetworkSpec_builder{
-						NetworkClass: privatev1.NetworkClassReference_builder{Id: ncResp.GetObject().GetId()}.Build(),
+						NetworkClass: privatev1.NetworkClassReference_builder{Id: sharedNetworkClass.GetId()}.Build(),
 					}.Build(),
 				}.Build(),
 			).Do(ctx)
@@ -182,6 +194,26 @@ var _ = Describe("Public NAT gateways server", func() {
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			Expect(getResp.GetObject().GetId()).To(Equal(createResp.GetObject().GetId()))
+		})
+
+		It("rejects caller-supplied output status on Create", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			message := "malicious status"
+			_, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
+				Object: publicv1.NATGateway_builder{
+					Metadata: publicv1.Metadata_builder{Tenant: testTenant}.Build(),
+					Spec: publicv1.NATGatewaySpec_builder{
+						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+					Status: publicv1.NATGatewayStatus_builder{
+						State:   publicv1.NATGatewayState_NAT_GATEWAY_STATE_READY,
+						Message: &message,
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
 		})
 
 		It("lists NATGateways", func() {
@@ -229,9 +261,43 @@ var _ = Describe("Public NAT gateways server", func() {
 			object.GetMetadata().SetLabels(map[string]string{"env": "test"})
 			updateResp, err := publicServer.Update(ctx, publicv1.NATGatewaysUpdateRequest_builder{
 				Object: object,
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"metadata.labels"},
+				},
 			}.Build())
 			Expect(err).ToNot(HaveOccurred())
 			Expect(updateResp.GetObject().GetMetadata().GetLabels()).To(HaveKeyWithValue("env", "test"))
+		})
+
+		It("rejects output-only status updates with nil and explicit masks", func() {
+			vnID := createVirtualNetwork()
+			eip := createAllocatedExternalIP()
+			createResp, err := publicServer.Create(ctx, publicv1.NATGatewaysCreateRequest_builder{
+				Object: publicv1.NATGateway_builder{
+					Metadata: publicv1.Metadata_builder{
+						Tenant: testTenant,
+						Name:   fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+					}.Build(),
+					Spec: publicv1.NATGatewaySpec_builder{
+						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: vnID}.Build(),
+						ExternalIp:     publicv1.ExternalIPLocalReference_builder{Id: eip.GetId()}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = publicServer.Update(ctx, publicv1.NATGatewaysUpdateRequest_builder{
+				Object: createResp.GetObject(),
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
+
+			_, err = publicServer.Update(ctx, publicv1.NATGatewaysUpdateRequest_builder{
+				Object: publicv1.NATGateway_builder{Id: createResp.GetObject().GetId()}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{
+					Paths: []string{"status.state"},
+				},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(codes.InvalidArgument))
 		})
 
 		It("deletes a NATGateway", func() {

@@ -203,51 +203,6 @@ var _ = Describe("Default tenancy logic", Ordered, func() {
 		})
 	})
 
-	Describe("Determine visible tenants", func() {
-		var logic *DefaultTenancyLogic
-
-		BeforeEach(func(ctx context.Context) {
-			var err error
-			logic, err = NewDefaultTenancyLogic().
-				SetLogger(logger).
-				Build()
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("Returns tenants and shared", func(ctx context.Context) {
-			subject := &Subject{
-				User:    "my_user",
-				Tenants: collections.NewSet("tenant-a", "tenant-b"),
-			}
-			ctx = ContextWithSubject(ctx, subject)
-			result, err := logic.DetermineVisibleTenants(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result.Equal(SharedTenants.Union(collections.NewSet("tenant-a", "tenant-b")))).To(BeTrue())
-		})
-
-		It("Returns universal set when tenants is universal", func(ctx context.Context) {
-			subject := &Subject{
-				User:    "my_user",
-				Tenants: AllTenants,
-			}
-			ctx = ContextWithSubject(ctx, subject)
-			result, err := logic.DetermineVisibleTenants(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result.Equal(AllTenants)).To(BeTrue())
-		})
-
-		It("Returns only shared when tenants is empty", func(ctx context.Context) {
-			subject := &Subject{
-				User:    "my_user",
-				Tenants: collections.NewSet[string](),
-			}
-			ctx = ContextWithSubject(ctx, subject)
-			result, err := logic.DetermineVisibleTenants(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result.Equal(SharedTenants)).To(BeTrue())
-		})
-	})
-
 	Describe("Determine visibility", func() {
 		var logic *DefaultTenancyLogic
 

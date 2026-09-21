@@ -27,4 +27,9 @@ type TokenSource interface {
 // The tenant parameter identifies the tenant namespace and must not be empty.
 type TenantTokenSource interface {
 	VaultToken(ctx context.Context, tenant string) (string, error)
+
+	// InvalidateTenantToken removes the cached Vault token for the specified tenant.
+	// This should be called when a tenant's Vault namespace is deleted to prevent
+	// stale tokens from being reused if the tenant is recreated with the same name.
+	InvalidateTenantToken(tenant string)
 }

@@ -1,7 +1,10 @@
 # Fulfillment service
 
 This project contains the code for the fulfillment service. For instructions on how to install it
-in a production environment see the [installation guide](docs/INSTALL.md).
+in a deployed environment see the [installation guide](docs/INSTALL.md). For a guided walkthrough
+of how a request flows through the service — the shared data model, the transaction/event
+mechanism, and the end-to-end path from a `Create` call to a Kubernetes custom resource — see
+[docs/CODEWALK.md](docs/CODEWALK.md).
 
 The API is defined using protocol buffers in the [`proto`](proto) directory. An OpenAPI
 specification is generated automatically from those definitions and published as raw YAML at
@@ -30,6 +33,42 @@ To work with this project you will need the following tools:
 
 See [dev/README.md](dev/README.md) for more information about the `dev.py` script and how to extend
 it with new commands.
+
+## Working with Protocol Buffers
+
+The API is defined using protocol buffers in the [`proto`](proto) directory.
+
+### Editing Proto Files
+
+**IMPORTANT**: The proto contract lives in the **top-level `proto/` module**
+, not here. Edit service definitions in `proto/private/` and
+test-only definitions in `proto/tests/`. `proto/public/` and `proto/gen/` are
+generated and must never be edited manually.
+
+For any proto change, regenerate ONCE from `proto/`:
+
+```bash
+make -C ../proto generate   # dev.py build protos (public) + buf generate (Go)
+make -C ../proto lint       # buf lint
+```
+
+### Generated Code
+
+The single generated Go tree at `proto/gen/` is imported by every module as
+`github.com/osac-project/osac/proto/gen/...` — there are no more per-component
+`internal/api/` copies. Commit, for a proto change:
+
+1. Your edits to `.proto` files in `proto/private/` (or `proto/tests/`)
+2. The regenerated `proto/public/` (not needed for test-only changes)
+3. The regenerated `proto/gen/`
+
+CI (`Check generated code (proto)`) fails the PR if `proto/gen/` or
+`proto/public/` is stale. Run `go generate ./...` here afterward if a proto
+change altered a mocked gRPC interface, and `go mod tidy` after module changes.
+
+A CI check (`check-generated-code.yaml`) runs on every PR to verify that the generated code is up to date. If the check fails, it means you forgot to regenerate or commit the generated code.
+
+See [docs/CLEANAPI.md](docs/CLEANAPI.md) for a complete guide on using cleanapi annotations, best practices, and common workflows. See [AGENTS.md](AGENTS.md) for build commands and development workflow.
 
 ## Building the binaries
 

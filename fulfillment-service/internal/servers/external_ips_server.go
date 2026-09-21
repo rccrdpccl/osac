@@ -22,10 +22,10 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ExternalIPsServerBuilder struct {
@@ -198,6 +198,9 @@ func (s *ExternalIPsServer) Create(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
+	if err = rejectOutputStatusOnCreate(publicExternalIP.HasStatus()); err != nil {
+		return
+	}
 	privateExternalIP := &privatev1.ExternalIP{}
 	err = s.inMapper.Copy(ctx, publicExternalIP, privateExternalIP)
 	if err != nil {
@@ -240,6 +243,9 @@ func (s *ExternalIPsServer) Update(ctx context.Context,
 	publicExternalIP := request.GetObject()
 	if publicExternalIP == nil {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
+		return
+	}
+	if err = validatePublicMetadataUpdateMask(request.GetUpdateMask()); err != nil {
 		return
 	}
 	privateExternalIP := &privatev1.ExternalIP{}

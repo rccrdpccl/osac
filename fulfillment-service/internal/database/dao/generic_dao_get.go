@@ -48,10 +48,6 @@ func (r *GetRequest[O]) SetLock(value bool) *GetRequest[O] {
 
 // Do executes the get operation and returns the response.
 func (r *GetRequest[O]) Do(ctx context.Context) (response *GetResponse[O], err error) {
-	err = r.init(ctx)
-	if err != nil {
-		return
-	}
 	r.tx, err = database.TxFromContext(ctx)
 	if err != nil {
 		return
@@ -62,17 +58,27 @@ func (r *GetRequest[O]) Do(ctx context.Context) (response *GetResponse[O], err e
 }
 
 func (r *GetRequest[O]) do(ctx context.Context) (response *GetResponse[O], err error) {
-	// Add the where clause to filter by tenant:
-	err = r.addTenancyFilter(ctx)
-	if err != nil {
-		return
-	}
-
-	// Add the where clause to filter by identifier:
+	// Check parameters:
 	if r.id == "" {
 		err = errors.New("object identifier is mandatory")
 		return
 	}
+
+	// Check visibility:
+	ok, err := r.addVisibilityFilter(ctx)
+	if err != nil {
+		return
+	}
+	if !ok {
+		err = &ErrNotFound{
+			IDs: []string{
+				r.id,
+			},
+		}
+		return
+	}
+
+	// Add the where clause to filter by identifier:
 	r.sql.params = append(r.sql.params, r.id)
 	if r.sql.filter.Len() > 0 {
 		r.sql.filter.WriteString(` and`)

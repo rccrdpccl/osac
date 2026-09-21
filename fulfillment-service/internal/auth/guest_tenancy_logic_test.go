@@ -55,12 +55,4 @@ var _ = Describe("Guest tenancy logic", func() {
 			Expect(result).To(Equal("guest"))
 		})
 	})
-
-	Describe("Determine visible tenants", func() {
-		It("Should return the guest and shared tenants", func() {
-			result, err := logic.DetermineVisibleTenants(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result.Equal(GuestTenants.Union(SharedTenants))).To(BeTrue())
-		})
-	})
 })

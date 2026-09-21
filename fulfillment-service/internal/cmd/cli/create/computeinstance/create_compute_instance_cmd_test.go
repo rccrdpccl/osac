@@ -19,7 +19,7 @@ import (
 	"github.com/spf13/pflag"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("parseNetworkAttachmentFlag", func() {
@@ -65,6 +65,14 @@ var _ = Describe("parseNetworkAttachmentFlag", func() {
 // Legacy subnet and security-groups tests removed - these fields are no longer supported
 
 var _ = Describe("buildSpec", func() {
+	It("should send the resolved instance type ID", func() {
+		c := &runnerContext{}
+		c.args.instanceType = "instance-type-id"
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetInstanceType().GetId()).To(Equal("instance-type-id"))
+	})
+
 	It("should populate attachments when network-attachment flags are set", func() {
 		c := &runnerContext{}
 		c.args.networkAttachments = []string{"n1", "subnet=n2,security-groups=g1"}
@@ -102,9 +110,26 @@ var _ = Describe("buildSpec", func() {
 
 		Expect(spec.HasDiskImage()).To(BeFalse())
 	})
+
+	It("should set user_data_secret when user-data-secret is provided", func() {
+		c := &runnerContext{}
+		c.args.userDataSecret = "cloud-init"
+		spec, err := c.buildSpec("tmpl", nil)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(spec.GetUserDataSecret().GetName()).To(Equal("cloud-init"))
+	})
 })
 
 var _ = Describe("buildSpecFromCatalogItem", func() {
+	It("should send the resolved instance type ID", func() {
+		c := &runnerContext{}
+		c.args.instanceType = "instance-type-id"
+		spec, err := c.buildSpecFromCatalogItem("cat-001")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetInstanceType().GetId()).To(Equal("instance-type-id"))
+	})
+
 	It("should populate attachments when network-attachment flags are set", func() {
 		c := &runnerContext{}
 		c.args.networkAttachments = []string{"n1", "subnet=n2,security-groups=g1"}
@@ -160,6 +185,15 @@ var _ = Describe("buildSpecFromCatalogItem", func() {
 
 		Expect(spec.HasDiskImage()).To(BeFalse())
 	})
+
+	It("should set user_data_secret when user-data-secret is provided", func() {
+		c := &runnerContext{}
+		c.args.userDataSecret = "cloud-init"
+		spec, err := c.buildSpecFromCatalogItem("cat-006")
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(spec.GetUserDataSecret().GetName()).To(Equal("cloud-init"))
+	})
 })
 
 var _ = Describe("Create computeinstance flag registration", func() {
@@ -208,6 +242,17 @@ var _ = Describe("Create computeinstance flag registration", func() {
 })
 
 var _ = Describe("Create computeinstance flag validation", func() {
+	It("should reject user data and a user data secret together", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		cmd.SetArgs([]string{"--template", "tpl-001", "--user-data", "data", "--user-data-secret", "cloud-init"})
+		err := cmd.Execute()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("user-data"))
+		Expect(err.Error()).To(ContainSubstring("user-data-secret"))
+	})
+
 	It("should return error when both --catalog-item and --template are set", func() {
 		cmd := Cmd()
 		cmd.SetOut(GinkgoWriter)
@@ -230,6 +275,46 @@ var _ = Describe("Create computeinstance flag validation", func() {
 		Expect(err.Error()).To(ContainSubstring("at least one of the flags"))
 		Expect(err.Error()).To(ContainSubstring("catalog-item"))
 		Expect(err.Error()).To(ContainSubstring("template"))
+	})
+})
+
+var _ = Describe("buildBootDisk", func() {
+	It("should return nil when neither size nor storage tier is set", func() {
+		c := &runnerContext{}
+		disk, err := c.buildBootDisk()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disk).To(BeNil())
+	})
+
+	It("should return disk with only storage tier when size is not set", func() {
+		c := &runnerContext{}
+		c.args.bootDiskStorageTier = "premium"
+		disk, err := c.buildBootDisk()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disk).NotTo(BeNil())
+		Expect(disk.GetStorageTier().GetName()).To(Equal("premium"))
+		Expect(disk.HasSizeGib()).To(BeFalse())
+	})
+
+	It("should return disk with both fields when both are set", func() {
+		c := &runnerContext{}
+		c.args.bootDiskSizeGiB = 100
+		c.args.bootDiskStorageTier = "premium"
+		disk, err := c.buildBootDisk()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disk).NotTo(BeNil())
+		Expect(disk.GetSizeGib()).To(Equal(int32(100)))
+		Expect(disk.GetStorageTier().GetName()).To(Equal("premium"))
+	})
+
+	It("should return disk with only size when storage tier is not set", func() {
+		c := &runnerContext{}
+		c.args.bootDiskSizeGiB = 50
+		disk, err := c.buildBootDisk()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(disk).NotTo(BeNil())
+		Expect(disk.GetSizeGib()).To(Equal(int32(50)))
+		Expect(disk.HasStorageTier()).To(BeFalse())
 	})
 })
 
@@ -257,21 +342,49 @@ var _ = Describe("--additional-disk flag parsing", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(disks).To(HaveLen(1))
 		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
-		Expect(disks[0].GetStorageTier()).To(Equal("e2e-x"))
+		Expect(disks[0].GetStorageTier().GetName()).To(Equal("e2e-x"))
 	})
 
-	It("should treat each flag occurrence as a distinct disk", func() {
+	It("should parse multiple disks with different storage tiers", func() {
+		raw := rawDisks(
+			"--additional-disk", "size=50,storage-tier=fast",
+			"--additional-disk", "size=100,storage-tier=archive",
+		)
+		Expect(raw).To(Equal([]string{
+			"size=50,storage-tier=fast",
+			"size=100,storage-tier=archive",
+		}))
+
+		disks, err := parseAdditionalDisks(raw)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(disks).To(HaveLen(2))
+		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
+		Expect(disks[0].GetStorageTier().GetName()).To(Equal("fast"))
+		Expect(disks[1].GetSizeGib()).To(Equal(int32(100)))
+		Expect(disks[1].GetStorageTier().GetName()).To(Equal("archive"))
+	})
+
+	It("should reject a bare integer additional disk", func() {
 		raw := rawDisks(
 			"--additional-disk", "size=50,storage-tier=e2e-x",
 			"--additional-disk", "100",
 		)
 		Expect(raw).To(Equal([]string{"size=50,storage-tier=e2e-x", "100"}))
 
-		disks, err := parseAdditionalDisks(raw)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(disks).To(HaveLen(2))
-		Expect(disks[0].GetSizeGib()).To(Equal(int32(50)))
-		Expect(disks[0].GetStorageTier()).To(Equal("e2e-x"))
-		Expect(disks[1].GetSizeGib()).To(Equal(int32(100)))
+		_, err := parseAdditionalDisks(raw)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("storage-tier=<name>"))
+	})
+
+	It("should reject an additional disk without a storage tier", func() {
+		_, err := parseAdditionalDisks([]string{"size=100"})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("storage-tier=<name>"))
+	})
+
+	It("should reject an additional disk with an empty storage tier", func() {
+		_, err := parseAdditionalDisks([]string{"size=100,storage-tier="})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("value is empty"))
 	})
 })

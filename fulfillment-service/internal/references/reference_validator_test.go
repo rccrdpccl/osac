@@ -27,8 +27,8 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	testsv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/tests/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	testsv1 "github.com/osac-project/osac/proto/gen/osac/tests/v1"
 )
 
 var _ = Describe("Reference validator", func() {
@@ -80,6 +80,54 @@ var _ = Describe("Reference validator", func() {
 				})
 			}).To(PanicWith(ContainSubstring("Register called after interceptor started serving")))
 		})
+	})
+
+	It("skips only configured reference paths for configured methods", func() {
+		updateMethod := "/osac.private.v1.ComputeInstances/Update"
+		v, err := NewReferenceValidator().SetLogger(logger).
+			SetExcludedReferencePaths([]string{updateMethod}, "object.spec.target").
+			Build()
+		Expect(err).ToNot(HaveOccurred())
+		targetLookups := 0
+		v.Register("osac.tests.v1.TestTargetReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+			targetLookups++
+			Expect(tenant).To(Equal("tenant-a"))
+			return nil, &errRefNotFound{identifier: name}
+		})
+		localLookups := 0
+		v.Register("osac.tests.v1.TestTargetLocalReference", func(ctx context.Context, tenant, project, id, name string) (*ResolvedRef, error) {
+			localLookups++
+			return &ResolvedRef{ID: "local-id", Name: name}, nil
+		})
+		request := testsv1.UpdateTestResourceWithRefsRequest_builder{Object: testsv1.TestResourceWithRefs_builder{
+			Metadata: testsv1.Metadata_builder{Tenant: "tenant-a"}.Build(),
+			Spec: testsv1.TestRefSpec_builder{
+				Target:      testsv1.TestTargetReference_builder{Name: "excluded"}.Build(),
+				LocalTarget: testsv1.TestTargetLocalReference_builder{Name: "validated"}.Build(),
+			}.Build(),
+		}.Build()}.Build()
+		called := false
+		handler := func(ctx context.Context, request any) (any, error) { called = true; return nil, nil }
+		_, err = v.UnaryServer(context.Background(), request, &grpc.UnaryServerInfo{FullMethod: updateMethod}, handler)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(called).To(BeTrue())
+		Expect(targetLookups).To(BeZero())
+		Expect(localLookups).To(Equal(1))
+
+		called = false
+		_, err = v.UnaryServer(context.Background(), request,
+			&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.OtherResources/Update"}, handler)
+		Expect(err).To(HaveOccurred())
+		Expect(called).To(BeFalse())
+		Expect(targetLookups).To(Equal(1))
+		Expect(localLookups).To(Equal(2))
+
+		_, err = v.UnaryServer(context.Background(), request,
+			&grpc.UnaryServerInfo{FullMethod: "/osac.private.v1.ComputeInstances/Create"}, handler)
+		Expect(err).To(HaveOccurred())
+		Expect(called).To(BeFalse())
+		Expect(targetLookups).To(Equal(2))
+		Expect(localLookups).To(Equal(3))
 	})
 
 	Describe("Method filtering", func() {
@@ -590,6 +638,17 @@ var _ = Describe("Reference validator", func() {
 				SetLogger(logger).
 				Build()
 			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("Reports whether a lookup is registered", func() {
+			Expect(validator.HasLookup("osac.tests.v1.TestTargetReference")).To(BeFalse())
+			validator.Register("osac.tests.v1.TestTargetReference", func(
+				ctx context.Context, tenant, project, id, name string,
+			) (*ResolvedRef, error) {
+				return &ResolvedRef{ID: id, Tenant: tenant, Project: project, Name: name}, nil
+			})
+			Expect(validator.HasLookup("osac.tests.v1.TestTargetReference")).To(BeTrue())
+			Expect(validator.HasLookup("osac.tests.v1.TestTargetLocalReference")).To(BeFalse())
 		})
 
 		It("Calls registered lookup function with correct arguments", func() {

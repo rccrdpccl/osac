@@ -64,13 +64,6 @@ func (p *GuestTenancyLogic) DetermineDefaultTenant(_ context.Context) (result st
 	return
 }
 
-// DetermineVisibleTenants returns a set containing both the guest and shared tenants, allowing guest users to see
-// objects from both tenants.
-func (p *GuestTenancyLogic) DetermineVisibleTenants(_ context.Context) (result collections.Set[string], err error) {
-	result = GuestTenants.Union(SharedTenants)
-	return
-}
-
 // DetermineVisibility returns a visibility that grants access only to the shared tenant.
 func (p *GuestTenancyLogic) DetermineVisibility(_ context.Context) (result *Visibility, err error) {
 	result, err = NewVisibility().

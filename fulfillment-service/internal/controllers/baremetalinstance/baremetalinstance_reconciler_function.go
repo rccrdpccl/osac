@@ -13,7 +13,9 @@ language governing permissions and limitations under the License.
 
 package baremetalinstance
 
-//go:generate mockgen -source=../../api/osac/private/v1/baremetal_instances_service_grpc.pb.go -destination=bare_metal_instances_client_mock.go -package=baremetalinstance BareMetalInstancesClient
+//go:generate mockgen -destination=bare_metal_instances_client_mock.go -package=baremetalinstance github.com/osac-project/osac/proto/gen/osac/private/v1 BareMetalInstancesClient
+//go:generate mockgen -destination=secrets_client_mock.go -package=baremetalinstance github.com/osac-project/osac/proto/gen/osac/private/v1 SecretsClient
+//go:generate mockgen -destination=disk_images_client_mock.go -package=baremetalinstance github.com/osac-project/osac/proto/gen/osac/private/v1 DiskImagesClient
 
 import (
 	"context"
@@ -27,21 +29,21 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const objectPrefix = "bmi-"
@@ -61,12 +63,15 @@ type FunctionBuilder struct {
 }
 
 type function struct {
-	logger                              *slog.Logger
-	hubCache                            controllers.HubCache
-	bareMetalInstancesClient            privatev1.BareMetalInstancesClient
-	bareMetalInstanceCatalogItemsClient privatev1.BareMetalInstanceCatalogItemsClient
-	hubsClient                          privatev1.HubsClient
-	maskCalculator                      *masks.Calculator
+	logger                           *slog.Logger
+	hubCache                         controllers.HubCache
+	bareMetalInstancesClient         privatev1.BareMetalInstancesClient
+	bareMetalInstanceTypesClient     privatev1.BareMetalInstanceTypesClient
+	bareMetalInstanceTemplatesClient privatev1.BareMetalInstanceTemplatesClient
+	hubsClient                       privatev1.HubsClient
+	secretsClient                    privatev1.SecretsClient
+	diskImagesClient                 privatev1.DiskImagesClient
+	maskCalculator                   *masks.Calculator
 }
 
 type task struct {
@@ -117,12 +122,15 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 	}
 
 	object := &function{
-		logger:                              b.logger,
-		bareMetalInstancesClient:            privatev1.NewBareMetalInstancesClient(b.connection),
-		bareMetalInstanceCatalogItemsClient: privatev1.NewBareMetalInstanceCatalogItemsClient(b.connection),
-		hubsClient:                          privatev1.NewHubsClient(b.connection),
-		hubCache:                            b.hubCache,
-		maskCalculator:                      masks.NewCalculator().Build(),
+		logger:                           b.logger,
+		bareMetalInstancesClient:         privatev1.NewBareMetalInstancesClient(b.connection),
+		bareMetalInstanceTypesClient:     privatev1.NewBareMetalInstanceTypesClient(b.connection),
+		bareMetalInstanceTemplatesClient: privatev1.NewBareMetalInstanceTemplatesClient(b.connection),
+		hubsClient:                       privatev1.NewHubsClient(b.connection),
+		secretsClient:                    privatev1.NewSecretsClient(b.connection),
+		diskImagesClient:                 privatev1.NewDiskImagesClient(b.connection),
+		hubCache:                         b.hubCache,
+		maskCalculator:                   masks.NewCalculator().Build(),
 	}
 	result = object.run
 	return
@@ -175,7 +183,7 @@ func (t *task) update(ctx context.Context) error {
 		return err
 	}
 
-	if t.bareMetalInstance.GetSpec().HasUserData() {
+	if t.bareMetalInstance.GetSpec().HasUserData() || t.bareMetalInstance.GetSpec().GetUserDataSecret() != nil {
 		t.userDataSecretName = fmt.Sprintf("%s%s", t.bareMetalInstance.GetId(), userDataSecretSuffix)
 	}
 
@@ -215,7 +223,7 @@ func (t *task) setDefaults() {
 		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
 	}
 	if t.bareMetalInstance.GetStatus().GetState() == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_UNSPECIFIED {
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING, nil)
 	}
 	for value := range privatev1.BareMetalInstanceConditionType_name {
 		if value != 0 {
@@ -252,7 +260,7 @@ func (t *task) delete(ctx context.Context) (err error) {
 		return nil
 	}
 
-	t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING)
+	t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING, nil)
 	t.updateCondition(
 		privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_READY,
 		privatev1.ConditionStatus_CONDITION_STATUS_FALSE, "", "")
@@ -396,7 +404,7 @@ func (t *task) setFailed(err error) {
 	if !t.bareMetalInstance.HasStatus() {
 		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
 	}
-	t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED)
+	t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, nil)
 	t.updateCondition(
 		privatev1.BareMetalInstanceConditionType_BARE_METAL_INSTANCE_CONDITION_TYPE_CONFIGURATION_APPLIED,
 		privatev1.ConditionStatus_CONDITION_STATUS_FALSE,
@@ -540,33 +548,49 @@ func (t *task) syncStatus(object *bmfov1alpha1.BareMetalInstance) {
 func (t *task) syncState(object *bmfov1alpha1.BareMetalInstance, powerSynced *metav1.Condition) {
 	switch object.Status.Phase {
 	case bmfov1alpha1.BareMetalInstancePhaseFailed:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, nil)
 		return
 	case bmfov1alpha1.BareMetalInstancePhaseDeleting:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING, nil)
 		return
 	}
 
 	if powerSynced == nil {
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING, nil)
 		return
 	}
 
 	switch {
 	case powerSynced.Status == metav1.ConditionTrue && powerSynced.Reason == bmfov1alpha1.HostConditionReasonPowerOn:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_RUNNING, &powerSynced.LastTransitionTime)
 	case powerSynced.Status == metav1.ConditionTrue && powerSynced.Reason == bmfov1alpha1.HostConditionReasonPowerOff:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPED)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPED, &powerSynced.LastTransitionTime)
 	case powerSynced.Status == metav1.ConditionFalse && powerSynced.Reason == bmfov1alpha1.HostConditionReasonProgressing:
 		if object.Spec.RunStrategy == bmfov1alpha1.RunStrategyHalted {
-			t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPING)
+			t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STOPPING, &powerSynced.LastTransitionTime)
 		} else {
-			t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STARTING)
+			t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_STARTING, &powerSynced.LastTransitionTime)
 		}
 	case powerSynced.Status == metav1.ConditionFalse:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_FAILED, &powerSynced.LastTransitionTime)
 	default:
-		t.bareMetalInstance.GetStatus().SetState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING)
+		t.setState(privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_PROVISIONING, &powerSynced.LastTransitionTime)
+	}
+}
+
+func (t *task) setState(state privatev1.BareMetalInstanceState, transitionTime *metav1.Time) {
+	if !t.bareMetalInstance.HasStatus() {
+		t.bareMetalInstance.SetStatus(&privatev1.BareMetalInstanceStatus{})
+	}
+	status := t.bareMetalInstance.GetStatus()
+	if status.GetState() == state {
+		return
+	}
+	status.SetState(state)
+	if transitionTime != nil && !transitionTime.IsZero() {
+		status.SetStateTransitionTime(timestamppb.New(transitionTime.Time))
+	} else {
+		status.SetStateTransitionTime(timestamppb.Now())
 	}
 }
 
@@ -610,16 +634,62 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 	}
 	object.Annotations[annotations.Tenant] = t.bareMetalInstance.GetMetadata().GetTenant()
 
-	catalogItemID := t.bareMetalInstance.GetSpec().GetCatalogItem()
-	catalogItemResp, err := t.r.bareMetalInstanceCatalogItemsClient.Get(ctx, privatev1.BareMetalInstanceCatalogItemsGetRequest_builder{
-		Id: catalogItemID.GetId(),
-	}.Build())
-	if err != nil {
-		return fmt.Errorf("failed to get catalog item '%s': %w", catalogItemID, err)
+	// The API materializes the Template; the catalog reference is provenance only.
+	templateID := t.bareMetalInstance.GetSpec().GetTemplate().GetId()
+	if templateID == "" {
+		return fmt.Errorf("BareMetalInstance must have a materialized template")
 	}
 
-	object.Spec.HostType = defaultHostType
-	object.Spec.TemplateID = catalogItemResp.GetObject().GetTemplate().GetId()
+	// Resolve host selection labels for the CRD's Selector.HostSelector. When an instance type is
+	// specified, map its host_label_selector. Otherwise fall back to the template's host_type
+	// (legacy path), which the backends map to the osac.openshift.io/host-type label.
+	if object.Spec.Selector.HostSelector == nil {
+		object.Spec.Selector.HostSelector = make(map[string]string)
+	}
+	if t.bareMetalInstance.GetSpec().HasInstanceType() {
+		instanceTypeRef := t.bareMetalInstance.GetSpec().GetInstanceType()
+		instanceTypeResp, err := t.r.bareMetalInstanceTypesClient.Get(ctx, privatev1.BareMetalInstanceTypesGetRequest_builder{
+			Id: instanceTypeRef.GetId(),
+		}.Build())
+		if err != nil {
+			return fmt.Errorf("failed to get instance type '%s': %w", instanceTypeRef.GetId(), err)
+		}
+
+		instanceType := instanceTypeResp.GetObject()
+		if instanceType.GetSpec().HasHostLabelSelector() {
+			for key, value := range instanceType.GetSpec().GetHostLabelSelector().GetMatchLabels() {
+				object.Spec.Selector.HostSelector[key] = value
+			}
+		}
+	} else {
+		// Fall back to template host_type when no instance type is specified.
+		templateResp, err := t.r.bareMetalInstanceTemplatesClient.Get(ctx, privatev1.BareMetalInstanceTemplatesGetRequest_builder{
+			Id: templateID,
+		}.Build())
+		if err != nil {
+			return fmt.Errorf("failed to get instance template '%s': %w", templateID, err)
+		}
+		hostType := templateResp.GetObject().GetHostType()
+		if hostType == "" {
+			hostType = defaultHostType
+		}
+		object.Spec.Selector.HostSelector["hostType"] = hostType
+	}
+
+	// Validate that HostSelector is non-empty after resolving from instance type or template.
+	// The CRD requires MinProperties=1, so an empty selector would fail K8s admission.
+	// Return an explicit error here rather than letting K8s reject with a generic validation error.
+	if len(object.Spec.Selector.HostSelector) == 0 {
+		if t.bareMetalInstance.GetSpec().HasInstanceType() {
+			return fmt.Errorf(
+				"instance type '%s' has no host_label_selector - cannot determine host selection",
+				t.bareMetalInstance.GetSpec().GetInstanceType().GetId(),
+			)
+		}
+		return fmt.Errorf("cannot determine host selection: no instance_type and no template host_type")
+	}
+
+	object.Spec.TemplateID = templateID
 	object.Spec.TemplateParameters = ""
 	object.Spec.RunStrategy = bmfov1alpha1.RunStrategyUnspecified
 	object.Spec.RestartTrigger = t.bareMetalInstance.GetSpec().GetRestartTrigger()
@@ -643,13 +713,15 @@ func (t *task) mutateBMI(ctx context.Context, object *bmfov1alpha1.BareMetalInst
 	if t.userDataSecretName != "" {
 		params["userDataSecret"] = t.userDataSecretName
 	}
-	if t.bareMetalInstance.GetSpec().HasImage() {
-		params["imageURL"] = t.bareMetalInstance.GetSpec().GetImage().GetSourceRef()
-		if st := t.bareMetalInstance.GetSpec().GetImage().GetSourceType(); st != "" {
-			params["imageSourceType"] = st
-		} else {
-			delete(params, "imageSourceType")
+	if diskImageRef := t.bareMetalInstance.GetSpec().GetDiskImage(); diskImageRef != nil {
+		diskImageKey := controllers.RefKeyStr(diskImageRef)
+		diResp, diErr := t.r.diskImagesClient.Get(ctx, privatev1.DiskImagesGetRequest_builder{
+			Id: diskImageKey,
+		}.Build())
+		if diErr != nil {
+			return fmt.Errorf("failed to resolve disk image '%s': %w", diskImageKey, diErr)
 		}
+		params["imageURL"] = diResp.GetObject().GetSpec().GetSourceRef()
 	}
 	if len(params) > 0 {
 		paramsJSON, err := json.Marshal(params)
@@ -696,6 +768,10 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *bmfov1alpha1.Bar
 	if t.userDataSecretName == "" {
 		return nil
 	}
+	userData, err := t.resolveUserData(ctx)
+	if err != nil {
+		return err
+	}
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -714,14 +790,17 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *bmfov1alpha1.Bar
 			},
 		},
 		StringData: map[string]string{
-			userDataSecretKey: t.bareMetalInstance.GetSpec().GetUserData(),
+			userDataSecretKey: userData,
 		},
 	}
 
-	err := t.hubClient.Create(ctx, secret)
-	if apierrors.IsAlreadyExists(err) {
+	_, err = controllerutil.CreateOrPatch(ctx, t.hubClient, secret, func() error {
+		if secret.StringData == nil {
+			secret.StringData = map[string]string{}
+		}
+		secret.StringData[userDataSecretKey] = userData
 		return nil
-	}
+	})
 	if err != nil {
 		return err
 	}
@@ -732,4 +811,26 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *bmfov1alpha1.Bar
 		slog.String("name", secret.GetName()),
 	)
 	return nil
+}
+
+func (t *task) resolveUserData(ctx context.Context) (string, error) {
+	ref := t.bareMetalInstance.GetSpec().GetUserDataSecret()
+	if ref == nil {
+		return t.bareMetalInstance.GetSpec().GetUserData(), nil
+	}
+	if t.r.secretsClient == nil {
+		return "", errors.New("secrets client is required to resolve user_data_secret")
+	}
+	if ref.GetId() == "" {
+		return "", errors.New("user_data_secret must have an id")
+	}
+	response, err := t.r.secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{Id: ref.GetId()}.Build())
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch user_data_secret: %w", err)
+	}
+	value, ok := response.GetObject().GetData()[userDataSecretKey]
+	if !ok || len(value) == 0 {
+		return "", fmt.Errorf("secret %q is missing non-empty data[%q]", ref.GetId(), userDataSecretKey)
+	}
+	return string(value), nil
 }

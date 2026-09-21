@@ -12,7 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // TemplateParameterDefinition represents a common interface for template parameter definitions
@@ -154,6 +154,33 @@ func ProcessTemplateParametersWithDefaults(
 	}
 
 	return actualParameters
+}
+
+// ApplyTemplateParameterDefaultsAndValidate returns detached Template inputs after filling defaults.
+// Supplied values, including unknown names and explicit nils, are retained for validation rather than
+// silently dropped. It checks requiredness and types before decoding payloads and checking temporal
+// values. Neither the Template nor the supplied map is mutated; invalid values return gRPC errors.
+func ApplyTemplateParameterDefaultsAndValidate(template Template, provided map[string]*anypb.Any) (map[string]*anypb.Any, error) {
+	resolved := ProcessTemplateParametersWithDefaults(template, provided)
+	// Keep unknown and explicitly nil parameters for validation instead of silently dropping them.
+	for name, value := range provided {
+		resolved[name] = proto.Clone(value).(*anypb.Any)
+	}
+	if err := ValidateTemplateParameters(template, resolved); err != nil {
+		return nil, err
+	}
+	for name, value := range resolved {
+		payload, err := value.UnmarshalNew()
+		if err != nil {
+			return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'template_parameters.%s': invalid parameter payload", name)
+		}
+		if valid, ok := payload.(interface{ CheckValid() error }); ok {
+			if err := valid.CheckValid(); err != nil {
+				return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'template_parameters.%s': %s", name, err.Error())
+			}
+		}
+	}
+	return resolved, nil
 }
 
 // ClusterTemplateAdapter adapts ClusterTemplate to the Template interface

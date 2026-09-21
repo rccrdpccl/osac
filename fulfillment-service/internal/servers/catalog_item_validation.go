@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Red Hat Inc.
+Copyright (c) 2026 Red Hat Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the
 License. You may obtain a copy of the License at
@@ -14,172 +14,24 @@ language governing permissions and limitations under the License.
 package servers
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"slices"
-	"strconv"
-	"strings"
-	"time"
-
-	"github.com/santhosh-tekuri/jsonschema/v6"
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
-	"github.com/osac-project/osac/fulfillment-service/internal/maputil"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // catalogItem is implemented by ClusterCatalogItem, ComputeInstanceCatalogItem,
 // and BareMetalInstanceCatalogItem.
 type catalogItem interface {
-	proto.Message
 	GetPublished() bool
-	GetFieldDefinitions() []*privatev1.FieldDefinition
 	GetMetadata() *privatev1.Metadata
 }
 
-// resourceRef is the common interface for typed resource reference messages.
-type resourceRef interface {
-	GetId() string
-	GetName() string
-}
-
-// refKey extracts a display/lookup key from a typed resource reference.
-// Returns the id if set, otherwise the name.
-func refKey(ref resourceRef) string {
-	if id := ref.GetId(); id != "" {
-		return id
-	}
-	return ref.GetName()
-}
-
-// validateFieldDefinitions checks that field definitions are well-formed:
-//   - Non-editable fields must have a default value.
-//   - Fields with a validation_schema must contain valid JSON.
-func validateFieldDefinitions(fieldDefinitions []*privatev1.FieldDefinition) error {
-	for _, fd := range fieldDefinitions {
-		if !fd.GetEditable() && !fd.HasDefault() {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"non-editable field '%s' must have a default value", fd.GetPath())
-		}
-		if schema := fd.GetValidationSchema(); schema != "" {
-			var doc any
-			if err := json.Unmarshal([]byte(schema), &doc); err != nil {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"field '%s' has invalid validation_schema: %v", fd.GetPath(), err)
-			}
-		}
-	}
-	return nil
-}
-
-// applyFieldDefinitions validates and applies field definitions from a catalog item against a resource spec.
-// Rejects any spec field not listed in field_definitions (except system fields catalog_item and template).
-// For non-editable fields: rejects user-provided values; applies the catalog item default.
-// For editable fields with user values: validates against the JSON Schema.
-// For editable fields without user values: applies the catalog item default.
-func applyFieldDefinitions(
-	spec proto.Message,
-	fieldDefinitions []*privatev1.FieldDefinition,
-) error {
-	if len(fieldDefinitions) == 0 {
-		return nil
-	}
-
-	marshaller := protojson.MarshalOptions{UseProtoNames: true}
-	specJSON, err := marshaller.Marshal(spec)
-	if err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to marshal spec: %v", err)
-	}
-
-	var specMap map[string]any
-	if err := json.Unmarshal(specJSON, &specMap); err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to parse spec: %v", err)
-	}
-
-	allowedPaths := map[string]bool{
-		"catalog_item": true,
-		"template":     true,
-	}
-	for _, fd := range fieldDefinitions {
-		if fd.GetPath() != "" {
-			allowedPaths[fd.GetPath()] = true
-		}
-	}
-	var unlisted []string
-	for _, path := range collectLeafPaths(specMap, "") {
-		if !isPathCovered(path, allowedPaths) {
-			unlisted = append(unlisted, path)
-		}
-	}
-	if len(unlisted) > 0 {
-		slices.Sort(unlisted)
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"fields not allowed by catalog item: %s", strings.Join(unlisted, ", "))
-	}
-
-	compiler := jsonschema.NewCompiler()
-
-	for _, fd := range fieldDefinitions {
-		path := fd.GetPath()
-		if path == "" {
-			continue
-		}
-
-		defaultVal := fd.GetDefault()
-		userVal, userHasValue := maputil.GetNestedValue(specMap, path)
-
-		if !fd.GetEditable() {
-			if userHasValue && userVal != nil {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"field '%s' is not editable", path)
-			}
-			if err := applyDefault(specMap, path, defaultVal); err != nil {
-				return err
-			}
-		} else {
-			if userHasValue && userVal != nil {
-				schema := fd.GetValidationSchema()
-				if schema != "" {
-					if err := validateAgainstSchema(compiler, path, unwrapAnyValue(path, userVal), schema); err != nil {
-						return err
-					}
-				}
-			} else {
-				if defaultVal == nil {
-					return grpcstatus.Errorf(grpccodes.InvalidArgument,
-						"field '%s' is required but no value was provided and no default is defined", path)
-				}
-				if err := applyDefault(specMap, path, defaultVal); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	updatedJSON, err := json.Marshal(specMap)
-	if err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to serialize updated spec: %v", err)
-	}
-
-	proto.Reset(spec)
-	if err := protojson.Unmarshal(updatedJSON, spec); err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal, "failed to apply updated spec: %v", err)
-	}
-
-	return nil
-}
-
-// validateCatalogItemAccess checks that a catalog item is published and not deleted.
-// Tenant visibility is enforced by the GenericDAO's tenancy logic at the query level.
-func validateCatalogItemAccess(item catalogItem, ref string) error {
+// validateCatalogItemForCreation allows a new resource to use only a published, active Catalog
+// Item. The DAO lookup has already limited the item to what this caller may see.
+func validateCatalogItemForCreation(item catalogItem, ref string) error {
 	if item.GetMetadata().HasDeletionTimestamp() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"catalog item '%s' has been deleted", ref)
@@ -191,317 +43,31 @@ func validateCatalogItemAccess(item catalogItem, ref string) error {
 	return nil
 }
 
-func applyDefault(specMap map[string]any, path string, defaultVal *structpb.Value) error {
-	if defaultVal == nil {
-		return nil
+// preserveCatalogItemProvenance keeps an object's original spec.catalog_item reference. Updates
+// compare any supplied ID, name, and scope with the stored reference without fetching the Catalog
+// Item, which may have been deleted. An ID-only match is accepted; changing or clearing the
+// reference is rejected.
+func preserveCatalogItemProvenance[T interface {
+	fullResourceReference
+	proto.Message
+}](current, candidate T, mask *fieldmaskpb.FieldMask) (T, error) {
+	if proto.Equal(current, candidate) || (mask == nil && !candidate.ProtoReflect().IsValid()) {
+		return cloneMessage(current), nil
 	}
-	defaultAny, err := defaultVal.MarshalJSON()
-	if err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal,
-			"failed to marshal default for field '%s': %v", path, err)
+	if !current.ProtoReflect().IsValid() || !candidate.ProtoReflect().IsValid() ||
+		candidate.GetId() != current.GetId() ||
+		(candidate.GetName() != "" && candidate.GetName() != current.GetName()) ||
+		(candidate.GetProject() != "" && candidate.GetProject() != current.GetProject()) ||
+		(candidate.GetShared() && !current.GetShared()) {
+		return candidate, grpcstatus.Errorf(grpccodes.InvalidArgument, "cannot change spec.catalog_item from '%s' to '%s': catalog item is immutable", refKey(current), refKey(candidate))
 	}
-	var parsed any
-	if err := json.Unmarshal(defaultAny, &parsed); err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal,
-			"failed to parse default for field '%s': %v", path, err)
-	}
-	if strings.HasPrefix(path, "template_parameters.") {
-		parsed = wrapValueAsAny(parsed)
-	}
-	// The disk_image default is normally already a DiskImageReference object
-	// ({"id": ..., "name": ...}), normalized on catalog-item create/update (see
-	// validateFieldDefinitionsDiskImage), so its id resolves the ComputeInstance reference
-	// unambiguously. This wrap is a defensive fallback: a bare-string default is converted to the
-	// {"name": ...} object the proto DiskImageReference field expects.
-	if path == "disk_image" {
-		if s, ok := parsed.(string); ok {
-			parsed = map[string]any{"name": s}
+	// A false shared flag has no protobuf presence; a mask targeting that flag makes it explicit.
+	for _, path := range mask.GetPaths() {
+		if (path == "spec.catalog_item.shared" && candidate.GetShared() != current.GetShared()) ||
+			(path == "spec.catalog_item.project" && candidate.GetProject() != current.GetProject()) ||
+			(path == "spec.catalog_item.name" && candidate.GetName() != current.GetName()) {
+			return candidate, grpcstatus.Errorf(grpccodes.InvalidArgument, "cannot change spec.catalog_item from '%s' to '%s': catalog item is immutable", refKey(current), refKey(candidate))
 		}
 	}
-	maputil.SetNestedValue(specMap, path, parsed)
-	return nil
-}
-
-// wrapValueAsAny wraps a Go value in the protobuf Any JSON format required by
-// map<string, google.protobuf.Any> fields. Int64 values are encoded as strings
-// per the proto3 JSON mapping.
-func wrapValueAsAny(value any) map[string]any {
-	switch v := value.(type) {
-	case bool:
-		return map[string]any{
-			"@type": "type.googleapis.com/google.protobuf.BoolValue",
-			"value": v,
-		}
-	case float64:
-		if v == float64(int64(v)) {
-			return map[string]any{
-				"@type": "type.googleapis.com/google.protobuf.Int64Value",
-				"value": fmt.Sprintf("%d", int64(v)),
-			}
-		}
-		return map[string]any{
-			"@type": "type.googleapis.com/google.protobuf.DoubleValue",
-			"value": v,
-		}
-	default:
-		return map[string]any{
-			"@type": "type.googleapis.com/google.protobuf.StringValue",
-			"value": fmt.Sprintf("%v", v),
-		}
-	}
-}
-
-// unwrapAnyValue extracts the inner value from a protobuf Any JSON wrapper
-// for template_parameters paths. For other paths, returns the value unchanged.
-func unwrapAnyValue(path string, val any) any {
-	if !strings.HasPrefix(path, "template_parameters.") {
-		return val
-	}
-	m, ok := val.(map[string]any)
-	if !ok {
-		return val
-	}
-	v, exists := m["value"]
-	if !exists {
-		return val
-	}
-	typeURL, _ := m["@type"].(string)
-	if strings.HasSuffix(typeURL, "Int64Value") || strings.HasSuffix(typeURL, "UInt64Value") {
-		if s, ok := v.(string); ok {
-			if f, err := strconv.ParseFloat(s, 64); err == nil {
-				return f
-			}
-		}
-	}
-	return v
-}
-
-func validateAgainstSchema(compiler *jsonschema.Compiler, path string, value any, schemaStr string) error {
-	resourceName := "schema_" + strings.ReplaceAll(path, ".", "_") + ".json"
-	var schemaDoc any
-	if err := json.Unmarshal([]byte(schemaStr), &schemaDoc); err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal,
-			"invalid validation schema for field '%s': %v", path, err)
-	}
-	if err := compiler.AddResource(resourceName, schemaDoc); err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal,
-			"invalid validation schema for field '%s': %v", path, err)
-	}
-	schema, err := compiler.Compile(resourceName)
-	if err != nil {
-		return grpcstatus.Errorf(grpccodes.Internal,
-			"failed to compile validation schema for field '%s': %v", path, err)
-	}
-	if err := schema.Validate(value); err != nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"validation failed for field '%s': %v", path, err)
-	}
-	return nil
-}
-
-func collectLeafPaths(m map[string]any, prefix string) []string {
-	var paths []string
-	for key, val := range m {
-		fullPath := key
-		if prefix != "" {
-			fullPath = prefix + "." + key
-		}
-		if nested, ok := val.(map[string]any); ok {
-			// Treat template_parameters entries as opaque leaves —
-			// their inner @type/value keys are protobuf Any encoding details.
-			if prefix == "template_parameters" {
-				paths = append(paths, fullPath)
-			} else {
-				paths = append(paths, collectLeafPaths(nested, fullPath)...)
-			}
-		} else {
-			paths = append(paths, fullPath)
-		}
-	}
-	return paths
-}
-
-func isPathCovered(path string, allowedPaths map[string]bool) bool {
-	if allowedPaths[path] {
-		return true
-	}
-	for i := range path {
-		if path[i] == '.' && allowedPaths[path[:i]] {
-			return true
-		}
-	}
-	return false
-}
-
-// validateInstanceTypeState looks up an instance type by name and validates its state.
-// Returns warnings for DEPRECATED types, error for OBSOLETE or not-found types.
-// The source parameter provides context for error messages (e.g., " in spec_defaults", " in field_definitions").
-// Pass an empty string for source when validating directly on a ComputeInstance.
-func validateInstanceTypeState(
-	ctx context.Context,
-	instanceTypesDao *dao.GenericDAO[*privatev1.InstanceType],
-	instanceTypeName string,
-	source string,
-) ([]string, error) {
-	getResponse, err := instanceTypesDao.Get().
-		SetId(instanceTypeName).
-		Do(ctx)
-	if err != nil {
-		var notFoundErr *dao.ErrNotFound
-		if errors.As(err, &notFoundErr) {
-			return nil, grpcstatus.Errorf(grpccodes.NotFound,
-				"instance type '%s'%s not found", instanceTypeName, source)
-		}
-		return nil, grpcstatus.Errorf(grpccodes.Internal,
-			"failed to retrieve instance type '%s'", instanceTypeName)
-	}
-
-	it := getResponse.GetObject()
-	state := it.GetSpec().GetState()
-	var warnings []string
-
-	switch state {
-	case privatev1.InstanceTypeState_INSTANCE_TYPE_STATE_OBSOLETE:
-		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"instance type '%s'%s is obsolete and cannot be used",
-			instanceTypeName, source)
-	case privatev1.InstanceTypeState_INSTANCE_TYPE_STATE_DEPRECATED:
-		warning := fmt.Sprintf("Instance type '%s'%s is deprecated", instanceTypeName, source)
-		dep := it.GetSpec().GetDeprecation()
-		if dep != nil {
-			if dep.GetObsolescenceTimestamp() != nil {
-				warning += fmt.Sprintf(" and will become obsolete on %s",
-					dep.GetObsolescenceTimestamp().AsTime().Format(time.RFC3339))
-			}
-			if dep.GetReplacement() != nil {
-				warning += fmt.Sprintf(". Consider using '%s' instead", refKey(dep.GetReplacement()))
-			}
-		}
-		warnings = append(warnings, warning)
-	}
-
-	return warnings, nil
-}
-
-// validateDiskImageState looks up a DiskImage by id or name through the tenant-filtered DAO and
-// validates its lifecycle. It returns the resolved DiskImage (callers such as the ComputeInstance
-// handler backfill id/name onto the stored reference), a warning for DEPRECATED images, an error
-// for OBSOLETE or not-found images, and (nil, nil, nil) when key is empty. source adds context to
-// error messages (e.g. " in field_definitions"); pass "" when validating directly on a
-// ComputeInstance. Shared by the ComputeInstance, ComputeInstanceTemplate, and CatalogItem servers,
-// mirroring validateInstanceTypeState.
-//
-// Names are unique only per tenant, so a lookup by name may match several rows (a shared image plus
-// same-name tenant images). preferredTenant breaks the tie: the preferred-tenant image wins, then
-// the shared image, otherwise the ambiguity is an InvalidArgument. Callers pass their default tenant
-// (own tenant for a tenant-scoped caller, shared for an admin; see
-// auth.TenancyLogic.DetermineDefaultTenant). A key that is an id matches at most one row, so callers
-// that always pass an id (ComputeInstance, ComputeInstanceTemplate) can pass an empty preferredTenant.
-//
-// Error codes follow the instance_type / ComputeInstance handlers: NotFound for missing,
-// FailedPrecondition for OBSOLETE, a warning for DEPRECATED. A cross-tenant reference resolves to
-// zero rows under the DAO's tenancy filter and collapses into the not-found case, avoiding any leak
-// of cross-tenant existence.
-func validateDiskImageState(
-	ctx context.Context,
-	diskImagesDao *dao.GenericDAO[*privatev1.DiskImage],
-	key string,
-	preferredTenant string,
-	source string,
-) (*privatev1.DiskImage, []string, error) {
-	if key == "" {
-		return nil, nil, nil
-	}
-
-	response, err := diskImagesDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			return nil, nil, grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-		}
-		return nil, nil, grpcstatus.Errorf(grpccodes.Internal,
-			"failed to retrieve disk image '%s'", key)
-	}
-
-	var diskImage *privatev1.DiskImage
-	switch response.GetTotal() {
-	case 0:
-		return nil, nil, grpcstatus.Errorf(grpccodes.NotFound,
-			"disk image '%s'%s not found", key, source)
-	case 1:
-		diskImage = response.GetItems()[0]
-	default:
-		// The name resolved to multiple disk images; break the tie by tenant precedence.
-		diskImage, err = resolvePreferredDiskImage(ctx, diskImagesDao, key, preferredTenant, source)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	lifecycle := diskImage.GetSpec().GetLifecycle()
-	var warnings []string
-
-	switch lifecycle {
-	case privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_OBSOLETE:
-		return nil, nil, grpcstatus.Errorf(grpccodes.FailedPrecondition,
-			"disk image '%s'%s is obsolete and cannot be used", key, source)
-	case privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED:
-		warning := fmt.Sprintf("Disk image '%s'%s is deprecated", key, source)
-		dep := diskImage.GetSpec().GetDeprecation()
-		if dep != nil && dep.GetObsolescenceTimestamp() != nil {
-			warning += fmt.Sprintf(" and will become obsolete on %s",
-				dep.GetObsolescenceTimestamp().AsTime().Format(time.RFC3339))
-		}
-		warnings = append(warnings, warning)
-	}
-
-	return diskImage, warnings, nil
-}
-
-// resolvePreferredDiskImage breaks a disk-image name collision deterministically. Names are unique
-// only per tenant, so a shared image and one or more same-name tenant images can coexist. The image
-// owned by preferredTenant wins; failing that, the shared image; failing that, the collision is a
-// genuine ambiguity (e.g. a provider admin naming a name held by several tenants but by no shared
-// image) and is reported as InvalidArgument. Each candidate is fetched with an explicit tenant
-// filter (on top of the DAO's own tenancy filter) so the choice is exact regardless of how many
-// tenants share the name. An empty preferredTenant yields no candidate tenants and falls straight
-// through to the ambiguity error.
-func resolvePreferredDiskImage(
-	ctx context.Context,
-	diskImagesDao *dao.GenericDAO[*privatev1.DiskImage],
-	name string,
-	preferredTenant string,
-	source string,
-) (*privatev1.DiskImage, error) {
-	tenants := make([]string, 0, 2)
-	for _, tenant := range []string{preferredTenant, auth.SharedTenant} {
-		if tenant != "" && !slices.Contains(tenants, tenant) {
-			tenants = append(tenants, tenant)
-		}
-	}
-
-	for _, tenant := range tenants {
-		response, err := diskImagesDao.List().
-			SetFilter(fmt.Sprintf("this.metadata.name == %s && this.metadata.tenant == %s",
-				strconv.Quote(name), strconv.Quote(tenant))).
-			SetLimit(1).
-			Do(ctx)
-		if err != nil {
-			var deniedErr *dao.ErrDenied
-			if errors.As(err, &deniedErr) {
-				return nil, grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-			}
-			return nil, grpcstatus.Errorf(grpccodes.Internal,
-				"failed to retrieve disk image '%s'", name)
-		}
-		if response.GetTotal() >= 1 {
-			return response.GetItems()[0], nil
-		}
-	}
-
-	return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
-		"there are multiple disk images with identifier or name '%s'%s", name, source)
+	return cloneMessage(current), nil
 }

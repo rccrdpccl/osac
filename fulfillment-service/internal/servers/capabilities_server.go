@@ -19,13 +19,15 @@ import (
 	"log/slog"
 	"slices"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // CapabilitiesServerBuilder contains the data and logic needed to create a new capabilities server.
 type CapabilitiesServerBuilder struct {
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
 }
 
 // Make sure that we implement the interface:
@@ -37,6 +39,7 @@ type CapabilitiesServer struct {
 
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
 }
 
 // NewCapabilitiesServer creates a builder that can the be used to configure and create a new capabilities server.
@@ -47,6 +50,12 @@ func NewCapabilitiesServer() *CapabilitiesServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *CapabilitiesServerBuilder) SetLogger(value *slog.Logger) *CapabilitiesServerBuilder {
 	b.logger = value
+	return b
+}
+
+// SetServiceFlags sets the services advertised by the server.
+func (b *CapabilitiesServerBuilder) SetServiceFlags(value *services.Flags) *CapabilitiesServerBuilder {
+	b.serviceFlags = value
 	return b
 }
 
@@ -73,6 +82,7 @@ func (b *CapabilitiesServerBuilder) Build() (result *CapabilitiesServer, err err
 	result = &CapabilitiesServer{
 		logger:                   b.logger,
 		authnTrustedTokenIssuers: authnTrustedTokenIssuers,
+		serviceFlags:             b.serviceFlags,
 	}
 	return
 }
@@ -80,10 +90,15 @@ func (b *CapabilitiesServerBuilder) Build() (result *CapabilitiesServer, err err
 // Get is the implementation of the method that returns the capabilities of the server.
 func (s *CapabilitiesServer) Get(ctx context.Context,
 	request *publicv1.CapabilitiesGetRequest) (response *publicv1.CapabilitiesGetResponse, err error) {
+	var enabledServices []string
+	if s.serviceFlags != nil {
+		enabledServices = s.serviceFlags.EnabledServices()
+	}
 	response = publicv1.CapabilitiesGetResponse_builder{
 		Authn: &publicv1.AuthnCapabilities{
 			TrustedTokenIssuers: s.authnTrustedTokenIssuers,
 		},
+		EnabledServices: enabledServices,
 	}.Build()
 	return response, nil
 }

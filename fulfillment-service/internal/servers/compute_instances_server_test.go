@@ -15,18 +15,22 @@ package servers
 
 import (
 	"fmt"
+	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("Compute instances server", func() {
@@ -144,7 +148,7 @@ var _ = Describe("Compute instances server", func() {
 						Tenant: testTenant,
 					}.Build(),
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 16,
 						State:     privatev1.InstanceTypeState_INSTANCE_TYPE_STATE_ACTIVE,
 					}.Build(),
@@ -163,7 +167,7 @@ var _ = Describe("Compute instances server", func() {
 					Id: "standard",
 					Metadata: privatev1.Metadata_builder{
 						Name:   "standard",
-						Tenant: testTenant,
+						Tenant: "shared",
 					}.Build(),
 					Spec: privatev1.StorageTierSpec_builder{
 						Description: "Standard storage tier",
@@ -229,7 +233,7 @@ var _ = Describe("Compute instances server", func() {
 					{
 						Name:        "cpu_count",
 						Title:       "CPU Count",
-						Description: "Number of CPU cores",
+						Description: "Number of vCPUs",
 						Required:    false,
 						Type:        "type.googleapis.com/google.protobuf.Int32Value",
 						Default:     cpuDefault,
@@ -247,10 +251,10 @@ var _ = Describe("Compute instances server", func() {
 					InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 					DiskImage:    privatev1.DiskImageReference_builder{Id: "test-disk-image"}.Build(),
 					BootDisk: privatev1.ComputeInstanceDisk_builder{
-						SizeGib:     10,
-						StorageTier: new("standard"),
+						SizeGib:     proto.Int32(10),
+						StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 					}.Build(),
-					RunStrategy: new("Always"),
+					RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 				}.Build(),
 			}.Build()
 
@@ -468,11 +472,11 @@ var _ = Describe("Compute instances server", func() {
 					Spec: publicv1.ComputeInstanceSpec_builder{
 						Template:     publicv1.ComputeInstanceTemplateReference_builder{Id: "general.small"}.Build(),
 						InstanceType: publicv1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
-						RunStrategy:  new("Always"),
+						RunStrategy:  publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 						DiskImage:    publicv1.DiskImageReference_builder{Id: "test-disk-image"}.Build(),
 						BootDisk: publicv1.ComputeInstanceDisk_builder{
-							SizeGib:     20,
-							StorageTier: new("standard"),
+							SizeGib:     proto.Int32(20),
+							StorageTier: publicv1.StorageTierReference_builder{Name: "standard"}.Build(),
 						}.Build(),
 						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
 							publicv1.ComputeNetworkAttachment_builder{
@@ -513,7 +517,7 @@ var _ = Describe("Compute instances server", func() {
 			// Verify explicit fields were preserved:
 			Expect(object.GetSpec().GetTemplate().GetId()).To(Equal("general.small"))
 			Expect(object.GetSpec().GetInstanceType().GetId()).To(Equal("standard-4-16"))
-			Expect(object.GetSpec().GetRunStrategy()).To(Equal("Always"))
+			Expect(object.GetSpec().GetRunStrategy()).To(Equal(publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS))
 			Expect(object.GetSpec().GetDiskImage().GetId()).To(Equal("test-disk-image"))
 			Expect(object.GetSpec().GetBootDisk().GetSizeGib()).To(BeNumerically("==", 20))
 
@@ -524,7 +528,7 @@ var _ = Describe("Compute instances server", func() {
 			Expect(err).ToNot(HaveOccurred())
 			fetched := getResponse.GetObject()
 			Expect(fetched.GetSpec().GetInstanceType().GetId()).To(Equal("standard-4-16"))
-			Expect(fetched.GetSpec().GetRunStrategy()).To(Equal("Always"))
+			Expect(fetched.GetSpec().GetRunStrategy()).To(Equal(publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS))
 			Expect(fetched.GetSpec().GetDiskImage().GetId()).To(Equal("test-disk-image"))
 			Expect(fetched.GetSpec().GetBootDisk().GetSizeGib()).To(BeNumerically("==", 20))
 			Expect(fetched.GetSpec().GetRestartRequestedAt()).ToNot(BeNil())
@@ -623,7 +627,7 @@ var _ = Describe("Compute instances server", func() {
 					}.Build(),
 					Spec: publicv1.ComputeInstanceSpec_builder{
 						Template:    publicv1.ComputeInstanceTemplateReference_builder{Id: "mapping-template"}.Build(),
-						RunStrategy: new("Halted"),
+						RunStrategy: publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_HALTED.Enum(),
 						NetworkAttachments: []*publicv1.ComputeNetworkAttachment{
 							publicv1.ComputeNetworkAttachment_builder{
 								Subnet: publicv1.SubnetLocalReference_builder{Id: "test-subnet"}.Build(),
@@ -637,11 +641,47 @@ var _ = Describe("Compute instances server", func() {
 
 			spec := response.GetObject().GetSpec()
 			// User-provided values preserved through mapping:
-			Expect(spec.GetRunStrategy()).To(Equal("Halted"))
+			Expect(spec.GetRunStrategy()).To(Equal(publicv1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_HALTED))
 			// Template defaults should be stored:
 			Expect(spec.GetInstanceType().GetId()).To(Equal("standard-4-16"))
 			Expect(spec.GetDiskImage().GetId()).To(Equal("test-disk-image"))
 			Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(10)))
 		})
 	})
+})
+
+var _ = Describe("Catalog publication and references", func() {
+	DescribeTable("resolves same-name catalog creation sources in the requested tenant", func(shared bool) {
+		Expect(seedComputeCatalogItemTemplate(ctx, auth.SharedTenant, "", "source-template")).To(Succeed())
+		catalogs, err := NewPrivateComputeInstanceCatalogItemsServer().SetLogger(logger).SetAttributionLogic(attribution).SetTenancyLogic(tenancy).Build()
+		Expect(err).ToNot(HaveOccurred())
+		for _, tenant := range []string{testTenant, auth.SharedTenant} {
+			_, err = catalogs.Create(ctx, privatev1.ComputeInstanceCatalogItemsCreateRequest_builder{Object: privatev1.ComputeInstanceCatalogItem_builder{
+				Metadata: privatev1.Metadata_builder{Name: "same-name", Tenant: tenant}.Build(), Title: "Offering", Published: tenant == auth.SharedTenant,
+				Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "source-template"}.Build(),
+			}.Build()}.Build())
+			Expect(err).ToNot(HaveOccurred())
+		}
+		server, err := NewComputeInstancesServer().SetLogger(logger).SetAttributionLogic(attribution).SetTenancyLogic(tenancy).Build()
+		Expect(err).ToNot(HaveOccurred())
+		request := publicv1.ComputeInstancesCreateRequest_builder{Object: publicv1.ComputeInstance_builder{
+			Metadata: publicv1.Metadata_builder{Name: "vm"}.Build(), Spec: publicv1.ComputeInstanceSpec_builder{
+				CatalogItem: publicv1.ComputeInstanceCatalogItemReference_builder{Name: "same-name", Shared: shared}.Build(),
+			}.Build(),
+		}.Build()}.Build()
+		original := proto.Clone(request)
+		_, err = server.Create(ctx, request)
+		if shared {
+			// Correct shared source reaches ordinary required-field validation.
+			Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+			Expect(status.Convert(err).Message()).To(ContainSubstring("instance_type"))
+		} else {
+			Expect(status.Code(err)).To(Equal(codes.NotFound))
+			Expect(status.Convert(err).Message()).To(ContainSubstring("not published"))
+		}
+		Expect(proto.Equal(request, original)).To(BeTrue())
+	},
+		Entry("selects the published shared item", true),
+		Entry("rejects the unpublished tenant item", false),
+	)
 })

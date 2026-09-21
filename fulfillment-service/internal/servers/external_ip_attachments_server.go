@@ -22,10 +22,10 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type ExternalIPAttachmentsServerBuilder struct {
@@ -197,6 +197,9 @@ func (s *ExternalIPAttachmentsServer) Create(ctx context.Context,
 	if publicAttachment == nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 	}
+	if err := rejectOutputStatusOnCreate(publicAttachment.HasStatus()); err != nil {
+		return nil, err
+	}
 	privateAttachment := &privatev1.ExternalIPAttachment{}
 	err := s.inMapper.Copy(ctx, publicAttachment, privateAttachment)
 	if err != nil {
@@ -237,6 +240,9 @@ func (s *ExternalIPAttachmentsServer) Update(ctx context.Context,
 	publicAttachment := request.GetObject()
 	if publicAttachment == nil {
 		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
+	}
+	if err := validatePublicMetadataUpdateMask(request.GetUpdateMask()); err != nil {
+		return nil, err
 	}
 	privateAttachment := &privatev1.ExternalIPAttachment{}
 	err := s.inMapper.Copy(ctx, publicAttachment, privateAttachment)

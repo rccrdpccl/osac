@@ -43,10 +43,6 @@ func (r *CreateRequest[O]) SetObject(value O) *CreateRequest[O] {
 
 // Do executes the create operation and returns the response.
 func (r *CreateRequest[O]) Do(ctx context.Context) (response *CreateResponse[O], err error) {
-	err = r.init(ctx)
-	if err != nil {
-		return
-	}
 	r.tx, err = database.TxFromContext(ctx)
 	if err != nil {
 		return
@@ -212,9 +208,10 @@ func (r *CreateRequest[O]) translateError(ctx context.Context, id, tenant, proje
 	switch pgErr.Code {
 	case pgerrcode.UniqueViolation:
 		return &ErrAlreadyExists{
-			Kind: r.dao.kind,
-			ID:   id,
-			Name: name,
+			Kind:           r.dao.kind,
+			ID:             id,
+			Name:           name,
+			ConstraintName: pgErr.ConstraintName,
 		}
 	case errReferenceCode:
 		return &ErrReference{

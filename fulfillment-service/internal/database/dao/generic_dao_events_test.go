@@ -22,9 +22,9 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Generic DAO events", func() {
@@ -63,9 +63,10 @@ var _ = Describe("Generic DAO events", func() {
 
 		// Create a tenancy logic without restrictions:
 		tenancy = auth.NewMockTenancyLogic(ctrl)
-		tenancy.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(auth.AllTenants, nil).
+		tenancy.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(auth.TotalVisibility(), nil).
 			AnyTimes()
+
 		// Create the tenant used in the tests:
 		tenantsDao, err := NewGenericDAO[*privatev1.Tenant]().
 			SetLogger(logger).

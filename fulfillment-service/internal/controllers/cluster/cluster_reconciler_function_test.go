@@ -24,8 +24,10 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
@@ -33,13 +35,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
+	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/gvks"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("validateTenant", func() {
@@ -210,7 +213,7 @@ var _ = Describe("update tenant annotation", func() {
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu.gb200": privatev1.ClusterNodeSet_builder{
 						HostType: &privatev1.HostTypeReference{Name: "gpu.gb200"},
-						Size:     5,
+						Size:     proto.Int32(5),
 					}.Build(),
 				},
 			}.Build(),
@@ -296,7 +299,7 @@ var _ = Describe("update tenant annotation", func() {
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu.gb200": privatev1.ClusterNodeSet_builder{
 						HostType: &privatev1.HostTypeReference{Name: "gpu.gb200"},
-						Size:     5,
+						Size:     proto.Int32(5),
 					}.Build(),
 				},
 			}.Build(),
@@ -376,7 +379,7 @@ var _ = Describe("update tenant annotation", func() {
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu.gb200": privatev1.ClusterNodeSet_builder{
 						HostType: &privatev1.HostTypeReference{Name: "gpu.gb200"},
-						Size:     5,
+						Size:     proto.Int32(5),
 					}.Build(),
 				},
 			}.Build(),
@@ -425,7 +428,6 @@ var _ = Describe("update tenant annotation", func() {
 				Client:    fakeClient,
 			}, nil)
 
-		pullSecret := "my-pull-secret"
 		sshKey := "ssh-ed25519 AAAA..."
 		versionName := "4-17-0"
 		resolvedImage := "quay.io/openshift-release-dev/ocp-release:4.17.0-multi"
@@ -455,7 +457,6 @@ var _ = Describe("update tenant annotation", func() {
 			}.Build(),
 			Spec: privatev1.ClusterSpec_builder{
 				Template:     &privatev1.ClusterTemplateReference{Name: "test-template"},
-				PullSecret:   &pullSecret,
 				SshPublicKey: &sshKey,
 				Version:      &privatev1.ClusterVersionReference{Name: versionName},
 				Network: privatev1.ClusterNetwork_builder{
@@ -489,7 +490,6 @@ var _ = Describe("update tenant annotation", func() {
 		Expect(list.Items).To(HaveLen(1))
 
 		createdCR := list.Items[0]
-		Expect(createdCR.Spec.PullSecret).To(Equal(pullSecret))
 		Expect(createdCR.Spec.SSHPublicKey).To(Equal(sshKey))
 		Expect(createdCR.Spec.ReleaseImage).To(Equal(resolvedImage))
 		Expect(createdCR.Spec.Network).ToNot(BeNil())
@@ -636,7 +636,7 @@ var _ = Describe("update tenant annotation", func() {
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu.gb200": privatev1.ClusterNodeSet_builder{
 						HostType: &privatev1.HostTypeReference{Name: "gpu.gb200"},
-						Size:     5,
+						Size:     proto.Int32(5),
 					}.Build(),
 				},
 			}.Build(),
@@ -744,7 +744,7 @@ var _ = Describe("update tenant annotation", func() {
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu.gb200": privatev1.ClusterNodeSet_builder{
 						HostType: &privatev1.HostTypeReference{Name: "gpu.gb200"},
-						Size:     3,
+						Size:     proto.Int32(3),
 					}.Build(),
 				},
 			}.Build(),
@@ -1098,6 +1098,150 @@ var _ = Describe("delete", func() {
 		Expect(err).ToNot(HaveOccurred())
 		// Finalizer should be removed to allow archiving
 		Expect(hasFinalizer(t.cluster)).To(BeFalse())
+	})
+})
+
+var _ = Describe("deleteClusterSecrets", func() {
+	const (
+		clusterID   = "cluster-secret-cleanup-id"
+		clusterName = "my-cluster"
+		tenantName  = "test-tenant"
+		hubID       = "test-hub"
+	)
+
+	var (
+		ctx  context.Context
+		ctrl *gomock.Controller
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		ctrl = gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+	})
+
+	makeCluster := func() *privatev1.Cluster {
+		return privatev1.Cluster_builder{
+			Id: clusterID,
+			Metadata: privatev1.Metadata_builder{
+				Name:       clusterName,
+				Tenant:     tenantName,
+				Finalizers: []string{finalizers.Controller},
+			}.Build(),
+			Status: privatev1.ClusterStatus_builder{
+				Hub: hubID,
+			}.Build(),
+		}.Build()
+	}
+
+	It("should delete both kubeconfig and password secrets", func() {
+		cluster := makeCluster()
+		// Set status fields with secret references
+		cluster.GetStatus().SetKubeconfigSecret(&privatev1.SecretLocalReference{
+			Id:   "secret-kubeconfig-id",
+			Name: clusterName + "-kubeconfig",
+		})
+		cluster.GetStatus().SetPasswordSecret(&privatev1.SecretLocalReference{
+			Id:   "secret-password-id",
+			Name: clusterName + "-password",
+		})
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		// Expect Delete to be called for both secrets
+		kubeconfigDeleteCall := secretsClient.EXPECT().
+			Delete(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsDeleteRequest, _ ...grpc.CallOption) (*privatev1.SecretsDeleteResponse, error) {
+				Expect(req.GetId()).To(Equal("secret-kubeconfig-id"))
+				return &privatev1.SecretsDeleteResponse{}, nil
+			})
+
+		secretsClient.EXPECT().
+			Delete(gomock.Any(), gomock.Any()).
+			After(kubeconfigDeleteCall).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsDeleteRequest, _ ...grpc.CallOption) (*privatev1.SecretsDeleteResponse, error) {
+				Expect(req.GetId()).To(Equal("secret-password-id"))
+				return &privatev1.SecretsDeleteResponse{}, nil
+			})
+
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster: cluster,
+		}
+
+		err := t.deleteClusterSecrets(ctx)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should succeed when no secret references exist", func() {
+		cluster := makeCluster()
+		// No status fields set — refs are nil
+
+		secretsClient := NewMockSecretsClient(ctrl)
+		// No expectations — no Delete calls should happen
+
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster: cluster,
+		}
+
+		err := t.deleteClusterSecrets(ctx)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should treat NotFound on Delete as success", func() {
+		cluster := makeCluster()
+		cluster.GetStatus().SetKubeconfigSecret(&privatev1.SecretLocalReference{
+			Id:   "secret-kubeconfig-id",
+			Name: clusterName + "-kubeconfig",
+		})
+
+		secretsClient := NewMockSecretsClient(ctrl)
+		secretsClient.EXPECT().
+			Delete(gomock.Any(), gomock.Any()).
+			Return(nil, status.Errorf(codes.NotFound, "secret not found"))
+
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster: cluster,
+		}
+
+		err := t.deleteClusterSecrets(ctx)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should propagate transient Delete errors", func() {
+		cluster := makeCluster()
+		cluster.GetStatus().SetKubeconfigSecret(&privatev1.SecretLocalReference{
+			Id:   "secret-kubeconfig-id",
+			Name: clusterName + "-kubeconfig",
+		})
+
+		secretsClient := NewMockSecretsClient(ctrl)
+		secretsClient.EXPECT().
+			Delete(gomock.Any(), gomock.Any()).
+			Return(nil, status.Errorf(codes.Internal, "database error"))
+
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster: cluster,
+		}
+
+		err := t.deleteClusterSecrets(ctx)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("failed to delete hub secret"))
 	})
 })
 
@@ -1540,5 +1684,562 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		Expect(progressingCondition.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
 		Expect(progressingCondition.GetReason()).To(Equal("ValidationFailed"))
 		Expect(progressingCondition.GetMessage()).To(ContainSubstring("invalid template"))
+	})
+})
+
+var _ = Describe("ensureClusterSecrets", func() {
+	const (
+		clusterID    = "test-cluster-id"
+		clusterName  = "my-cluster"
+		tenantName   = "my-tenant"
+		projectName  = "my-project"
+		hubID        = "test-hub"
+		hubNamespace = "test-ns"
+		hcNamespace  = "clusters-ns"
+		hcName       = "my-hosted-cluster"
+	)
+
+	var (
+		ctx  context.Context
+		ctrl *gomock.Controller
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		ctrl = gomock.NewController(GinkgoT())
+		DeferCleanup(ctrl.Finish)
+	})
+
+	makeHostedCluster := func(kubeconfigSecret, passwordSecret string) *unstructured.Unstructured {
+		hc := &unstructured.Unstructured{}
+		hc.SetGroupVersionKind(gvks.HostedCluster)
+		hc.SetNamespace(hcNamespace)
+		hc.SetName(hcName)
+		if kubeconfigSecret != "" {
+			Expect(unstructured.SetNestedField(hc.Object, kubeconfigSecret,
+				"status", "kubeconfig", "name")).To(Succeed())
+		}
+		if passwordSecret != "" {
+			Expect(unstructured.SetNestedField(hc.Object, passwordSecret,
+				"status", "kubeadminPassword", "name")).To(Succeed())
+		}
+		return hc
+	}
+
+	makeCluster := func(state privatev1.ClusterState) *privatev1.Cluster {
+		return privatev1.Cluster_builder{
+			Id: clusterID,
+			Metadata: privatev1.Metadata_builder{
+				Finalizers: []string{finalizers.Controller},
+				Tenant:     tenantName,
+				Project:    projectName,
+				Name:       clusterName,
+			}.Build(),
+			Spec: privatev1.ClusterSpec_builder{
+				Template: &privatev1.ClusterTemplateReference{Name: "test-template"},
+			}.Build(),
+			Status: privatev1.ClusterStatus_builder{
+				State: state,
+				Hub:   hubID,
+			}.Build(),
+		}.Build()
+	}
+
+	makeSecret := func(id, name string) *privatev1.Secret {
+		return privatev1.Secret_builder{
+			Id: id,
+			Metadata: privatev1.Metadata_builder{
+				Name:   name,
+				Tenant: tenantName,
+			}.Build(),
+			Backend: privatev1.SecretBackend_SECRET_BACKEND_HUB,
+		}.Build()
+	}
+
+	makeOrder := func(withRef bool) *osacv1alpha1.ClusterOrder {
+		order := &osacv1alpha1.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "order-abc",
+				Namespace: hubNamespace,
+				Labels: map[string]string{
+					labels.ClusterOrderUuid: clusterID,
+				},
+				Annotations: map[string]string{
+					annotations.Tenant: tenantName,
+				},
+			},
+			Spec: osacv1alpha1.ClusterOrderSpec{
+				TemplateID: "test-template",
+			},
+		}
+		if withRef {
+			order.Status.ClusterReference = &osacv1alpha1.ClusterOrderClusterReferenceType{
+				Namespace:         hcNamespace,
+				HostedClusterName: hcName,
+			}
+		}
+		return order
+	}
+
+	It("should create kubeconfig and password secrets when cluster is READY", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("my-kubeconfig-secret", "my-password-secret")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existingOrder).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		kubeconfigCall := secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsCreateRequest,
+				_ ...grpc.CallOption) (*privatev1.SecretsCreateResponse, error) {
+				secret := req.GetObject()
+				Expect(secret.GetMetadata().GetName()).To(Equal(clusterName + "-kubeconfig"))
+				Expect(secret.GetMetadata().GetTenant()).To(Equal(tenantName))
+				Expect(secret.GetMetadata().GetProject()).To(Equal(projectName))
+				Expect(secret.GetMetadata().GetLabels()).To(
+					HaveKeyWithValue(labels.SecretType, "cluster-kubeconfig"))
+				Expect(secret.GetBackend()).To(Equal(privatev1.SecretBackend_SECRET_BACKEND_HUB))
+				Expect(secret.GetType()).To(Equal(privatev1.SecretType_SECRET_TYPE_KUBECONFIG))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("hub_id", hubID))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("namespace", hcNamespace))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("secret_name", "my-kubeconfig-secret"))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("key", "kubeconfig"))
+				return &privatev1.SecretsCreateResponse{
+					Object: makeSecret("kubeconfig-id", clusterName+"-kubeconfig"),
+				}, nil
+			})
+
+		secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			After(kubeconfigCall).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsCreateRequest,
+				_ ...grpc.CallOption) (*privatev1.SecretsCreateResponse, error) {
+				secret := req.GetObject()
+				Expect(secret.GetMetadata().GetName()).To(Equal(clusterName + "-password"))
+				Expect(secret.GetMetadata().GetLabels()).To(
+					HaveKeyWithValue(labels.SecretType, "cluster-password"))
+				Expect(secret.GetType()).To(Equal(privatev1.SecretType_SECRET_TYPE_OPAQUE))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("secret_name", "my-password-secret"))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("key", "password"))
+				return &privatev1.SecretsCreateResponse{
+					Object: makeSecret("password-id", clusterName+"-password"),
+				}, nil
+			})
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		// Verify status fields were set
+		Expect(cluster.GetStatus().GetKubeconfigSecret()).ToNot(BeNil())
+		Expect(cluster.GetStatus().GetKubeconfigSecret().GetId()).To(Equal("kubeconfig-id"))
+		Expect(cluster.GetStatus().GetPasswordSecret()).ToNot(BeNil())
+		Expect(cluster.GetStatus().GetPasswordSecret().GetId()).To(Equal("password-id"))
+	})
+
+	It("should skip secret creation when cluster is PROGRESSING", func() {
+		existingOrder := makeOrder(true)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existingOrder).
+			Build()
+
+		hubCache := controllers.NewMockHubCache(ctrl)
+		hubCache.EXPECT().
+			Get(gomock.Any(), hubID).
+			Return(&controllers.HubEntry{
+				Namespace: hubNamespace,
+				Client:    fakeClient,
+			}, nil)
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				hubCache:      hubCache,
+				secretsClient: secretsClient,
+			},
+			cluster: cluster,
+		}
+
+		err := t.update(ctx)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should handle AlreadyExists gracefully", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("my-kubeconfig-secret", "my-password-secret")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existingOrder).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		// First Create returns AlreadyExists, then List returns the existing secret
+		kubeconfigCreateCall := secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(nil, status.Errorf(codes.AlreadyExists, "secret already exists"))
+
+		secretsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			After(kubeconfigCreateCall).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsListRequest, _ ...grpc.CallOption) (*privatev1.SecretsListResponse, error) {
+				Expect(req.GetFilter()).To(ContainSubstring("my-cluster-kubeconfig"))
+				return &privatev1.SecretsListResponse{
+					Items: []*privatev1.Secret{
+						makeSecret("existing-kubeconfig-id", clusterName+"-kubeconfig"),
+					},
+				}, nil
+			})
+
+		// Second Create returns AlreadyExists, then List returns the existing secret
+		passwordCreateCall := secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(nil, status.Errorf(codes.AlreadyExists, "secret already exists"))
+
+		secretsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			After(passwordCreateCall).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsListRequest, _ ...grpc.CallOption) (*privatev1.SecretsListResponse, error) {
+				Expect(req.GetFilter()).To(ContainSubstring("my-cluster-password"))
+				return &privatev1.SecretsListResponse{
+					Items: []*privatev1.Secret{
+						makeSecret("existing-password-id", clusterName+"-password"),
+					},
+				}, nil
+			})
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		// Verify status fields were set
+		Expect(cluster.GetStatus().GetKubeconfigSecret().GetId()).To(Equal("existing-kubeconfig-id"))
+		Expect(cluster.GetStatus().GetPasswordSecret().GetId()).To(Equal("existing-password-id"))
+	})
+
+	It("should skip when ClusterReference is nil", func() {
+		existingOrder := makeOrder(false)
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster: cluster,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should skip when HostedCluster is not found", func() {
+		existingOrder := makeOrder(true)
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should skip when HostedCluster kubeconfig and password are not populated", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("", "")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cluster.GetStatus().GetKubeconfigSecret()).To(BeNil())
+		Expect(cluster.GetStatus().GetPasswordSecret()).To(BeNil())
+	})
+
+	It("should create only kubeconfig when password status is missing", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("my-kubeconfig-secret", "")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsCreateRequest,
+				_ ...grpc.CallOption) (*privatev1.SecretsCreateResponse, error) {
+				secret := req.GetObject()
+				Expect(secret.GetMetadata().GetName()).To(Equal(clusterName + "-kubeconfig"))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("secret_name", "my-kubeconfig-secret"))
+				return &privatev1.SecretsCreateResponse{
+					Object: makeSecret("kubeconfig-id", clusterName+"-kubeconfig"),
+				}, nil
+			})
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cluster.GetStatus().GetKubeconfigSecret()).ToNot(BeNil())
+		Expect(cluster.GetStatus().GetKubeconfigSecret().GetId()).To(Equal("kubeconfig-id"))
+		Expect(cluster.GetStatus().GetPasswordSecret()).To(BeNil())
+	})
+
+	It("should create only password when kubeconfig status is missing", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("", "my-password-secret")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsCreateRequest,
+				_ ...grpc.CallOption) (*privatev1.SecretsCreateResponse, error) {
+				secret := req.GetObject()
+				Expect(secret.GetMetadata().GetName()).To(Equal(clusterName + "-password"))
+				Expect(secret.GetCoordinates()).To(HaveKeyWithValue("secret_name", "my-password-secret"))
+				return &privatev1.SecretsCreateResponse{
+					Object: makeSecret("password-id", clusterName+"-password"),
+				}, nil
+			})
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cluster.GetStatus().GetKubeconfigSecret()).To(BeNil())
+		Expect(cluster.GetStatus().GetPasswordSecret()).ToNot(BeNil())
+		Expect(cluster.GetStatus().GetPasswordSecret().GetId()).To(Equal("password-id"))
+	})
+
+	It("should skip creation when status references are already populated", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("my-kubeconfig-secret", "my-password-secret")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+		// No Create calls expected
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		cluster.GetStatus().SetKubeconfigSecret(&privatev1.SecretLocalReference{
+			Id:   "existing-kubeconfig-id",
+			Name: clusterName + "-kubeconfig",
+		})
+		cluster.GetStatus().SetPasswordSecret(&privatev1.SecretLocalReference{
+			Id:   "existing-password-id",
+			Name: clusterName + "-password",
+		})
+
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cluster.GetStatus().GetKubeconfigSecret().GetId()).To(Equal("existing-kubeconfig-id"))
+		Expect(cluster.GetStatus().GetPasswordSecret().GetId()).To(Equal("existing-password-id"))
+	})
+
+	It("should skip kubeconfig but create password when only kubeconfig is already populated", func() {
+		existingOrder := makeOrder(true)
+		hc := makeHostedCluster("my-kubeconfig-secret", "my-password-secret")
+
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+		Expect(fakeClient.Create(ctx, hc)).To(Succeed())
+
+		secretsClient := NewMockSecretsClient(ctrl)
+
+		// Only password Create expected
+		secretsClient.EXPECT().
+			Create(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, req *privatev1.SecretsCreateRequest,
+				_ ...grpc.CallOption) (*privatev1.SecretsCreateResponse, error) {
+				secret := req.GetObject()
+				Expect(secret.GetMetadata().GetName()).To(Equal(clusterName + "-password"))
+				return &privatev1.SecretsCreateResponse{
+					Object: makeSecret("password-id", clusterName+"-password"),
+				}, nil
+			})
+
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_READY)
+		cluster.GetStatus().SetKubeconfigSecret(&privatev1.SecretLocalReference{
+			Id:   "existing-kubeconfig-id",
+			Name: clusterName + "-kubeconfig",
+		})
+
+		t := &task{
+			r: &function{
+				logger:        logger,
+				secretsClient: secretsClient,
+			},
+			cluster:      cluster,
+			hubId:        hubID,
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureClusterSecrets(ctx, existingOrder)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cluster.GetStatus().GetKubeconfigSecret().GetId()).To(Equal("existing-kubeconfig-id"))
+		Expect(cluster.GetStatus().GetPasswordSecret().GetId()).To(Equal("password-id"))
+	})
+
+	It("should set ResourceClass from BaremetalInstanceType when HostType is nil", func() {
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING)
+		cluster.GetSpec().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
+			"workers": privatev1.ClusterNodeSet_builder{
+				Size: proto.Int32(1),
+				BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{
+					Name: "ci-worker-bm",
+				}.Build(),
+			}.Build(),
+		})
+
+		t := &task{
+			r: &function{
+				logger: logger,
+			},
+			cluster: cluster,
+		}
+
+		nrs := t.prepareNodeRequests()
+		Expect(nrs).To(HaveLen(1))
+		Expect(nrs[0].ResourceClass).To(Equal("ci-worker-bm"))
+		Expect(nrs[0].NumberOfNodes).To(Equal(1))
+		Expect(nrs[0].BareMetal).ToNot(BeNil())
+		Expect(nrs[0].BareMetal.InstanceType).To(Equal("ci-worker-bm"))
 	})
 })

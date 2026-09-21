@@ -18,8 +18,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
 
 	"maps"
 
@@ -32,12 +30,14 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/computeinstancespec"
+	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateComputeInstancesServerBuilder struct {
@@ -47,6 +47,7 @@ type PrivateComputeInstancesServerBuilder struct {
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
 	filterDesc        protoreflect.MessageDescriptor
+	secretStore       vault.SecretStore
 }
 
 var _ privatev1.ComputeInstancesServer = (*PrivateComputeInstancesServer)(nil)
@@ -55,6 +56,7 @@ type PrivateComputeInstancesServer struct {
 	privatev1.UnimplementedComputeInstancesServer
 
 	logger                  *slog.Logger
+	notifier                events.Notifier
 	tenancyLogic            auth.TenancyLogic
 	generic                 *GenericServer[*privatev1.ComputeInstance]
 	templatesDao            *dao.GenericDAO[*privatev1.ComputeInstanceTemplate]
@@ -62,11 +64,14 @@ type PrivateComputeInstancesServer struct {
 	subnetsDao              *dao.GenericDAO[*privatev1.Subnet]
 	securityGroupsDao       *dao.GenericDAO[*privatev1.SecurityGroup]
 	instanceTypesDao        *dao.GenericDAO[*privatev1.InstanceType]
-	storageTiersDao         *dao.GenericDAO[*privatev1.StorageTier]
 	diskImagesDao           *dao.GenericDAO[*privatev1.DiskImage]
 	externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
 	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
 	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	lifecycle               *externalIPLifecycle
+	secretsDao              *dao.GenericDAO[*privatev1.Secret]
+	secretStore             vault.SecretStore
+	storageTiersDao         *dao.GenericDAO[*privatev1.StorageTier]
 }
 
 func NewPrivateComputeInstancesServer() *PrivateComputeInstancesServerBuilder {
@@ -104,6 +109,11 @@ func (b *PrivateComputeInstancesServerBuilder) SetMetricsRegisterer(value promet
 // expressions. This is optional. When unset, the descriptor of this server's own private message type is used.
 func (b *PrivateComputeInstancesServerBuilder) SetFilterDesc(value protoreflect.MessageDescriptor) *PrivateComputeInstancesServerBuilder {
 	b.filterDesc = value
+	return b
+}
+
+func (b *PrivateComputeInstancesServerBuilder) SetSecretStore(value vault.SecretStore) *PrivateComputeInstancesServerBuilder {
+	b.secretStore = value
 	return b
 }
 
@@ -168,16 +178,6 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		return
 	}
 
-	// Create the StorageTiers DAO for storage tier validation:
-	storageTiersDao, err := dao.NewGenericDAO[*privatev1.StorageTier]().
-		SetLogger(b.logger).
-		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
-	if err != nil {
-		return
-	}
-
 	// Create the DiskImages DAO for disk image validation:
 	diskImagesDao, err := dao.NewGenericDAO[*privatev1.DiskImage]().
 		SetLogger(b.logger).
@@ -188,25 +188,37 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		return
 	}
 
-	externalIPPoolDao, err := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
+	externalIPPoolDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIPPool]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	addDAOEventCallback(externalIPPoolDaoBuilder, b.notifier)
+	externalIPPoolDao, err := externalIPPoolDaoBuilder.Build()
 	if err != nil {
 		return
 	}
 
-	externalIPDao, err := dao.NewGenericDAO[*privatev1.ExternalIP]().
+	externalIPDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIP]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
-		SetMetricsRegisterer(b.metricsRegisterer).
-		Build()
+		SetMetricsRegisterer(b.metricsRegisterer)
+	addDAOEventCallback(externalIPDaoBuilder, b.notifier)
+	externalIPDao, err := externalIPDaoBuilder.Build()
 	if err != nil {
 		return
 	}
 
-	externalIPAttachmentDao, err := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+	externalIPAttachmentDaoBuilder := dao.NewGenericDAO[*privatev1.ExternalIPAttachment]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer)
+	addDAOEventCallback(externalIPAttachmentDaoBuilder, b.notifier)
+	externalIPAttachmentDao, err := externalIPAttachmentDaoBuilder.Build()
+	if err != nil {
+		return
+	}
+
+	secretsDao, err := dao.NewGenericDAO[*privatev1.Secret]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -230,8 +242,14 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 	}
 
 	// Create and populate the object:
+	storageTiersDao, err := dao.NewGenericDAO[*privatev1.StorageTier]().SetLogger(b.logger).SetTenancyLogic(b.tenancyLogic).SetMetricsRegisterer(b.metricsRegisterer).Build()
+	if err != nil {
+		return
+	}
 	result = &PrivateComputeInstancesServer{
+		storageTiersDao:         storageTiersDao,
 		logger:                  b.logger,
+		notifier:                b.notifier,
 		tenancyLogic:            b.tenancyLogic,
 		generic:                 generic,
 		templatesDao:            templatesDao,
@@ -239,12 +257,23 @@ func (b *PrivateComputeInstancesServerBuilder) Build() (result *PrivateComputeIn
 		subnetsDao:              subnetsDao,
 		securityGroupsDao:       securityGroupsDao,
 		instanceTypesDao:        instanceTypesDao,
-		storageTiersDao:         storageTiersDao,
 		diskImagesDao:           diskImagesDao,
 		externalIPPoolDao:       externalIPPoolDao,
 		externalIPDao:           externalIPDao,
 		externalIPAttachmentDao: externalIPAttachmentDao,
+		secretsDao:              secretsDao,
+		secretStore:             b.secretStore,
 	}
+	result.lifecycle = newExternalIPLifecycle(
+		externalIPDao,
+		externalIPAttachmentDao,
+		nil,
+		externalIPPoolDao,
+		generic.dao,
+		nil,
+		nil,
+		nil,
+	)
 	return
 }
 
@@ -273,7 +302,7 @@ func (s *PrivateComputeInstancesServer) injectDefaultNetworkAttachments(ctx cont
 	}
 
 	spec := vm.GetSpec()
-	subnet, err := findDefaultSubnet(ctx, s.logger, s.subnetsDao, tenant)
+	subnet, err := findDefaultSubnet(ctx, s.logger, s.subnetsDao, tenant, vm.GetMetadata().GetProject())
 	if err != nil {
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to look up default subnet: %v", err)
 	}
@@ -287,7 +316,7 @@ func (s *PrivateComputeInstancesServer) injectDefaultNetworkAttachments(ctx cont
 	}.Build()
 
 	virtualNetworkID := refKey(subnet.GetSpec().GetVirtualNetwork())
-	sg, err := findDefaultSecurityGroup(ctx, s.logger, s.securityGroupsDao, virtualNetworkID, tenant)
+	sg, err := findDefaultSecurityGroup(ctx, s.logger, s.securityGroupsDao, virtualNetworkID, tenant, vm.GetMetadata().GetProject())
 	if err != nil {
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to look up default security group: %v", err)
 	}
@@ -309,141 +338,164 @@ func (s *PrivateComputeInstancesServer) injectDefaultNetworkAttachments(ctx cont
 	return nil
 }
 
-func (s *PrivateComputeInstancesServer) Create(ctx context.Context,
-	request *privatev1.ComputeInstancesCreateRequest) (response *privatev1.ComputeInstancesCreateResponse, err error) {
-	// Auto-inject default network attachments if none provided:
-	if len(request.GetObject().GetSpec().GetNetworkAttachments()) == 0 {
-		err = s.injectDefaultNetworkAttachments(ctx, request.GetObject())
-		if err != nil {
-			return
-		}
-	}
-
-	// Validate tenant isolation for network references:
-	err = s.validateNetworkReferencesTenancy(ctx, request.GetObject())
-	if err != nil {
-		return
-	}
-
-	// Validate network references state (exists, READY):
-	err = s.validateNetworkReferencesState(ctx, request.GetObject())
-	if err != nil {
-		return
-	}
-
-	// Dispatch between catalog item and template paths:
-	spec := request.GetObject().GetSpec()
-	catalogItemRef := spec.GetCatalogItem()
-	templateRef := spec.GetTemplate()
-	if catalogItemRef != nil && templateRef != nil {
-		err = grpcstatus.Errorf(grpccodes.InvalidArgument,
-			"catalog_item and template are mutually exclusive")
-		return
-	}
-	var template *privatev1.ComputeInstanceTemplate
-	if catalogItemRef != nil {
-		err = s.validateAndTransformCatalogItem(ctx, request.GetObject())
-		if err != nil {
-			return
-		}
-		template, err = s.fetchTemplate(ctx, refKey(spec.GetTemplate()))
-	} else {
-		template, err = s.fetchAndValidateTemplate(ctx, request.GetObject())
-	}
-	if err != nil {
-		return
-	}
-
-	// Apply the template's spec defaults and validate required fields, regardless
-	// of whether the template was referenced directly or resolved via a catalog item.
-	err = s.applySpecDefaults(spec, template)
-	if err != nil {
-		return
-	}
-
-	err = s.validateStorageTiers(ctx, spec)
-	if err != nil {
-		return
-	}
-
-	// Validate instance type existence and state (D-02: validate-only, no resolution).
-	// Must run after template/catalog defaults are applied so instance_type defaults
-	// from templates are visible.
+func (s *PrivateComputeInstancesServer) Create(ctx context.Context, request *privatev1.ComputeInstancesCreateRequest) (response *privatev1.ComputeInstancesCreateResponse, err error) {
 	var warnings []string
-	warnings, err = s.validateInstanceType(ctx, request.GetObject())
+	err = s.generic.CreateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context, _ *privatev1.ComputeInstance, candidate *privatev1.ComputeInstance) error {
+		warnings, err = s.prepareCreate(ctx, candidate)
+		return err
+	})
+	if err != nil {
+		return
+	}
+	if !isDryRun(ctx) && response.GetObject().GetSpec().GetAutoExternalIpAttachment() {
+		err = s.autoProvisionExternalIP(ctx, response.GetObject())
+		if err != nil {
+			if tx, txErr := database.TxFromContext(ctx); txErr == nil {
+				tx.ReportError(&err)
+			}
+			return
+		}
+	}
+	response.SetWarnings(warnings)
+	return
+}
+
+// prepareCreate fills the new VM before it is stored. It selects either a published Catalog
+// Item or a direct Template, applies Catalog rules and Template defaults, then checks the
+// resulting image, instance type, network, and other required inputs.
+func (s *PrivateComputeInstancesServer) prepareCreate(ctx context.Context, candidate *privatev1.ComputeInstance) (warnings []string, err error) {
+	spec := candidate.GetSpec()
+	template, err := s.resolveCreationSource(ctx, candidate)
 	if err != nil {
 		return
 	}
 
-	// Validate disk image existence, lifecycle state, and backfill id+name.
+	err = s.applyComputeTemplate(candidate, template)
+	if err != nil {
+		return
+	}
+	if err = s.validateAndResolveUserDataSecret(ctx, spec, true); err != nil {
+		return
+	}
+
+	// Apply Catalog rules before adding the tenant's default network. Otherwise a locked
+	// network field could mistake the server-provided attachment for a caller override.
+	if len(spec.GetNetworkAttachments()) == 0 {
+		err = s.injectDefaultNetworkAttachments(ctx, candidate)
+		if err != nil {
+			return
+		}
+	}
+
+	// Validate and resolve the final network, including Catalog and Template defaults.
+	if err = s.validateNetworkReferencesState(ctx, candidate); err != nil {
+		return
+	}
+
+	// Validate instance type and disk image existence and lifecycle after defaults are applied.
+	warnings, err = s.validateInstanceType(ctx, candidate)
+	if err != nil {
+		return
+	}
 	var diskImageWarnings []string
-	diskImageWarnings, err = s.validateDiskImage(ctx, request.GetObject())
+	diskImageWarnings, err = s.validateDiskImage(ctx, candidate)
 	if err != nil {
 		return
 	}
 	warnings = append(warnings, diskImageWarnings...)
-
-	err = s.generic.Create(ctx, request, &response)
-	if err != nil {
-		return
-	}
-
-	if spec.GetAutoExternalIpAttachment() {
-		err = s.autoProvisionExternalIP(ctx, response.GetObject())
-		if err != nil {
-			return
-		}
-	}
-
-	// Attach warnings to the response (deprecation notices for DEPRECATED instance types).
-	if len(warnings) > 0 {
-		response.SetWarnings(warnings)
-	}
+	err = s.validateStorageTiers(ctx, candidate)
 	return
+}
+
+// validateStorageTiers checks all disk tiers after Catalog policies and Template defaults
+// have been applied. It stores each tier's actual ID and name and rejects inactive
+// tiers; volume provisioning chooses the backend later.
+func (s *PrivateComputeInstancesServer) validateStorageTiers(ctx context.Context, instance *privatev1.ComputeInstance) error {
+	spec := instance.GetSpec()
+	disks := append([]*privatev1.ComputeInstanceDisk{spec.GetBootDisk()}, spec.GetAdditionalDisks()...)
+	for _, disk := range disks {
+		ref := disk.GetStorageTier()
+		if ref == nil {
+			continue
+		}
+		tier, err := resolveResourceInScope(ctx, s.storageTiersDao, referenceScope{tenant: auth.SharedTenant}, ref.GetId(), ref.GetName(), "storage tier", " in disks", grpccodes.NotFound)
+		if err != nil {
+			return err
+		}
+		if err := validateResolvedStorageTier(tier, " in disks"); err != nil {
+			return err
+		}
+		disk.SetStorageTier(canonicalStorageTierReference(tier))
+	}
+	return nil
+}
+
+// resolveCreationSource accepts exactly one provisioning source: spec.catalog_item or
+// spec.template. For a Catalog Item it finds the item's Template and applies its field rules;
+// for a direct Template it resolves that reference under the VM's assigned tenant/project.
+func (s *PrivateComputeInstancesServer) resolveCreationSource(ctx context.Context,
+	candidate *privatev1.ComputeInstance) (*privatev1.ComputeInstanceTemplate, error) {
+	spec := candidate.GetSpec()
+	if spec.GetCatalogItem() != nil && spec.GetTemplate() != nil {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"catalog_item and template are mutually exclusive")
+	}
+	if spec.GetCatalogItem() != nil {
+		return s.resolveCatalogItem(ctx, candidate)
+	}
+	if spec.GetTemplate() == nil {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "template is mandatory")
+	}
+	return resolveAndCanonicalizeReference(ctx, s.templatesDao, candidate.GetMetadata(), spec.GetTemplate(),
+		"template", grpccodes.InvalidArgument)
 }
 
 func (s *PrivateComputeInstancesServer) Update(ctx context.Context,
 	request *privatev1.ComputeInstancesUpdateRequest) (response *privatev1.ComputeInstancesUpdateResponse, err error) {
-	// Only validate fields affected by the update mask. With a field mask the object
-	// is sparse so validating fields absent from it would fail incorrectly.
-	mask := request.GetUpdateMask()
-	isBeingDeleted := request.GetObject().GetMetadata().GetDeletionTimestamp() != nil
-
-	// ALWAYS validate tenant isolation for network references, even during deletion.
-	// This prevents cross-tenant updates on ComputeInstances being deleted.
-	if hasMaskPrefix(mask, "spec.network_attachments") {
-		err = s.validateNetworkReferencesTenancy(ctx, request.GetObject())
-		if err != nil {
-			return
+	err = s.generic.UpdateWithCandidatePreparation(ctx, request, &response, func(ctx context.Context, current, candidate *privatev1.ComputeInstance) error {
+		if err := validateComputeInstanceImmutability(current, candidate, request.GetUpdateMask()); err != nil {
+			return err
 		}
-	}
-
-	// Only validate resource state (exists, READY) if NOT being deleted.
-	// Referenced resources (subnets, security groups) may already be deleted during cleanup.
-	if !isBeingDeleted && hasMaskPrefix(mask, "spec.network_attachments") {
-		err = s.validateNetworkReferencesState(ctx, request.GetObject())
-		if err != nil {
-			return
+		if err := s.validateAndResolveUserDataSecret(
+			ctx,
+			candidate.GetSpec(),
+			updateIncludesField(request.GetUpdateMask(), "spec.user_data_secret"),
+		); err != nil {
+			return err
 		}
-	}
-
-	err = s.validateTemplateImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-
-	err = s.validateNetworkAttachmentsImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-
-	err = s.validateDiskImmutability(ctx, request)
-	if err != nil {
-		return
-	}
-
-	err = s.generic.Update(ctx, request, &response)
+		if updateIncludesField(request.GetUpdateMask(), "spec.network_attachments") {
+			// During deletion, keep the existing visibility check without requiring dependencies
+			// to remain present or ready. Otherwise resolve and validate the final network once.
+			if current.GetMetadata().HasDeletionTimestamp() {
+				return s.validateNetworkReferencesTenancy(ctx, candidate)
+			}
+			return s.validateNetworkReferencesState(ctx, candidate)
+		}
+		return nil
+	})
 	return
+}
+
+func (s *PrivateComputeInstancesServer) validateAndResolveUserDataSecret(
+	ctx context.Context,
+	spec *privatev1.ComputeInstanceSpec,
+	resolve bool,
+) error {
+	if spec.HasUserData() && spec.GetUserDataSecret() != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"user_data and user_data_secret are mutually exclusive")
+	}
+	if !resolve || spec.GetUserDataSecret() == nil {
+		return nil
+	}
+	resolved, err := validateUserDataSecret(
+		ctx, s.logger, s.secretsDao, s.secretStore, spec.GetUserDataSecret(),
+	)
+	if err != nil {
+		return err
+	}
+	spec.SetUserDataSecret(resolved)
+	return nil
 }
 
 func (s *PrivateComputeInstancesServer) Delete(ctx context.Context,
@@ -474,166 +526,59 @@ func (s *PrivateComputeInstancesServer) Signal(ctx context.Context,
 	return
 }
 
-// fetchAndValidateTemplate fetches the template, validates parameters in the compute instance spec,
-// applies template parameter defaults, and returns the template.
-func (s *PrivateComputeInstancesServer) fetchAndValidateTemplate(ctx context.Context, vm *privatev1.ComputeInstance) (*privatev1.ComputeInstanceTemplate, error) {
-	if vm == nil {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance is mandatory")
-	}
-
-	spec := vm.GetSpec()
-	if spec == nil {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance spec is mandatory")
-	}
-
-	template, err := s.fetchTemplate(ctx, refKey(spec.GetTemplate()))
-	if err != nil {
-		return nil, err
-	}
-
-	// Validate template parameters:
-	vmParameters := spec.GetTemplateParameters()
-	err = utils.ValidateComputeInstanceTemplateParameters(template, vmParameters)
-	if err != nil {
-		return nil, err
-	}
-
-	// Set default values for template parameters:
-	actualVmParameters := utils.ProcessTemplateParametersWithDefaults(
-		utils.ComputeInstanceTemplateAdapter{ComputeInstanceTemplate: template},
-		vmParameters,
-	)
-	spec.SetTemplateParameters(actualVmParameters)
-
-	return template, nil
-}
-
-// fetchTemplate fetches a compute instance template
-func (s *PrivateComputeInstancesServer) fetchTemplate(ctx context.Context, templateID string) (*privatev1.ComputeInstanceTemplate, error) {
-	if templateID == "" {
-		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "template ID is mandatory")
-	}
-
-	getTemplateResponse, err := s.templatesDao.Get().
-		SetId(templateID).
-		Do(ctx)
-	if err != nil {
-		var notFoundErr *dao.ErrNotFound
-		if errors.As(err, &notFoundErr) {
-			return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"template '%s' does not exist", templateID)
-		}
-		s.logger.ErrorContext(
-			ctx,
-			"Template retrieval failed",
-			slog.String("template_id", templateID),
-			slog.Any("error", err),
-		)
-		return nil, grpcstatus.Errorf(
-			grpccodes.Internal,
-			"failed to retrieve template '%s'",
-			templateID,
-		)
-	}
-
-	template := getTemplateResponse.GetObject()
-	if template == nil {
-		return nil, grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"template '%s' does not exist",
-			templateID,
-		)
-	}
-	return template, nil
-}
-
-// applySpecDefaults applies template spec defaults to the spec in place and validates
-// that all required fields are present. User-provided values are never overridden.
-func (s *PrivateComputeInstancesServer) applySpecDefaults(
-	spec *privatev1.ComputeInstanceSpec,
+// applyComputeTemplate validates the VM's Template parameters, fills omitted spec fields from
+// the Template, and stores the Template's actual ID, name, and scope on the VM. References
+// copied from a shared Template retain that scope when the VM belongs to a tenant.
+func (s *PrivateComputeInstancesServer) applyComputeTemplate(
+	instance *privatev1.ComputeInstance,
 	template *privatev1.ComputeInstanceTemplate,
 ) error {
+	spec := instance.GetSpec()
+	parameters, err := utils.ApplyTemplateParameterDefaultsAndValidate(
+		utils.ComputeInstanceTemplateAdapter{ComputeInstanceTemplate: template}, spec.GetTemplateParameters())
+	if err != nil {
+		return err
+	}
+	spec.SetTemplateParameters(parameters)
+
+	inheritInstanceType := spec.GetInstanceType() == nil
+	inheritDiskImage := spec.GetDiskImage() == nil
 	utils.ApplySpecDefaults(spec, template.GetSpecDefaults())
+	if inheritInstanceType && spec.GetInstanceType() != nil {
+		inheritReferenceScope(spec.GetInstanceType(), template.GetMetadata())
+	}
+	if inheritDiskImage && spec.GetDiskImage() != nil {
+		inheritReferenceScope(spec.GetDiskImage(), template.GetMetadata())
+	}
+	spec.SetTemplate(canonicalComputeInstanceTemplateReference(template))
 	return utils.ValidateRequiredSpecFields(spec)
 }
 
-// validateInstanceType validates the instance_type field on a ComputeInstance during creation.
-// Per D-01, the API stores only the instance_type name and does NOT expand cores/memory_gib.
-// Per D-02, the API validates existence and state but resolution happens in the reconciler.
+// validateInstanceType checks the instance type selected by the caller, Catalog policy, or
+// Template and fills its stored ID/name/scope. The VM keeps the reference; the controller
+// reads vCPUs and memory from the type later.
 func (s *PrivateComputeInstancesServer) validateInstanceType(
 	ctx context.Context,
 	ci *privatev1.ComputeInstance,
 ) ([]string, error) {
 	spec := ci.GetSpec()
 	instanceTypeRef := spec.GetInstanceType()
-	var warnings []string
-	var instanceTypeName string
-
-	if instanceTypeRef != nil {
-		instanceTypeName = refKey(instanceTypeRef)
+	if instanceTypeRef == nil || refKey(instanceTypeRef) == "" {
+		return nil, nil
 	}
+	identifier := refKey(instanceTypeRef)
 
-	if instanceTypeName == "" {
-		// instance_type not on the spec directly. If a template is referenced
-		// (e.g. via catalog item), check whether its spec_defaults provide one.
-		if templateRef := spec.GetTemplate(); templateRef != nil {
-			template, fetchErr := s.fetchTemplate(ctx, refKey(templateRef))
-			if fetchErr == nil && template.GetSpecDefaults().HasInstanceType() {
-				instanceTypeName = refKey(template.GetSpecDefaults().GetInstanceType())
-			}
-		}
-	}
-
-	if instanceTypeName == "" {
-		return warnings, nil
-	}
-
-	// Look up the instance type and validate its state.
-	stateWarnings, err := validateInstanceTypeState(ctx, s.instanceTypesDao, instanceTypeName, "")
+	resolved, err := resolveAndCanonicalizeReference(
+		ctx, s.instanceTypesDao, ci.GetMetadata(), instanceTypeRef, "instance type", grpccodes.NotFound,
+	)
 	if err != nil {
 		return nil, err
 	}
-	warnings = append(warnings, stateWarnings...)
-
-	return warnings, nil
+	return validateResolvedInstanceType(resolved, identifier, "")
 }
 
-// validateStorageTiers checks that all storage tiers referenced by boot and additional disks exist.
-func (s *PrivateComputeInstancesServer) validateStorageTiers(
-	ctx context.Context,
-	spec *privatev1.ComputeInstanceSpec,
-) error {
-	tiers := map[string]bool{}
-	if tier := spec.GetBootDisk().GetStorageTier(); tier != "" {
-		tiers[tier] = true
-	}
-	for _, disk := range spec.GetAdditionalDisks() {
-		if tier := disk.GetStorageTier(); tier != "" {
-			tiers[tier] = true
-		}
-	}
-	for name := range tiers {
-		_, err := s.storageTiersDao.Get().
-			SetId(name).
-			Do(ctx)
-		if err != nil {
-			var notFoundErr *dao.ErrNotFound
-			if errors.As(err, &notFoundErr) {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"storage tier '%s' does not exist", name)
-			}
-			return grpcstatus.Errorf(grpccodes.Internal,
-				"failed to retrieve storage tier '%s'", name)
-		}
-	}
-	return nil
-}
-
-// validateDiskImage resolves the disk_image reference via the shared
-// validateDiskImageState helper (catalog_item_validation.go), which performs the
-// id-or-name lookup and lifecycle validation shared with the Template and CatalogItem
-// servers. On success it backfills id/name/shared on the stored reference so it is
-// complete, and returns warnings for DEPRECATED images.
+// validateDiskImage checks the image selected by the caller, Catalog policy, or Template and
+// stores its actual ID/name/scope. Deprecated images produce a warning; obsolete ones fail.
 func (s *PrivateComputeInstancesServer) validateDiskImage(
 	ctx context.Context,
 	ci *privatev1.ComputeInstance,
@@ -649,52 +594,52 @@ func (s *PrivateComputeInstancesServer) validateDiskImage(
 		return nil, nil
 	}
 
-	diskImage, warnings, err := validateDiskImageState(ctx, s.diskImagesDao, key, "", "")
+	diskImage, err := resolveDiskImageReference(ctx, s.diskImagesDao, referenceScope{tenant: ci.GetMetadata().GetTenant(), project: ci.GetMetadata().GetProject()}, diskImageRef, "")
 	if err != nil {
 		return nil, err
 	}
-
-	// Backfill id, name, and shared so the stored reference is complete.
-	diskImageRef.Id = diskImage.GetId()
-	diskImageRef.Name = diskImage.GetMetadata().GetName()
-	diskImageRef.Shared = diskImage.GetMetadata().GetTenant() == auth.SharedTenant
+	warnings, err := validateResolvedDiskImage(diskImage, key, "")
+	if err != nil {
+		return nil, err
+	}
+	spec.SetDiskImage(canonicalDiskImageReference(diskImage))
 
 	return warnings, nil
 }
 
-// validateTemplateImmutability ensures that the template and template_parameters fields
-// cannot be changed after compute instance creation.
-func (s *PrivateComputeInstancesServer) validateTemplateImmutability(ctx context.Context,
-	request *privatev1.ComputeInstancesUpdateRequest) error {
-	updateMask := request.GetUpdateMask()
-	updatingTemplate := hasMaskPrefix(updateMask, "spec.template")
-	updatingTemplateParams := hasMaskPrefix(updateMask, "spec.template_parameters")
-	updatingCatalogItem := hasMaskPrefix(updateMask, "spec.catalog_item")
-	updatingInstanceType := hasMaskPrefix(updateMask, "spec.instance_type")
-	updatingDiskImage := hasMaskPrefix(updateMask, "spec.disk_image")
-	updatingAutoExternalIP := hasMaskPrefix(updateMask, "spec.auto_external_ip_attachment")
+func validateComputeInstanceImmutability(
+	current, candidate *privatev1.ComputeInstance,
+	updateMask *fieldmaskpb.FieldMask,
+) error {
+	if err := validateComputeTemplateImmutability(current, candidate, updateMask); err != nil {
+		return err
+	}
+	if err := validateComputeNetworkAttachmentsImmutability(current, candidate, updateMask); err != nil {
+		return err
+	}
+	return validateComputeDiskImmutability(current, candidate, updateMask)
+}
 
-	if !updatingTemplate && !updatingTemplateParams && !updatingCatalogItem && !updatingInstanceType && !updatingDiskImage && !updatingAutoExternalIP {
+// validateComputeTemplateImmutability ensures that template-derived fields cannot be changed after creation.
+func validateComputeTemplateImmutability(
+	current, candidate *privatev1.ComputeInstance,
+	updateMask *fieldmaskpb.FieldMask,
+) error {
+	updatingTemplate := updateIncludesField(updateMask, "spec.template")
+	updatingTemplateParams := updateIncludesField(updateMask, "spec.template_parameters")
+	updatingCatalogItem := updateIncludesField(updateMask, "spec.catalog_item")
+	updatingInstanceType := updateIncludesField(updateMask, "spec.instance_type")
+	updatingDiskImage := updateIncludesField(updateMask, "spec.disk_image")
+	updatingAutoExternalIP := updateIncludesField(updateMask, "spec.auto_external_ip_attachment")
+	updatingUserDataSecret := updateIncludesField(updateMask, "spec.user_data_secret")
+
+	if !updatingTemplate && !updatingTemplateParams && !updatingCatalogItem && !updatingInstanceType &&
+		!updatingDiskImage && !updatingAutoExternalIP && !updatingUserDataSecret {
 		return nil
 	}
 
-	ci := request.GetObject()
-	if ci == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance is mandatory")
-	}
-	id := ci.GetId()
-	if id == "" {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance id is mandatory")
-	}
-
-	getResponse, err := s.generic.dao.Get().SetId(id).Do(ctx)
-	if err != nil {
-		return err
-	}
-	existingCI := getResponse.GetObject()
-
-	existingSpec := existingCI.GetSpec()
-	newSpec := request.GetObject().GetSpec()
+	existingSpec := current.GetSpec()
+	newSpec := candidate.GetSpec()
 
 	if updatingTemplate && refKey(existingSpec.GetTemplate()) != refKey(newSpec.GetTemplate()) {
 		return grpcstatus.Errorf(
@@ -717,13 +662,12 @@ func (s *PrivateComputeInstancesServer) validateTemplateImmutability(ctx context
 		}
 	}
 
-	if updatingCatalogItem && refKey(existingSpec.GetCatalogItem()) != refKey(newSpec.GetCatalogItem()) {
-		return grpcstatus.Errorf(
-			grpccodes.InvalidArgument,
-			"cannot change spec.catalog_item from '%s' to '%s': catalog item is immutable",
-			refKey(existingSpec.GetCatalogItem()),
-			refKey(newSpec.GetCatalogItem()),
-		)
+	if updatingCatalogItem {
+		ref, err := preserveCatalogItemProvenance(existingSpec.GetCatalogItem(), newSpec.GetCatalogItem(), updateMask)
+		if err != nil {
+			return err
+		}
+		newSpec.SetCatalogItem(ref)
 	}
 
 	if updatingInstanceType && refKey(existingSpec.GetInstanceType()) != refKey(newSpec.GetInstanceType()) {
@@ -749,42 +693,35 @@ func (s *PrivateComputeInstancesServer) validateTemplateImmutability(ctx context
 			"cannot change spec.auto_external_ip_attachment: auto_external_ip_attachment is immutable after creation")
 	}
 
+	// The user_data_secret reference is immutable once set. Setting it for the first time is
+	// allowed, including migration from inline user_data, and it cannot be changed or cleared
+	// afterwards. Mutual exclusion with inline user_data is enforced separately.
+	if updatingUserDataSecret && existingSpec.GetUserDataSecret() != nil &&
+		!proto.Equal(existingSpec.GetUserDataSecret(), newSpec.GetUserDataSecret()) {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"cannot change spec.user_data_secret: user_data_secret is immutable after creation")
+	}
+
 	return nil
 }
 
-// validateNetworkAttachmentsImmutability ensures subnet references cannot be changed
+// validateComputeNetworkAttachmentsImmutability ensures subnet references cannot be changed
 // in networkAttachments array after creation. Security groups can be modified.
-func (s *PrivateComputeInstancesServer) validateNetworkAttachmentsImmutability(
-	ctx context.Context,
-	request *privatev1.ComputeInstancesUpdateRequest,
+func validateComputeNetworkAttachmentsImmutability(
+	current, candidate *privatev1.ComputeInstance,
+	updateMask *fieldmaskpb.FieldMask,
 ) error {
-	updateMask := request.GetUpdateMask()
-	updatingNetworkAttachments := hasMaskPrefix(updateMask, "spec.network_attachments")
+	updatingNetworkAttachments := updateIncludesField(updateMask, "spec.network_attachments")
 
 	if !updatingNetworkAttachments {
 		return nil
 	}
 
-	ci := request.GetObject()
-	if ci == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance is mandatory")
-	}
-	id := ci.GetId()
-	if id == "" {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance id is mandatory")
-	}
-
-	getResponse, err := s.generic.dao.Get().SetId(id).Do(ctx)
-	if err != nil {
-		return err
-	}
-	existingCI := getResponse.GetObject()
-
-	existingAttachments := existingCI.GetSpec().GetNetworkAttachments()
+	existingAttachments := current.GetSpec().GetNetworkAttachments()
 	if err := computeinstancespec.ValidateNetworkAttachments(existingAttachments); err != nil {
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to parse existing network attachments configuration: %s", err.Error())
 	}
-	newAttachments := request.GetObject().GetSpec().GetNetworkAttachments()
+	newAttachments := candidate.GetSpec().GetNetworkAttachments()
 	if err := computeinstancespec.ValidateNetworkAttachments(newAttachments); err != nil {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "invalid network attachments configuration: %s", err.Error())
 	}
@@ -817,37 +754,21 @@ func (s *PrivateComputeInstancesServer) validateNetworkAttachmentsImmutability(
 	return nil
 }
 
-// validateDiskImmutability ensures that boot_disk and additional_disks cannot be
+// validateComputeDiskImmutability ensures that boot_disk and additional_disks cannot be
 // modified after creation. The entire DiskSpec is immutable (size_gib and storage_tier).
-func (s *PrivateComputeInstancesServer) validateDiskImmutability(
-	ctx context.Context,
-	request *privatev1.ComputeInstancesUpdateRequest,
+func validateComputeDiskImmutability(
+	current, candidate *privatev1.ComputeInstance,
+	updateMask *fieldmaskpb.FieldMask,
 ) error {
-	updateMask := request.GetUpdateMask()
-	updatingBootDisk := hasMaskPrefix(updateMask, "spec.boot_disk")
-	updatingAdditionalDisks := hasMaskPrefix(updateMask, "spec.additional_disks")
+	updatingBootDisk := updateIncludesField(updateMask, "spec.boot_disk")
+	updatingAdditionalDisks := updateIncludesField(updateMask, "spec.additional_disks")
 
 	if !updatingBootDisk && !updatingAdditionalDisks {
 		return nil
 	}
 
-	ci := request.GetObject()
-	if ci == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance is mandatory")
-	}
-	id := ci.GetId()
-	if id == "" {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "compute instance id is mandatory")
-	}
-
-	getResponse, err := s.generic.dao.Get().SetId(id).Do(ctx)
-	if err != nil {
-		return err
-	}
-	existingCI := getResponse.GetObject()
-
-	existingSpec := existingCI.GetSpec()
-	newSpec := request.GetObject().GetSpec()
+	existingSpec := current.GetSpec()
+	newSpec := candidate.GetSpec()
 
 	// Validate boot_disk immutability
 	if updatingBootDisk {
@@ -862,11 +783,11 @@ func (s *PrivateComputeInstancesServer) validateDiskImmutability(
 			)
 		}
 
-		if existingBootDisk.GetStorageTier() != newBootDisk.GetStorageTier() {
+		if !storageTierRefsEqual(existingBootDisk.GetStorageTier(), newBootDisk.GetStorageTier()) {
 			return grpcstatus.Errorf(
 				grpccodes.InvalidArgument,
 				"cannot change spec.boot_disk.storage_tier from %q to %q: boot disk is immutable",
-				existingBootDisk.GetStorageTier(), newBootDisk.GetStorageTier(),
+				existingBootDisk.GetStorageTier().GetName(), newBootDisk.GetStorageTier().GetName(),
 			)
 		}
 	}
@@ -896,11 +817,11 @@ func (s *PrivateComputeInstancesServer) validateDiskImmutability(
 				)
 			}
 
-			if existingDisk.GetStorageTier() != newDisk.GetStorageTier() {
+			if !storageTierRefsEqual(existingDisk.GetStorageTier(), newDisk.GetStorageTier()) {
 				return grpcstatus.Errorf(
 					grpccodes.InvalidArgument,
 					"cannot change spec.additional_disks[%d].storage_tier from %q to %q: disk is immutable",
-					i, existingDisk.GetStorageTier(), newDisk.GetStorageTier(),
+					i, existingDisk.GetStorageTier().GetName(), newDisk.GetStorageTier().GetName(),
 				)
 			}
 		}
@@ -909,18 +830,13 @@ func (s *PrivateComputeInstancesServer) validateDiskImmutability(
 	return nil
 }
 
-func hasMaskPrefix(mask *fieldmaskpb.FieldMask, prefixes ...string) bool {
-	if mask == nil || len(mask.GetPaths()) == 0 {
-		return true
+// storageTierRefsEqual compares two StorageTierReference values for equality.
+// If both have non-empty IDs, comparison is by ID. Otherwise falls back to name comparison.
+func storageTierRefsEqual(a, b *privatev1.StorageTierReference) bool {
+	if a.GetId() != "" && b.GetId() != "" {
+		return a.GetId() == b.GetId()
 	}
-	for _, path := range mask.GetPaths() {
-		for _, prefix := range prefixes {
-			if path == prefix || strings.HasPrefix(path, prefix+".") {
-				return true
-			}
-		}
-	}
-	return false
+	return a.GetName() == b.GetName()
 }
 
 // validateNetworkReferencesTenancy validates that referenced Subnet and SecurityGroups
@@ -1013,7 +929,8 @@ func (s *PrivateComputeInstancesServer) validateNetworkReferencesTenancy(
 // exist, are in READY state, and SecurityGroups belong to the same VirtualNetwork as their attachment's Subnet.
 //
 // This validation is SKIPPED during deletion because resources may already be deleted.
-// Tenant isolation is validated separately by validateNetworkReferencesTenancy.
+// Resolution checks tenant/project ownership and fills the final reference IDs. During deletion,
+// validateNetworkReferencesTenancy still runs separately without requiring readiness.
 //
 // Implements requirements VAL-01, VAL-02, VAL-03.
 func (s *PrivateComputeInstancesServer) validateNetworkReferencesState(
@@ -1041,33 +958,15 @@ func (s *PrivateComputeInstancesServer) validateNetworkReferencesState(
 		subnetRef := att.GetSubnet()
 		securityGroupRefs := att.GetSecurityGroups()
 
-		// At this point, subnetRef is guaranteed to be non-nil because
-		// ValidateNetworkAttachments ensures all attachments have non-empty subnet
-		var subnet *privatev1.Subnet
-		var virtualNetworkID string
 		subnetKey := refKey(subnetRef)
-
-		// VAL-01: Validate Subnet exists and is READY
-		getSubnetResponse, getErr := s.subnetsDao.Get().
-			SetId(subnetKey).
-			Do(ctx)
-		if getErr != nil {
-			var notFoundErr *dao.ErrNotFound
-			if errors.As(getErr, &notFoundErr) {
+		subnet, err := resolveAndCanonicalizeReference(ctx, s.subnetsDao, vm.GetMetadata(), subnetRef,
+			"subnet", grpccodes.NotFound)
+		if err != nil {
+			if grpcstatus.Code(err) == grpccodes.NotFound {
 				return grpcstatus.Errorf(grpccodes.InvalidArgument,
 					"network_attachments[%d]: subnet '%s' does not exist", i, subnetKey)
 			}
-			// Note: TenancyErr won't happen here because tenancy was already validated
-			s.logger.ErrorContext(ctx, "Failed to query Subnet",
-				slog.String("subnet_id", subnetKey),
-				slog.Any("error", getErr))
-			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate subnet")
-		}
-
-		subnet = getSubnetResponse.GetObject()
-		if subnet == nil {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"network_attachments[%d]: subnet '%s' does not exist", i, subnetKey)
+			return err
 		}
 
 		// VAL-02: Validate READY state
@@ -1077,7 +976,7 @@ func (s *PrivateComputeInstancesServer) validateNetworkReferencesState(
 				i, subnetKey, subnet.GetStatus().GetState().String())
 		}
 
-		virtualNetworkID = refKey(subnet.GetSpec().GetVirtualNetwork())
+		virtualNetworkID := refKey(subnet.GetSpec().GetVirtualNetwork())
 
 		for _, sgRef := range securityGroupRefs {
 			if sgRef == nil {
@@ -1085,26 +984,14 @@ func (s *PrivateComputeInstancesServer) validateNetworkReferencesState(
 			}
 			sgKey := refKey(sgRef)
 
-			getSGResponse, getErr := s.securityGroupsDao.Get().
-				SetId(sgKey).
-				Do(ctx)
-			if getErr != nil {
-				var notFoundErr *dao.ErrNotFound
-				if errors.As(getErr, &notFoundErr) {
+			sg, err := resolveAndCanonicalizeReference(ctx, s.securityGroupsDao, vm.GetMetadata(), sgRef,
+				"security group", grpccodes.NotFound)
+			if err != nil {
+				if grpcstatus.Code(err) == grpccodes.NotFound {
 					return grpcstatus.Errorf(grpccodes.InvalidArgument,
 						"network_attachments[%d]: security group '%s' does not exist", i, sgKey)
 				}
-				// Note: TenancyErr won't happen here because tenancy was already validated
-				s.logger.ErrorContext(ctx, "Failed to query SecurityGroup",
-					slog.String("security_group_id", sgKey),
-					slog.Any("error", getErr))
-				return grpcstatus.Errorf(grpccodes.Internal, "failed to validate security group")
-			}
-
-			sg := getSGResponse.GetObject()
-			if sg == nil {
-				return grpcstatus.Errorf(grpccodes.InvalidArgument,
-					"network_attachments[%d]: security group '%s' does not exist", i, sgKey)
+				return err
 			}
 
 			// VAL-02: Validate READY state
@@ -1129,72 +1016,51 @@ func (s *PrivateComputeInstancesServer) validateNetworkReferencesState(
 	return nil
 }
 
-// validateAndTransformCatalogItem validates a catalog item reference, ensures it references
-// a template, and applies its field definitions to the compute instance spec. Every catalog
-// item must reference a template — it's the only source of the spec defaults (image,
-// boot_disk, run_strategy, instance_type) that provisioning requires; a catalog item without
-// one can never produce a valid compute instance. Callers fetch the template separately once
-// this succeeds, using the template reference now set on the spec.
-func (s *PrivateComputeInstancesServer) validateAndTransformCatalogItem(
+// resolveCatalogItem finds the VM's published Catalog Item in the VM's selected tenant/project
+// or shared scope, then finds the item's Template under the item's ownership. It applies locked
+// and editable field and parameter rules to the new VM and returns that Template for defaults.
+func (s *PrivateComputeInstancesServer) resolveCatalogItem(
 	ctx context.Context, ci *privatev1.ComputeInstance,
-) error {
+) (*privatev1.ComputeInstanceTemplate, error) {
 	if ci == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 	}
 	catalogItemRef := ci.GetSpec().GetCatalogItem()
 	if catalogItemRef == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog_item is mandatory")
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "catalog_item is mandatory")
 	}
 	catalogItemRefStr := refKey(catalogItemRef)
 
-	catalogItem, err := s.lookupCatalogItem(ctx, catalogItemRefStr)
+	catalogItem, err := resolveAndCanonicalizeLockedReference(ctx, s.catalogItemsDao, ci.GetMetadata(), catalogItemRef, "catalog item", grpccodes.NotFound)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if err := validateCatalogItemAccess(catalogItem, catalogItemRefStr); err != nil {
-		return err
+	if err := validateCatalogItemForCreation(catalogItem, catalogItemRefStr); err != nil {
+		return nil, err
 	}
 
 	templateRef := catalogItem.GetTemplate()
 	if templateRef == nil {
-		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"catalog item '%s' does not reference a template", catalogItemRefStr)
 	}
-	ci.GetSpec().SetTemplate(templateRef)
-
-	return applyFieldDefinitions(ci.GetSpec(), catalogItem.GetFieldDefinitions())
-}
-
-func (s *PrivateComputeInstancesServer) lookupCatalogItem(ctx context.Context,
-	key string) (result *privatev1.ComputeInstanceCatalogItem, err error) {
-	if key == "" {
-		return
+	templateRef = cloneMessage(templateRef)
+	resolvedTemplate, resolveErr := resolveAndCanonicalizeLockedReference(ctx, s.templatesDao, catalogItem.GetMetadata(), templateRef, "template", grpccodes.InvalidArgument)
+	if resolveErr != nil {
+		return nil, resolveErr
 	}
-	response, err := s.catalogItemsDao.List().
-		SetFilter(fmt.Sprintf("this.id == %[1]s || this.metadata.name == %[1]s", strconv.Quote(key))).
-		SetLimit(1).
-		Do(ctx)
-	if err != nil {
-		var deniedErr *dao.ErrDenied
-		if errors.As(err, &deniedErr) {
-			err = grpcstatus.Errorf(grpccodes.PermissionDenied, "%s", deniedErr.Reason)
-			return
-		}
-		s.logger.ErrorContext(ctx, "Failed to lookup catalog item",
-			slog.String("key", key),
-			slog.Any("error", err))
-		err = grpcstatus.Errorf(grpccodes.Internal, "failed to lookup catalog item")
-		return
+	if err := applyComputeInstanceCatalogItemPolicies(ci.GetSpec(), catalogItem.GetFields()); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.InvalidArgument, "%s", err)
 	}
-	items := response.GetItems()
-	if len(items) == 0 {
-		err = grpcstatus.Errorf(grpccodes.NotFound,
-			"there is no catalog item with identifier or name '%s'", key)
-		return
+	parameters, parameterErr := applyCatalogItemTemplateParameterPolicies(
+		utils.ComputeInstanceTemplateAdapter{ComputeInstanceTemplate: resolvedTemplate},
+		catalogItem.GetTemplateParameters(), ci.GetSpec().GetTemplateParameters())
+	if parameterErr != nil {
+		return nil, parameterErr
 	}
-	result = items[0]
-	return
+	ci.GetSpec().SetTemplateParameters(parameters)
+	return resolvedTemplate, nil
 }
 
 const (
@@ -1212,9 +1078,14 @@ func (s *PrivateComputeInstancesServer) autoProvisionExternalIP(
 
 	tenant := ci.GetMetadata().GetTenant()
 	ciID := ci.GetId()
+	shortID := ciID
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
 
 	eip := privatev1.ExternalIP_builder{
 		Metadata: privatev1.Metadata_builder{
+			Name:   fmt.Sprintf("auto-eip-%s", shortID),
 			Tenant: tenant,
 			Labels: map[string]string{
 				autoCreatedLabel:    "true",
@@ -1239,6 +1110,11 @@ func (s *PrivateComputeInstancesServer) autoProvisionExternalIP(
 	}
 	eipID := eipResp.GetObject().GetId()
 
+	err = s.lifecycle.lockNewAttachmentReferences(ctx, eipID, ciID, s.generic.dao)
+	if err != nil {
+		return fmt.Errorf("auto_external_ip_attachment: failed to lock attachment references: %w", err)
+	}
+
 	err = UpdatePoolCapacity(ctx, s.externalIPPoolDao, pool.GetId(), 1)
 	if err != nil {
 		return grpcstatus.Errorf(grpccodes.FailedPrecondition, "auto_external_ip_attachment: %s", err)
@@ -1246,6 +1122,7 @@ func (s *PrivateComputeInstancesServer) autoProvisionExternalIP(
 
 	attachment := privatev1.ExternalIPAttachment_builder{
 		Metadata: privatev1.Metadata_builder{
+			Name:   fmt.Sprintf("auto-eipa-%s", shortID),
 			Tenant: tenant,
 			Labels: map[string]string{
 				autoCreatedLabel:    "true",
@@ -1270,11 +1147,6 @@ func (s *PrivateComputeInstancesServer) autoProvisionExternalIP(
 		return fmt.Errorf("auto_external_ip_attachment: failed to create ExternalIPAttachment: %w", err)
 	}
 
-	err = s.updateExternalIPAttachedFlag(ctx, eipID, true)
-	if err != nil {
-		return fmt.Errorf("auto_external_ip_attachment: %w", err)
-	}
-
 	return nil
 }
 
@@ -1289,58 +1161,19 @@ func (s *PrivateComputeInstancesServer) autoCleanupExternalIP(ctx context.Contex
 	}
 
 	for _, attachment := range listResp.GetItems() {
+		attachmentID := attachment.GetId()
 		eipRef := attachment.GetSpec().GetExternalIp()
 		eipID := refKey(eipRef)
 
-		_, err = s.externalIPAttachmentDao.Delete().SetId(attachment.GetId()).Do(ctx)
-		if err != nil {
-			return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete attachment: %w", err)
-		}
-
 		if eipID != "" {
-			err = s.updateExternalIPAttachedFlag(ctx, eipID, false)
-			if err != nil {
-				return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
-			}
-
-			eipResp, getErr := s.externalIPDao.Get().SetId(eipID).Do(ctx)
-			if getErr != nil {
-				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to get ExternalIP: %w", getErr)
-			}
-			poolRef := eipResp.GetObject().GetSpec().GetPool()
-
-			_, err = s.externalIPDao.Delete().SetId(eipID).Do(ctx)
-			if err != nil {
-				return fmt.Errorf("auto_external_ip_attachment cleanup: failed to delete ExternalIP: %w", err)
-			}
-
-			if poolRef != nil {
-				err = UpdatePoolCapacity(ctx, s.externalIPPoolDao, refKey(poolRef), -1)
-				if err != nil {
-					return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
-				}
-			}
+			err = s.lifecycle.deleteAttachmentAndExternalIP(ctx, attachmentID, eipID)
+		} else {
+			err = s.lifecycle.deleteAttachment(ctx, attachmentID)
+		}
+		if err != nil {
+			return fmt.Errorf("auto_external_ip_attachment cleanup: %w", err)
 		}
 	}
 
-	return nil
-}
-
-func (s *PrivateComputeInstancesServer) updateExternalIPAttachedFlag(ctx context.Context, externalIPID string, attached bool) error {
-	getResponse, err := s.externalIPDao.Get().
-		SetId(externalIPID).
-		SetLock(true).
-		Do(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get ExternalIP for attached flag update: %w", err)
-	}
-
-	eip := getResponse.GetObject()
-	eip.GetStatus().SetAttached(attached)
-
-	_, err = s.externalIPDao.Update().SetObject(eip).Do(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to update ExternalIP attached flag: %w", err)
-	}
 	return nil
 }

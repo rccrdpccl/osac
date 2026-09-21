@@ -94,18 +94,6 @@ func (p *DefaultTenancyLogic) DetermineDefaultTenant(ctx context.Context) (resul
 	return
 }
 
-// DetermineVisibleTenants extracts the subject from the auth context and returns the identifiers of the tenants
-// that the current user has permission to see, including the shared tenant.
-func (p *DefaultTenancyLogic) DetermineVisibleTenants(ctx context.Context) (result collections.Set[string],
-	err error) {
-	subject := SubjectFromContext(ctx)
-	result = subject.Tenants
-	if result.Finite() {
-		result = SharedTenants.Union(result)
-	}
-	return
-}
-
 // DetermineVisibility extracts the subject from the auth context and returns the set of project names that the
 // current user has permission to see for each visible tenant. The returned visibility is frozen and must not be
 // modified.

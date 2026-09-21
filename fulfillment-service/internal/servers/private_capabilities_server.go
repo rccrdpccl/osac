@@ -19,13 +19,15 @@ import (
 	"log/slog"
 	"slices"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // PrivateCapabilitiesServerBuilder contains the data and logic needed to create a new private capabilities server.
 type PrivateCapabilitiesServerBuilder struct {
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
 }
 
 var _ privatev1.CapabilitiesServer = (*PrivateCapabilitiesServer)(nil)
@@ -36,6 +38,7 @@ type PrivateCapabilitiesServer struct {
 
 	logger                   *slog.Logger
 	authnTrustedTokenIssuers []string
+	serviceFlags             *services.Flags
 }
 
 // NewPrivateCapabilitiesServer creates a builder that can then be used to configure and create a new private
@@ -47,6 +50,12 @@ func NewPrivateCapabilitiesServer() *PrivateCapabilitiesServerBuilder {
 // SetLogger sets the logger to use. This is mandatory.
 func (b *PrivateCapabilitiesServerBuilder) SetLogger(value *slog.Logger) *PrivateCapabilitiesServerBuilder {
 	b.logger = value
+	return b
+}
+
+// SetServiceFlags sets the services advertised by the server.
+func (b *PrivateCapabilitiesServerBuilder) SetServiceFlags(value *services.Flags) *PrivateCapabilitiesServerBuilder {
+	b.serviceFlags = value
 	return b
 }
 
@@ -72,6 +81,7 @@ func (b *PrivateCapabilitiesServerBuilder) Build() (result *PrivateCapabilitiesS
 	result = &PrivateCapabilitiesServer{
 		logger:                   b.logger,
 		authnTrustedTokenIssuers: authnTrustedTokenIssuers,
+		serviceFlags:             b.serviceFlags,
 	}
 	return
 }
@@ -79,10 +89,15 @@ func (b *PrivateCapabilitiesServerBuilder) Build() (result *PrivateCapabilitiesS
 // Get is the implementation of the method that returns the capabilities of the server.
 func (s *PrivateCapabilitiesServer) Get(ctx context.Context,
 	request *privatev1.CapabilitiesGetRequest) (response *privatev1.CapabilitiesGetResponse, err error) {
+	var enabledServices []string
+	if s.serviceFlags != nil {
+		enabledServices = s.serviceFlags.EnabledServices()
+	}
 	response = privatev1.CapabilitiesGetResponse_builder{
 		Authn: &privatev1.AuthnCapabilities{
 			TrustedTokenIssuers: s.authnTrustedTokenIssuers,
 		},
+		EnabledServices: enabledServices,
 	}.Build()
 	return response, nil
 }

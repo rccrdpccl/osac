@@ -1,323 +1,80 @@
-# AGENTS.md
+# Fulfillment service
 
-This file provides guidance to AI coding agents when working with code in this repository.
+gRPC and REST APIs, persistence, authorization, resource lifecycle, and the
+`osac` CLI.
 
-## Where to Find Information
+This component is part of the OSAC monorepo, not an isolated project. Its APIs,
+generated artifacts, deployment configuration, and runtime behavior may affect
+other components. Apply the repository-wide rules in
+[`../AGENTS.md`](../AGENTS.md), consider downstream consumers before changing
+behavior, and follow the instructions for every affected component.
 
-This file contains only frequently-needed commands and non-obvious rules. For detailed information:
+## Required context
 
-- **Setup & local development**: [README.md](README.md)
-- **API design conventions**: [docs/API.md](docs/API.md)
-- **Authentication & authorization**: [docs/AUTH.md](docs/AUTH.md)
-- **Installation & deployment**: [docs/INSTALL.md](docs/INSTALL.md)
-- **Console access architecture**: [docs/VM_CONSOLE.md](docs/VM_CONSOLE.md)
-- **Database patterns**: See examples in `internal/database/migrations/*.up.sql` for:
-  - Materialized helper tables with triggers (cross-object constraints)
-  - Backfill patterns (`update table set data = data`)
-  - Custom SQLSTATE error codes (map in `internal/database/dao/*_errors.go`)
-- **Server patterns**: See `internal/servers/*_server.go` for:
-  - Public/private server delegation
-  - Builder pattern for server configuration
-- **Testing patterns**: See `*_suite_test.go` files for Ginkgo/Gomega setup
-- **CLI design guidelines**: [`internal/cmd/cli/.claude/rules/cli-ux.md`](internal/cmd/cli/.claude/rules/cli-ux.md)
-- **Dev tooling**: [dev/README.md](dev/README.md) for extending `dev.py`
-- **Linter configuration**:
-  - Go: `.golangci.yml`
-  - Python: `pyproject.toml`
-  - YAML: root-level `.yamllint.yaml` (no component-local copy anymore)
+Before changing this component, identify the documents relevant to the change
+below, then read and follow them. These documents are authoritative for their
+respective areas.
 
-**Before planning or implementing any change, read every document listed above that is
-relevant to the area you are working in.** Do not rely solely on existing source code as a
-reference -- the documents above describe design intent and conventions that are not always
-obvious from the code alone. Skipping them leads to subtle bugs and convention violations.
+- API or proto work: [`docs/API.md`](docs/API.md) and [`docs/CLEANAPI.md`](docs/CLEANAPI.md)
+- Authentication/authorization: [`docs/AUTH.md`](docs/AUTH.md)
+- Database or request lifecycle: [`docs/CODEWALK.md`](docs/CODEWALK.md)
+- Deployment and local setup: [`docs/INSTALL.md`](docs/INSTALL.md) and [`README.md`](README.md)
+- CLI-specific conventions: [`internal/cmd/cli/AGENTS.md`](internal/cmd/cli/AGENTS.md)
 
-## Overview
+## Invariants
 
-The fulfillment-service is a gRPC server with REST gateway for managing infrastructure resources
-(clusters, hosts, compute instances, networking). It uses PostgreSQL for storage, OPA for
-authorization, and supports Kubernetes deployment via Helm.
+- The proto contract lives in the top-level `proto/` module, not here. `proto/private/` is the API source of truth; `proto/tests/` contains editable test-only definitions.
+- Never edit `proto/public/` or `proto/gen/` manually; `proto/tests/` is editable test-proto source. Generated Go is one shared tree at `proto/gen/`, imported by every module as `github.com/osac-project/osac/proto/gen/...`.
+- Express field and cross-field validation with proto validation annotations when possible, not duplicated Go checks.
+- Base resource messages follow the custom `OSAC_OBJECT_SHAPE` rule. An intentional exception requires `// buf:lint:ignore OSAC_OBJECT_SHAPE` directly above the message.
+- Update validation operates on the stored object after applying the update mask, not on the partial request alone.
+- Public servers wrap private servers and add tenant/auth behavior; preserve that boundary.
+- Existing database migrations are immutable. Add a new numbered migration instead of changing an applied one.
+- Tenant authorization and attribution must remain enforced on every public resource path.
 
-## Build and Test Commands
+## Generated files
+
+- Proto changes are regenerated ONCE, in the top-level `proto/` module: `make -C ../proto generate` (= `uv run dev.py build protos` for `proto/public/` + `buf generate` for `proto/gen/`). `make -C ../proto lint` runs `buf lint`. No more per-consumer `buf generate`.
+- Commit the `proto/private/` (or `proto/tests/`) source, the regenerated `proto/public/`, and the regenerated `proto/gen/`. CI (`Check generated code (proto)`) fails the PR if `proto/gen/` or `proto/public/` is stale.
+- Test-only proto changes under `proto/tests/` still regenerate `proto/gen/` but not `proto/public/`.
+- Run `go generate ./...` here for mocks and other `go:generate` outputs; run `go mod tidy` after module changes.
+- Never hand-edit `proto/public/`, `proto/gen/`, `*_mock.go`, or `go.sum`.
+
+## Validation
+
+Run these checks from `fulfillment-service/` as applicable.
+
+### Local checks
 
 ```bash
-# Build binaries
-go build ./cmd/fulfillment-service
-go build ./cmd/osac
-
-# Run unit tests only (excludes integration tests in it/)
-ginkgo run -r internal
-
-# Run a specific package's tests
-ginkgo run internal/servers
-
-# Run tests matching a name pattern
-ginkgo run -r internal --focus="CreateCluster"
-
-# Run tests with verbose output
-ginkgo run -v internal/servers
-
-# Skip tests matching a pattern
-ginkgo run -r internal --skip="database"
-
-# Lint
 uv run dev.py lint
-
-# Proto: full build pipeline (public from private, lint, generate)
-uv run dev.py build protos
-
-# Proto: incremental - just generate Go code (skip public proto generation)
-buf generate
-
-# Proto: just lint
-uv run dev.py lint proto
-
-# Run all tests including integration (requires kind cluster)
-ginkgo run -r
-```
-
-### Integration Tests
-
-```bash
-# Create Kind cluster + deploy infrastructure
-make -C ../osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
-
-# Build image, deploy fulfillment-service via osac chart, run tests
-make -C ../osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
-
-# Clean up
-make -C ../osac-installer uninstall PLATFORM=kind PROFILE=dev NS=osac
-```
-
-Requires `/etc/hosts` entries:
-- `127.0.0.1 keycloak.keycloak.svc.cluster.local`
-- `127.0.0.1 fulfillment-api.osac.svc.cluster.local`
-- `127.0.0.1 fulfillment-internal-api.osac.svc.cluster.local`
-
-### Linting and Code Generation
-
-```bash
-# Lint Go code
-uv run dev.py lint
-
-# Lint proto files
-uv run dev.py lint proto
-
-# Full proto build pipeline (generate public from private, lint, generate Go code)
-uv run dev.py build protos
-
-# Incremental: just generate Go code from proto (skip public proto generation)
-buf generate
-
-# Regenerate mocks
-go generate ./...
-
-# Python linting
 uv run ruff check
-
-# Tidy Go modules
-go mod tidy
+helm lint charts/service -f charts/service/ci-values.yaml
+helm template test charts/service -f charts/service/ci-values.yaml
+go build ./cmd/fulfillment-service ./cmd/osac
+ginkgo run -r internal
 ```
 
-**CRITICAL**: After any `.proto` file change:
-- Run `uv run dev.py build protos` for the complete workflow (generates public API from private API, lints, and generates Go code)
-- Or run `uv run dev.py lint proto && buf generate` for incremental builds (skips public proto generation)
+`ginkgo run -r internal` runs the unit suites without `it/`. For a focused
+server run, use `ginkgo run internal/servers`.
 
-Generated code lands in `internal/api/` (never edit manually).
+### Integration tests
 
-**Proto Workflow**:
-- **Private protos** (`proto/private/`): Full API with internal implementation details. Some resources have `[(cleanapi.field).private = true]` annotations to filter sensitive fields from the public API.
-- **Public protos** (`proto/public/`): Generated from private protos using protoc-gen-cleanapi. Private fields/messages are removed. This is the API published to buf.build.
-- **cleanapi**: The proto file defining annotations is exported from `buf.build/cleanapi/cleanapi:v0.0.8` to `.buf/deps/cleanapi` when running `uv run dev.py build protos`. This directory is gitignored and not committed.
+The installer test target builds, loads, and deploys the current service image.
+It reuses the existing cluster and database. For a full suite run, use a fresh
+environment unless the user agrees to reuse the database. See `README.md` for
+prerequisites and host entries.
 
-Buf and protoc are installed separately - see the [buf installation guide](https://buf.build/docs/installation) and install protoc with `brew install protobuf` on macOS.
+To prepare a fresh environment, recreate the dedicated `osac-dev` Kind
+cluster. Collect useful diagnostics before deleting it.
 
-For extending `dev.py` with new commands, see [dev/README.md](dev/README.md).
-
-### Running Locally
-
-See [README.md](README.md) for instructions on running the service locally, including PostgreSQL setup and starting the gRPC server and REST gateway.
-
-## Development Tooling
-
-Development and build tasks are automated through the `dev.py` script, which is run with `uv run
-dev.py`. When a new task needs to be automated (for example building, formatting, generating code,
-running tests with specific options, or installing a tool), refer to [dev/README.md](dev/README.md).
-
-## Architecture
-
-### Code Organization
-
-- `cmd/fulfillment-service/` - Service binary entry point (calls `internal/cmd/service.Root()`)
-- `cmd/osac/` - CLI binary entry point (calls `internal/cmd/cli.Root()`)
-- `internal/cmd/service/start/` - Server startup commands (grpcserver, restgateway, controller)
-- `internal/servers/` - gRPC service implementations (one `*_server.go` per resource)
-- `proto/` - Protocol Buffer definitions (public/private/tests)
-- `internal/api/` - Generated Go code from protobuf (see [Files Requiring Extra Caution](#files-requiring-extra-caution))
-- `internal/database/` - PostgreSQL access layer with generic DAO
-- `internal/database/dao/` - Generic type-safe DAO (`GenericDAO[O Object]`)
-- `internal/database/migrations/` - SQL migration files
-- `internal/auth/` - Authentication, tenancy, and attribution logic
-- `internal/controllers/` - Kubernetes controllers
-- `internal/testing/` - Test utilities (test server, database helpers)
-- `it/` - Integration tests
-- `charts/` - Helm charts
-
-### Proto Structure
-
-Protos are split into public and private APIs under `proto/`:
-
-```text
-proto/public/osac/public/v1/          - User-facing API (generated from private)
-proto/private/osac/private/v1/        - Admin/controller API (source of truth, full CRUD + Signal RPC)
-proto/tests/osac/tests/v1/            - Test-only proto definitions
+```bash
+kind delete cluster --name osac-dev
+make -C ../osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
 ```
 
-Each resource has `<resource>_type.proto` (message definitions) and `<resource>s_service.proto` (RPC methods). Generated Go code lands in `internal/api/osac/{public,private}/v1/`.
+Then run the suite:
 
-**Public from Private**: The public API is generated from private API using protoc-gen-cleanapi. Fields/messages marked with `[(cleanapi.field).private = true]` are filtered out. Run `uv run dev.py build protos` to regenerate public protos after changing private protos with cleanapi annotations.
-
-### Server Implementation Pattern
-
-Public servers delegate to private servers and add tenant/auth logic:
-- `ClustersServer` (public) wraps `PrivateClustersServer` (private)
-- Builder pattern: `ClustersServerBuilder` configures dependencies
-- Both server files live in `internal/servers/` (e.g., `clusters_server.go` + `private_clusters_server.go`)
-
-### Database Layer
-
-Uses `pgx/v5` with a generic DAO pattern:
-- `GenericDAO[O Object]` provides type-safe CRUD for any protobuf message
-- Resources stored as JSON-serialized protobuf in a `data` column
-- Standard columns: `id`, `name`, `creation_timestamp`, `deletion_timestamp`, `finalizers`, `creator`, `tenant`, `labels`, `annotations`, `data`
-- CEL filter expressions translated to SQL WHERE clauses via `FilterTranslator`
-- Migrations in `internal/database/migrations/` (numbered `*.up.sql` files)
-
-### gRPC Interceptor Chain
-
-The gRPC server uses chained interceptors (configured in `internal/cmd/service/start/grpcserver/`):
-1. Panic recovery
-2. Prometheus metrics
-3. Structured logging (slog)
-4. Authentication (JWT validation)
-5. Database transaction management
-
-### Mock Generation
-
-Uses `go.uber.org/mock` (uber-go/mock). Mocks are generated with `//go:generate mockgen` directives and live alongside source files (e.g., `attribution_logic_mock.go`).
-
-### Testing Pattern
-
-Tests use Ginkgo v2 + Gomega. Typical suite setup in `*_suite_test.go`:
-- `BeforeSuite` initializes logger, auth logic, database
-- `DeferCleanup` for teardown
-- `dao.CreateTables[T]()` dynamically creates test schemas
-
-## Automated Hooks
-
-The following automated checks are configured and should be run at the appropriate times:
-
-- **After proto changes**: See [Linting and Code Generation](#linting-and-code-generation).
-- **After Go module changes**: When `go.mod` is edited, run `go mod tidy`.
-- **Before committing**: `buf lint` (via `uv run dev.py lint proto`) and the Go linter (via `uv run dev.py lint go`) run automatically as pre-commit hooks — see the `fulfillment-service-*` hooks in the root-level `.pre-commit-config.yaml` (there is no component-local `.pre-commit-config.yaml` anymore) — so there is no need to remember to run them manually, though you still can with `uv run dev.py lint`.
-- **Before creating a PR**: Run `gofmt -s -w .` (auto-formats, then fails if any files changed — commit the fixes first), `uv run dev.py lint proto`, and `ginkgo run -r internal`.
-
-`buf lint` includes a custom plugin rule, `OSAC_OBJECT_SHAPE` (implemented in `cmd/buf-plugin-osac-lint/`), which checks that the base message of every resource — the message returned by `Get` and accepted by `Create` — has the standard `id`/`metadata`/`spec`/`status` shape described above. Messages that intentionally deviate from this shape must be marked with a `// buf:lint:ignore OSAC_OBJECT_SHAPE` comment directly above the message declaration.
-
-## CLI Command Help Text
-
-When adding or modifying CLI commands, write help text (both `Short` and `Long` descriptions, as
-well as flag help strings) using Markdown. The help system renders Markdown at display time, so the
-source strings should use Markdown syntax for emphasis, inline code, code blocks, and similar
-formatting.
-
-Because raw backticks would conflict with Go string syntax, use the `{{ bt }}` template function for
-inline code and `{{ bt 3 }}` for fenced code blocks.
-
-For flag help, start with a short type hint in italics (e.g. `_[BOOLEAN]_`, `_URL_`,
-`_FILE|DIRECTORY_`) followed by a dash and the description.
-
-Do not end `shortHelp` strings with a trailing period — the help template does not append one.
-
-Refer to existing commands such as `internal/cmd/cli/login/login_cmd.go` for style and examples of
-how help text is structured.
-
-### Private-API Subcommands
-
-Subcommands that use the private API (`privatev1`) must be annotated so they are hidden from
-`--help` when private mode (--private) is disabled or configuration is unavailable. Wrap the `AddCommand` call with
-`help.MarkPrivateAPI`:
-
-```go
-result.AddCommand(help.MarkPrivateAPI(mysubcommand.Cmd()))
+```bash
+make -C ../osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=fulfillment
 ```
-
-Add the subcommand name to the `privateNames` map in the corresponding `*_cmd_test.go` annotation
-test (e.g. `create_cmd_test.go`, `describe_cmd_test.go`).
-
-## API Design Guidelines
-
-Before making any API design or implementation decision (adding or modifying `.proto` files,
-services, messages, or REST transcoding), read [docs/API.md](docs/API.md). That document contains
-the full set of conventions and rules for the API, including object structure, naming, services,
-request/response patterns, REST transcoding, enums, conditions, object references, and
-documentation requirements. OSAC follows [Kubernetes API
-conventions](https://github.com/kubernetes/community/blob/main/contributors/devel/sig-architecture/api-conventions.md)
-adapted for protobuf.
-
-## Validation Constraints
-
-When adding new proto fields, always include `buf.validate` annotations for any constraints on the field:
-
-- **Required fields**: `[(buf.validate.field).string.min_len = 1]` or `[(buf.validate.field).repeated.min_items = 1]`
-- **Format validation**: `pattern` for regex, `email`, `uuid`, etc.
-- **Range constraints**: `gte`, `lte`, `gt`, `lt` for numeric fields
-- **Map validation**: Use `.map.keys` and `.map.values` for key/value constraints
-- **CEL expressions**: Use `[(buf.validate.field).cel = {...}]` for complex field validation
-- **Message-level CEL**: Use `option (buf.validate.message).cel = {...}` for cross-field or resource-specific constraints
-
-### Validation Flow
-
-- **Create requests**: Validated by protovalidate interceptor before reaching server handlers
-- **Update requests**: Interceptor skips validation; server validates the merged object after applying `update_mask`
-  - This prevents false validation errors when clients send partial objects for update
-  - Server merges request fields (per mask) with DB object, then validates the complete result
-
-### Resource-Specific Validation
-
-To override embedded message validation (e.g., Projects allowing dots in names while Metadata doesn't):
-1. Use `[(buf.validate.field).ignore = IGNORE_ALWAYS]` on the embedded field to skip its standard validation
-2. Add message-level CEL to validate the field with resource-specific rules:
-   ```protobuf
-   option (buf.validate.message).cel = {
-     expression: "this.metadata.name == '' || this.metadata.name.split('.').all(...)"
-   };
-   ```
-
-Do not implement validation in Go code that can be expressed declaratively in proto.
-
-As with any proto change, run `uv run dev.py lint proto && buf generate` afterward (see [Linting and Code Generation](#linting-and-code-generation)).
-
-## Common Pitfalls
-
-- `SERVICE_SUFFIX` lint rule is intentionally excluded in `buf.yaml`
-- Unit tests: run `ginkgo run -r internal` (not `ginkgo run -r`) to avoid triggering integration tests
-- CI timeout: 1 hour for unit and integration test runs
-- Platform-gated tests (`//go:build darwin`, e.g. `internal/config/config_secret_store_darwin_test.go`) are skipped by `ginkgo run -r internal` on non-macOS machines and in the default Linux CI; they run separately in `.github/workflows/darwin-keychain-tests.yml` on a `macos-latest` runner
-
-See [Linting and Code Generation](#linting-and-code-generation) for the required `uv run dev.py lint proto && buf generate` step, and [Files Requiring Extra Caution](#files-requiring-extra-caution) for generated paths that must never be hand-edited.
-
-## Files Requiring Extra Caution
-
-### Never Edit Manually
-
-- `internal/api/` - fully generated by `buf generate` from proto files
-- `go.sum` - managed by `go mod tidy`
-- `*_mock.go` files - generated by `mockgen` via `//go:generate` directives
-- `dist/` - build artifacts from goreleaser (created only during `goreleaser build`, not committed to repository)
-
-### Verify Before Changing
-
-- `charts/` - maintained Helm chart sources, not generated; call out the change explicitly in the PR description so a reviewer from [OWNERS](OWNERS) can confirm it's intentional
-- `proto/**/*.proto` - changes cascade to generated code (see [Linting and Code Generation](#linting-and-code-generation))
-- `internal/database/migrations/*.up.sql` - existing migrations must never be modified; only add new numbered files
-- `.goreleaser.yaml`, `buf.yaml`, `buf.gen.yaml` - infrastructure config; call out the change explicitly in the PR description so a reviewer from [OWNERS](OWNERS) can confirm it's intentional (pre-commit/yamllint config now lives in the root-level `.pre-commit-config.yaml`/`.yamllint.yaml`, not here)

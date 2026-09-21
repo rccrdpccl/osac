@@ -24,9 +24,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/packages"
 	"github.com/osac-project/osac/fulfillment-service/internal/testing"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type testTenantKey struct{}
@@ -172,6 +172,7 @@ var _ = Describe("Reflection helper", func() {
 				"tenant",
 				"user",
 				"virtualnetwork",
+				"volume",
 			))
 		})
 
@@ -204,6 +205,7 @@ var _ = Describe("Reflection helper", func() {
 				"tenants",
 				"users",
 				"virtualnetworks",
+				"volumes",
 			))
 		})
 
@@ -405,7 +407,7 @@ var _ = Describe("Reflection helper", func() {
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
 										HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-										Size:     3,
+										Size:     proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -418,7 +420,7 @@ var _ = Describe("Reflection helper", func() {
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
 										HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-										Size:     3,
+										Size:     proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -439,7 +441,7 @@ var _ = Describe("Reflection helper", func() {
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"xyz": publicv1.ClusterNodeSet_builder{
 							HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-							Size:     3,
+							Size:     proto.Int32(3),
 						}.Build(),
 					},
 				}.Build(),
@@ -453,7 +455,7 @@ var _ = Describe("Reflection helper", func() {
 						NodeSets: map[string]*publicv1.ClusterNodeSet{
 							"xyz": publicv1.ClusterNodeSet_builder{
 								HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-								Size:     3,
+								Size:     proto.Int32(3),
 							}.Build(),
 						},
 					}.Build(),
@@ -474,7 +476,7 @@ var _ = Describe("Reflection helper", func() {
 							Spec: publicv1.ClusterSpec_builder{
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
-										Size: 3,
+										Size: proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -487,7 +489,7 @@ var _ = Describe("Reflection helper", func() {
 								NodeSets: map[string]*publicv1.ClusterNodeSet{
 									"xyz": publicv1.ClusterNodeSet_builder{
 										HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-										Size:     3,
+										Size:     proto.Int32(3),
 									}.Build(),
 								},
 							}.Build(),
@@ -508,7 +510,7 @@ var _ = Describe("Reflection helper", func() {
 				Spec: publicv1.ClusterSpec_builder{
 					NodeSets: map[string]*publicv1.ClusterNodeSet{
 						"xyz": publicv1.ClusterNodeSet_builder{
-							Size: 3,
+							Size: proto.Int32(3),
 						}.Build(),
 					},
 				}.Build(),
@@ -522,7 +524,7 @@ var _ = Describe("Reflection helper", func() {
 						NodeSets: map[string]*publicv1.ClusterNodeSet{
 							"xyz": publicv1.ClusterNodeSet_builder{
 								HostType: publicv1.HostTypeReference_builder{Id: "acme_1tib"}.Build(),
-								Size:     3,
+								Size:     proto.Int32(3),
 							}.Build(),
 						},
 					}.Build(),

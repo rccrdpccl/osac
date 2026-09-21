@@ -13,8 +13,8 @@ language governing permissions and limitations under the License.
 
 package volume
 
-//go:generate mockgen -source=../../api/osac/private/v1/volumes_service_grpc.pb.go -destination=volumes_client_mock.go -package=volume VolumesClient
-//go:generate mockgen -source=../../api/osac/private/v1/hubs_service_grpc.pb.go -destination=hubs_client_mock.go -package=volume HubsClient
+//go:generate mockgen -destination=volumes_client_mock.go -package=volume github.com/osac-project/osac/proto/gen/osac/private/v1 VolumesClient
+//go:generate mockgen -destination=hubs_client_mock.go -package=volume github.com/osac-project/osac/proto/gen/osac/private/v1 HubsClient
 
 import (
 	"context"
@@ -26,17 +26,18 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const objectPrefix = "vol-"
@@ -189,7 +190,8 @@ func (t *task) update(ctx context.Context) error {
 					labels.VolumeUuid: t.volume.GetId(),
 				},
 				Annotations: map[string]string{
-					annotations.Tenant: t.volume.GetMetadata().GetTenant(),
+					annotations.Tenant:  t.volume.GetMetadata().GetTenant(),
+					annotations.Project: t.volume.GetMetadata().GetProject(),
 				},
 			},
 			Spec: spec,
@@ -198,13 +200,7 @@ func (t *task) update(ctx context.Context) error {
 		if err != nil {
 			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
 		}
-		// Populate status.backend/protocol from the resolved private volume so the
-		// operator can select the vendor controller endpoint and protocol on the
-		// first provisioning reconcile, before any vendor round-trip. Status is a
-		// subresource, so it is set with a separate update after Create.
-		newObject.Status.Backend = t.volume.GetStatus().GetBackend()
-		newObject.Status.Protocol = protoProtocolToCRD(t.volume.GetStatus().GetProtocol())
-		if err = t.hubClient.Status().Update(ctx, newObject); err != nil {
+		if err = t.stampStatus(ctx, newObject); err != nil {
 			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
 		}
 		t.r.logger.DebugContext(
@@ -215,9 +211,17 @@ func (t *task) update(ctx context.Context) error {
 		)
 	} else {
 		update := object.DeepCopy()
+		if update.Annotations == nil {
+			update.Annotations = make(map[string]string)
+		}
+		update.Annotations[annotations.Tenant] = t.volume.GetMetadata().GetTenant()
+		update.Annotations[annotations.Project] = t.volume.GetMetadata().GetProject()
 		update.Spec = spec
 		err = t.hubClient.Patch(ctx, update, clnt.MergeFrom(object))
 		if err != nil {
+			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
+		}
+		if err = t.stampStatus(ctx, update); err != nil {
 			return controllers.HandleK8sWriteError(ctx, t.r.logger, err, t.setFailed)
 		}
 		t.r.logger.DebugContext(
@@ -409,10 +413,20 @@ func (t *task) setFailed(err error) {
 // buildSpec maps the proto VolumeSpec to the osac-operator CRD VolumeSpec.
 // Access mode is converted from the proto enum to the CRD typed string.
 func (t *task) buildSpec() osacv1alpha1.VolumeSpec {
+	var topology *osacv1alpha1.VolumeTopology
+	if source := t.volume.GetSpec().GetTopology(); source != nil {
+		segments := make(map[string]string, len(source.GetSegments()))
+		for key, value := range source.GetSegments() {
+			segments[key] = value
+		}
+		topology = &osacv1alpha1.VolumeTopology{Segments: segments}
+	}
+
 	return osacv1alpha1.VolumeSpec{
 		StorageTier: t.volume.GetSpec().GetStorageTier(),
 		SizeGiB:     t.volume.GetSpec().GetSizeGib(),
 		AccessMode:  protoAccessModeToCRD(t.volume.GetSpec().GetAccessMode()),
+		Topology:    topology,
 	}
 }
 
@@ -431,6 +445,53 @@ func protoAccessModeToCRD(mode privatev1.VolumeAccessMode) osacv1alpha1.VolumeAc
 	default:
 		return osacv1alpha1.VolumeAccessModeReadWriteOnce
 	}
+}
+
+// statusStampMaxAttempts is the total number of Status().Update() attempts
+// stampStatus makes before giving up and returning the error for a
+// controller-runtime requeue.
+const statusStampMaxAttempts = 4
+
+// stampStatus ensures the resolved provider and protocol on the hub
+// Volume CR match the values in the private Volume proto. It is called on both
+// the create and patch-spec branches so that a stamp lost to a concurrent
+// operator write (resourceVersion conflict) is recovered on the next reconcile.
+// On conflict the method re-fetches the CR and retries, avoiding a full
+// reconcile round-trip.
+func (t *task) stampStatus(ctx context.Context, object *osacv1alpha1.Volume) error {
+	provider := t.volume.GetStatus().GetProvider()
+	protocol := protoProtocolToCRD(t.volume.GetStatus().GetProtocol())
+
+	if provider == "" || protocol == "" {
+		t.r.logger.WarnContext(ctx, "provider or protocol is empty in proto source, skipping status stamp (incomplete tier resolution)")
+		return nil
+	}
+
+	if object.Status.Provider == provider && object.Status.Protocol == protocol {
+		return nil
+	}
+
+	var lastErr error
+	for attempt := range statusStampMaxAttempts {
+		object.Status.Provider = provider
+		object.Status.Protocol = protocol
+		lastErr = t.hubClient.Status().Update(ctx, object)
+		if lastErr == nil {
+			return nil
+		}
+		if !apierrors.IsConflict(lastErr) {
+			return lastErr
+		}
+		if attempt < statusStampMaxAttempts-1 {
+			t.r.logger.DebugContext(ctx, "Status stamp conflict, retrying",
+				slog.Int("attempt", attempt+1),
+			)
+			if err := t.hubClient.Get(ctx, clnt.ObjectKeyFromObject(object), object); err != nil {
+				return err
+			}
+		}
+	}
+	return lastErr
 }
 
 // protoProtocolToCRD maps the resolved storage protocol from the private Volume

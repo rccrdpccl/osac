@@ -29,14 +29,14 @@ type BaseConfig struct {
 	KeycloakIssuerURL        string
 	KeycloakClientID         string
 	KeycloakClientSecretFile string
+	KeycloakAudience         string
 }
 
 // LifecycleConfig holds the additional settings needed for tenant
 // namespace lifecycle management in Vault.
 type LifecycleConfig struct {
-	Role             string
-	MountPath        string
-	KeycloakAudience string
+	Role      string
+	MountPath string
 }
 
 func getString(flags *pflag.FlagSet, name string) (string, error) {
@@ -84,6 +84,11 @@ func AddBaseFlags(flags *pflag.FlagSet) {
 		"",
 		keycloakClientSecretFileFlagHelp,
 	)
+	_ = flags.String(
+		keycloakAudienceFlagName,
+		"osac-api",
+		keycloakAudienceFlagHelp,
+	)
 }
 
 // AddLifecycleFlags registers the vault flags needed for tenant namespace
@@ -98,11 +103,6 @@ func AddLifecycleFlags(flags *pflag.FlagSet) {
 		lifecycleMountPathFlagName,
 		"jwt",
 		lifecycleMountPathFlagHelp,
-	)
-	_ = flags.String(
-		keycloakAudienceFlagName,
-		"osac-api",
-		keycloakAudienceFlagHelp,
 	)
 }
 
@@ -136,6 +136,10 @@ func BaseConfigFromFlags(flags *pflag.FlagSet) (BaseConfig, error) {
 	if err != nil {
 		return BaseConfig{}, err
 	}
+	audience, err := getString(flags, keycloakAudienceFlagName)
+	if err != nil {
+		return BaseConfig{}, err
+	}
 	return BaseConfig{
 		Endpoint:                 endpoint,
 		Namespace:                namespace,
@@ -144,6 +148,7 @@ func BaseConfigFromFlags(flags *pflag.FlagSet) (BaseConfig, error) {
 		KeycloakIssuerURL:        issuerURL,
 		KeycloakClientID:         clientID,
 		KeycloakClientSecretFile: clientSecretFile,
+		KeycloakAudience:         audience,
 	}, nil
 }
 
@@ -157,15 +162,10 @@ func LifecycleConfigFromFlags(flags *pflag.FlagSet) (LifecycleConfig, error) {
 	if err != nil {
 		return LifecycleConfig{}, err
 	}
-	audience, err := getString(flags, keycloakAudienceFlagName)
-	if err != nil {
-		return LifecycleConfig{}, err
-	}
 
 	return LifecycleConfig{
-		Role:             role,
-		MountPath:        mountPath,
-		KeycloakAudience: audience,
+		Role:      role,
+		MountPath: mountPath,
 	}, nil
 }
 

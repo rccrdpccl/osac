@@ -29,11 +29,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("buildSpec", func() {
@@ -291,17 +291,12 @@ var _ = Describe("delete", func() {
 		// This test verifies the core behavior: when a hub is decommissioned/deleted,
 		// the reconciler removes its finalizer to allow the security group to be archived.
 
-		// Mock VirtualNetworksClient to return a parent VN with hub assignment
-		mockVNClient := NewMockVirtualNetworksClient(ctrl)
-		mockVNClient.EXPECT().
-			Get(gomock.Any(), gomock.Any()).
-			Return(&privatev1.VirtualNetworksGetResponse{
-				Object: privatev1.VirtualNetwork_builder{
-					Id: vnetID,
-					Status: privatev1.VirtualNetworkStatus_builder{
-						Hub: hubID,
-					}.Build(),
-				}.Build(),
+		// Mock HubsClient to return a hub
+		hubsClient := controllers.NewMockHubsClient(ctrl)
+		hubsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			Return(&privatev1.HubsListResponse{
+				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: hubID}.Build()},
 			}, nil)
 
 		// Mock HubCache to return ErrHubNotFound (hub decommissioned)
@@ -321,9 +316,9 @@ var _ = Describe("delete", func() {
 		}.Build()
 
 		f := &function{
-			logger:                logger,
-			virtualNetworksClient: mockVNClient,
-			hubCache:              mockHubCache,
+			logger:     logger,
+			hubsClient: hubsClient,
+			hubCache:   mockHubCache,
 		}
 
 		t := &task{
@@ -427,17 +422,12 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			}).
 			Build()
 
-		vnClient := NewMockVirtualNetworksClient(ctrl)
-		vnClient.EXPECT().
-			Get(gomock.Any(), gomock.Any()).
-			Return(privatev1.VirtualNetworksGetResponse_builder{
-				Object: privatev1.VirtualNetwork_builder{
-					Id: "vnet-1",
-					Status: privatev1.VirtualNetworkStatus_builder{
-						Hub: "hub-1",
-					}.Build(),
-				}.Build(),
-			}.Build(), nil)
+		hubsClient := controllers.NewMockHubsClient(ctrl)
+		hubsClient.EXPECT().
+			List(gomock.Any(), gomock.Any()).
+			Return(&privatev1.HubsListResponse{
+				Items: []*privatev1.Hub{privatev1.Hub_builder{Id: "hub-1"}.Build()},
+			}, nil)
 
 		hubCache := controllers.NewMockHubCache(ctrl)
 		hubCache.EXPECT().
@@ -468,11 +458,11 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		}.Build()
 
 		f := &function{
-			logger:                logger,
-			hubCache:              hubCache,
-			securityGroupsClient:  securityGroupsClient,
-			virtualNetworksClient: vnClient,
-			maskCalculator:        masks.NewCalculator().Build(),
+			logger:               logger,
+			hubCache:             hubCache,
+			securityGroupsClient: securityGroupsClient,
+			hubsClient:           hubsClient,
+			maskCalculator:       masks.NewCalculator().Build(),
 		}
 
 		err := f.run(ctx, sg)

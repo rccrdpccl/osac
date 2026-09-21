@@ -22,10 +22,10 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type NATGatewaysServerBuilder struct {
@@ -198,6 +198,9 @@ func (s *NATGatewaysServer) Create(ctx context.Context,
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
 		return
 	}
+	if err = rejectOutputStatusOnCreate(publicNATGateway.HasStatus()); err != nil {
+		return
+	}
 	privateNATGateway := &privatev1.NATGateway{}
 	err = s.inMapper.Copy(ctx, publicNATGateway, privateNATGateway)
 	if err != nil {
@@ -240,6 +243,9 @@ func (s *NATGatewaysServer) Update(ctx context.Context,
 	publicNATGateway := request.GetObject()
 	if publicNATGateway == nil {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object is mandatory")
+		return
+	}
+	if err = validatePublicMetadataUpdateMask(request.GetUpdateMask()); err != nil {
 		return
 	}
 	privateNATGateway := &privatev1.NATGateway{}

@@ -22,9 +22,9 @@ import (
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/exit"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // mockClusterVersionsClient is a minimal mock that intercepts List calls.
@@ -71,6 +71,57 @@ var _ = Describe("Create cluster flag registration", func() {
 		flag := cmd.Flags().Lookup("template")
 		Expect(flag).NotTo(BeNil())
 		Expect(flag.Shorthand).To(Equal("t"))
+	})
+
+	It("should register --node-set flag", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		flag := cmd.Flags().Lookup("node-set")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.Usage).To(ContainSubstring("Node set configuration"))
+	})
+})
+
+var _ = Describe("Parse cluster node set flag", func() {
+	It("should parse structured mapping syntax", func() {
+		name, ns, err := parseClusterNodeSetFlag("workers={size: 2, baremetal_instance_type: {name: ci-worker-bm}}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("workers"))
+		Expect(ns.GetSize()).To(Equal(int32(2)))
+		Expect(ns.GetBaremetalInstanceType().GetName()).To(Equal("ci-worker-bm"))
+	})
+
+	It("should parse flat mapping syntax", func() {
+		name, ns, err := parseClusterNodeSetFlag("workers={size: 2, baremetal_instance_type: ci-worker-bm}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("workers"))
+		Expect(ns.GetSize()).To(Equal(int32(2)))
+		Expect(ns.GetBaremetalInstanceType().GetName()).To(Equal("ci-worker-bm"))
+	})
+
+	It("should parse comma-separated syntax", func() {
+		name, ns, err := parseClusterNodeSetFlag("workers,size=3,baremetal_instance_type=ci-worker-bm")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("workers"))
+		Expect(ns.GetSize()).To(Equal(int32(3)))
+		Expect(ns.GetBaremetalInstanceType().GetName()).To(Equal("ci-worker-bm"))
+	})
+
+	It("should parse unspaced structured mapping syntax", func() {
+		name, ns, err := parseClusterNodeSetFlag("workers={size:2,baremetal_instance_type:{name:ci-worker-bm}}")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("workers"))
+		Expect(ns.GetSize()).To(Equal(int32(2)))
+		Expect(ns.GetBaremetalInstanceType().GetName()).To(Equal("ci-worker-bm"))
+	})
+
+	It("should parse name=key,size=val syntax", func() {
+		name, ns, err := parseClusterNodeSetFlag("name=workers,size=4,baremetal_instance_type=ci-worker-bm")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(name).To(Equal("workers"))
+		Expect(ns.GetSize()).To(Equal(int32(4)))
+		Expect(ns.GetBaremetalInstanceType().GetName()).To(Equal("ci-worker-bm"))
 	})
 })
 
@@ -258,25 +309,6 @@ var _ = Describe("Create cluster pull secret flags", func() {
 		Expect(flag.DefValue).To(Equal(""))
 	})
 
-	It("should register --pull-secret-file flag", func() {
-		cmd := Cmd()
-		cmd.SetOut(GinkgoWriter)
-		cmd.SetErr(GinkgoWriter)
-		flag := cmd.Flags().Lookup("pull-secret-file")
-		Expect(flag).NotTo(BeNil())
-		Expect(flag.DefValue).To(Equal(""))
-	})
-
-	It("should reject both --pull-secret and --pull-secret-file", func() {
-		cmd := Cmd()
-		cmd.SetOut(GinkgoWriter)
-		cmd.SetErr(GinkgoWriter)
-		cmd.SetArgs([]string{"--catalog-item", "cat-001", "--name", "test", "--pull-secret", "my-secret", "--pull-secret-file", "/tmp/secret"})
-		err := cmd.Execute()
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("if any flags in the group"))
-		Expect(err.Error()).To(ContainSubstring("pull-secret"))
-	})
 })
 
 var _ = Describe("Create cluster networking flags", func() {

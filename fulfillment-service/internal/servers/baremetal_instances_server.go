@@ -22,10 +22,11 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 type BareMetalInstancesServerBuilder struct {
@@ -34,6 +35,7 @@ type BareMetalInstancesServerBuilder struct {
 	attributionLogic  auth.AttributionLogic
 	tenancyLogic      auth.TenancyLogic
 	metricsRegisterer prometheus.Registerer
+	secretStore       vault.SecretStore
 }
 
 var _ publicv1.BareMetalInstancesServer = (*BareMetalInstancesServer)(nil)
@@ -82,6 +84,11 @@ func (b *BareMetalInstancesServerBuilder) SetMetricsRegisterer(value prometheus.
 	return b
 }
 
+func (b *BareMetalInstancesServerBuilder) SetSecretStore(value vault.SecretStore) *BareMetalInstancesServerBuilder {
+	b.secretStore = value
+	return b
+}
+
 func (b *BareMetalInstancesServerBuilder) Build() (result *BareMetalInstancesServer, err error) {
 	if b.logger == nil {
 		err = errors.New("logger is mandatory")
@@ -95,6 +102,7 @@ func (b *BareMetalInstancesServerBuilder) Build() (result *BareMetalInstancesSer
 	inMapper, err := NewGenericMapper[*publicv1.BareMetalInstance, *privatev1.BareMetalInstance]().
 		SetLogger(b.logger).
 		SetStrict(true).
+		AddIgnoredFields("osac.public.v1.BareMetalInstanceStatus.state_transition_time").
 		Build()
 	if err != nil {
 		return
@@ -113,6 +121,7 @@ func (b *BareMetalInstancesServerBuilder) Build() (result *BareMetalInstancesSer
 		SetAttributionLogic(b.attributionLogic).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
+		SetSecretStore(b.secretStore).
 		SetFilterDesc((*publicv1.BareMetalInstance)(nil).ProtoReflect().Descriptor()).
 		Build()
 	if err != nil {
@@ -219,6 +228,7 @@ func (s *BareMetalInstancesServer) Create(ctx context.Context,
 
 	response = &publicv1.BareMetalInstancesCreateResponse{}
 	response.SetObject(createdPublicBMI)
+	response.SetWarnings(privateResponse.GetWarnings())
 	return
 }
 
@@ -233,6 +243,12 @@ func (s *BareMetalInstancesServer) Update(ctx context.Context,
 	if id == "" {
 		err = grpcstatus.Errorf(grpccodes.InvalidArgument, "object identifier is mandatory")
 		return
+	}
+	for _, path := range request.GetUpdateMask().GetPaths() {
+		if path == "status" || path == "status.state_transition_time" {
+			err = grpcstatus.Errorf(grpccodes.InvalidArgument, "status.state_transition_time is output-only")
+			return
+		}
 	}
 
 	// When there's a field mask, copy to a new private object and let the generic server handle the

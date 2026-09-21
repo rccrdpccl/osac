@@ -199,6 +199,8 @@ allow if {
 allow if {
   has_client_permissions
   grpc_method in {
+    "/osac.public.v1.AddOnOperators/Get",
+    "/osac.public.v1.AddOnOperators/List",
     "/osac.public.v1.BareMetalInstanceCatalogItems/Get",
     "/osac.public.v1.BareMetalInstanceCatalogItems/List",
     "/osac.public.v1.BareMetalInstanceTemplates/Get",
@@ -219,10 +221,6 @@ allow if {
     "/osac.public.v1.Clusters/Create",
     "/osac.public.v1.Clusters/Delete",
     "/osac.public.v1.Clusters/Get",
-    "/osac.public.v1.Clusters/GetKubeconfig",
-    "/osac.public.v1.Clusters/GetKubeconfigViaHttp",
-    "/osac.public.v1.Clusters/GetPassword",
-    "/osac.public.v1.Clusters/GetPasswordViaHttp",
     "/osac.public.v1.Clusters/List",
     "/osac.public.v1.Clusters/Update",
     "/osac.public.v1.ComputeInstanceCatalogItems/Get",
@@ -245,6 +243,8 @@ allow if {
     "/osac.public.v1.HostTypes/List",
     "/osac.public.v1.InstanceTypes/Get",
     "/osac.public.v1.InstanceTypes/List",
+    "/osac.public.v1.StorageTiers/Get",
+    "/osac.public.v1.StorageTiers/List",
     "/osac.public.v1.Subnets/Create",
     "/osac.public.v1.Subnets/Delete",
     "/osac.public.v1.Subnets/Get",
@@ -286,6 +286,11 @@ allow if {
     "/osac.public.v1.Secrets/Get",
     "/osac.public.v1.Secrets/List",
     "/osac.public.v1.Secrets/Update",
+    "/osac.public.v1.Volumes/Create",
+    "/osac.public.v1.Volumes/Delete",
+    "/osac.public.v1.Volumes/Get",
+    "/osac.public.v1.Volumes/List",
+    "/osac.public.v1.Volumes/Update",
   }
 }
 

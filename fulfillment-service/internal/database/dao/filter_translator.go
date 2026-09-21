@@ -33,8 +33,8 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // FilterTranslatorBuilder contains the data and logic needed to create a filter translator. Don't create instances of
@@ -352,6 +352,26 @@ func (t *FilterTranslator) translateCall(expr ast.CallExpr) (result filterTransl
 			return
 		}
 		result, err = t.translateToLike(funcName, expr.Target(), funcArgs[0], "%", "")
+	case "size":
+		if len(funcArgs) != 0 {
+			err = fmt.Errorf(
+				"expected no arguments for function '%s' but got %d",
+				funcName, len(funcArgs),
+			)
+			return
+		}
+		targetTr, targetErr := t.translate(expr.Target())
+		if targetErr != nil {
+			err = targetErr
+			return
+		}
+		if targetTr.kind != filterTranslatorJsonArrayKind {
+			err = fmt.Errorf("function '%s' isn't supported for field of kind '%s'", funcName, targetTr.kind)
+			return
+		}
+		result.sql = fmt.Sprintf("coalesce(jsonb_array_length(%s), 0)", targetTr.sql)
+		result.kind = filterTranslatorNumericKind
+		result.precedence = filterTranslatorMaxPrecedence
 	default:
 		err = fmt.Errorf("function '%s' isn't supported", funcName)
 		return

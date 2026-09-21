@@ -28,10 +28,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/externalippool"
-	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/kubeconfig"
-	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/password"
+	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/storagetier"
 	"github.com/osac-project/osac/fulfillment-service/internal/cmd/cli/get/token"
 	"github.com/osac-project/osac/fulfillment-service/internal/config"
 	"github.com/osac-project/osac/fulfillment-service/internal/logging"
@@ -39,6 +37,7 @@ import (
 	"github.com/osac-project/osac/fulfillment-service/internal/reflection"
 	"github.com/osac-project/osac/fulfillment-service/internal/rendering"
 	"github.com/osac-project/osac/fulfillment-service/internal/terminal"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 //go:embed templates
@@ -66,8 +65,7 @@ func Cmd() *cobra.Command {
 		ValidArgsFunction:     completeObjectTypes,
 	}
 	result.AddCommand(externalippool.Cmd())
-	result.AddCommand(kubeconfig.Cmd())
-	result.AddCommand(password.Cmd())
+	result.AddCommand(storagetier.Cmd())
 	result.AddCommand(token.Cmd())
 	flags := result.Flags()
 	flags.StringVarP(

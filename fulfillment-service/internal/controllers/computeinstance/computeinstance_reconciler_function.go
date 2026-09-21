@@ -13,9 +13,10 @@ language governing permissions and limitations under the License.
 
 package computeinstance
 
-//go:generate mockgen -source=../../api/osac/private/v1/compute_instances_service_grpc.pb.go -destination=compute_instances_client_mock.go -package=computeinstance ComputeInstancesClient
-//go:generate mockgen -source=../../api/osac/private/v1/instance_types_service_grpc.pb.go -destination=instance_types_client_mock.go -package=computeinstance InstanceTypesClient
-//go:generate mockgen -source=../../api/osac/private/v1/disk_images_service_grpc.pb.go -destination=disk_images_client_mock.go -package=computeinstance DiskImagesClient
+//go:generate mockgen -destination=compute_instances_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 ComputeInstancesClient
+//go:generate mockgen -destination=instance_types_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 InstanceTypesClient
+//go:generate mockgen -destination=disk_images_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 DiskImagesClient
+//go:generate mockgen -destination=secrets_client_mock.go -package=computeinstance github.com/osac-project/osac/proto/gen/osac/private/v1 SecretsClient
 
 import (
 	"context"
@@ -25,24 +26,25 @@ import (
 	"math/rand/v2"
 	"slices"
 
-	"github.com/osac-project/osac/fulfillment-service/internal/computeinstancespec"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
+	"github.com/osac-project/osac/fulfillment-service/internal/computeinstancespec"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/annotations"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
 	"github.com/osac-project/osac/fulfillment-service/internal/masks"
 	"github.com/osac-project/osac/fulfillment-service/internal/utils"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // objectPrefix is the prefix that will be used in the `generateName` field of the resources created in the hub.
@@ -74,6 +76,7 @@ type function struct {
 	hubsClient             privatev1.HubsClient
 	instanceTypesClient    privatev1.InstanceTypesClient
 	diskImagesClient       privatev1.DiskImagesClient
+	secretsClient          privatev1.SecretsClient
 	maskCalculator         *masks.Calculator
 }
 
@@ -132,6 +135,7 @@ func (b *FunctionBuilder) Build() (result controllers.ReconcilerFunction[*privat
 		hubsClient:             privatev1.NewHubsClient(b.connection),
 		instanceTypesClient:    privatev1.NewInstanceTypesClient(b.connection),
 		diskImagesClient:       privatev1.NewDiskImagesClient(b.connection),
+		secretsClient:          privatev1.NewSecretsClient(b.connection),
 		hubCache:               b.hubCache,
 		maskCalculator:         masks.NewCalculator().Build(),
 	}
@@ -212,7 +216,7 @@ func (t *task) update(ctx context.Context) error {
 	}
 
 	// Set the user data Secret name if user data is provided (no K8s call yet):
-	if t.computeInstance.GetSpec().HasUserData() {
+	if t.computeInstance.GetSpec().HasUserData() || t.computeInstance.GetSpec().GetUserDataSecret() != nil {
 		t.userDataSecretName = fmt.Sprintf("%s%s", t.computeInstance.GetId(), userDataSecretSuffix)
 	}
 
@@ -706,7 +710,7 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 		return fmt.Errorf("failed to resolve instance type '%s': %w", instanceTypeKey, err)
 	}
 	itSpec := response.GetObject().GetSpec()
-	spec.Cores = itSpec.GetCores()
+	spec.VCPUs = itSpec.GetVcpus()
 	spec.MemoryGiB = itSpec.GetMemoryGib()
 	if gpu := itSpec.GetGpu(); gpu != nil {
 		spec.Gpu = &osacv1alpha1.GpuSpec{
@@ -716,7 +720,12 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 		}
 	}
 	if ciSpec.HasRunStrategy() {
-		spec.RunStrategy = osacv1alpha1.RunStrategyType(ciSpec.GetRunStrategy())
+		switch ciSpec.GetRunStrategy() {
+		case privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS:
+			spec.RunStrategy = osacv1alpha1.RunStrategyAlways
+		case privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_HALTED:
+			spec.RunStrategy = osacv1alpha1.RunStrategyHalted
+		}
 	}
 	if ciSpec.HasSshPublicKey() {
 		spec.SSHKey = ciSpec.GetSshPublicKey()
@@ -745,7 +754,7 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 	if ciSpec.HasBootDisk() {
 		spec.BootDisk = osacv1alpha1.DiskSpec{
 			SizeGiB:     ciSpec.GetBootDisk().GetSizeGib(),
-			StorageTier: ciSpec.GetBootDisk().GetStorageTier(),
+			StorageTier: ciSpec.GetBootDisk().GetStorageTier().GetName(),
 		}
 	}
 	if len(ciSpec.GetAdditionalDisks()) > 0 {
@@ -753,7 +762,7 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 		for _, disk := range ciSpec.GetAdditionalDisks() {
 			disks = append(disks, osacv1alpha1.DiskSpec{
 				SizeGiB:     disk.GetSizeGib(),
-				StorageTier: disk.GetStorageTier(),
+				StorageTier: disk.GetStorageTier().GetName(),
 			})
 		}
 		spec.AdditionalDisks = disks
@@ -765,12 +774,15 @@ func (t *task) addExplicitFields(ctx context.Context, spec *osacv1alpha1.Compute
 // ensureUserDataSecret creates a Kubernetes Secret containing the cloud-init user data
 // provided via the fulfillment API. The Secret is owned by the ComputeInstance CR so that
 // Kubernetes garbage collection handles cleanup automatically on deletion.
-// The user data field is immutable, so the Secret is only created once.
 func (t *task) ensureUserDataSecret(ctx context.Context, owner *osacv1alpha1.ComputeInstance) error {
 	if t.userDataSecretName == "" {
 		return nil
 	}
 
+	userData, err := t.resolveUserData(ctx)
+	if err != nil {
+		return err
+	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: t.hubNamespace,
@@ -788,14 +800,17 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *osacv1alpha1.Com
 			},
 		},
 		StringData: map[string]string{
-			userDataSecretKey: t.computeInstance.GetSpec().GetUserData(),
+			userDataSecretKey: userData,
 		},
 	}
 
-	err := t.hubClient.Create(ctx, secret)
-	if apierrors.IsAlreadyExists(err) {
+	_, err = controllerutil.CreateOrPatch(ctx, t.hubClient, secret, func() error {
+		if secret.StringData == nil {
+			secret.StringData = map[string]string{}
+		}
+		secret.StringData[userDataSecretKey] = userData
 		return nil
-	}
+	})
 	if err != nil {
 		return err
 	}
@@ -806,6 +821,28 @@ func (t *task) ensureUserDataSecret(ctx context.Context, owner *osacv1alpha1.Com
 		slog.String("name", secret.GetName()),
 	)
 	return nil
+}
+
+func (t *task) resolveUserData(ctx context.Context) (string, error) {
+	ref := t.computeInstance.GetSpec().GetUserDataSecret()
+	if ref == nil {
+		return t.computeInstance.GetSpec().GetUserData(), nil
+	}
+	if t.r.secretsClient == nil {
+		return "", errors.New("secrets client is required to resolve user_data_secret")
+	}
+	if ref.GetId() == "" {
+		return "", errors.New("user_data_secret must have an id")
+	}
+	response, err := t.r.secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{Id: ref.GetId()}.Build())
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch user_data_secret: %w", err)
+	}
+	value, ok := response.GetObject().GetData()[userDataSecretKey]
+	if !ok || len(value) == 0 {
+		return "", fmt.Errorf("secret %q is missing non-empty data[%q]", ref.GetId(), userDataSecretKey)
+	}
+	return string(value), nil
 }
 
 func mapSourceType(st privatev1.SourceType) osacv1alpha1.ImageSourceType {

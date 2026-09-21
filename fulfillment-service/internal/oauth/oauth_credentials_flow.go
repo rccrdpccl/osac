@@ -27,6 +27,7 @@ type credentialsFlow struct {
 
 func (f *credentialsFlow) run(ctx context.Context) (result *auth.Token, err error) {
 	tokenRequest := tokenEndpointRequest{
+		Audience:     f.source.audience,
 		ClientId:     f.source.clientId,
 		ClientSecret: f.source.clientSecret,
 		GrantType:    "client_credentials",

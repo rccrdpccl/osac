@@ -38,6 +38,7 @@ type AuthenticatorBuilder struct {
 	keycloakIssuerURL    string
 	keycloakClientID     string
 	keycloakClientSecret string
+	keycloakAudience     string
 	caPool               *x509.CertPool
 }
 
@@ -102,6 +103,11 @@ func (b *AuthenticatorBuilder) SetKeycloakClientSecret(value string) *Authentica
 	return b
 }
 
+func (b *AuthenticatorBuilder) SetKeycloakAudience(value string) *AuthenticatorBuilder {
+	b.keycloakAudience = value
+	return b
+}
+
 func (b *AuthenticatorBuilder) SetCaPool(value *x509.CertPool) *AuthenticatorBuilder {
 	b.caPool = value
 	return b
@@ -148,15 +154,20 @@ func (b *AuthenticatorBuilder) Build() (result *Authenticator, err error) {
 		return
 	}
 
-	oauthTokenSource, oauthErr := oauth.NewTokenSource().
+	tokenSourceBuilder := oauth.NewTokenSource().
 		SetLogger(b.logger).
 		SetFlow(oauth.CredentialsFlow).
 		SetIssuer(b.keycloakIssuerURL).
 		SetClientId(b.keycloakClientID).
 		SetClientSecret(b.keycloakClientSecret).
 		SetCaPool(b.caPool).
-		SetStore(tokenStore).
-		Build()
+		SetStore(tokenStore)
+
+	if b.keycloakAudience != "" {
+		tokenSourceBuilder.SetAudience(b.keycloakAudience)
+	}
+
+	oauthTokenSource, oauthErr := tokenSourceBuilder.Build()
 	if oauthErr != nil {
 		err = fmt.Errorf("failed to create keycloak token source: %w", oauthErr)
 		return

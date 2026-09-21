@@ -64,6 +64,7 @@ func NewLifecycleClientFromConfig(
 		SetKeycloakIssuerURL(base.KeycloakIssuerURL).
 		SetKeycloakClientID(base.KeycloakClientID).
 		SetKeycloakClientSecret(keycloakClientSecret).
+		SetKeycloakAudience(base.KeycloakAudience).
 		SetCaPool(caPool).
 		Build()
 	if err != nil {
@@ -82,7 +83,7 @@ func NewLifecycleClientFromConfig(
 		SetParentNamespace(base.Namespace).
 		SetKVMountPath(base.KVMountPath).
 		SetKeycloakIssuerURL(base.KeycloakIssuerURL).
-		SetKeycloakAudience(lifecycle.KeycloakAudience).
+		SetKeycloakAudience(base.KeycloakAudience).
 		SetServiceClientID(base.KeycloakClientID).
 		SetCaPool(caPool)
 	if base.CaCertFile != "" {

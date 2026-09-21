@@ -22,14 +22,15 @@ import (
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/servers"
+	"github.com/osac-project/osac/fulfillment-service/internal/services"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // ResourceServerDeps bundles the dependencies needed to construct every filterable resource's public/private
@@ -49,6 +50,8 @@ type ResourceServerDeps struct {
 	// before the gRPC server's interceptor chain is built, which happens before RegisterResourceServers is
 	// called. It's threaded through here so registration still happens in one place.
 	PrivateUsersServer privatev1.UsersServer
+
+	Services *services.Flags
 }
 
 // ResourceServers exposes the constructed servers and shared infrastructure that code outside the
@@ -72,119 +75,146 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		return nil, fmt.Errorf("notifier must be a *database.Notifier, got %T", deps.Notifier)
 	}
 
-	// Create the cluster templates server:
-	deps.Logger.InfoContext(ctx, "Creating cluster templates server")
-	clusterTemplatesServer, err := servers.NewClusterTemplatesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cluster templates server: %w", err)
-	}
-	publicv1.RegisterClusterTemplatesServer(registrar, clusterTemplatesServer)
+	// CaaS: public cluster templates and catalog items
+	if deps.Services.CaaS {
+		deps.Logger.InfoContext(ctx, "Creating cluster templates server")
+		clusterTemplatesServer, err := servers.NewClusterTemplatesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create cluster templates server: %w", err)
+		}
+		publicv1.RegisterClusterTemplatesServer(registrar, clusterTemplatesServer)
 
-	// Create the cluster catalog items server:
-	deps.Logger.InfoContext(ctx, "Creating cluster catalog items server")
-	clusterCatalogItemsServer, err := servers.NewClusterCatalogItemsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cluster catalog items server: %w", err)
-	}
-	publicv1.RegisterClusterCatalogItemsServer(registrar, clusterCatalogItemsServer)
+		deps.Logger.InfoContext(ctx, "Creating add-on operators server")
+		addOnOperatorsServer, err := servers.NewAddOnOperatorsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create add-on operators server: %w", err)
+		}
+		publicv1.RegisterAddOnOperatorsServer(registrar, addOnOperatorsServer)
 
-	// Create the compute instance catalog items server:
-	deps.Logger.InfoContext(ctx, "Creating compute instance catalog items server")
-	computeInstanceCatalogItemsServer, err := servers.NewComputeInstanceCatalogItemsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create compute instance catalog items server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating cluster catalog items server")
+		clusterCatalogItemsServer, err := servers.NewClusterCatalogItemsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create cluster catalog items server: %w", err)
+		}
+		publicv1.RegisterClusterCatalogItemsServer(registrar, clusterCatalogItemsServer)
 	}
-	publicv1.RegisterComputeInstanceCatalogItemsServer(registrar, computeInstanceCatalogItemsServer)
 
-	// Create the private cluster templates server:
-	deps.Logger.InfoContext(ctx, "Creating private cluster templates server")
-	privateClusterTemplatesServer, err := servers.NewPrivateClusterTemplatesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private cluster templates server: %w", err)
+	if deps.Services.VMaaS {
+		deps.Logger.InfoContext(ctx, "Creating compute instance catalog items server")
+		computeInstanceCatalogItemsServer, err := servers.NewComputeInstanceCatalogItemsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create compute instance catalog items server: %w", err)
+		}
+		publicv1.RegisterComputeInstanceCatalogItemsServer(registrar, computeInstanceCatalogItemsServer)
 	}
-	privatev1.RegisterClusterTemplatesServer(registrar, privateClusterTemplatesServer)
 
-	// Create the private cluster catalog items server:
-	deps.Logger.InfoContext(ctx, "Creating private cluster catalog items server")
-	privateClusterCatalogItemsServer, err := servers.NewPrivateClusterCatalogItemsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private cluster catalog items server: %w", err)
-	}
-	privatev1.RegisterClusterCatalogItemsServer(registrar, privateClusterCatalogItemsServer)
+	if deps.Services.CaaS {
+		deps.Logger.InfoContext(ctx, "Creating private cluster templates server")
+		privateClusterTemplatesServer, err := servers.NewPrivateClusterTemplatesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private cluster templates server: %w", err)
+		}
+		privatev1.RegisterClusterTemplatesServer(registrar, privateClusterTemplatesServer)
 
-	// Create the private compute instance catalog items server:
-	deps.Logger.InfoContext(ctx, "Creating private compute instance catalog items server")
-	privateComputeInstanceCatalogItemsServer, err := servers.NewPrivateComputeInstanceCatalogItemsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private compute instance catalog items server: %w", err)
-	}
-	privatev1.RegisterComputeInstanceCatalogItemsServer(registrar, privateComputeInstanceCatalogItemsServer)
+		deps.Logger.InfoContext(ctx, "Creating private add-on operators server")
+		privateAddOnOperatorsServer, err := servers.NewPrivateAddOnOperatorsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private add-on operators server: %w", err)
+		}
+		privatev1.RegisterAddOnOperatorsServer(registrar, privateAddOnOperatorsServer)
 
-	// Create the clusters server:
-	deps.Logger.InfoContext(ctx, "Creating clusters server")
-	clustersServer, err := servers.NewClustersServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		SetScheme(deps.HubScheme).
-		SetSecretStore(deps.SecretStore).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create clusters server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private cluster catalog items server")
+		privateClusterCatalogItemsServer, err := servers.NewPrivateClusterCatalogItemsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private cluster catalog items server: %w", err)
+		}
+		privatev1.RegisterClusterCatalogItemsServer(registrar, privateClusterCatalogItemsServer)
 	}
-	publicv1.RegisterClustersServer(registrar, clustersServer)
 
-	// Create the private clusters server:
-	deps.Logger.InfoContext(ctx, "Creating private clusters server")
-	privateClustersServer, err := servers.NewPrivateClustersServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private clusters server: %w", err)
+	if deps.Services.VMaaS {
+		deps.Logger.InfoContext(ctx, "Creating private compute instance catalog items server")
+		privateComputeInstanceCatalogItemsServer, err := servers.NewPrivateComputeInstanceCatalogItemsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private compute instance catalog items server: %w", err)
+		}
+		privatev1.RegisterComputeInstanceCatalogItemsServer(registrar, privateComputeInstanceCatalogItemsServer)
 	}
-	privatev1.RegisterClustersServer(registrar, privateClustersServer)
+
+	if deps.Services.CaaS {
+		deps.Logger.InfoContext(ctx, "Creating clusters server")
+		clustersServer, err := servers.NewClustersServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create clusters server: %w", err)
+		}
+		publicv1.RegisterClustersServer(registrar, clustersServer)
+
+		deps.Logger.InfoContext(ctx, "Creating private clusters server")
+		privateClustersServer, err := servers.NewPrivateClustersServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private clusters server: %w", err)
+		}
+		privatev1.RegisterClustersServer(registrar, privateClustersServer)
+	}
 
 	// Create the host types server:
 	deps.Logger.InfoContext(ctx, "Creating host types server")
@@ -194,6 +224,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PublicAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetServiceFlags(deps.Services).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create host types server: %w", err)
@@ -208,179 +239,181 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetServiceFlags(deps.Services).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create private host types server: %w", err)
 	}
 	privatev1.RegisterHostTypesServer(registrar, privateHostTypesServer)
 
-	// Create the compute instance templates server:
-	deps.Logger.InfoContext(ctx, "Creating compute instance templates server")
-	computeInstanceTemplatesServer, err := servers.NewComputeInstanceTemplatesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create compute instance templates server: %w", err)
-	}
-	publicv1.RegisterComputeInstanceTemplatesServer(registrar, computeInstanceTemplatesServer)
+	// VMaaS: compute instance templates and compute instances.
+	var privateComputeInstancesServer privatev1.ComputeInstancesServer
+	if deps.Services.VMaaS {
+		deps.Logger.InfoContext(ctx, "Creating compute instance templates server")
+		computeInstanceTemplatesServer, err := servers.NewComputeInstanceTemplatesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create compute instance templates server: %w", err)
+		}
+		publicv1.RegisterComputeInstanceTemplatesServer(registrar, computeInstanceTemplatesServer)
 
-	// Create the private compute instance templates server:
-	deps.Logger.InfoContext(ctx, "Creating private compute instance templates server")
-	privateComputeInstanceTemplatesServer, err := servers.NewPrivateComputeInstanceTemplatesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private compute instance templates server: %w", err)
-	}
-	privatev1.RegisterComputeInstanceTemplatesServer(registrar, privateComputeInstanceTemplatesServer)
+		deps.Logger.InfoContext(ctx, "Creating private compute instance templates server")
+		privateComputeInstanceTemplatesServer, err := servers.NewPrivateComputeInstanceTemplatesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private compute instance templates server: %w", err)
+		}
+		privatev1.RegisterComputeInstanceTemplatesServer(registrar, privateComputeInstanceTemplatesServer)
 
-	// Create the compute instances server:
-	deps.Logger.InfoContext(ctx, "Creating compute instances server")
-	computeInstancesServer, err := servers.NewComputeInstancesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create compute instances server: %w", err)
-	}
-	publicv1.RegisterComputeInstancesServer(registrar, computeInstancesServer)
+		deps.Logger.InfoContext(ctx, "Creating compute instances server")
+		computeInstancesServer, err := servers.NewComputeInstancesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetSecretStore(deps.SecretStore).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create compute instances server: %w", err)
+		}
+		publicv1.RegisterComputeInstancesServer(registrar, computeInstancesServer)
 
-	// Create the private compute instances server:
-	deps.Logger.InfoContext(ctx, "Creating private compute instances server")
-	privateComputeInstancesServer, err := servers.NewPrivateComputeInstancesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private compute instances server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private compute instances server")
+		privateComputeInstancesServer, err = servers.NewPrivateComputeInstancesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetSecretStore(deps.SecretStore).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private compute instances server: %w", err)
+		}
+		privatev1.RegisterComputeInstancesServer(registrar, privateComputeInstancesServer)
 	}
-	privatev1.RegisterComputeInstancesServer(registrar, privateComputeInstancesServer)
 
-	// Create the disk images server:
-	deps.Logger.InfoContext(ctx, "Creating disk images server")
-	diskImagesServer, err := servers.NewDiskImagesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create disk images server: %w", err)
-	}
-	publicv1.RegisterDiskImagesServer(registrar, diskImagesServer)
+	// Disk images are required by both VMaaS and BMaaS workflows.
+	if deps.Services.VMaaS || deps.Services.BMaaS {
+		deps.Logger.InfoContext(ctx, "Creating disk images server")
+		diskImagesServer, err := servers.NewDiskImagesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create disk images server: %w", err)
+		}
+		publicv1.RegisterDiskImagesServer(registrar, diskImagesServer)
 
-	// Create the private disk images server:
-	deps.Logger.InfoContext(ctx, "Creating private disk images server")
-	privateDiskImagesServer, err := servers.NewPrivateDiskImagesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private disk images server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private disk images server")
+		privateDiskImagesServer, err := servers.NewPrivateDiskImagesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private disk images server: %w", err)
+		}
+		privatev1.RegisterDiskImagesServer(registrar, privateDiskImagesServer)
 	}
-	privatev1.RegisterDiskImagesServer(registrar, privateDiskImagesServer)
 
-	// Create the bare metal instance templates server:
-	deps.Logger.InfoContext(ctx, "Creating bare metal instance templates server")
-	bareMetalInstanceTemplatesServer, err := servers.NewBareMetalInstanceTemplatesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create bare metal instance templates server: %w", err)
-	}
-	publicv1.RegisterBareMetalInstanceTemplatesServer(registrar, bareMetalInstanceTemplatesServer)
+	if deps.Services.BMaaS {
+		deps.Logger.InfoContext(ctx, "Creating bare metal instance templates server")
+		bareMetalInstanceTemplatesServer, err := servers.NewBareMetalInstanceTemplatesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create bare metal instance templates server: %w", err)
+		}
+		publicv1.RegisterBareMetalInstanceTemplatesServer(registrar, bareMetalInstanceTemplatesServer)
 
-	// Create the bare metal instance catalog items server:
-	deps.Logger.InfoContext(ctx, "Creating bare metal instance catalog items server")
-	bareMetalInstanceCatalogItemsServer, err := servers.NewBareMetalInstanceCatalogItemsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create bare metal instance catalog items server: %w", err)
-	}
-	publicv1.RegisterBareMetalInstanceCatalogItemsServer(registrar, bareMetalInstanceCatalogItemsServer)
+		deps.Logger.InfoContext(ctx, "Creating bare metal instance catalog items server")
+		bareMetalInstanceCatalogItemsServer, err := servers.NewBareMetalInstanceCatalogItemsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create bare metal instance catalog items server: %w", err)
+		}
+		publicv1.RegisterBareMetalInstanceCatalogItemsServer(registrar, bareMetalInstanceCatalogItemsServer)
 
-	// Create the bare metal instances server:
-	deps.Logger.InfoContext(ctx, "Creating bare metal instances server")
-	bareMetalInstancesServer, err := servers.NewBareMetalInstancesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create bare metal instances server: %w", err)
-	}
-	publicv1.RegisterBareMetalInstancesServer(registrar, bareMetalInstancesServer)
+		deps.Logger.InfoContext(ctx, "Creating bare metal instances server")
+		bareMetalInstancesServer, err := servers.NewBareMetalInstancesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetSecretStore(deps.SecretStore).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create bare metal instances server: %w", err)
+		}
+		publicv1.RegisterBareMetalInstancesServer(registrar, bareMetalInstancesServer)
 
-	// Create the private bare metal instance templates server:
-	deps.Logger.InfoContext(ctx, "Creating private bare metal instance templates server")
-	privateBareMetalInstanceTemplatesServer, err := servers.NewPrivateBareMetalInstanceTemplatesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private bare metal instance templates server: %w", err)
-	}
-	privatev1.RegisterBareMetalInstanceTemplatesServer(registrar, privateBareMetalInstanceTemplatesServer)
+		deps.Logger.InfoContext(ctx, "Creating private bare metal instance templates server")
+		privateBareMetalInstanceTemplatesServer, err := servers.NewPrivateBareMetalInstanceTemplatesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private bare metal instance templates server: %w", err)
+		}
+		privatev1.RegisterBareMetalInstanceTemplatesServer(registrar, privateBareMetalInstanceTemplatesServer)
 
-	// Create the private bare metal instance catalog items server:
-	deps.Logger.InfoContext(ctx, "Creating private bare metal instance catalog items server")
-	privateBareMetalInstanceCatalogItemsServer, err := servers.NewPrivateBareMetalInstanceCatalogItemsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private bare metal instance catalog items server: %w", err)
-	}
-	privatev1.RegisterBareMetalInstanceCatalogItemsServer(registrar, privateBareMetalInstanceCatalogItemsServer)
+		deps.Logger.InfoContext(ctx, "Creating private bare metal instance catalog items server")
+		privateBareMetalInstanceCatalogItemsServer, err := servers.NewPrivateBareMetalInstanceCatalogItemsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private bare metal instance catalog items server: %w", err)
+		}
+		privatev1.RegisterBareMetalInstanceCatalogItemsServer(registrar, privateBareMetalInstanceCatalogItemsServer)
 
-	// Create the private bare metal instances server:
-	deps.Logger.InfoContext(ctx, "Creating private bare metal instances server")
-	privateBareMetalInstancesServer, err := servers.NewPrivateBareMetalInstancesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private bare metal instances server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private bare metal instances server")
+		privateBareMetalInstancesServer, err := servers.NewPrivateBareMetalInstancesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			SetSecretStore(deps.SecretStore).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private bare metal instances server: %w", err)
+		}
+		privatev1.RegisterBareMetalInstancesServer(registrar, privateBareMetalInstancesServer)
 	}
-	privatev1.RegisterBareMetalInstancesServer(registrar, privateBareMetalInstancesServer)
 
 	// Create the private hubs server:
 	deps.Logger.InfoContext(ctx, "Creating private hubs server")
@@ -521,89 +554,91 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 	}
 	privatev1.RegisterNetworkClassesServer(registrar, privateNetworkClassesServer)
 
-	// Create the instance types server:
-	deps.Logger.InfoContext(ctx, "Creating instance types server")
-	instanceTypesServer, err := servers.NewInstanceTypesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create instance types server: %w", err)
-	}
-	publicv1.RegisterInstanceTypesServer(registrar, instanceTypesServer)
+	// VMaaS: instance types
+	if deps.Services.VMaaS {
+		deps.Logger.InfoContext(ctx, "Creating instance types server")
+		instanceTypesServer, err := servers.NewInstanceTypesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create instance types server: %w", err)
+		}
+		publicv1.RegisterInstanceTypesServer(registrar, instanceTypesServer)
 
-	// Create the private instance types server:
-	deps.Logger.InfoContext(ctx, "Creating private instance types server")
-	privateInstanceTypesServer, err := servers.NewPrivateInstanceTypesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private instance types server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private instance types server")
+		privateInstanceTypesServer, err := servers.NewPrivateInstanceTypesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private instance types server: %w", err)
+		}
+		privatev1.RegisterInstanceTypesServer(registrar, privateInstanceTypesServer)
 	}
-	privatev1.RegisterInstanceTypesServer(registrar, privateInstanceTypesServer)
 
-	// Create the bare metal instance types server:
-	deps.Logger.InfoContext(ctx, "Creating bare metal instance types server")
-	bareMetalInstanceTypesServer, err := servers.NewBareMetalInstanceTypesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create bare metal instance types server: %w", err)
-	}
-	publicv1.RegisterBareMetalInstanceTypesServer(registrar, bareMetalInstanceTypesServer)
+	// BMaaS: bare metal instance types
+	if deps.Services.BMaaS {
+		deps.Logger.InfoContext(ctx, "Creating bare metal instance types server")
+		bareMetalInstanceTypesServer, err := servers.NewBareMetalInstanceTypesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create bare metal instance types server: %w", err)
+		}
+		publicv1.RegisterBareMetalInstanceTypesServer(registrar, bareMetalInstanceTypesServer)
 
-	// Create the private bare metal instance types server:
-	deps.Logger.InfoContext(ctx, "Creating private bare metal instance types server")
-	privateBareMetalInstanceTypesServer, err := servers.NewPrivateBareMetalInstanceTypesServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private bare metal instance types server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private bare metal instance types server")
+		privateBareMetalInstanceTypesServer, err := servers.NewPrivateBareMetalInstanceTypesServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private bare metal instance types server: %w", err)
+		}
+		privatev1.RegisterBareMetalInstanceTypesServer(registrar, privateBareMetalInstanceTypesServer)
 	}
-	privatev1.RegisterBareMetalInstanceTypesServer(registrar, privateBareMetalInstanceTypesServer)
 
-	// Create the cluster versions server:
-	deps.Logger.InfoContext(ctx, "Creating cluster versions server")
-	clusterVersionsServer, err := servers.NewClusterVersionsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PublicAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cluster versions server: %w", err)
-	}
-	publicv1.RegisterClusterVersionsServer(registrar, clusterVersionsServer)
+	if deps.Services.CaaS {
+		deps.Logger.InfoContext(ctx, "Creating cluster versions server")
+		clusterVersionsServer, err := servers.NewClusterVersionsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PublicAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create cluster versions server: %w", err)
+		}
+		publicv1.RegisterClusterVersionsServer(registrar, clusterVersionsServer)
 
-	// Create the private cluster versions server:
-	deps.Logger.InfoContext(ctx, "Creating private cluster versions server")
-	privateClusterVersionsServer, err := servers.NewPrivateClusterVersionsServer().
-		SetLogger(deps.Logger).
-		SetNotifier(deps.Notifier).
-		SetAttributionLogic(deps.PrivateAttributionLogic).
-		SetTenancyLogic(deps.TenancyLogic).
-		SetMetricsRegisterer(deps.MetricsRegisterer).
-		Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create private cluster versions server: %w", err)
+		deps.Logger.InfoContext(ctx, "Creating private cluster versions server")
+		privateClusterVersionsServer, err := servers.NewPrivateClusterVersionsServer().
+			SetLogger(deps.Logger).
+			SetNotifier(deps.Notifier).
+			SetAttributionLogic(deps.PrivateAttributionLogic).
+			SetTenancyLogic(deps.TenancyLogic).
+			SetMetricsRegisterer(deps.MetricsRegisterer).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create private cluster versions server: %w", err)
+		}
+		privatev1.RegisterClusterVersionsServer(registrar, privateClusterVersionsServer)
 	}
-	privatev1.RegisterClusterVersionsServer(registrar, privateClusterVersionsServer)
 
 	// Create the private storage backends server:
 	deps.Logger.InfoContext(ctx, "Creating private storage backends server")
@@ -674,6 +709,21 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		return nil, fmt.Errorf("failed to create private storage tiers server: %w", err)
 	}
 	privatev1.RegisterStorageTiersServer(registrar, privateStorageTiersServer)
+
+	// Create the storage tiers server:
+	deps.Logger.InfoContext(ctx, "Creating storage tiers server")
+	storageTiersServer, err := servers.NewStorageTiersServer().
+		SetLogger(deps.Logger).
+		SetNotifier(deps.Notifier).
+		SetAttributionLogic(deps.PublicAttributionLogic).
+		SetTenancyLogic(deps.TenancyLogic).
+		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetStorageBackendsDAO(storageBackendsDAO).
+		Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create storage tiers server: %w", err)
+	}
+	publicv1.RegisterStorageTiersServer(registrar, storageTiersServer)
 
 	// Create the roles server:
 	deps.Logger.InfoContext(ctx, "Creating roles server")
@@ -934,6 +984,7 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetSecretStore(deps.SecretStore).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create private identity providers server: %w", err)
@@ -962,11 +1013,27 @@ func RegisterResourceServers(ctx context.Context, registrar grpc.ServiceRegistra
 		SetAttributionLogic(deps.PrivateAttributionLogic).
 		SetTenancyLogic(deps.TenancyLogic).
 		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetDefaultNetworkingProvisioner(defaultNetworkingProvisioner).
 		Build()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create private projects server: %w", err)
 	}
 	privatev1.RegisterProjectsServer(registrar, privateProjectsServer)
+
+	// Create the volumes server:
+	deps.Logger.InfoContext(ctx, "Creating volumes server")
+	volumesServer, err := servers.NewVolumesServer().
+		SetLogger(deps.Logger).
+		SetNotifier(deps.Notifier).
+		SetAttributionLogic(deps.PublicAttributionLogic).
+		SetTenancyLogic(deps.TenancyLogic).
+		SetMetricsRegisterer(deps.MetricsRegisterer).
+		SetTierResolver(deps.TierResolver).
+		Build()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create volumes server: %w", err)
+	}
+	publicv1.RegisterVolumesServer(registrar, volumesServer)
 
 	// Create the private volumes server:
 	deps.Logger.InfoContext(ctx, "Creating private volumes server")

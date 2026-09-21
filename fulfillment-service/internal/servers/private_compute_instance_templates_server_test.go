@@ -25,7 +25,7 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private compute instance templates server", func() {
@@ -431,7 +431,7 @@ var _ = Describe("Private compute instance templates server", func() {
 							Name: name,
 						}.Build(),
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:       4,
+							Vcpus:       4,
 							MemoryGib:   16,
 							Description: "Test instance type.",
 						}.Build(),
@@ -627,6 +627,52 @@ var _ = Describe("Private compute instance templates server", func() {
 		})
 
 		Describe("Disk image validation in spec_defaults", func() {
+			It("Allows an empty disk image reference on Create", func() {
+				response, err := server.Create(ctx, privatev1.ComputeInstanceTemplatesCreateRequest_builder{
+					Object: privatev1.ComputeInstanceTemplate_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:       "Template with empty disk image reference",
+						Description: "Template with an empty disk image reference.",
+						SpecDefaults: privatev1.ComputeInstanceTemplateSpecDefaults_builder{
+							DiskImage: privatev1.DiskImageReference_builder{}.Build(),
+						}.Build(),
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				Expect(response.GetWarnings()).To(BeEmpty())
+			})
+
+			It("Allows an empty disk image reference on Update", func() {
+				createResponse, err := server.Create(ctx, privatev1.ComputeInstanceTemplatesCreateRequest_builder{
+					Object: privatev1.ComputeInstanceTemplate_builder{
+						Metadata: privatev1.Metadata_builder{
+							Name: fmt.Sprintf("test-%s", uuid.NewString()[:8]),
+						}.Build(),
+						Title:       "Template for empty disk image update",
+						Description: "Template without spec defaults.",
+					}.Build(),
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+
+				response, err := server.Update(ctx, privatev1.ComputeInstanceTemplatesUpdateRequest_builder{
+					Object: privatev1.ComputeInstanceTemplate_builder{
+						Id: createResponse.GetObject().GetId(),
+						SpecDefaults: privatev1.ComputeInstanceTemplateSpecDefaults_builder{
+							DiskImage: privatev1.DiskImageReference_builder{}.Build(),
+						}.Build(),
+					}.Build(),
+					UpdateMask: &fieldmaskpb.FieldMask{
+						Paths: []string{"spec_defaults"},
+					},
+				}.Build())
+				Expect(err).ToNot(HaveOccurred())
+				Expect(response).ToNot(BeNil())
+				Expect(response.GetWarnings()).To(BeEmpty())
+			})
+
 			It("Returns warning when spec_defaults references a DEPRECATED disk image on Create", func() {
 				createDiskImageWithLifecycle("deprecated-di",
 					privatev1.DiskImageLifecycle_DISK_IMAGE_LIFECYCLE_DEPRECATED,

@@ -29,13 +29,13 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
-	"github.com/osac-project/osac/fulfillment-service/internal/collections"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/uuid"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 // eventsCollector reads events from a Watch stream in the background and collects them for later assertions.
@@ -143,10 +143,31 @@ var _ = Describe("Events server visibility", func() {
 	}
 
 	// makeTenancy creates a mock tenancy logic returning the given visible tenants:
-	makeTenancy := func(tenants collections.Set[string]) *auth.MockTenancyLogic {
+	makeTenancy := func(tenants ...string) *auth.MockTenancyLogic {
+		builder := auth.NewVisibility()
+		builder.AddVisibleTenants(auth.SharedTenant)
+		for _, tenant := range tenants {
+			builder.AddVisibleTenants(tenant)
+		}
+		visibility, err := builder.Build()
+		Expect(err).ToNot(HaveOccurred())
 		mock := auth.NewMockTenancyLogic(ctrl)
-		mock.EXPECT().DetermineVisibleTenants(gomock.Any()).
-			Return(tenants, nil).
+		mock.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
+			AnyTimes()
+		return mock
+	}
+
+	// makeTenancyWithProject creates a mock tenancy logic returning visibility of the given tenant and named project:
+	makeTenancyWithProject := func(tenant, project string) *auth.MockTenancyLogic {
+		builder := auth.NewVisibility()
+		builder.AddVisibleTenants(auth.SharedTenant)
+		builder.AddVisibleProject(tenant, project)
+		visibility, err := builder.Build()
+		Expect(err).ToNot(HaveOccurred())
+		mock := auth.NewMockTenancyLogic(ctrl)
+		mock.EXPECT().DetermineVisibility(gomock.Any()).
+			Return(visibility, nil).
 			AnyTimes()
 		return mock
 	}
@@ -177,15 +198,15 @@ var _ = Describe("Events server visibility", func() {
 
 	It("Delivers events when tenant is visible", func() {
 		// Send an event for a visible tenant:
-		server, client := startServer(makeTenancy(
-			collections.NewSet("tenant-a"),
-		))
+		server, client := startServer(makeTenancy("tenant-a"))
 		collector, cancel := startWatch(server, client)
 		defer cancel()
+		timestamp := timestamppb.New(time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC))
 		sendEvent(
 			privatev1.Event_builder{
-				Id:   uuid.New(),
-				Type: privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+				Id:        uuid.New(),
+				Type:      privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+				Timestamp: timestamp,
 				Cluster: privatev1.Cluster_builder{
 					Id: uuid.New(),
 					Metadata: privatev1.Metadata_builder{
@@ -200,12 +221,11 @@ var _ = Describe("Events server visibility", func() {
 
 		// Verify that the event is for the visible tenant:
 		Expect(collector.Events()[0].GetCluster().GetMetadata().GetTenant()).To(Equal("tenant-a"))
+		Expect(collector.Events()[0].GetTimestamp().AsTime()).To(Equal(timestamp.AsTime()))
 	})
 
 	It("Filters out events when tenant is not visible", func() {
-		server, client := startServer(makeTenancy(
-			collections.NewSet("tenant-b"),
-		))
+		server, client := startServer(makeTenancy("tenant-b"))
 		collector, cancel := startWatch(server, client)
 		defer cancel()
 		sendEvent(
@@ -225,9 +245,7 @@ var _ = Describe("Events server visibility", func() {
 
 	It("Delivers only visible events when multiple are sent", func() {
 		// Send two events, one for a visible tenant and one for a non-visible tenant:
-		server, client := startServer(makeTenancy(
-			collections.NewSet("tenant-a"),
-		))
+		server, client := startServer(makeTenancy("tenant-a"))
 		collector, cancel := startWatch(server, client)
 		defer cancel()
 		sendEvent(
@@ -263,11 +281,55 @@ var _ = Describe("Events server visibility", func() {
 		Consistently(collector.Events, time.Second).Should(HaveLen(1))
 	})
 
+	It("Delivers events when project is visible", func() {
+		// Send an event for a visible project:
+		server, client := startServer(makeTenancyWithProject("tenant-a", "project-x"))
+		collector, cancel := startWatch(server, client)
+		defer cancel()
+		sendEvent(
+			privatev1.Event_builder{
+				Id:   uuid.New(),
+				Type: privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+				Cluster: privatev1.Cluster_builder{
+					Id: uuid.New(),
+					Metadata: privatev1.Metadata_builder{
+						Tenant:  "tenant-a",
+						Project: "project-x",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		)
+
+		// Wait till there is one event in the collector:
+		Eventually(collector.Events, time.Second).Should(HaveLen(1))
+
+		// Verify that the event is for the visible project:
+		Expect(collector.Events()[0].GetCluster().GetMetadata().GetProject()).To(Equal("project-x"))
+	})
+
+	It("Filters out events when project is not visible", func() {
+		server, client := startServer(makeTenancyWithProject("tenant-a", "project-y"))
+		collector, cancel := startWatch(server, client)
+		defer cancel()
+		sendEvent(
+			privatev1.Event_builder{
+				Id:   uuid.New(),
+				Type: privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
+				Cluster: privatev1.Cluster_builder{
+					Id: uuid.New(),
+					Metadata: privatev1.Metadata_builder{
+						Tenant:  "tenant-a",
+						Project: "project-x",
+					}.Build(),
+				}.Build(),
+			}.Build(),
+		)
+		Consistently(collector.Events, time.Second).Should(BeEmpty())
+	})
+
 	It("Delivers event with cluster payload", func() {
 		// Send an event with cluster payload:
-		server, client := startServer(makeTenancy(
-			collections.NewSet("tenant-a"),
-		))
+		server, client := startServer(makeTenancy("tenant-a"))
 		collector, cancel := startWatch(server, client)
 		defer cancel()
 		sendEvent(
@@ -292,9 +354,7 @@ var _ = Describe("Events server visibility", func() {
 
 	It("Delivers event with compute instance payload", func() {
 		// Send an event with compute instance payload:
-		server, client := startServer(makeTenancy(
-			collections.NewSet("tenant-a"),
-		))
+		server, client := startServer(makeTenancy("tenant-a"))
 		collector, cancel := startWatch(server, client)
 		defer cancel()
 		sendEvent(
@@ -319,9 +379,7 @@ var _ = Describe("Events server visibility", func() {
 
 	It("Delivers event with bare metal instance payload", func() {
 		// Send an event with bare metal instance payload:
-		server, client := startServer(makeTenancy(
-			collections.NewSet("tenant-a"),
-		))
+		server, client := startServer(makeTenancy("tenant-a"))
 		collector, cancel := startWatch(server, client)
 		defer cancel()
 		sendEvent(
@@ -348,9 +406,7 @@ var _ = Describe("Events server visibility", func() {
 	// separate from FilterTranslator/GenericServer/GenericDAO's public-filter-oracle fix. This is the only
 	// regression coverage confirming that environment stays scoped to the public Event message.
 	It("Rejects a filter referencing the private-only hub field", func() {
-		_, client := startServer(makeTenancy(
-			collections.NewSet("tenant-a"),
-		))
+		_, client := startServer(makeTenancy("tenant-a"))
 
 		// The server-streaming call returns immediately, before the server handler has run (see startWatch above),
 		// so the filter-compile failure surfaces on the first Recv, not on Watch itself:

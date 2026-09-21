@@ -22,12 +22,13 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
 	"github.com/osac-project/osac/fulfillment-service/internal/vault"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type PrivateSecretsServerBuilder struct {
@@ -127,6 +128,7 @@ func (b *PrivateSecretsServerBuilder) Build() (result *PrivateSecretsServer, err
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
 		SetFilterDesc(b.filterDesc).
+		AddAllowedTenants(auth.SharedTenant).
 		Build()
 	if err != nil {
 		return
@@ -158,6 +160,9 @@ func (s *PrivateSecretsServer) Get(ctx context.Context,
 	}
 
 	obj := response.GetObject()
+	if err = s.authorizeSharedSecretManagement(ctx, obj); err != nil {
+		return
+	}
 	if s.secretStore != nil && obj.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT {
 		tenant := obj.GetMetadata().GetTenant()
 		project := obj.GetMetadata().GetProject()
@@ -206,25 +211,47 @@ func (s *PrivateSecretsServer) Create(ctx context.Context,
 		secret.SetBackend(privatev1.SecretBackend_SECRET_BACKEND_VAULT)
 	}
 
-	if s.secretStore != nil && secret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT {
-		tenant, tenantErr := s.determineTenant(ctx, secret)
-		if tenantErr != nil {
-			err = tenantErr
-			return
-		}
-		project := secret.GetMetadata().GetProject()
-		name := secret.GetMetadata().GetName()
-
-		err = s.secretStore.Store(ctx, tenant, project, name, secret.GetData())
-		if err != nil {
-			err = vault.ToGrpcError(err)
-			return
-		}
-
+	persistInVault := s.secretStore != nil && secret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT
+	var data map[string][]byte
+	if persistInVault {
+		data = secret.GetData()
 		secret.SetData(nil)
 	}
 
-	err = s.generic.Create(ctx, request, &response)
+	create := func(opCtx context.Context) error {
+		if createErr := s.generic.Create(opCtx, request, &response); createErr != nil {
+			return createErr
+		}
+		created := response.GetObject()
+		if authErr := s.authorizeSharedSecretManagement(opCtx, created); authErr != nil {
+			return authErr
+		}
+		if created.GetMetadata().GetTenant() == auth.SharedTenant {
+			if created.GetBackend() != privatev1.SecretBackend_SECRET_BACKEND_VAULT {
+				return grpcstatus.Errorf(grpccodes.InvalidArgument, "shared Secrets must use the Vault backend")
+			}
+			if s.secretStore == nil {
+				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
+					"shared Secrets require a configured Vault backend")
+			}
+		}
+		if !persistInVault || isDryRun(opCtx) {
+			return nil
+		}
+		storeErr := s.secretStore.Store(
+			opCtx,
+			created.GetMetadata().GetTenant(),
+			created.GetMetadata().GetProject(),
+			created.GetMetadata().GetName(),
+			data,
+		)
+		return vault.ToGrpcError(storeErr)
+	}
+
+	err = s.withSavepoint(ctx, create)
+	if err != nil {
+		response = nil
+	}
 	return
 }
 
@@ -245,30 +272,45 @@ func (s *PrivateSecretsServer) Update(ctx context.Context,
 	}
 
 	existingSecret := getResponse.GetObject()
+	if err = s.authorizeSharedSecretManagement(ctx, existingSecret); err != nil {
+		return
+	}
 
-	err = s.validateSecretUpdate(ctx, request.GetObject(), existingSecret)
+	err = s.validateSecretUpdate(ctx, request.GetObject(), request.GetUpdateMask(), existingSecret)
 	if err != nil {
 		return
 	}
 
-	if s.secretStore != nil &&
+	persistInVault := s.secretStore != nil &&
 		existingSecret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT &&
-		len(request.GetObject().GetData()) > 0 {
-
-		tenant := existingSecret.GetMetadata().GetTenant()
-		project := existingSecret.GetMetadata().GetProject()
-		name := existingSecret.GetMetadata().GetName()
-
-		err = s.secretStore.Store(ctx, tenant, project, name, request.GetObject().GetData())
-		if err != nil {
-			err = vault.ToGrpcError(err)
-			return
-		}
-
+		len(request.GetObject().GetData()) > 0
+	var data map[string][]byte
+	if persistInVault {
+		data = request.GetObject().GetData()
 		request.GetObject().SetData(nil)
 	}
 
-	err = s.generic.Update(ctx, request, &response)
+	update := func(opCtx context.Context) error {
+		if updateErr := s.generic.Update(opCtx, request, &response); updateErr != nil {
+			return updateErr
+		}
+		if !persistInVault || isDryRun(opCtx) {
+			return nil
+		}
+		storeErr := s.secretStore.Store(
+			opCtx,
+			existingSecret.GetMetadata().GetTenant(),
+			existingSecret.GetMetadata().GetProject(),
+			existingSecret.GetMetadata().GetName(),
+			data,
+		)
+		return vault.ToGrpcError(storeErr)
+	}
+
+	err = s.withSavepoint(ctx, update)
+	if err != nil {
+		response = nil
+	}
 	return
 }
 
@@ -280,16 +322,16 @@ func (s *PrivateSecretsServer) Delete(ctx context.Context,
 		defer tx.ReportError(&err)
 	}
 
-	var obj *privatev1.Secret
-	if s.secretStore != nil {
-		getRequest := &privatev1.SecretsGetRequest{}
-		getRequest.SetId(request.GetId())
-		var getResponse *privatev1.SecretsGetResponse
-		err = s.generic.Get(ctx, getRequest, &getResponse)
-		if err != nil {
-			return
-		}
-		obj = getResponse.GetObject()
+	getRequest := &privatev1.SecretsGetRequest{}
+	getRequest.SetId(request.GetId())
+	var getResponse *privatev1.SecretsGetResponse
+	err = s.generic.Get(ctx, getRequest, &getResponse)
+	if err != nil {
+		return
+	}
+	obj := getResponse.GetObject()
+	if err = s.authorizeSharedSecretManagement(ctx, obj); err != nil {
+		return
 	}
 
 	err = s.generic.Delete(ctx, request, &response)
@@ -297,7 +339,7 @@ func (s *PrivateSecretsServer) Delete(ctx context.Context,
 		return
 	}
 
-	if obj != nil && obj.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT {
+	if s.secretStore != nil && obj != nil && obj.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_VAULT {
 		tenant := obj.GetMetadata().GetTenant()
 		project := obj.GetMetadata().GetProject()
 		name := obj.GetMetadata().GetName()
@@ -312,8 +354,53 @@ func (s *PrivateSecretsServer) Delete(ctx context.Context,
 	return
 }
 
+// authorizeSharedSecretManagement restricts decrypted reads and mutations of shared Secrets to
+// platform administrators and controllers. Both identities have universal tenant scope. Metadata
+// remains listable so shared template references can be resolved without exposing credential data.
+func (s *PrivateSecretsServer) authorizeSharedSecretManagement(ctx context.Context, secret *privatev1.Secret) error {
+	if secret == nil || secret.GetMetadata().GetTenant() != auth.SharedTenant {
+		return nil
+	}
+	allowed, err := s.canManageSharedSecrets(ctx)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return grpcstatus.Errorf(
+			grpccodes.PermissionDenied,
+			"shared Secrets can only be read or managed by platform administrators and controllers",
+		)
+	}
+	return nil
+}
+
+func (s *PrivateSecretsServer) canManageSharedSecrets(ctx context.Context) (bool, error) {
+	assignable, err := s.tenancyLogic.DetermineAssignableTenants(ctx)
+	if err != nil {
+		return false, grpcstatus.Errorf(grpccodes.Internal, "failed to determine shared Secret access")
+	}
+	return assignable.Universal(), nil
+}
+
+func (s *PrivateSecretsServer) withSavepoint(ctx context.Context, operation func(context.Context) error) error {
+	tx, err := database.TxFromContext(ctx)
+	if err != nil {
+		return operation(ctx)
+	}
+	return tx.Savepoint(ctx, operation)
+}
+
 func (s *PrivateSecretsServer) Signal(ctx context.Context,
 	request *privatev1.SecretsSignalRequest) (response *privatev1.SecretsSignalResponse, err error) {
+	getRequest := &privatev1.SecretsGetRequest{}
+	getRequest.SetId(request.GetId())
+	var getResponse *privatev1.SecretsGetResponse
+	if err = s.generic.Get(ctx, getRequest, &getResponse); err != nil {
+		return
+	}
+	if err = s.authorizeSharedSecretManagement(ctx, getResponse.GetObject()); err != nil {
+		return
+	}
 	err = s.generic.Signal(ctx, request, &response)
 	return
 }
@@ -325,6 +412,9 @@ func (s *PrivateSecretsServer) validateSecretCreate(secret *privatev1.Secret) er
 	if secret.GetMetadata() == nil || secret.GetMetadata().GetName() == "" {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'metadata.name' is required")
 	}
+	if secret.GetType() == privatev1.SecretType_SECRET_TYPE_UNSPECIFIED {
+		secret.SetType(privatev1.SecretType_SECRET_TYPE_OPAQUE)
+	}
 
 	switch secret.GetBackend() {
 	case privatev1.SecretBackend_SECRET_BACKEND_HUB:
@@ -332,10 +422,7 @@ func (s *PrivateSecretsServer) validateSecretCreate(secret *privatev1.Secret) er
 			return err
 		}
 	default:
-		if len(secret.GetData()) == 0 {
-			return grpcstatus.Errorf(grpccodes.InvalidArgument,
-				"field 'data' is required")
-		}
+		return validateSecretData(secret.GetType(), secret.GetData())
 	}
 
 	return nil
@@ -346,6 +433,12 @@ func (s *PrivateSecretsServer) validateHubSecretCreate(secret *privatev1.Secret)
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'coordinates' is required when backend is HUB")
 	}
+	for _, key := range []string{CoordinateHubID, CoordinateNamespace, CoordinateSecretName} {
+		if secret.GetCoordinates()[key] == "" {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument,
+				"coordinate %q is required when backend is HUB", key)
+		}
+	}
 	if len(secret.GetData()) > 0 {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'data' must be empty when backend is HUB")
@@ -353,29 +446,56 @@ func (s *PrivateSecretsServer) validateHubSecretCreate(secret *privatev1.Secret)
 	return nil
 }
 
-func (s *PrivateSecretsServer) determineTenant(ctx context.Context, secret *privatev1.Secret) (string, error) {
-	if t := secret.GetMetadata().GetTenant(); t != "" {
-		return t, nil
-	}
-	t, err := s.tenancyLogic.DetermineDefaultTenant(ctx)
-	if err != nil {
-		return "", grpcstatus.Errorf(grpccodes.Internal, "failed to determine tenant: %v", err)
-	}
-	return t, nil
-}
-
 func (s *PrivateSecretsServer) validateSecretUpdate(_ context.Context,
-	newSecret *privatev1.Secret, existingSecret *privatev1.Secret) error {
+	newSecret *privatev1.Secret, updateMask *fieldmaskpb.FieldMask, existingSecret *privatev1.Secret) error {
 	if newSecret.GetBackend() != privatev1.SecretBackend_SECRET_BACKEND_UNSPECIFIED &&
 		newSecret.GetBackend() != existingSecret.GetBackend() {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'backend' is immutable and cannot be changed from '%s' to '%s'",
 			existingSecret.GetBackend(), newSecret.GetBackend())
 	}
-	if existingSecret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_HUB &&
-		len(newSecret.GetData()) > 0 {
+	typeUpdated := updateMask == nil || len(updateMask.GetPaths()) == 0 ||
+		updateIncludesField(updateMask, "type")
+	if typeUpdated && newSecret.GetType() != existingSecret.GetType() {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"field 'type' is immutable and cannot be changed from '%s' to '%s'",
+			existingSecret.GetType(), newSecret.GetType())
+	}
+
+	dataUpdated := updateMask == nil || len(updateMask.GetPaths()) == 0 ||
+		updateIncludesField(updateMask, "data")
+	if !dataUpdated {
+		return nil
+	}
+	if existingSecret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_HUB && len(newSecret.GetData()) > 0 {
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"field 'data' must be empty when backend is HUB")
+	}
+	if existingSecret.GetBackend() == privatev1.SecretBackend_SECRET_BACKEND_HUB {
+		return nil
+	}
+	return validateSecretData(existingSecret.GetType(), newSecret.GetData())
+}
+
+func validateSecretData(secretType privatev1.SecretType, data map[string][]byte) error {
+	key := ""
+	switch secretType {
+	case privatev1.SecretType_SECRET_TYPE_OPAQUE, privatev1.SecretType_SECRET_TYPE_UNSPECIFIED:
+		return nil
+	case privatev1.SecretType_SECRET_TYPE_PULL_SECRET:
+		key = ".dockerconfigjson"
+	case privatev1.SecretType_SECRET_TYPE_KUBECONFIG:
+		key = "kubeconfig"
+	case privatev1.SecretType_SECRET_TYPE_USER_DATA:
+		key = "userdata"
+	case privatev1.SecretType_SECRET_TYPE_VALUE:
+		key = "value"
+	default:
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "field 'type' has unknown value %d", secretType)
+	}
+	if len(data[key]) == 0 {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument,
+			"secret type %s requires a non-empty data[%q] entry", secretType, key)
 	}
 	return nil
 }

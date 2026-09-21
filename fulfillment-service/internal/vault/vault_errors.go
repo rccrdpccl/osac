@@ -72,3 +72,12 @@ func ToGrpcError(err error) error {
 	return grpcstatus.Error(grpccodes.Internal,
 		"vault operation failed")
 }
+
+// isPermissionDeniedError checks if the error is a Vault permission denied error (HTTP 403).
+func isPermissionDeniedError(err error) bool {
+	var respErr *vaultapi.ResponseError
+	if errors.As(err, &respErr) && respErr.StatusCode == http.StatusForbidden {
+		return true
+	}
+	return false
+}

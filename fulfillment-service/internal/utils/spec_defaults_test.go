@@ -20,7 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("ApplySpecDefaults", func() {
@@ -51,9 +51,9 @@ var _ = Describe("ApplySpecDefaults", func() {
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib: 10,
+				SizeGib: proto.Int32(10),
 			}.Build(),
-			RunStrategy: proto.String("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
@@ -61,7 +61,7 @@ var _ = Describe("ApplySpecDefaults", func() {
 		Expect(spec.GetInstanceType().GetId()).To(Equal("standard-4-16"))
 		Expect(spec.GetDiskImage().GetId()).To(Equal("test-disk-image"))
 		Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(10)))
-		Expect(spec.GetRunStrategy()).To(Equal("Always"))
+		Expect(spec.GetRunStrategy()).To(Equal(privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS))
 	})
 
 	It("Does not override user-provided values", func() {
@@ -69,23 +69,23 @@ var _ = Describe("ApplySpecDefaults", func() {
 			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "user-type"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "user-disk-image"},
-			RunStrategy:  proto.String("Halted"),
+			RunStrategy:  privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_HALTED.Enum(),
 		}.Build()
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "default-type"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "default-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib: 10,
+				SizeGib: proto.Int32(10),
 			}.Build(),
-			RunStrategy: proto.String("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
 		Expect(spec.GetInstanceType().GetId()).To(Equal("user-type"))
 		Expect(spec.GetDiskImage().GetId()).To(Equal("user-disk-image"))
-		Expect(spec.GetRunStrategy()).To(Equal("Halted"))
+		Expect(spec.GetRunStrategy()).To(Equal(privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_HALTED))
 		Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(10)))
 	})
 
@@ -96,13 +96,13 @@ var _ = Describe("ApplySpecDefaults", func() {
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
-			RunStrategy:  proto.String("Always"),
+			RunStrategy:  privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
 		Expect(spec.GetInstanceType().GetId()).To(Equal("standard-4-16"))
-		Expect(spec.GetRunStrategy()).To(Equal("Always"))
+		Expect(spec.GetRunStrategy()).To(Equal(privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS))
 		Expect(spec.HasDiskImage()).To(BeFalse())
 		Expect(spec.HasBootDisk()).To(BeFalse())
 	})
@@ -115,7 +115,7 @@ var _ = Describe("ApplySpecDefaults", func() {
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib: 20,
+				SizeGib: proto.Int32(20),
 			}.Build(),
 		}.Build()
 
@@ -128,63 +128,63 @@ var _ = Describe("ApplySpecDefaults", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib: 50,
+				SizeGib: proto.Int32(50),
 			}.Build(),
 		}.Build()
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
 		Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(50)))
-		Expect(spec.GetBootDisk().GetStorageTier()).To(Equal("standard"))
+		Expect(spec.GetBootDisk().GetStorageTier().GetName()).To(Equal("standard"))
 	})
 
 	It("Does not override user-provided boot_disk storage_tier with template default", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     50,
-				StorageTier: new("fast"),
+				SizeGib:     proto.Int32(50),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "fast"}.Build(),
 			}.Build(),
 		}.Build()
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
-		Expect(spec.GetBootDisk().GetStorageTier()).To(Equal("fast"))
+		Expect(spec.GetBootDisk().GetStorageTier().GetName()).To(Equal("fast"))
 	})
 
 	It("Merges default boot_disk size when user provides only storage_tier", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template: privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				StorageTier: new("fast"),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "fast"}.Build(),
 			}.Build(),
 		}.Build()
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
 		Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(20)))
-		Expect(spec.GetBootDisk().GetStorageTier()).To(Equal("fast"))
+		Expect(spec.GetBootDisk().GetStorageTier().GetName()).To(Equal("fast"))
 	})
 
 	It("Clones entire boot_disk default including storage_tier when user provides no boot_disk", func() {
@@ -194,15 +194,15 @@ var _ = Describe("ApplySpecDefaults", func() {
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
 		Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(20)))
-		Expect(spec.GetBootDisk().GetStorageTier()).To(Equal("standard"))
+		Expect(spec.GetBootDisk().GetStorageTier().GetName()).To(Equal("standard"))
 	})
 
 	It("Applies instance_type default when user provides no compute fields", func() {
@@ -241,16 +241,16 @@ var _ = Describe("ApplySpecDefaults", func() {
 		}.Build()
 
 		defaults := privatev1.ComputeInstanceTemplateSpecDefaults_builder{
-			RunStrategy: proto.String("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 			DiskImage:   &privatev1.DiskImageReference{Id: "default-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib: 20,
+				SizeGib: proto.Int32(20),
 			}.Build(),
 		}.Build()
 
 		ApplySpecDefaults(spec, defaults)
 
-		Expect(spec.GetRunStrategy()).To(Equal("Always"))
+		Expect(spec.GetRunStrategy()).To(Equal(privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS))
 		Expect(spec.GetDiskImage().GetId()).To(Equal("default-disk-image"))
 		Expect(spec.GetBootDisk().GetSizeGib()).To(Equal(int32(20)))
 	})
@@ -323,7 +323,7 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
-			RunStrategy:  proto.String("Always"),
+			RunStrategy:  privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		err := ValidateRequiredSpecFields(spec)
@@ -341,10 +341,10 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
-			RunStrategy: proto.String("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		err := ValidateRequiredSpecFields(spec)
@@ -356,10 +356,10 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 			Template:  privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			DiskImage: &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
-			RunStrategy: proto.String("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		err := ValidateRequiredSpecFields(spec)
@@ -389,18 +389,18 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
-			RunStrategy: proto.String("always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_UNSPECIFIED.Enum(),
 		}.Build()
 
 		err := ValidateRequiredSpecFields(spec)
 		Expect(err).To(HaveOccurred())
 		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
 		Expect(err.Error()).To(ContainSubstring("invalid run_strategy"))
-		Expect(err.Error()).To(ContainSubstring("Always"))
-		Expect(err.Error()).To(ContainSubstring("Halted"))
+		Expect(err.Error()).To(ContainSubstring("COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS"))
+		Expect(err.Error()).To(ContainSubstring("COMPUTE_INSTANCE_RUN_STRATEGY_HALTED"))
 	})
 
 	It("Rejects boot_disk with zero size", func() {
@@ -409,9 +409,10 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(0),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
-			RunStrategy: new("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
 		err := ValidateRequiredSpecFields(spec)
@@ -420,81 +421,111 @@ var _ = Describe("ValidateRequiredSpecFields", func() {
 		Expect(err.Error()).To(ContainSubstring("boot_disk.size_gib"))
 	})
 
-	It("Accepts boot_disk with empty storage_tier", func() {
+	It("Rejects boot_disk with empty storage_tier", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new(""),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: ""}.Build(),
 			}.Build(),
-			RunStrategy: new("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
-		Expect(ValidateRequiredSpecFields(spec)).To(Succeed())
+		err := ValidateRequiredSpecFields(spec)
+		Expect(err).To(HaveOccurred())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("boot_disk.storage_tier is required"))
 	})
 
-	It("Accepts boot_disk without storage_tier", func() {
+	It("Rejects boot_disk without storage_tier", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib: 20,
+				SizeGib: proto.Int32(20),
 			}.Build(),
-			RunStrategy: new("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
-		Expect(ValidateRequiredSpecFields(spec)).To(Succeed())
+		err := ValidateRequiredSpecFields(spec)
+		Expect(err).To(HaveOccurred())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("boot_disk.storage_tier is required"))
 	})
 
-	It("Accepts additional_disk with empty storage_tier", func() {
+	It("Rejects additional_disk with empty storage_tier", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
 			AdditionalDisks: []*privatev1.ComputeInstanceDisk{
 				privatev1.ComputeInstanceDisk_builder{
-					SizeGib:     100,
-					StorageTier: new("standard"),
+					SizeGib:     proto.Int32(100),
+					StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 				}.Build(),
 				privatev1.ComputeInstanceDisk_builder{
-					SizeGib:     200,
-					StorageTier: new(""),
+					SizeGib:     proto.Int32(200),
+					StorageTier: privatev1.StorageTierReference_builder{Name: ""}.Build(),
 				}.Build(),
 			},
-			RunStrategy: new("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
-		Expect(ValidateRequiredSpecFields(spec)).To(Succeed())
+		err := ValidateRequiredSpecFields(spec)
+		Expect(err).To(HaveOccurred())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("additional_disks[1].storage_tier is required"))
 	})
 
-	It("Accepts additional_disk without storage_tier", func() {
+	It("Rejects additional_disk without storage_tier", func() {
 		spec := privatev1.ComputeInstanceSpec_builder{
 			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
 			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
 			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 			BootDisk: privatev1.ComputeInstanceDisk_builder{
-				SizeGib:     20,
-				StorageTier: new("standard"),
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 			}.Build(),
 			AdditionalDisks: []*privatev1.ComputeInstanceDisk{
 				privatev1.ComputeInstanceDisk_builder{
-					SizeGib:     100,
-					StorageTier: new("standard"),
+					SizeGib:     proto.Int32(100),
+					StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 				}.Build(),
 				privatev1.ComputeInstanceDisk_builder{
-					SizeGib: 200,
+					SizeGib: proto.Int32(200),
 				}.Build(),
 			},
-			RunStrategy: new("Always"),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 		}.Build()
 
-		Expect(ValidateRequiredSpecFields(spec)).To(Succeed())
+		err := ValidateRequiredSpecFields(spec)
+		Expect(err).To(HaveOccurred())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("additional_disks[1].storage_tier is required"))
+	})
+
+	It("Rejects whitespace-only storage_tier values", func() {
+		spec := privatev1.ComputeInstanceSpec_builder{
+			Template:     privatev1.ComputeInstanceTemplateReference_builder{Id: "test.template"}.Build(),
+			InstanceType: privatev1.InstanceTypeReference_builder{Id: "standard-4-16"}.Build(),
+			DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
+			BootDisk: privatev1.ComputeInstanceDisk_builder{
+				SizeGib:     proto.Int32(20),
+				StorageTier: privatev1.StorageTierReference_builder{Name: " \t\n"}.Build(),
+			}.Build(),
+			RunStrategy: privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
+		}.Build()
+
+		err := ValidateRequiredSpecFields(spec)
+		Expect(err).To(HaveOccurred())
+		Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+		Expect(err.Error()).To(ContainSubstring("boot_disk.storage_tier is required"))
 	})
 })

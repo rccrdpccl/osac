@@ -18,7 +18,7 @@ import (
 	. "github.com/onsi/gomega"
 	"google.golang.org/protobuf/proto"
 
-	publicv1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/public/v1"
+	publicv1 "github.com/osac-project/osac/proto/gen/osac/public/v1"
 )
 
 var _ = Describe("parseBareMetalNetworkAttachmentFlag", func() {
@@ -133,6 +133,23 @@ var _ = Describe("applyNetworkingFlags", func() {
 })
 
 var _ = Describe("Create baremetalinstance flag registration", func() {
+	It("should register --disk-image flag", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+
+		flag := cmd.Flags().Lookup("disk-image")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.Usage).To(ContainSubstring("DiskImage"))
+		Expect(cmd.ParseFlags([]string{"--disk-image", "rhel-9"})).To(Succeed())
+	})
+
+	It("should not register legacy image flags", func() {
+		cmd := Cmd()
+		Expect(cmd.Flags().Lookup("image")).To(BeNil())
+		Expect(cmd.Flags().Lookup("image-source-type")).To(BeNil())
+	})
+
 	It("should register --network-attachment flag", func() {
 		cmd := Cmd()
 		cmd.SetOut(GinkgoWriter)
@@ -140,6 +157,55 @@ var _ = Describe("Create baremetalinstance flag registration", func() {
 		flag := cmd.Flags().Lookup("network-attachment")
 		Expect(flag).NotTo(BeNil())
 		Expect(flag.Usage).To(ContainSubstring("network attachment"))
+	})
+
+	It("should register --user-data-secret flag", func() {
+		cmd := Cmd()
+		flag := cmd.Flags().Lookup("user-data-secret")
+		Expect(flag).NotTo(BeNil())
+		Expect(flag.Usage).To(ContainSubstring("Secret resource"))
+	})
+
+	It("should reject user data and a user data secret together", func() {
+		cmd := Cmd()
+		cmd.SetOut(GinkgoWriter)
+		cmd.SetErr(GinkgoWriter)
+		cmd.SetArgs([]string{"--catalog-item", "cat-001", "--user-data", "data", "--user-data-secret", "cloud-init"})
+		err := cmd.Execute()
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("user-data"))
+		Expect(err.Error()).To(ContainSubstring("user-data-secret"))
+	})
+})
+
+var _ = Describe("applyUserDataFlags", func() {
+	It("should set a secret reference", func() {
+		c := &runnerContext{}
+		c.args.userDataSecret = "cloud-init"
+		spec := publicv1.BareMetalInstanceSpec_builder{}
+
+		c.applyUserDataFlags(&spec)
+
+		Expect(spec.Build().GetUserDataSecret().GetName()).To(Equal("cloud-init"))
+	})
+})
+
+var _ = Describe("buildSpec", func() {
+	It("should set disk_image from the disk-image flag", func() {
+		c := &runnerContext{}
+		c.args.diskImage = "rhel-9"
+
+		spec, err := c.buildSpec("catalog-item-id", false)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.GetDiskImage().GetName()).To(Equal("rhel-9"))
+	})
+
+	It("should leave disk_image unset when the disk-image flag is empty", func() {
+		c := &runnerContext{}
+
+		spec, err := c.buildSpec("catalog-item-id", false)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(spec.HasDiskImage()).To(BeFalse())
 	})
 })
 

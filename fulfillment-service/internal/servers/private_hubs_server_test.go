@@ -26,10 +26,10 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	"github.com/osac-project/osac/fulfillment-service/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("Private hubs server", func() {
@@ -291,7 +291,8 @@ var _ = Describe("Private hubs server", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				_, err = secretsDao.Create().SetObject(privatev1.Secret_builder{
-					Id: "my-secret-id",
+					Id:   "my-secret-id",
+					Type: privatev1.SecretType_SECRET_TYPE_KUBECONFIG,
 					Metadata: privatev1.Metadata_builder{
 						Name:   "my-secret-name",
 						Tenant: auth.SharedTenant,

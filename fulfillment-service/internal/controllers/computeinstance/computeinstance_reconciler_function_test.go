@@ -22,9 +22,9 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"go.uber.org/mock/gomock"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -39,11 +39,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	privatev1 "github.com/osac-project/osac/fulfillment-service/internal/api/osac/private/v1"
+	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
+
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers"
 	"github.com/osac-project/osac/fulfillment-service/internal/controllers/finalizers"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/gvks"
 	"github.com/osac-project/osac/fulfillment-service/internal/kubernetes/labels"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("buildSpec", func() {
@@ -154,7 +156,7 @@ var _ = Describe("buildSpec", func() {
 					Object: privatev1.InstanceType_builder{
 						Id: "standard-4-8",
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 8,
 						}.Build(),
 					}.Build(),
@@ -185,21 +187,21 @@ var _ = Describe("buildSpec", func() {
 					Spec: privatev1.ComputeInstanceSpec_builder{
 						Template:     &privatev1.ComputeInstanceTemplateReference{Name: template},
 						InstanceType: &privatev1.InstanceTypeReference{Name: "standard-4-8"},
-						RunStrategy:  new("Always"),
+						RunStrategy:  privatev1.ComputeInstanceRunStrategy_COMPUTE_INSTANCE_RUN_STRATEGY_ALWAYS.Enum(),
 						SshPublicKey: new("ssh-rsa AAAA..."),
 						DiskImage:    &privatev1.DiskImageReference{Id: "test-disk-image"},
 						BootDisk: privatev1.ComputeInstanceDisk_builder{
-							SizeGib:     20,
-							StorageTier: new("fast"),
+							SizeGib:     proto.Int32(20),
+							StorageTier: privatev1.StorageTierReference_builder{Name: "fast"}.Build(),
 						}.Build(),
 						AdditionalDisks: []*privatev1.ComputeInstanceDisk{
 							privatev1.ComputeInstanceDisk_builder{
-								SizeGib:     100,
-								StorageTier: new("standard"),
+								SizeGib:     proto.Int32(100),
+								StorageTier: privatev1.StorageTierReference_builder{Name: "standard"}.Build(),
 							}.Build(),
 							privatev1.ComputeInstanceDisk_builder{
-								SizeGib:     50,
-								StorageTier: new("archive"),
+								SizeGib:     proto.Int32(50),
+								StorageTier: privatev1.StorageTierReference_builder{Name: "archive"}.Build(),
 							}.Build(),
 						},
 						NetworkAttachments: []*privatev1.ComputeNetworkAttachment{
@@ -215,7 +217,7 @@ var _ = Describe("buildSpec", func() {
 			spec, err := task.buildSpec(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			Expect(spec.Cores).To(Equal(int32(4)))
+			Expect(spec.VCPUs).To(Equal(int32(4)))
 			Expect(spec.MemoryGiB).To(Equal(int32(8)))
 			Expect(spec.RunStrategy).To(Equal(osacv1alpha1.RunStrategyType("Always")))
 			Expect(spec.SSHKey).To(Equal("ssh-rsa AAAA..."))
@@ -266,7 +268,7 @@ var _ = Describe("buildSpec", func() {
 				Return(privatev1.InstanceTypesGetResponse_builder{
 					Object: privatev1.InstanceType_builder{
 						Spec: privatev1.InstanceTypeSpec_builder{
-							Cores:     4,
+							Vcpus:     4,
 							MemoryGib: 8,
 						}.Build(),
 					}.Build(),
@@ -433,7 +435,7 @@ var _ = Describe("buildSpec", func() {
 			spec, err := task.buildSpec(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			Expect(spec.Cores).To(BeZero())
+			Expect(spec.VCPUs).To(BeZero())
 			Expect(spec.MemoryGiB).To(BeZero())
 			Expect(spec.RunStrategy).To(BeEmpty())
 			Expect(spec.SSHKey).To(BeEmpty())
@@ -1279,11 +1281,51 @@ var _ = Describe("ensureUserDataSecret", func() {
 		Expect(ownerRefs[0].Kind).To(Equal("ComputeInstance"))
 	})
 
-	It("should be idempotent when Secret already exists", func() {
-		existingSecret := &unstructured.Unstructured{}
-		existingSecret.SetGroupVersionKind(gvks.Secret)
-		existingSecret.SetNamespace(hubNamespace)
-		existingSecret.SetName(ciID + userDataSecretSuffix)
+	It("should create a Secret from a referenced OSAC Secret", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		secretsClient := NewMockSecretsClient(ctrl)
+		secretsClient.EXPECT().Get(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, request *privatev1.SecretsGetRequest, _ ...grpc.CallOption) (*privatev1.SecretsGetResponse, error) {
+				Expect(request.GetId()).To(Equal("source-secret-id"))
+				return privatev1.SecretsGetResponse_builder{Object: privatev1.Secret_builder{
+					Data: map[string][]byte{userDataSecretKey: []byte("referenced-data")},
+				}.Build()}.Build(), nil
+			},
+		)
+		scheme := runtime.NewScheme()
+		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
+		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		t := &task{
+			r: &function{logger: logger, secretsClient: secretsClient},
+			computeInstance: privatev1.ComputeInstance_builder{Id: ciID, Spec: privatev1.ComputeInstanceSpec_builder{
+				UserDataSecret: privatev1.SecretLocalReference_builder{Id: "source-secret-id"}.Build(),
+			}.Build()}.Build(),
+			hubNamespace: hubNamespace, hubClient: fakeClient, userDataSecretName: ciID + userDataSecretSuffix,
+		}
+		Expect(t.ensureUserDataSecret(ctx, owner)).To(Succeed())
+		secret := &corev1.Secret{}
+		Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: hubNamespace, Name: ciID + userDataSecretSuffix}, secret)).To(Succeed())
+		Expect(secret.StringData[userDataSecretKey]).To(Equal("referenced-data"))
+	})
+
+	It("should reject a referenced OSAC Secret without userdata", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		secretsClient := NewMockSecretsClient(ctrl)
+		secretsClient.EXPECT().Get(gomock.Any(), gomock.Any()).Return(
+			privatev1.SecretsGetResponse_builder{Object: privatev1.Secret_builder{Data: map[string][]byte{"other": []byte("value")}}.Build()}.Build(), nil)
+		t := &task{r: &function{logger: logger, secretsClient: secretsClient},
+			computeInstance: privatev1.ComputeInstance_builder{Spec: privatev1.ComputeInstanceSpec_builder{
+				UserDataSecret: privatev1.SecretLocalReference_builder{Id: "source-secret-id"}.Build(),
+			}.Build()}.Build(), userDataSecretName: ciID + userDataSecretSuffix}
+		Expect(t.ensureUserDataSecret(ctx, owner)).To(MatchError(ContainSubstring("missing non-empty data")))
+	})
+
+	It("should update user data when Secret already exists", func() {
+		existingSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: hubNamespace, Name: ciID + userDataSecretSuffix},
+			StringData: map[string]string{userDataSecretKey: "old-data"},
+		}
 
 		scheme := runtime.NewScheme()
 		Expect(osacv1alpha1.AddToScheme(scheme)).To(Succeed())
@@ -1308,6 +1350,9 @@ var _ = Describe("ensureUserDataSecret", func() {
 
 		err := t.ensureUserDataSecret(ctx, owner)
 		Expect(err).ToNot(HaveOccurred())
+		secret := &corev1.Secret{}
+		Expect(fakeClient.Get(ctx, clnt.ObjectKey{Namespace: hubNamespace, Name: ciID + userDataSecretSuffix}, secret)).To(Succeed())
+		Expect(secret.StringData[userDataSecretKey]).To(Equal("some-data"))
 	})
 
 	It("should propagate error when Secret creation fails", func() {
@@ -1849,7 +1894,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 			Build()
 	})
 
-	It("resolves instance_type to cores/memory_gib on CR spec", func() {
+	It("resolves instance_type to vCPUs/memory_gib on CR spec", func() {
 		mockInstanceTypesClient := NewMockInstanceTypesClient(ctrl)
 		mockInstanceTypesClient.EXPECT().
 			Get(gomock.Any(), gomock.Any()).
@@ -1857,7 +1902,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Object: privatev1.InstanceType_builder{
 					Id: "test-type",
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 8,
 					}.Build(),
 				}.Build(),
@@ -1884,7 +1929,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 
 		spec, err := t.buildSpec(ctx)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(spec.Cores).To(Equal(int32(4)))
+		Expect(spec.VCPUs).To(Equal(int32(4)))
 		Expect(spec.MemoryGiB).To(Equal(int32(8)))
 	})
 
@@ -1896,7 +1941,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Object: privatev1.InstanceType_builder{
 					Id: "gpu-a100-8core",
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     8,
+						Vcpus:     8,
 						MemoryGib: 64,
 						Gpu: privatev1.GpuSpec_builder{
 							PciDeviceSelector: "10DE:20B0",
@@ -1928,7 +1973,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 
 		spec, err := t.buildSpec(ctx)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(spec.Cores).To(Equal(int32(8)))
+		Expect(spec.VCPUs).To(Equal(int32(8)))
 		Expect(spec.MemoryGiB).To(Equal(int32(64)))
 		Expect(spec.Gpu).ToNot(BeNil())
 		Expect(spec.Gpu.PciDeviceSelector).To(Equal("10DE:20B0"))
@@ -1944,7 +1989,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Object: privatev1.InstanceType_builder{
 					Id: "standard-4-8",
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 8,
 					}.Build(),
 				}.Build(),
@@ -1971,7 +2016,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 
 		spec, err := t.buildSpec(ctx)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(spec.Cores).To(Equal(int32(4)))
+		Expect(spec.VCPUs).To(Equal(int32(4)))
 		Expect(spec.MemoryGiB).To(Equal(int32(8)))
 		Expect(spec.Gpu).To(BeNil())
 	})
@@ -1984,7 +2029,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Object: privatev1.InstanceType_builder{
 					Id: "gpu-a100-8core",
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     8,
+						Vcpus:     8,
 						MemoryGib: 64,
 						Gpu: privatev1.GpuSpec_builder{
 							PciDeviceSelector: "10DE:20B0",
@@ -2057,7 +2102,7 @@ var _ = Describe("instance_type resolution in reconciler", func() {
 				Object: privatev1.InstanceType_builder{
 					Id: "test-type",
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 8,
 					}.Build(),
 				}.Build(),
@@ -2254,7 +2299,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			Return(privatev1.InstanceTypesGetResponse_builder{
 				Object: privatev1.InstanceType_builder{
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     150,
+						Vcpus:     150,
 						MemoryGib: 2,
 					}.Build(),
 				}.Build(),
@@ -2268,9 +2313,9 @@ var _ = Describe("Kubernetes validation error handling", func() {
 						"vm-test",
 						field.ErrorList{
 							field.Invalid(
-								field.NewPath("spec", "cores"),
+								field.NewPath("spec", "vcpus"),
 								150,
-								"spec.cores in body should be less than or equal to 128",
+								"spec.vcpus in body should be less than or equal to 128",
 							),
 						},
 					)
@@ -2298,7 +2343,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 		Expect(configCondition).ToNot(BeNil())
 		Expect(configCondition.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
 		Expect(configCondition.GetReason()).To(Equal("ValidationFailed"))
-		Expect(configCondition.GetMessage()).To(ContainSubstring("spec.cores"))
+		Expect(configCondition.GetMessage()).To(ContainSubstring("spec.vcpus"))
 		Expect(configCondition.GetMessage()).To(ContainSubstring("128"))
 	})
 
@@ -2308,7 +2353,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			Return(privatev1.InstanceTypesGetResponse_builder{
 				Object: privatev1.InstanceType_builder{
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     200,
+						Vcpus:     200,
 						MemoryGib: 2,
 					}.Build(),
 				}.Build(),
@@ -2332,9 +2377,9 @@ var _ = Describe("Kubernetes validation error handling", func() {
 						"vm-existing",
 						field.ErrorList{
 							field.Invalid(
-								field.NewPath("spec", "cores"),
+								field.NewPath("spec", "vcpus"),
 								200,
-								"spec.cores in body should be less than or equal to 128",
+								"spec.vcpus in body should be less than or equal to 128",
 							),
 						},
 					)
@@ -2386,7 +2431,7 @@ var _ = Describe("Kubernetes validation error handling", func() {
 			Return(privatev1.InstanceTypesGetResponse_builder{
 				Object: privatev1.InstanceType_builder{
 					Spec: privatev1.InstanceTypeSpec_builder{
-						Cores:     4,
+						Vcpus:     4,
 						MemoryGib: 2,
 					}.Build(),
 				}.Build(),
@@ -2402,9 +2447,9 @@ var _ = Describe("Kubernetes validation error handling", func() {
 						"vm-test",
 						field.ErrorList{
 							field.Invalid(
-								field.NewPath("spec", "cores"),
+								field.NewPath("spec", "vcpus"),
 								150,
-								"spec.cores in body should be less than or equal to 128",
+								"spec.vcpus in body should be less than or equal to 128",
 							),
 						},
 					)

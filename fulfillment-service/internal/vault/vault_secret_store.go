@@ -165,12 +165,30 @@ func (s *VaultSecretStore) Store(ctx context.Context, tenant, project, name stri
 	secretPath := s.secretPath(project, name)
 	_, err = client.KVv2(s.kvMountPath).Put(ctx, secretPath, vaultData)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to store secret in vault",
-			slog.String("tenant", tenant),
-			slog.String("path", secretPath),
-			slog.Any("error", err),
-		)
-		return fmt.Errorf("failed to store secret in vault: %w", err)
+		// If permission denied, the cached token may be stale (e.g., tenant namespace
+		// was deleted and recreated). Invalidate the token and retry once.
+		if isPermissionDeniedError(err) {
+			s.logger.DebugContext(ctx, "Permission denied, invalidating cached token and retrying",
+				slog.String("tenant", tenant),
+			)
+			s.tokenSource.InvalidateTenantToken(tenant)
+
+			// Retry with a fresh token
+			client, retryErr := s.tenantClient(ctx, tenant)
+			if retryErr != nil {
+				return retryErr
+			}
+			_, err = client.KVv2(s.kvMountPath).Put(ctx, secretPath, vaultData)
+		}
+
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to store secret in vault",
+				slog.String("tenant", tenant),
+				slog.String("path", secretPath),
+				slog.Any("error", err),
+			)
+			return fmt.Errorf("failed to store secret in vault: %w", err)
+		}
 	}
 
 	return nil
@@ -198,12 +216,30 @@ func (s *VaultSecretStore) Fetch(ctx context.Context, tenant, project, name stri
 	secretPath := s.secretPath(project, name)
 	secret, err := client.KVv2(s.kvMountPath).Get(ctx, secretPath)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to fetch secret from vault",
-			slog.String("tenant", tenant),
-			slog.String("path", secretPath),
-			slog.Any("error", err),
-		)
-		return nil, fmt.Errorf("failed to fetch secret from vault: %w", err)
+		// If permission denied, the cached token may be stale (e.g., tenant namespace
+		// was deleted and recreated). Invalidate the token and retry once.
+		if isPermissionDeniedError(err) {
+			s.logger.DebugContext(ctx, "Permission denied, invalidating cached token and retrying",
+				slog.String("tenant", tenant),
+			)
+			s.tokenSource.InvalidateTenantToken(tenant)
+
+			// Retry with a fresh token
+			client, retryErr := s.tenantClient(ctx, tenant)
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			secret, err = client.KVv2(s.kvMountPath).Get(ctx, secretPath)
+		}
+
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to fetch secret from vault",
+				slog.String("tenant", tenant),
+				slog.String("path", secretPath),
+				slog.Any("error", err),
+			)
+			return nil, fmt.Errorf("failed to fetch secret from vault: %w", err)
+		}
 	}
 
 	result := make(map[string][]byte, len(secret.Data))
@@ -243,12 +279,30 @@ func (s *VaultSecretStore) Delete(ctx context.Context, tenant, project, name str
 	secretPath := s.secretPath(project, name)
 	err = client.KVv2(s.kvMountPath).DeleteMetadata(ctx, secretPath)
 	if err != nil {
-		s.logger.ErrorContext(ctx, "Failed to delete secret from vault",
-			slog.String("tenant", tenant),
-			slog.String("path", secretPath),
-			slog.Any("error", err),
-		)
-		return fmt.Errorf("failed to delete secret from vault: %w", err)
+		// If permission denied, the cached token may be stale (e.g., tenant namespace
+		// was deleted and recreated). Invalidate the token and retry once.
+		if isPermissionDeniedError(err) {
+			s.logger.DebugContext(ctx, "Permission denied, invalidating cached token and retrying",
+				slog.String("tenant", tenant),
+			)
+			s.tokenSource.InvalidateTenantToken(tenant)
+
+			// Retry with a fresh token
+			client, retryErr := s.tenantClient(ctx, tenant)
+			if retryErr != nil {
+				return retryErr
+			}
+			err = client.KVv2(s.kvMountPath).DeleteMetadata(ctx, secretPath)
+		}
+
+		if err != nil {
+			s.logger.ErrorContext(ctx, "Failed to delete secret from vault",
+				slog.String("tenant", tenant),
+				slog.String("path", secretPath),
+				slog.Any("error", err),
+			)
+			return fmt.Errorf("failed to delete secret from vault: %w", err)
+		}
 	}
 
 	return nil

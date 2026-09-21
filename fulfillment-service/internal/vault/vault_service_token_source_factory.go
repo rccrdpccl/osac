@@ -52,6 +52,7 @@ func NewServiceTenantTokenSourceFromConfig(
 		SetKeycloakIssuerURL(base.KeycloakIssuerURL).
 		SetKeycloakClientID(base.KeycloakClientID).
 		SetKeycloakClientSecret(keycloakClientSecret).
+		SetKeycloakAudience(base.KeycloakAudience).
 		SetCaPool(caPool).
 		Build()
 	if err != nil {

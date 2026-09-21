@@ -79,6 +79,18 @@ func (m *MockTenantTokenSource) EXPECT() *MockTenantTokenSourceMockRecorder {
 	return m.recorder
 }
 
+// InvalidateTenantToken mocks base method.
+func (m *MockTenantTokenSource) InvalidateTenantToken(tenant string) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "InvalidateTenantToken", tenant)
+}
+
+// InvalidateTenantToken indicates an expected call of InvalidateTenantToken.
+func (mr *MockTenantTokenSourceMockRecorder) InvalidateTenantToken(tenant any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InvalidateTenantToken", reflect.TypeOf((*MockTenantTokenSource)(nil).InvalidateTenantToken), tenant)
+}
+
 // VaultToken mocks base method.
 func (m *MockTenantTokenSource) VaultToken(ctx context.Context, tenant string) (string, error) {
 	m.ctrl.T.Helper()

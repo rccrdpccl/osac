@@ -42,6 +42,7 @@ class Tool:
         extracted_name: str = "",
         checksums_url: str = "",
         artifact_url: str = "",
+        arch_override: dict[str, str] | None = None,
     ):
         """
         Initialize a Tool definition.
@@ -57,11 +58,12 @@ class Tool:
             raise ValueError(f"Tool checksums are required for '{name}'")
 
         # Get normalized architecture name
-        arch_name = _ARCH_MAP.get(_SYSTEM_ARCH)
+        arch_map = arch_override if arch_override is not None else _ARCH_MAP
+        arch_name = arch_map.get(_SYSTEM_ARCH)
         if arch_name is None:
             raise ValueError(
                 f"Unsupported architecture '{_SYSTEM_ARCH}' for tool '{name}'. "
-                f"Supported architectures: {', '.join(_ARCH_MAP.keys())}"
+                f"Supported architectures: {', '.join(arch_map.keys())}"
             )
 
         # Save basic metadata
@@ -124,26 +126,35 @@ class Tool:
 
 GOLANGCI_LINT = Tool(
     name="golangci-lint",
-    version="2.12.2",
+    version="2.13.2",
     github_repo="golangci/golangci-lint",
     version_pattern=r"^golangci-lint has version (?P<version>\S+) built",
     checksums={
-        "golangci-lint-{version}-checksums.txt": "9accc7943a5b4be44416a7d4efa7efb3d18c7f1919d6581cc3536e185301a2d4",
+        "golangci-lint-{version}-checksums.txt": "b5830eaec7cf0accdbfe3a27cc372c4987f80a22db494a6bacee287bf4b03c3c",
     },
 )
 
 PROTOC_GEN_CLEANAPI = Tool(
     name="protoc-gen-cleanapi",
-    version="0.0.8",
+    version="0.0.12",
     github_repo="jhernand/protoc-gen-cleanapi",
     version_command=["protoc-gen-cleanapi", "--version"],
     version_pattern=r"^(?P<version>\S+)",
     checksums={
         "protoc-gen-cleanapi_{version}_checksums.txt":
-        "22ee7ea769c14fe48fafa2a1f60cc4f21a5bb91cc6ca60c1415b204e9dedf40b",
+        "eaf158c71951b1238d20a1e48cbf5fd4af536dff4f2e75d2296fbb31d1157094",
     },
     # Override defaults - this tool uses underscores and no version in artifact name
     checksums_artifact="protoc-gen-cleanapi_{version}_checksums.txt",
     compressed_artifact_name="protoc-gen-cleanapi_{sys_os}_{sys_arch}.tar.gz",
     extracted_name="protoc-gen-cleanapi",  # Binary extracted directly, not in versioned dir
+    # This tool uses x86_64/i386 instead of amd64/386
+    arch_override={
+        "x86_64": "x86_64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "amd64": "x86_64",
+        "i386": "i386",
+        "i686": "i386",
+    },
 )

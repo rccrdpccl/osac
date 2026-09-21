@@ -23,12 +23,20 @@ columns:
   value: this.spec.catalog_item.id
   type: osac.private.v1.BareMetalInstanceCatalogItem
 
-- header: IMAGE
-  value: "has(this.spec.image) && has(this.spec.image.source_ref)? this.spec.image.source_ref: '-'"
+- header: DISK IMAGE
+  value: "has(this.spec.disk_image) ? this.spec.disk_image.name : '-'"
 
 - header: STATE
   value: this.status.state
   type: osac.private.v1.BareMetalInstanceState
+
+- header: INTERNAL IP
+  value: >-
+    has(this.status.network_attachment_statuses) && this.status.network_attachment_statuses.size() > 0 ?
+      (this.status.network_attachment_statuses.filter(a, has(a.ip_address) && a.ip_address != '').map(a, a.ip_address).join(',') != '' ?
+        this.status.network_attachment_statuses.filter(a, has(a.ip_address) && a.ip_address != '').map(a, a.ip_address).join(',')
+        : '-')
+      : '-'
 
 - header: HUB
   value: this.status.hub
