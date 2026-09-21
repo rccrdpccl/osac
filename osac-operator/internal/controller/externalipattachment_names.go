@@ -22,4 +22,8 @@ var (
 	osacExternalIPAttachmentIDLabel           string = fmt.Sprintf("%s/externalipattachment-uuid", osacPrefix)
 	osacExternalIPAttachmentFeedbackFinalizer string = fmt.Sprintf("%s/externalipattachment-feedback", osacPrefix)
 	osacExternalIPTargetIPAnnotation          string = fmt.Sprintf("%s/target-ip", osacPrefix)
+	// osacVirtualNetworkNameAnnotation carries the tenant VirtualNetwork CR name to the
+	// AAP job so the provisioning role can resolve the target network by name and
+	// create the NAT rule in the correct tenant network scope.
+	osacVirtualNetworkNameAnnotation string = fmt.Sprintf("%s/virtual-network-name", osacPrefix)
 )

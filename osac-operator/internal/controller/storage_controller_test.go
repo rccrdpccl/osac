@@ -26,9 +26,6 @@ import (
 	. "github.com/onsi/gomega"
 
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
-	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
-	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -38,9 +35,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+
+	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // mockStorageBackendsClient is a test double for StorageBackendsClient.
@@ -107,14 +109,15 @@ func createReadyTenantForStorage(ctx context.Context, name, namespace string) {
 func createHubSecret(ctx context.Context, tenantName, namespace string) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("vast-tenant-config-%s", tenantName),
+			Name:      fmt.Sprintf("lvms-tenant-config-%s", tenantName),
 			Namespace: namespace,
 			Labels: map[string]string{
-				osacTenantKey: tenantName,
+				osacTenantKey:            tenantName,
+				osacStorageProviderLabel: "lvms",
 			},
 		},
-		Data: map[string][]byte{
-			"vast_tenant_id": []byte("123"),
+		StringData: map[string]string{
+			"provider": "lvms",
 		},
 	}
 	Expect(k8sClient.Create(ctx, secret)).To(Succeed())
@@ -147,6 +150,18 @@ func (m *mockStorageTiersLister) List(ctx context.Context, in *privatev1.Storage
 	return m.listFunc(ctx, in, opts...)
 }
 
+// mockSecretsClient is a test double for SecretsClient. Set getFunc to override the
+// response for password_secret resolution scenarios.
+type mockSecretsClient struct {
+	getFunc      func(ctx context.Context, in *privatev1.SecretsGetRequest, opts ...grpc.CallOption) (*privatev1.SecretsGetResponse, error)
+	getCallCount int
+}
+
+func (m *mockSecretsClient) Get(ctx context.Context, in *privatev1.SecretsGetRequest, opts ...grpc.CallOption) (*privatev1.SecretsGetResponse, error) {
+	m.getCallCount++
+	return m.getFunc(ctx, in, opts...)
+}
+
 // newTestStorageTier builds a StorageTier fixture with one BackendAssociation per
 // backendID given. Passing no backendIDs produces a tier with zero associations.
 func newTestStorageTier(name string, backendIDs ...string) *privatev1.StorageTier {
@@ -154,15 +169,16 @@ func newTestStorageTier(name string, backendIDs ...string) *privatev1.StorageTie
 	for i, id := range backendIDs {
 		backends[i] = privatev1.BackendAssociation_builder{
 			BackendId:            id,
-			Protocol:             privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS,
 			MaxReadBandwidthMbs:  100,
 			MaxWriteBandwidthMbs: 100,
-			QuotaGib:             500,
 		}.Build()
 	}
 	return privatev1.StorageTier_builder{
 		Metadata: privatev1.Metadata_builder{Name: name}.Build(),
-		Spec:     privatev1.StorageTierSpec_builder{Backends: backends}.Build(),
+		Spec: privatev1.StorageTierSpec_builder{
+			Backends: backends,
+			Protocol: privatev1.StorageProtocol_STORAGE_PROTOCOL_NFS,
+		}.Build(),
 	}.Build()
 }
 
@@ -172,7 +188,28 @@ func newTestStorageTier(name string, backendIDs ...string) *privatev1.StorageTie
 const (
 	testBackendUsername = "test-backend-user"
 	testBackendPassword = "test-backend-password"
+	// testSecretPassword is the fixture password returned from a referenced Secret
+	// when a backend uses password_secret instead of an inline password.
+	testSecretPassword = "test-secret-password"
 )
+
+// newTestStorageBackendGetResponseWithSecret builds a StorageBackendsGetResponse whose
+// credentials carry a password_secret reference (id secretID) and no inline password —
+// the shape a backend created with password_secret has.
+func newTestStorageBackendGetResponseWithSecret(provider, secretID string) *privatev1.StorageBackendsGetResponse {
+	return privatev1.StorageBackendsGetResponse_builder{
+		Object: privatev1.StorageBackend_builder{
+			Spec: privatev1.StorageBackendSpec_builder{
+				Provider: provider,
+				Endpoint: "https://" + provider + ".example.com",
+				Credentials: privatev1.StorageBackendCredentials_builder{
+					Username:       testBackendUsername,
+					PasswordSecret: privatev1.SecretLocalReference_builder{Id: secretID}.Build(),
+				}.Build(),
+			}.Build(),
+		}.Build(),
+	}.Build()
+}
 
 // newTestStorageBackendGetResponse builds a StorageBackendsGetResponse fixture for
 // the given provider, with a fixed endpoint/credentials pair.
@@ -683,14 +720,13 @@ var _ = Describe("Storage Controller", func() {
 				},
 			}
 
-			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient)
+			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(defs).To(HaveLen(1))
 			Expect(defs[0].Name).To(Equal("fast"))
 			Expect(defs[0].Protocol).To(Equal("nfs"))
 			Expect(defs[0].Provider).To(Equal("vast"))
 			Expect(defs[0].BackendID).To(Equal("backend-1"))
-			Expect(defs[0].QuotaGiB).To(Equal(int64(500)))
 			Expect(defs[0].QosLimits.MaxReadBandwidthMBs).To(Equal(int32(100)))
 			Expect(defs[0].QosLimits.MaxWriteBandwidthMBs).To(Equal(int32(100)))
 			Expect(conns).To(HaveKeyWithValue("backend-1", provisioning.BackendConnection{
@@ -698,6 +734,92 @@ var _ = Describe("Storage Controller", func() {
 				Username: testBackendUsername,
 				Password: testBackendPassword,
 			}))
+		})
+
+		It("should resolve the backend password from the referenced Secret when the inline password is empty", func() {
+			tiersClient := &mockStorageTiersLister{
+				listFunc: func(context.Context, *privatev1.StorageTiersListRequest, ...grpc.CallOption) (*privatev1.StorageTiersListResponse, error) {
+					return privatev1.StorageTiersListResponse_builder{
+						Items: []*privatev1.StorageTier{newTestStorageTier("fast", "backend-1")},
+					}.Build(), nil
+				},
+			}
+			backendsClient := &mockStorageBackendsClient{
+				getFunc: func(context.Context, *privatev1.StorageBackendsGetRequest, ...grpc.CallOption) (*privatev1.StorageBackendsGetResponse, error) {
+					return newTestStorageBackendGetResponseWithSecret("vast", "secret-1"), nil
+				},
+			}
+			secretsClient := &mockSecretsClient{
+				getFunc: func(_ context.Context, in *privatev1.SecretsGetRequest, _ ...grpc.CallOption) (*privatev1.SecretsGetResponse, error) {
+					Expect(in.GetId()).To(Equal("secret-1"))
+					return privatev1.SecretsGetResponse_builder{
+						Object: privatev1.Secret_builder{
+							Type: privatev1.SecretType_SECRET_TYPE_VALUE,
+							Data: map[string][]byte{"value": []byte(testSecretPassword)},
+						}.Build(),
+					}.Build(), nil
+				},
+			}
+
+			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, secretsClient)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(defs).To(HaveLen(1))
+			Expect(secretsClient.getCallCount).To(Equal(1))
+			Expect(conns).To(HaveKeyWithValue("backend-1", provisioning.BackendConnection{
+				Endpoint: "https://vast.example.com",
+				Username: testBackendUsername,
+				Password: testSecretPassword,
+			}))
+		})
+
+		It("should skip a backend whose password_secret is missing data[\"value\"], not provision an empty password", func() {
+			tiersClient := &mockStorageTiersLister{
+				listFunc: func(context.Context, *privatev1.StorageTiersListRequest, ...grpc.CallOption) (*privatev1.StorageTiersListResponse, error) {
+					return privatev1.StorageTiersListResponse_builder{
+						Items: []*privatev1.StorageTier{newTestStorageTier("fast", "backend-1")},
+					}.Build(), nil
+				},
+			}
+			backendsClient := &mockStorageBackendsClient{
+				getFunc: func(context.Context, *privatev1.StorageBackendsGetRequest, ...grpc.CallOption) (*privatev1.StorageBackendsGetResponse, error) {
+					return newTestStorageBackendGetResponseWithSecret("vast", "secret-1"), nil
+				},
+			}
+			secretsClient := &mockSecretsClient{
+				getFunc: func(context.Context, *privatev1.SecretsGetRequest, ...grpc.CallOption) (*privatev1.SecretsGetResponse, error) {
+					return privatev1.SecretsGetResponse_builder{
+						Object: privatev1.Secret_builder{
+							Type: privatev1.SecretType_SECRET_TYPE_VALUE,
+							Data: map[string][]byte{},
+						}.Build(),
+					}.Build(), nil
+				},
+			}
+
+			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, secretsClient)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(defs).To(BeEmpty())
+			Expect(conns).NotTo(HaveKey("backend-1"))
+		})
+
+		It("should skip a backend using password_secret when no SecretsClient is configured", func() {
+			tiersClient := &mockStorageTiersLister{
+				listFunc: func(context.Context, *privatev1.StorageTiersListRequest, ...grpc.CallOption) (*privatev1.StorageTiersListResponse, error) {
+					return privatev1.StorageTiersListResponse_builder{
+						Items: []*privatev1.StorageTier{newTestStorageTier("fast", "backend-1")},
+					}.Build(), nil
+				},
+			}
+			backendsClient := &mockStorageBackendsClient{
+				getFunc: func(context.Context, *privatev1.StorageBackendsGetRequest, ...grpc.CallOption) (*privatev1.StorageBackendsGetResponse, error) {
+					return newTestStorageBackendGetResponseWithSecret("vast", "secret-1"), nil
+				},
+			}
+
+			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(defs).To(BeEmpty())
+			Expect(conns).NotTo(HaveKey("backend-1"))
 		})
 
 		It("should skip a tier with no backend association without failing", func() {
@@ -717,7 +839,7 @@ var _ = Describe("Storage Controller", func() {
 				},
 			}
 
-			defs, _, err := resolveTierDefinitions(ctx, tiersClient, backendsClient)
+			defs, _, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(defs).To(HaveLen(1))
 			Expect(defs[0].Name).To(Equal("fast"))
@@ -741,7 +863,7 @@ var _ = Describe("Storage Controller", func() {
 				},
 			}
 
-			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient)
+			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(defs).To(HaveLen(2))
 			Expect(backendsClient.getCallCount).To(Equal(1))
@@ -770,7 +892,7 @@ var _ = Describe("Storage Controller", func() {
 				},
 			}
 
-			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient)
+			defs, conns, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(defs).To(HaveLen(1))
 			Expect(defs[0].Name).To(Equal("fast"))
@@ -791,7 +913,7 @@ var _ = Describe("Storage Controller", func() {
 				},
 			}
 
-			_, _, err := resolveTierDefinitions(ctx, tiersClient, backendsClient)
+			_, _, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
 			Expect(err).To(HaveOccurred())
 		})
 
@@ -809,7 +931,7 @@ var _ = Describe("Storage Controller", func() {
 				},
 			}
 
-			_, _, err := resolveTierDefinitions(ctx, tiersClient, backendsClient)
+			_, _, err := resolveTierDefinitions(ctx, tiersClient, backendsClient, nil)
 			Expect(err).To(HaveOccurred())
 		})
 
@@ -1566,7 +1688,7 @@ var _ = Describe("Storage Controller", func() {
 
 			secret := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{
-				Name:      fmt.Sprintf("vast-tenant-config-%s", name),
+				Name:      fmt.Sprintf("lvms-tenant-config-%s", name),
 				Namespace: secretsNamespace,
 			}, secret)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, secret)).To(Succeed())
@@ -1588,6 +1710,51 @@ var _ = Describe("Storage Controller", func() {
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			}, 5*time.Second, 100*time.Millisecond).Should(Succeed())
+		})
+	})
+
+	Context("hubSecretExists provider filtering", func() {
+		It("should filter by storage-provider label when provider is non-empty", func() {
+			name := "storage-test-provider-filter"
+			// Create a secret with the lvms storage-provider label
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("lvms-tenant-config-%s", name),
+					Namespace: secretsNamespace,
+					Labels: map[string]string{
+						osacTenantKey:            name,
+						osacStorageProviderLabel: "lvms",
+					},
+				},
+				StringData: map[string]string{
+					"provider": "lvms",
+				},
+			}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, secret))).To(Succeed())
+			})
+
+			r := NewStorageReconciler(
+				testMcManager, testNamespace, mcmanager.LocalCluster,
+				nil, nil, pollInterval,
+				provisioning.DefaultMaxJobHistory,
+			)
+
+			// provider="lvms" → should find the secret
+			found, err := r.hubSecretExists(ctx, name, "lvms")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue(), "expected hub secret to be found when filtering by provider=lvms")
+
+			// provider="vast" → should NOT find the secret (wrong provider)
+			found, err = r.hubSecretExists(ctx, name, "vast")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeFalse(), "expected hub secret NOT to be found when filtering by provider=vast")
+
+			// provider="" → should find the secret (backward compat, no provider filter)
+			found, err = r.hubSecretExists(ctx, name, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found).To(BeTrue(), "expected hub secret to be found when provider is empty (backward compat)")
 		})
 	})
 
@@ -2169,6 +2336,159 @@ var _ = Describe("Storage Controller", func() {
 			clusterCond := tenant.GetStatusCondition(v1alpha1.TenantConditionClusterStorageReady)
 			Expect(clusterCond).NotTo(BeNil())
 			Expect(clusterCond.Status).To(Equal(metav1.ConditionTrue))
+		})
+	})
+
+	Context("CaaS: cluster deletion without storage provider (OSAC-4340)", func() {
+		// These tests verify that CaaS cluster deletion (finalizer removal)
+		// works independently of:
+		//   1. ClusterStorageProvider being configured
+		//   2. Stage 1 (handleBackendReadiness) returning stop=true
+		//
+		// The watch engagement options (WithEngageWithLocalCluster/
+		// WithEngageWithProviderClusters) on the ClusterOrder Watches call
+		// are verified by source inspection — envtest runs against the
+		// local cluster only, so it cannot exercise multicluster watch
+		// delivery. The functional tests below verify the behavioral fix:
+		// once a reconcile is triggered, CaaS deletion runs regardless of
+		// provider or Stage 1 state.
+
+		It("should remove the cluster-storage finalizer from a deleting ClusterOrder when no ClusterStorageProvider is configured", func() {
+			tenantName := "caas-delete-no-provider"
+			createReadyTenantForStorage(ctx, tenantName, testNamespace)
+
+			// No backends, no providers: the environment has no storage infrastructure configured.
+			r := NewStorageReconciler(
+				testMcManager, testNamespace, mcmanager.LocalCluster,
+				nil, nil, pollInterval, provisioning.DefaultMaxJobHistory,
+			)
+
+			// Create a ClusterOrder with the cluster-storage finalizer already present
+			// (as if a previous reconcile with a provider had added it).
+			co := newClusterOrder("caas-del-no-prov-co", testNamespace, map[string]string{
+				osacTenantKey: tenantName,
+			})
+			controllerutil.AddFinalizer(co, clusterStorageFinalizer)
+			Expect(k8sClient.Create(ctx, co)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, co))).To(Succeed())
+			})
+
+			// Verify the finalizer is present
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), co)).To(Succeed())
+			Expect(co.Finalizers).To(ContainElement(clusterStorageFinalizer))
+
+			// Delete the ClusterOrder — the finalizer should block deletion
+			Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+
+			// Reconcile the Tenant: handleCaaSDelete should process the
+			// deleting ClusterOrder even without a ClusterStorageProvider.
+			// The HCP does not exist (kubeconfig==nil), so cleanup is skipped
+			// and the finalizer is removed immediately.
+			nn := types.NamespacedName{Name: tenantName, Namespace: testNamespace}
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, storageReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+
+				updatedCO := &v1alpha1.ClusterOrder{}
+				err = k8sClient.Get(ctx, client.ObjectKeyFromObject(co), updatedCO)
+				g.Expect(client.IgnoreNotFound(err)).To(Succeed())
+				if err == nil {
+					g.Expect(updatedCO.Finalizers).NotTo(ContainElement(clusterStorageFinalizer),
+						"cluster-storage finalizer should be removed even without a ClusterStorageProvider")
+				}
+			}).Should(Succeed())
+		})
+
+		It("should remove the cluster-storage finalizer during Tenant deletion when no ClusterStorageProvider is configured", func() {
+			tenantName := "caas-tdel-no-provider"
+			createReadyTenantForStorage(ctx, tenantName, testNamespace)
+
+			// No backends, no providers.
+			r := NewStorageReconciler(
+				testMcManager, testNamespace, mcmanager.LocalCluster,
+				nil, nil, pollInterval, provisioning.DefaultMaxJobHistory,
+			)
+
+			// First reconcile: adds the storage finalizer to the Tenant
+			nn := types.NamespacedName{Name: tenantName, Namespace: testNamespace}
+			_, err := r.Reconcile(ctx, storageReconcileRequest(nn))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Create a ClusterOrder with the cluster-storage finalizer
+			co := newClusterOrder("caas-tdel-co", testNamespace, map[string]string{
+				osacTenantKey: tenantName,
+			})
+			controllerutil.AddFinalizer(co, clusterStorageFinalizer)
+			Expect(k8sClient.Create(ctx, co)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, co))).To(Succeed())
+			})
+
+			// Delete the Tenant — handleDelete should clean up CaaS finalizers
+			tenant := &v1alpha1.Tenant{}
+			Expect(k8sClient.Get(ctx, nn, tenant)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, tenant)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, storageReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+
+				// ClusterOrder's cluster-storage finalizer should be removed
+				updatedCO := &v1alpha1.ClusterOrder{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), updatedCO)).To(Succeed())
+				g.Expect(updatedCO.Finalizers).NotTo(ContainElement(clusterStorageFinalizer),
+					"cluster-storage finalizer should be removed from ClusterOrder during Tenant deletion")
+			}).Should(Succeed())
+		})
+
+		It("should remove the cluster-storage finalizer even when Stage 1 returns stop=true (backend registered, no AAP)", func() {
+			tenantName := "caas-del-stage1-stop"
+			createReadyTenantForStorage(ctx, tenantName, testNamespace)
+
+			// Backend registered but no AAP provider: Stage 1 (handleBackendReadiness)
+			// returns stop=true at the "backend registered but no AAP" branch.
+			// Before the OSAC-4340 fix, handleCaaSDelete was called AFTER Stage 1,
+			// so it was never reached. Now it runs before Stage 1.
+			r := NewStorageReconciler(
+				testMcManager, testNamespace, mcmanager.LocalCluster,
+				nil, nil, pollInterval, provisioning.DefaultMaxJobHistory,
+			)
+			r.BackendsClient = registeredBackendsClient(1)
+
+			// Create a ClusterOrder with the cluster-storage finalizer
+			co := newClusterOrder("caas-del-s1stop-co", testNamespace, map[string]string{
+				osacTenantKey: tenantName,
+			})
+			controllerutil.AddFinalizer(co, clusterStorageFinalizer)
+			Expect(k8sClient.Create(ctx, co)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, co))).To(Succeed())
+			})
+
+			// Verify the finalizer is present
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), co)).To(Succeed())
+			Expect(co.Finalizers).To(ContainElement(clusterStorageFinalizer))
+
+			// Delete the ClusterOrder
+			Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+
+			// Reconcile: Stage 1 will return stop=true (backend registered,
+			// no AAP), but handleCaaSDelete runs before Stage 1 so the
+			// finalizer is removed regardless.
+			nn := types.NamespacedName{Name: tenantName, Namespace: testNamespace}
+			Eventually(func(g Gomega) {
+				_, err := r.Reconcile(ctx, storageReconcileRequest(nn))
+				g.Expect(err).NotTo(HaveOccurred())
+
+				updatedCO := &v1alpha1.ClusterOrder{}
+				err = k8sClient.Get(ctx, client.ObjectKeyFromObject(co), updatedCO)
+				g.Expect(client.IgnoreNotFound(err)).To(Succeed())
+				if err == nil {
+					g.Expect(updatedCO.Finalizers).NotTo(ContainElement(clusterStorageFinalizer),
+						"cluster-storage finalizer should be removed even when Stage 1 returns stop=true")
+				}
+			}).Should(Succeed())
 		})
 	})
 })

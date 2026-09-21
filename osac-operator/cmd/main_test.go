@@ -19,12 +19,16 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
+	"github.com/osac-project/osac/osac-operator/internal/controller"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
@@ -82,6 +86,96 @@ var _ = Describe("ignoreCanceled", func() {
 	It("should preserve real errors", func() {
 		realErr := errors.New("connection refused")
 		Expect(ignoreCanceled(realErr)).To(Equal(realErr))
+	})
+})
+
+var _ = Describe("clusterOrderStallThresholdsFromEnv", func() {
+	stallThresholdEnvironmentVariables := []string{
+		envClusterPreparingInfrastructureStallThreshold,
+		envClusterControlPlaneStartingStallThreshold,
+		envClusterWorkersJoiningStallThreshold,
+		envClusterWorkersJoiningStallThresholdOverrides,
+	}
+
+	BeforeEach(func() {
+		type environmentValue struct {
+			value string
+			set   bool
+		}
+
+		originalValues := make(map[string]environmentValue, len(stallThresholdEnvironmentVariables))
+		for _, environmentVariable := range stallThresholdEnvironmentVariables {
+			value, set := os.LookupEnv(environmentVariable)
+			originalValues[environmentVariable] = environmentValue{value: value, set: set}
+			Expect(os.Unsetenv(environmentVariable)).To(Succeed())
+		}
+		DeferCleanup(func() {
+			for environmentVariable, originalValue := range originalValues {
+				if originalValue.set {
+					Expect(os.Setenv(environmentVariable, originalValue.value)).To(Succeed())
+					continue
+				}
+				Expect(os.Unsetenv(environmentVariable)).To(Succeed())
+			}
+		})
+	})
+
+	It("uses production defaults when thresholds are not configured", func() {
+		thresholds := clusterOrderStallThresholdsFromEnv()
+
+		Expect(thresholds).To(Equal(controller.DefaultClusterOrderStallThresholds()))
+	})
+
+	It("accepts configured thresholds and valid per-host-type worker overrides", func() {
+		Expect(os.Setenv(envClusterPreparingInfrastructureStallThreshold, "10m")).To(Succeed())
+		Expect(os.Setenv(envClusterControlPlaneStartingStallThreshold, "25m")).To(Succeed())
+		Expect(os.Setenv(envClusterWorkersJoiningStallThreshold, "15m")).To(Succeed())
+		Expect(os.Setenv(envClusterWorkersJoiningStallThresholdOverrides,
+			`{"fast":"5m","slow":"40m","invalid":"not-a-duration","zero":"0s"}`)).To(Succeed())
+
+		thresholds := clusterOrderStallThresholdsFromEnv()
+
+		Expect(thresholds.PreparingInfrastructure).To(Equal(10 * time.Minute))
+		Expect(thresholds.ControlPlaneStarting).To(Equal(25 * time.Minute))
+		Expect(thresholds.WorkersJoining).To(Equal(15 * time.Minute))
+		Expect(thresholds.WorkersJoiningByHostType).To(Equal(map[string]time.Duration{
+			"fast": 5 * time.Minute,
+			"slow": 40 * time.Minute,
+		}))
+	})
+
+	It("keeps defaults when the worker override configuration is malformed", func() {
+		Expect(os.Setenv(envClusterWorkersJoiningStallThresholdOverrides, "not-json")).To(Succeed())
+
+		thresholds := clusterOrderStallThresholdsFromEnv()
+
+		Expect(thresholds).To(Equal(controller.DefaultClusterOrderStallThresholds()))
+	})
+})
+
+var _ = Describe("tenant CSI fulfillment configuration", func() {
+	BeforeEach(func() {
+		for _, variable := range []string{envFulfillmentEndpoint, envFulfillmentIssuerURL} {
+			variable := variable
+			originalValue, wasSet := os.LookupEnv(variable)
+			DeferCleanup(func() {
+				if wasSet {
+					Expect(os.Setenv(variable, originalValue)).To(Succeed())
+					return
+				}
+				Expect(os.Unsetenv(variable)).To(Succeed())
+			})
+			Expect(os.Unsetenv(variable)).To(Succeed())
+		}
+	})
+
+	It("reads endpoint and issuer values from the operator environment", func() {
+		Expect(os.Setenv(envFulfillmentEndpoint, "fulfillment-api.example.com:443")).To(Succeed())
+		Expect(os.Setenv(envFulfillmentIssuerURL, "https://keycloak.example.com/realms/osac")).To(Succeed())
+
+		endpoint, issuerURL := fulfillmentConfigFromEnv()
+		Expect(endpoint).To(Equal("fulfillment-api.example.com:443"))
+		Expect(issuerURL).To(Equal("https://keycloak.example.com/realms/osac"))
 	})
 })
 
@@ -286,5 +380,79 @@ var _ = Describe("parseVendorControllers", func() {
 		_, err := parseVendorControllers("vast=")
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("backend and endpoint must not be empty"))
+	})
+})
+
+var _ = Describe("newVendorProvisionerRegistry", func() {
+	It("registers VAST and marks unsupported providers as unimplemented", func() {
+		registry, err := newVendorProvisionerRegistry(
+			fake.NewClientBuilder().Build(),
+			"osac-system",
+			map[string]string{"vast": "vast.svc:50051", "netapp": "netapp.svc:50052"},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(registry).To(HaveLen(2))
+		Expect(registry["vast"]).To(BeAssignableToTypeOf(&controller.VastVendorProvisioner{}))
+		_, registered := registry["netapp"]
+		Expect(registered).To(BeTrue())
+		Expect(registry["netapp"]).To(BeNil())
+	})
+
+	It("marks future provider keys as unimplemented", func() {
+		registry, err := newVendorProvisionerRegistry(
+			fake.NewClientBuilder().Build(),
+			"osac-system",
+			map[string]string{"netapp": "netapp.svc:50052"},
+		)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(registry).To(HaveLen(1))
+		Expect(registry["netapp"]).To(BeNil())
+	})
+})
+
+var _ = Describe("controllerFlags.validate", func() {
+	It("accepts all controllers enabled", func() {
+		f := &controllerFlags{
+			Tenant: true, Storage: true, Volume: true,
+			ComputeInstance: true, Cluster: true,
+			Networking: true, BareMetalInstance: true,
+		}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts CaaS with VMaaS", func() {
+		f := &controllerFlags{Cluster: true, ComputeInstance: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts CaaS with BMaaS", func() {
+		f := &controllerFlags{Cluster: true, BareMetalInstance: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts CaaS with both VMaaS and BMaaS", func() {
+		f := &controllerFlags{Cluster: true, ComputeInstance: true, BareMetalInstance: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("rejects CaaS without VMaaS or BMaaS", func() {
+		f := &controllerFlags{Cluster: true, Tenant: true, Networking: true}
+		Expect(f.validate()).To(MatchError(ContainSubstring("ComputeInstance")))
+		Expect(f.validate()).To(MatchError(ContainSubstring("BareMetalInstance")))
+	})
+
+	It("accepts VMaaS without CaaS", func() {
+		f := &controllerFlags{ComputeInstance: true, Tenant: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts BMaaS without CaaS", func() {
+		f := &controllerFlags{BareMetalInstance: true, Tenant: true}
+		Expect(f.validate()).To(Succeed())
+	})
+
+	It("accepts no controllers enabled", func() {
+		f := &controllerFlags{}
+		Expect(f.validate()).To(Succeed())
 	})
 })

@@ -20,9 +20,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// VolumeTopology carries CSI-style placement segments for a volume request.
+type VolumeTopology struct {
+	// Segments is a CSI-style topology map (e.g. {"osac.io/node": "worker-1"}).
+	// Keys mirror CSI topology keys; values are scheduler-resolved.
+	Segments map[string]string `json:"segments,omitempty"`
+}
+
 // VolumeSpec defines the desired state of Volume.
 type VolumeSpec struct {
-	// StorageTier is the name of the StorageTier that determines which backend
+	// StorageTier is the name of the StorageTier that determines which provider
 	// and protocol serve this volume.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
@@ -41,6 +48,18 @@ type VolumeSpec struct {
 	// +kubebuilder:validation:Enum=ReadWriteOnce;ReadOnlyMany;ReadWriteMany;ReadWriteOncePod
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="accessMode is immutable"
 	AccessMode VolumeAccessMode `json:"accessMode"`
+
+	// Topology carries CSI-style placement constraints for this volume.
+	// For node-local backends (e.g. LVMS), the "osac.io/node" segment
+	// pins the volume to the scheduler-selected node; the ComputeInstance
+	// using this volume is then node-pinned. For network backends,
+	// topology may carry zone/region segments or be empty.
+	// The target CSI driver must support WaitForFirstConsumer and
+	// advertise VOLUME_ACCESSIBILITY_CONSTRAINTS for topology to take
+	// effect. Immutable after creation.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="topology is immutable"
+	Topology *VolumeTopology `json:"topology,omitempty"`
 }
 
 // VolumeAccessMode defines valid Kubernetes PersistentVolume access modes.
@@ -107,16 +126,24 @@ type VolumeStatus struct {
 	// +kubebuilder:validation:Optional
 	VendorVolumeID string `json:"vendorVolumeID,omitempty"`
 
-	// Backend is the name of the StorageBackend that serves this volume.
+	// Provider identifies the registered VendorProvisioner implementation selected for this volume.
 	// Resolved during tier resolution at creation time.
 	// +kubebuilder:validation:Optional
-	Backend string `json:"backend,omitempty"`
+	Provider string `json:"provider,omitempty"`
 
 	// Protocol is the storage protocol used for this volume.
 	// Resolved during tier resolution at creation time.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Enum=Block;NFS
 	Protocol VolumeProtocol `json:"protocol,omitempty"`
+
+	// VendorContext holds backend-specific attach parameters needed by the vendor CSI controller
+	// (for example VAST's "subsystem" and "vip_pool_name"). Opaque to the operator's own
+	// reconciliation logic: set from the same parameters used for the vendor CreateVolume call,
+	// synced to fulfillment-service by the feedback controller, and forwarded unchanged by
+	// osac-csi-driver to the vendor CSI controller's ControllerPublishVolume.
+	// +kubebuilder:validation:Optional
+	VendorContext map[string]string `json:"vendorContext,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -126,7 +153,7 @@ type VolumeStatus struct {
 // +kubebuilder:printcolumn:name="Size",type=integer,JSONPath=`.spec.sizeGiB`
 // +kubebuilder:printcolumn:name="Access",type=string,JSONPath=`.spec.accessMode`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="Backend",type=string,JSONPath=`.status.backend`,priority=1
+// +kubebuilder:printcolumn:name="Provider",type=string,JSONPath=`.status.provider`,priority=1
 // +kubebuilder:printcolumn:name="VendorID",type=string,JSONPath=`.status.vendorVolumeID`,priority=1
 
 // Volume is the Schema for the volumes API.

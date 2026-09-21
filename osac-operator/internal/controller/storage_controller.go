@@ -49,8 +49,8 @@ import (
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const (
@@ -73,6 +73,15 @@ type StorageBackendsClient interface {
 // automatically; it is defined here to allow test mocking (mirrors StorageBackendsClient).
 type StorageTiersLister interface {
 	List(ctx context.Context, in *privatev1.StorageTiersListRequest, opts ...grpc.CallOption) (*privatev1.StorageTiersListResponse, error)
+}
+
+// SecretsClient is a narrow subset of the generated privatev1.SecretsClient used to
+// resolve a storage backend's password from a referenced Secret (Get) when the backend
+// supplies password_secret instead of an inline password. The generated client satisfies
+// this interface automatically; it is defined here to allow test mocking (mirrors
+// StorageBackendsClient).
+type SecretsClient interface {
+	Get(ctx context.Context, in *privatev1.SecretsGetRequest, opts ...grpc.CallOption) (*privatev1.SecretsGetResponse, error)
 }
 
 // StorageReconciler reconciles storage lifecycle on Tenant CRs.
@@ -101,6 +110,11 @@ type StorageReconciler struct {
 	// validation and extra_vars injection are both skipped — backward compatible
 	// with environments without a fulfillment service connection.
 	TiersClient StorageTiersLister
+	// SecretsClient resolves a storage backend's password from a referenced Secret
+	// when the backend supplies password_secret instead of an inline password. When
+	// nil, backends that rely on password_secret are skipped (see resolveTierDefinitions);
+	// backends with an inline password are unaffected.
+	SecretsClient SecretsClient
 }
 
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=tenants,verbs=get;list;watch;update;patch
@@ -108,7 +122,7 @@ type StorageReconciler struct {
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=tenants/finalizers,verbs=update
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=clusterorders,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedcontrolplanes,verbs=get
+// +kubebuilder:rbac:groups=hypershift.openshift.io,resources=hostedcontrolplanes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -228,7 +242,7 @@ func (r *StorageReconciler) patchClusterOrderStorageStatus(ctx context.Context, 
 //   - stop: when true, the caller should return (result, err) immediately
 //   - error: any unexpected failure
 func (r *StorageReconciler) handleBackendReadiness(ctx context.Context, instance *v1alpha1.Tenant, tenantName string) (hubSecretReady bool, result ctrl.Result, stop bool, err error) {
-	hubSecretReady, err = r.hubSecretExists(ctx, tenantName)
+	hubSecretReady, err = r.hubSecretExists(ctx, tenantName, "")
 	if err != nil {
 		return false, ctrl.Result{}, true, err
 	}
@@ -303,7 +317,23 @@ func (r *StorageReconciler) handleUpdate(ctx context.Context, instance *v1alpha1
 	// handleBackendReadiness), so both Stage 2's tier-coverage validation and
 	// every downstream AAP call in this reconcile see the same result without
 	// re-fetching.
-	ctx, tierDefinitions := resolveAndInjectTierContext(ctx, r.TiersClient, r.BackendsClient, "tenant", tenantName)
+	ctx, tierDefinitions := resolveAndInjectTierContext(ctx, r.TiersClient, r.BackendsClient, r.SecretsClient, "tenant", tenantName)
+
+	// Handle individual ClusterOrder deletions while the Tenant is still
+	// alive. When a ClusterOrder is deleted, mapClusterOrderToTenant
+	// triggers Tenant reconciliation, and we clean up cluster-side storage
+	// for that specific cluster here.
+	//
+	// This runs BEFORE Stage 1 so that early returns from backend readiness
+	// or StorageClass resolution cannot prevent CaaS cluster cleanup.
+	// When the HostedControlPlane is already gone (kubeconfig==nil), there
+	// is nothing to deprovision on the cluster side and the finalizer can
+	// be removed immediately. When no ClusterStorageProvider is configured,
+	// the finalizer is also removed without attempting AAP cleanup (OSAC-4340).
+	caasDelResult, caasDelErr := r.handleCaaSDelete(ctx, instance, false)
+	if caasDelErr != nil || caasDelResult.RequeueAfter > 0 {
+		return caasDelResult, caasDelErr
+	}
 
 	// Stage 1: check hub Secret and route provisioning based on backend registration.
 	// stop is always true when err is non-nil (handleBackendReadiness invariant).
@@ -430,15 +460,6 @@ func (r *StorageReconciler) handleUpdate(ctx context.Context, instance *v1alpha1
 		caasResult, caasErr := r.handleCaaSUpdate(ctx, instance)
 		if caasErr != nil || caasResult.RequeueAfter > 0 {
 			return caasResult, caasErr
-		}
-
-		// Handle individual ClusterOrder deletions while the Tenant is still
-		// alive. When a ClusterOrder is deleted, mapClusterOrderToTenant
-		// triggers Tenant reconciliation, and we clean up cluster-side storage
-		// for that specific cluster here.
-		caasDelResult, caasDelErr := r.handleCaaSDelete(ctx, instance, false)
-		if caasDelErr != nil || caasDelResult.RequeueAfter > 0 {
-			return caasDelResult, caasDelErr
 		}
 	}
 
@@ -635,18 +656,20 @@ func (r *StorageReconciler) handleDelete(ctx context.Context, instance *v1alpha1
 	// Resolved independently from handleUpdate's resolution (no caching between
 	// create and delete paths), before the first AAP-triggering call in this
 	// function, so every downstream call in this reconcile sees the same result.
-	ctx, _ = resolveAndInjectTierContext(ctx, r.TiersClient, r.BackendsClient, "tenant", instance.Name)
+	ctx, _ = resolveAndInjectTierContext(ctx, r.TiersClient, r.BackendsClient, r.SecretsClient, "tenant", instance.Name)
 
 	// CaaS cleanup: remove cluster-side storage (StorageClasses, CSI) from
 	// all CaaS clusters and remove our finalizer from their ClusterOrders.
 	// The ClusterOrders themselves are not being deleted (they have no
 	// OwnerReference to the Tenant), but the storage backend is about to be
 	// torn down so cluster-side resources must be removed first.
-	if r.ClusterStorageProvider != nil {
-		caasResult, caasErr := r.handleCaaSDelete(ctx, instance, true)
-		if caasErr != nil || caasResult.RequeueAfter > 0 {
-			return caasResult, caasErr
-		}
+	//
+	// This runs independently of ClusterStorageProvider: when the
+	// HostedControlPlane is already gone the finalizer is removed without
+	// triggering AAP deprovisioning (OSAC-4340).
+	caasResult, caasErr := r.handleCaaSDelete(ctx, instance, true)
+	if caasErr != nil || caasResult.RequeueAfter > 0 {
+		return caasResult, caasErr
 	}
 
 	// Stage 1: class cleanup
@@ -804,6 +827,12 @@ func (r *StorageReconciler) handleCaaSDelete(ctx context.Context, instance *v1al
 				"clusterOrder", co.Name, "tenant", tenantName)
 			r.Recorder.Eventf(co, nil, corev1.EventTypeWarning, "KubeConfigNotAvailable", "Teardown",
 				"HostedControlPlane not found during storage teardown, skipping cleanup")
+		} else if r.ClusterStorageProvider == nil {
+			// Cluster still exists but no storage provider is configured, so
+			// we cannot run an AAP deprovisioning job. Remove the finalizer
+			// without attempting cleanup (OSAC-4340).
+			log.Info("no cluster storage provider configured, skipping CaaS cluster-side cleanup",
+				"clusterOrder", co.Name, "tenant", tenantName)
 		} else {
 			provCtx := provisioning.WithAdminKubeconfig(ctx, string(kubeconfig))
 
@@ -870,7 +899,7 @@ func (r *StorageReconciler) handleBackendDeprovisioning(ctx context.Context, ins
 		return ctrl.Result{}, nil
 	}
 
-	hubSecretReady, err := r.hubSecretExists(ctx, instance.GetName())
+	hubSecretReady, err := r.hubSecretExists(ctx, instance.GetName(), "")
 	if err != nil {
 		log.Error(err, "failed to check hub Secret existence, requeueing")
 		return ctrl.Result{RequeueAfter: r.StatusPollInterval}, nil
@@ -897,11 +926,15 @@ func (r *StorageReconciler) handleBackendDeprovisioning(ctx context.Context, ins
 
 // --- Helpers ---
 
-func (r *StorageReconciler) hubSecretExists(ctx context.Context, tenantName string) (bool, error) {
+func (r *StorageReconciler) hubSecretExists(ctx context.Context, tenantName string, provider string) (bool, error) {
+	labels := map[string]string{osacTenantKey: tenantName}
+	if provider != "" {
+		labels[osacStorageProviderLabel] = provider
+	}
 	var secretList corev1.SecretList
 	if err := r.List(ctx, &secretList,
 		client.InNamespace(storageConfigNamespace()),
-		client.MatchingLabels{osacTenantKey: tenantName},
+		client.MatchingLabels(labels),
 	); err != nil {
 		return false, err
 	}
@@ -1117,6 +1150,8 @@ func (r *StorageReconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		Watches(
 			&v1alpha1.ClusterOrder{},
 			mchandler.EnqueueRequestsFromMapFunc(r.mapClusterOrderToTenant),
+			mcbuilder.WithEngageWithLocalCluster(true),
+			mcbuilder.WithEngageWithProviderClusters(false),
 		).
 		Watches(
 			&storagev1.StorageClass{},

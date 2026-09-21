@@ -21,13 +21,16 @@ import (
 	"fmt"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerutil "sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -37,11 +40,12 @@ import (
 	mc "sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/helpers"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const (
@@ -72,6 +76,9 @@ type SubnetReconciler struct {
 	// two-manager model isn't configured (no gRPC connection / networking namespace),
 	// in which case the controller always uses the legacy implementation-strategy path.
 	Resolver *dispatcher.Resolver
+	// NetworkProvisioningEnabled controls whether the controller dispatches AAP
+	// provisioning jobs. When false, resources are set to Ready immediately.
+	NetworkProvisioningEnabled bool
 }
 
 // NewSubnetReconciler creates a new reconciler for Subnet resources.
@@ -113,7 +120,10 @@ func NewSubnetReconciler(
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=subnets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=subnets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=osac.openshift.io,resources=virtualnetworks,verbs=get;list;watch
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=computeinstances,verbs=list
+// +kubebuilder:rbac:groups=osac.openshift.io,resources=baremetalinstances,verbs=list
 // +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;create;update;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;create;update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -210,11 +220,25 @@ func (r *SubnetReconciler) handleUpdate(ctx context.Context, subnet *v1alpha1.Su
 		}
 	}
 
+	// Ensure V-Net lock lease exists for move_network_attachment serialization
+	if err := r.ensureVNetLockLease(ctx, subnet); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Set phase to Progressing only on first reconcile (empty phase).
 	// Subsequent reconciles preserve the current phase — it gets updated
 	// by OnSuccess/OnFailed callbacks in RunProvisioningLifecycle.
 	if subnet.Status.Phase == "" {
 		subnet.Status.Phase = v1alpha1.SubnetPhaseProgressing
+	}
+
+	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
+	// immediately. IP address pool creation on the target cluster is also skipped
+	// since there is no backend to configure in noop mode.
+	if !r.NetworkProvisioningEnabled {
+		subnet.Status.Phase = v1alpha1.SubnetPhaseReady
+		setReadyConditionTrue(&subnet.Status.Conditions)
+		return ctrl.Result{}, nil
 	}
 
 	// Get parent VirtualNetwork by UUID label to read implementation strategy
@@ -314,6 +338,40 @@ func (r *SubnetReconciler) handleUpdate(ctx context.Context, subnet *v1alpha1.Su
 	return r.handleProvisioning(ctx, subnet, plan)
 }
 
+// ensureVNetLockLease creates a K8s Lease for V-Net mutex locking if it
+// doesn't already exist. The Lease is owned by the Subnet CR and will be
+// garbage collected when the Subnet is deleted.
+func (r *SubnetReconciler) ensureVNetLockLease(ctx context.Context, subnet *v1alpha1.Subnet) error {
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      vnetLockLeaseName(subnet.Name),
+			Namespace: subnet.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         v1alpha1.GroupVersion.String(),
+					Kind:               "Subnet",
+					Name:               subnet.Name,
+					UID:                subnet.UID,
+					Controller:         ptr.To(true),
+					BlockOwnerDeletion: ptr.To(false),
+				},
+			},
+		},
+		Spec: coordinationv1.LeaseSpec{
+			LeaseDurationSeconds: ptr.To(int32(120)),
+		},
+	}
+	err := r.Create(ctx, lease)
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("creating V-Net lock lease: %w", err)
+	}
+	ctrllog.FromContext(ctx).Info("created V-Net lock lease", "lease", lease.Name)
+	return nil
+}
+
 // updateSubnetStrategyAnnotations stamps the implementation-strategy, k8s
 // implementation-strategy, and VIP CIDR annotations AAP playbooks rely on, persisting
 // subnet if anything changed. The k8s annotation is compared and, when hasK8sTarget is
@@ -404,20 +462,59 @@ func (r *SubnetReconciler) handleDelete(ctx context.Context, subnet *v1alpha1.Su
 		return ctrl.Result{}, nil
 	}
 
-	// Remove MetalLB IPAddressPool before AAP deprovisioning (which removes the CUDN)
-	if err := r.deleteMetalLBIPAddressPool(ctx, subnet); err != nil {
-		return ctrl.Result{}, fmt.Errorf("deleting MetalLB IPAddressPool: %w", err)
+	// Gate: wait for ComputeInstances with network attachments to this subnet to be
+	// fully removed. Without this gate, the infrastructure backend rejects the subnet
+	// deletion because instances still exist on it.
+	subnetName := subnet.Name
+	ns := subnet.Namespace
+
+	ciList := &v1alpha1.ComputeInstanceList{}
+	if err := r.List(ctx, ciList, client.InNamespace(ns)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing ComputeInstances: %w", err)
+	}
+	for i := range ciList.Items {
+		for _, na := range ciList.Items[i].Spec.NetworkAttachments {
+			if na.SubnetRef == subnetName {
+				log.Info("waiting for ComputeInstance to be deleted before deprovisioning Subnet",
+					"computeInstance", ciList.Items[i].Name)
+				return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+			}
+		}
 	}
 
-	// Handle deprovisioning
-	result, err := r.handleDeprovisioning(ctx, subnet)
-	if err != nil {
-		return result, err
+	// Gate: wait for BareMetalInstances with network attachments to this subnet.
+	bmiList := &bmfov1alpha1.BareMetalInstanceList{}
+	if err := r.List(ctx, bmiList, client.InNamespace(ns)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing BareMetalInstances: %w", err)
+	}
+	for i := range bmiList.Items {
+		for _, na := range bmiList.Items[i].Spec.NetworkAttachments {
+			if na.SubnetRef == subnetName {
+				log.Info("waiting for BareMetalInstance to be deleted before deprovisioning Subnet",
+					"bareMetalInstance", bmiList.Items[i].Name)
+				return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+			}
+		}
 	}
 
-	// If we need to requeue (jobs still running), do so
-	if result.RequeueAfter > 0 {
-		return result, nil
+	if subnet.Annotations[osacImplementationStrategyAnnotation] == "" {
+		log.Info("skipping deprovisioning — resource was never provisioned")
+	} else {
+		// Remove the target-cluster IP address pool before AAP deprovisioning
+		if err := r.deleteMetalLBIPAddressPool(ctx, subnet); err != nil {
+			return ctrl.Result{}, fmt.Errorf("deleting MetalLB IPAddressPool: %w", err)
+		}
+
+		// Handle deprovisioning
+		result, err := r.handleDeprovisioning(ctx, subnet)
+		if err != nil {
+			return result, err
+		}
+
+		// If we need to requeue (jobs still running), do so
+		if result.RequeueAfter > 0 {
+			return result, nil
+		}
 	}
 
 	// Deprovisioning complete or skipped, remove base finalizer

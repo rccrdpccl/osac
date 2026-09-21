@@ -29,8 +29,8 @@ import (
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // tierListLimit is a generous upper bound on the number of storage tiers fetched in a
@@ -56,6 +56,7 @@ func resolveTierDefinitions(
 	ctx context.Context,
 	tiersClient StorageTiersLister,
 	backendsClient StorageBackendsClient,
+	secretsClient SecretsClient,
 ) ([]provisioning.TierDefinition, map[string]provisioning.BackendConnection, error) {
 	log := ctrllog.FromContext(ctx)
 
@@ -104,22 +105,33 @@ func resolveTierDefinitions(
 				return nil, nil, fmt.Errorf("get storage backend %q: %w", backendID, err)
 			}
 			spec := getResp.GetObject().GetSpec()
+			password, perr := resolveBackendPassword(ctx, secretsClient, spec.GetCredentials())
+			if perr != nil {
+				// A backend whose password cannot be resolved is skipped with a
+				// logged warning (like a NotFound backend) rather than provisioned
+				// with an empty password. The error carries only the backend id and
+				// reason — never the secret value.
+				log.Info("failed to resolve storage backend password, skipping tiers that reference it",
+					"backendID", backendID, "tier", tierName, "error", perr.Error())
+				backendCache[backendID] = backendResolution{found: false}
+				continue
+			}
 			resolution = backendResolution{provider: spec.GetProvider(), found: true}
 			backendCache[backendID] = resolution
 			connections[backendID] = provisioning.BackendConnection{
 				Endpoint: spec.GetEndpoint(),
 				Username: spec.GetCredentials().GetUsername(),
-				Password: spec.GetCredentials().GetPassword(),
+				Password: password,
 			}
 		}
 		if !resolution.found {
 			continue
 		}
 
-		protocol := storageProtocolToString(assoc.GetProtocol())
+		protocol := storageProtocolToString(tier.GetSpec().GetProtocol())
 		if protocol == "" {
 			log.Info("storage tier has unrecognized protocol, emitting empty protocol",
-				"tier", tierName, "protocol", assoc.GetProtocol())
+				"tier", tierName, "protocol", tier.GetSpec().GetProtocol())
 		}
 
 		definitions = append(definitions, provisioning.TierDefinition{
@@ -131,11 +143,54 @@ func resolveTierDefinitions(
 				MaxReadBandwidthMBs:  assoc.GetMaxReadBandwidthMbs(),
 				MaxWriteBandwidthMBs: assoc.GetMaxWriteBandwidthMbs(),
 			},
-			QuotaGiB: assoc.GetQuotaGib(),
 		})
 	}
 
 	return definitions, connections, nil
+}
+
+// resolveBackendPassword returns the storage backend password used for AAP provisioning,
+// preferring the inline credentials value and otherwise fetching data["value"] from
+// the referenced Secret via the Secrets API. A backend with neither an inline password
+// nor a password_secret reference yields an empty password with no error (backends that
+// legitimately need no credential are unaffected). When password_secret is set the secret
+// must resolve to a non-empty data["value"]; any failure is returned so the caller can
+// skip that backend rather than silently provision with an empty password. The returned
+// error carries only the secret id and reason — never the secret value.
+func resolveBackendPassword(
+	ctx context.Context,
+	secretsClient SecretsClient,
+	creds *privatev1.StorageBackendCredentials,
+) (string, error) {
+	if password := creds.GetPassword(); password != "" {
+		return password, nil
+	}
+	ref := creds.GetPasswordSecret()
+	if ref == nil {
+		return "", nil
+	}
+	if secretsClient == nil {
+		return "", fmt.Errorf("password_secret is set but no secrets client is configured")
+	}
+	id := ref.GetId()
+	if id == "" {
+		return "", fmt.Errorf("password_secret must have an id")
+	}
+	resp, err := secretsClient.Get(ctx, privatev1.SecretsGetRequest_builder{
+		Id: id,
+	}.Build())
+	if err != nil {
+		return "", fmt.Errorf("get password secret %q: %w", id, err)
+	}
+	if secretType := resp.GetObject().GetType(); secretType != privatev1.SecretType_SECRET_TYPE_VALUE {
+		return "", fmt.Errorf("secret %q has type %q, expected %q", id, secretType,
+			privatev1.SecretType_SECRET_TYPE_VALUE)
+	}
+	value, ok := resp.GetObject().GetData()["value"]
+	if !ok || len(value) == 0 {
+		return "", fmt.Errorf("secret %q is missing data[%q]", id, "value")
+	}
+	return string(value), nil
 }
 
 // resolveAndInjectTierContext resolves storage tier definitions and backend
@@ -152,6 +207,7 @@ func resolveAndInjectTierContext(
 	ctx context.Context,
 	tiersClient StorageTiersLister,
 	backendsClient StorageBackendsClient,
+	secretsClient SecretsClient,
 	logKV ...any,
 ) (context.Context, []provisioning.TierDefinition) {
 	log := ctrllog.FromContext(ctx)
@@ -160,7 +216,7 @@ func resolveAndInjectTierContext(
 	var backendConnections map[string]provisioning.BackendConnection
 	if tiersClient != nil && backendsClient != nil {
 		var err error
-		tierDefinitions, backendConnections, err = resolveTierDefinitions(ctx, tiersClient, backendsClient)
+		tierDefinitions, backendConnections, err = resolveTierDefinitions(ctx, tiersClient, backendsClient, secretsClient)
 		if err != nil {
 			log.Error(err, "failed to resolve storage tier definitions, proceeding without tier data", logKV...)
 			tierDefinitions = nil

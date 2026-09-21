@@ -37,9 +37,10 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
-	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 	ovnv1 "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/crd/userdefinednetwork/v1"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+
+	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
@@ -168,7 +169,7 @@ func newTestComputeInstanceSpec(templateID string) osacv1alpha1.ComputeInstanceS
 			SourceType: osacv1alpha1.ImageSourceTypeRegistry,
 			SourceRef:  "quay.io/fedora/fedora-coreos:stable",
 		},
-		Cores:     4,
+		VCPUs:     4,
 		MemoryGiB: 8,
 		BootDisk: osacv1alpha1.DiskSpec{
 			SizeGiB:     30,

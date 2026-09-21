@@ -29,6 +29,7 @@ spec:
         args:
           - --leader-elect
           - --health-probe-bind-address=:8081
+          - --metrics-bind-address=:8443
           - --grpc-insecure
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -62,6 +63,22 @@ spec:
           - name: OSAC_AAP_TEMPLATE_PREFIX
             value: {{ .Values.aap.templatePrefix | quote }}
           {{- end }}
+          {{- if .Values.stall.preparingInfrastructureThreshold }}
+          - name: OSAC_CLUSTER_PREPARING_INFRASTRUCTURE_STALL_THRESHOLD
+            value: {{ .Values.stall.preparingInfrastructureThreshold | quote }}
+          {{- end }}
+          {{- if .Values.stall.controlPlaneStartingThreshold }}
+          - name: OSAC_CLUSTER_CONTROL_PLANE_STARTING_STALL_THRESHOLD
+            value: {{ .Values.stall.controlPlaneStartingThreshold | quote }}
+          {{- end }}
+          {{- if .Values.stall.workersJoiningThreshold }}
+          - name: OSAC_CLUSTER_WORKERS_JOINING_STALL_THRESHOLD
+            value: {{ .Values.stall.workersJoiningThreshold | quote }}
+          {{- end }}
+          {{- if .Values.stall.workersJoiningByHostType }}
+          - name: OSAC_CLUSTER_WORKERS_JOINING_STALL_THRESHOLD_OVERRIDES
+            value: {{ .Values.stall.workersJoiningByHostType | toJson | quote }}
+          {{- end }}
           {{- if .Values.networkManagers.capabilitiesSyncInterval }}
           - name: OSAC_NETWORK_CLASS_SYNC_INTERVAL
             value: {{ .Values.networkManagers.capabilitiesSyncInterval | quote }}
@@ -70,6 +87,20 @@ spec:
             value: {{ .Values.fulfillment.serverAddress | default "fulfillment-internal-api:8001" | quote }}
           - name: OSAC_FULFILLMENT_TOKEN_FILE
             value: {{ .Values.fulfillment.tokenFile | default "/var/run/secrets/kubernetes.io/serviceaccount/token" | quote }}
+          {{- if .Values.fulfillment.configMap.name }}
+          - name: OSAC_FULFILLMENT_ENDPOINT
+            valueFrom:
+              configMapKeyRef:
+                name: {{ .Values.fulfillment.configMap.name }}
+                key: OSAC_FULFILLMENT_ENDPOINT
+                optional: {{ .Values.fulfillment.configMap.optional }}
+          - name: OSAC_FULFILLMENT_ISSUER_URL
+            valueFrom:
+              configMapKeyRef:
+                name: {{ .Values.fulfillment.configMap.name }}
+                key: OSAC_FULFILLMENT_ISSUER_URL
+                optional: {{ .Values.fulfillment.configMap.optional }}
+          {{- end }}
           - name: OSAC_CLUSTER_ORDER_NAMESPACE
             valueFrom:
               fieldRef:
@@ -99,19 +130,21 @@ spec:
               fieldRef:
                 fieldPath: metadata.namespace
           - name: OSAC_ENABLE_CLUSTER_CONTROLLER
-            value: {{ .Values.controllers.clusterOrder | quote }}
+            value: {{ include "osac-operator.controllerEnabled" (list . "clusterOrder" "caas") | quote }}
           - name: OSAC_ENABLE_COMPUTE_INSTANCE_CONTROLLER
-            value: {{ .Values.controllers.computeInstance | quote }}
+            value: {{ include "osac-operator.controllerEnabled" (list . "computeInstance" "vmaas") | quote }}
           - name: OSAC_ENABLE_TENANT_CONTROLLER
             value: {{ .Values.controllers.tenant | quote }}
           - name: OSAC_ENABLE_NETWORKING_CONTROLLER
             value: {{ .Values.controllers.networking | quote }}
           - name: OSAC_ENABLE_BAREMETAL_INSTANCE_CONTROLLER
-            value: {{ .Values.controllers.bareMetalInstance | quote }}
+            value: {{ include "osac-operator.controllerEnabled" (list . "bareMetalInstance" "bmaas") | quote }}
           - name: OSAC_ENABLE_STORAGE_CONTROLLER
             value: {{ .Values.controllers.storage | quote }}
           - name: OSAC_ENABLE_VOLUME_CONTROLLER
             value: {{ .Values.controllers.volume | quote }}
+          - name: OSAC_ENABLE_NETWORKING_PROVISIONING
+            value: {{ .Values.controllers.networkingProvisioning | default false | quote }}
 {{- if .Values.vendorControllers }}
 {{- $pairs := list }}
 {{- range $k, $v := .Values.vendorControllers }}

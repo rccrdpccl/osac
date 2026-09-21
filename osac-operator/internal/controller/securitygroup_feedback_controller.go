@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,8 +27,8 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // SecurityGroupFeedbackReconciler sends updates to the fulfillment service.
@@ -66,7 +67,8 @@ func NewSecurityGroupFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.Cl
 		},
 		Save: func(ctx context.Context, remote *privatev1.SecurityGroup) error {
 			_, err := sgClient.Update(ctx, privatev1.SecurityGroupsUpdateRequest_builder{
-				Object: remote,
+				Object:     remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{feedbackStatusStatePath}},
 			}.Build())
 			return err
 		},

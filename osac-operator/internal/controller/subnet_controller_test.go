@@ -23,6 +23,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -35,12 +36,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	bmfov1alpha1 "github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/dispatcheradapter"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/networkmanager"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("SubnetReconciler", func() {
@@ -56,13 +58,14 @@ var _ = Describe("SubnetReconciler", func() {
 		ctx = context.TODO()
 		mockProvider = &mockSubnetProvider{}
 		reconciler = &SubnetReconciler{
-			Client:               k8sClient,
-			APIReader:            k8sClient,
-			Scheme:               k8sClient.Scheme(),
-			NetworkingNamespace:  "default",
-			ProvisioningProvider: mockProvider,
-			StatusPollInterval:   1 * time.Second,
-			MaxJobHistory:        10,
+			Client:                     k8sClient,
+			APIReader:                  k8sClient,
+			Scheme:                     k8sClient.Scheme(),
+			NetworkingNamespace:        "default",
+			ProvisioningProvider:       mockProvider,
+			StatusPollInterval:         1 * time.Second,
+			MaxJobHistory:              10,
+			NetworkProvisioningEnabled: true,
 		}
 
 		// Create VirtualNetwork fixture. SubnetReconciler reads the fabric implementation
@@ -118,6 +121,13 @@ var _ = Describe("SubnetReconciler", func() {
 			existingSubnet.Finalizers = nil
 			_ = k8sClient.Update(ctx, existingSubnet)
 			_ = k8sClient.Delete(ctx, existingSubnet)
+		}
+
+		// Cleanup Lease
+		leaseKey := types.NamespacedName{Name: "netris-vnet-lock-" + subnet.Name, Namespace: subnet.Namespace}
+		existingLease := &coordinationv1.Lease{}
+		if err := k8sClient.Get(ctx, leaseKey, existingLease); err == nil {
+			_ = k8sClient.Delete(ctx, existingLease)
 		}
 	})
 
@@ -342,6 +352,141 @@ var _ = Describe("SubnetReconciler", func() {
 
 			// Cleanup
 			_ = k8sClient.Delete(ctx, unmanagedSubnet)
+		})
+
+		It("should create V-Net lock lease on first reconcile", func() {
+			Expect(k8sClient.Create(ctx, subnet)).To(Succeed())
+
+			req := mcreconcile.Request{Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      subnet.Name,
+					Namespace: subnet.Namespace,
+				},
+			}}
+
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify Lease was created
+			lease := &coordinationv1.Lease{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "netris-vnet-lock-" + subnet.Name,
+				Namespace: subnet.Namespace,
+			}, lease)).To(Succeed())
+
+			// Verify owner reference
+			Expect(lease.OwnerReferences).To(HaveLen(1))
+			Expect(lease.OwnerReferences[0].Kind).To(Equal("Subnet"))
+			Expect(lease.OwnerReferences[0].Name).To(Equal(subnet.Name))
+			Expect(*lease.OwnerReferences[0].Controller).To(BeTrue())
+			Expect(*lease.OwnerReferences[0].BlockOwnerDeletion).To(BeFalse())
+
+			// Verify lease duration
+			Expect(*lease.Spec.LeaseDurationSeconds).To(Equal(int32(120)))
+		})
+
+		It("should be idempotent when lease already exists", func() {
+			Expect(k8sClient.Create(ctx, subnet)).To(Succeed())
+
+			req := mcreconcile.Request{Request: reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      subnet.Name,
+					Namespace: subnet.Namespace,
+				},
+			}}
+
+			// First reconcile creates the lease
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Second reconcile should not error (lease already exists)
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify lease still exists with same properties
+			lease := &coordinationv1.Lease{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      "netris-vnet-lock-" + subnet.Name,
+				Namespace: subnet.Namespace,
+			}, lease)).To(Succeed())
+			Expect(*lease.Spec.LeaseDurationSeconds).To(Equal(int32(120)))
+		})
+
+		It("should wait for child ComputeInstance before deprovisioning", func() {
+			testSubnet := &osacv1alpha1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "subnet-with-ci",
+					Namespace:  "default",
+					Finalizers: []string{osacSubnetFinalizer},
+				},
+				Spec: osacv1alpha1.SubnetSpec{
+					VirtualNetwork: "ci-gate-vn",
+					IPv4CIDR:       "10.0.10.0/24",
+				},
+			}
+			Expect(k8sClient.Create(ctx, testSubnet)).To(Succeed())
+
+			ciSpec := newTestComputeInstanceSpec("test_template")
+			ciSpec.NetworkAttachments = []osacv1alpha1.ComputeNetworkAttachment{
+				{SubnetRef: testSubnet.Name},
+			}
+			childCI := &osacv1alpha1.ComputeInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "child-ci",
+					Namespace: "default",
+				},
+				Spec: ciSpec,
+			}
+			Expect(k8sClient.Create(ctx, childCI)).To(Succeed())
+
+			result, err := reconciler.handleDelete(ctx, testSubnet)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+
+			// Clean up
+			Expect(k8sClient.Delete(ctx, childCI)).To(Succeed())
+			_ = k8sClient.Delete(ctx, testSubnet)
+		})
+
+		It("should wait for child BareMetalInstance before deprovisioning", func() {
+			testSubnet := &osacv1alpha1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "subnet-with-bmi",
+					Namespace:  "default",
+					Finalizers: []string{osacSubnetFinalizer},
+				},
+				Spec: osacv1alpha1.SubnetSpec{
+					VirtualNetwork: "bmi-gate-vn",
+					IPv4CIDR:       "10.0.11.0/24",
+				},
+			}
+			Expect(k8sClient.Create(ctx, testSubnet)).To(Succeed())
+
+			childBMI := &bmfov1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "child-bmi",
+					Namespace: "default",
+				},
+				Spec: bmfov1alpha1.BareMetalInstanceSpec{
+					ExternalHostID: "test-host-id",
+					Selector: bmfov1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"test": "value"},
+					},
+					TemplateID: "noop",
+					NetworkAttachments: []bmfov1alpha1.BareMetalNetworkAttachment{
+						{SubnetRef: testSubnet.Name, Primary: true},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, childBMI)).To(Succeed())
+
+			result, err := reconciler.handleDelete(ctx, testSubnet)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+
+			// Clean up
+			Expect(k8sClient.Delete(ctx, childBMI)).To(Succeed())
+			_ = k8sClient.Delete(ctx, testSubnet)
 		})
 
 		It("should still handle delete for unmanaged subnet with finalizer", func() {

@@ -35,11 +35,11 @@ import (
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/dispatcheradapter"
 	"github.com/osac-project/osac/osac-operator/pkg/dispatcher"
 	"github.com/osac-project/osac/osac-operator/pkg/networkmanager"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const (
@@ -57,6 +57,7 @@ var _ = Describe("SecurityGroupReconciler", func() {
 		ctx          context.Context
 		sg           *osacv1alpha1.SecurityGroup
 		vnet         *osacv1alpha1.VirtualNetwork
+		readySubnet  *osacv1alpha1.Subnet
 	)
 
 	BeforeEach(func() {
@@ -102,12 +103,30 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			},
 		}
 
+		// Create Ready subnet fixture so the subnet-readiness gate passes by default
+		readySubnet = &osacv1alpha1.Subnet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-subnet",
+				Namespace: "test-namespace",
+				Labels: map[string]string{
+					osacVirtualNetworkIDLabel: "test-vnet-uuid",
+				},
+			},
+			Spec: osacv1alpha1.SubnetSpec{
+				VirtualNetwork: "test-vnet-uuid",
+			},
+		}
+
 		// Create fake client with fixtures
 		fakeClient = fake.NewClientBuilder().
 			WithScheme(testScheme).
-			WithObjects(vnet, sg).
-			WithStatusSubresource(&osacv1alpha1.SecurityGroup{}).
+			WithObjects(vnet, sg, readySubnet).
+			WithStatusSubresource(&osacv1alpha1.SecurityGroup{}, &osacv1alpha1.Subnet{}).
 			Build()
+
+		// Set subnet status to Ready (must be done after client creation with status subresource)
+		readySubnet.Status.Phase = osacv1alpha1.SubnetPhaseReady
+		Expect(fakeClient.Status().Update(ctx, readySubnet)).To(Succeed())
 
 		// Create mock provider
 		mockProvider = &mockProvisioningProvider{
@@ -116,13 +135,14 @@ var _ = Describe("SecurityGroupReconciler", func() {
 
 		// Create reconciler
 		reconciler = &SecurityGroupReconciler{
-			Client:               fakeClient,
-			APIReader:            fakeClient,
-			Scheme:               testScheme,
-			NetworkingNamespace:  "test-namespace",
-			ProvisioningProvider: mockProvider,
-			StatusPollInterval:   1 * time.Second,
-			MaxJobHistory:        10,
+			Client:                     fakeClient,
+			APIReader:                  fakeClient,
+			Scheme:                     testScheme,
+			NetworkingNamespace:        "test-namespace",
+			ProvisioningProvider:       mockProvider,
+			StatusPollInterval:         1 * time.Second,
+			MaxJobHistory:              10,
+			NetworkProvisioningEnabled: true,
 		}
 	})
 
@@ -173,10 +193,6 @@ var _ = Describe("SecurityGroupReconciler", func() {
 		It("should persist job status even when resource is concurrently modified", func() {
 			key := types.NamespacedName{Name: sg.Name, Namespace: sg.Namespace}
 
-			// First reconcile: adds finalizer + sets annotation, returns early
-			_, err := reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
-			Expect(err).NotTo(HaveOccurred())
-
 			// Simulate feedback controller: during TriggerProvision, modify
 			// the resource's metadata (add feedback finalizer) so the
 			// resourceVersion changes before the status flush runs.
@@ -193,9 +209,10 @@ var _ = Describe("SecurityGroupReconciler", func() {
 				}, nil
 			}
 
-			// Second reconcile: triggers job — the concurrent modification
-			// must not prevent the job from being recorded in status.
-			_, err = reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			// First reconcile: adds finalizer and triggers job (with no resolver,
+			// the annotation doesn't change so provisioning proceeds immediately).
+			// The concurrent modification must not prevent the job from being recorded.
+			_, err := reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
 			Expect(err).NotTo(HaveOccurred())
 
 			// Verify the job was persisted
@@ -232,7 +249,7 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			Expect(provisionCalled).To(BeTrue())
 		})
 
-		It("should default to network_policy strategy when spec has no implementationStrategy", func() {
+		It("should not stamp annotation when no resolver is configured", func() {
 			key := types.NamespacedName{Name: sg.Name, Namespace: sg.Namespace}
 
 			mockProvider.triggerProvisionFunc = func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
@@ -243,7 +260,7 @@ var _ = Describe("SecurityGroupReconciler", func() {
 				}, nil
 			}
 
-			// Reconcile twice (first adds finalizer, second sets annotation and provisions)
+			// Reconcile twice (first adds finalizer, second attempts annotation and provisions)
 			_, err := reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
 			Expect(err).NotTo(HaveOccurred())
 			_, err = reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
@@ -253,19 +270,19 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			updated := &osacv1alpha1.SecurityGroup{}
 			Expect(fakeClient.Get(ctx, key, updated)).To(Succeed())
 
-			// Verify annotation was set to the default network_policy strategy
-			Expect(updated.Annotations).NotTo(BeNil())
-			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(defaultSecurityGroupImplementationStrategy))
+			// With no resolver configured, the resolved strategy is "" and no annotation
+			// update occurs (the existing value "" matches the resolved value "").
+			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(""))
 		})
 
 		It("should not update when annotation already matches implementation strategy", func() {
-			// Create SecurityGroup with annotation already set to the default
+			// Create SecurityGroup with annotation already set (no resolver, so "" is the resolved value)
 			sgWithAnnotation := &osacv1alpha1.SecurityGroup{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "sg-with-annotation",
 					Namespace: "test-namespace",
 					Annotations: map[string]string{
-						osacImplementationStrategyAnnotation: defaultSecurityGroupImplementationStrategy,
+						osacImplementationStrategyAnnotation: "",
 					},
 				},
 				Spec: osacv1alpha1.SecurityGroupSpec{
@@ -295,7 +312,7 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			Expect(fakeClient.Get(ctx, key, updated)).To(Succeed())
 
 			// Verify annotation still matches (no duplicate Update calls)
-			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(defaultSecurityGroupImplementationStrategy))
+			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(""))
 		})
 
 		It("should update annotation when it differs from the resolved strategy", func() {
@@ -334,8 +351,8 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			updated := &osacv1alpha1.SecurityGroup{}
 			Expect(fakeClient.Get(ctx, key, updated)).To(Succeed())
 
-			// Verify annotation was updated to the default strategy
-			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(defaultSecurityGroupImplementationStrategy))
+			// With no resolver configured, annotation is updated to "" (dispatcher must be configured)
+			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(""))
 		})
 
 		It("should trigger provision job when no job exists", func() {
@@ -360,14 +377,12 @@ var _ = Describe("SecurityGroupReconciler", func() {
 
 			req := mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}}
 
-			// First reconcile adds finalizer and sets annotation, then requeues
+			// First reconcile adds finalizer and triggers the provision job (with no resolver,
+			// annotation doesn't change so provisioning proceeds immediately). Returns with
+			// RequeueAfter for status polling.
 			result, err := reconciler.Reconcile(ctx, req)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-
-			// Second reconcile triggers the provision job
-			_, err = reconciler.Reconcile(ctx, req)
-			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(reconciler.StatusPollInterval))
 
 			// Fetch updated SecurityGroup to check job state
 			updated := &osacv1alpha1.SecurityGroup{}
@@ -516,6 +531,15 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			toDelete := &osacv1alpha1.SecurityGroup{}
 			Expect(fakeClient.Get(ctx, key, toDelete)).To(Succeed())
 
+			// Set the implementation-strategy annotation to simulate a provisioned resource.
+			// Without a resolver, the annotation stays empty and deprovisioning is skipped.
+			if toDelete.Annotations == nil {
+				toDelete.Annotations = make(map[string]string)
+			}
+			toDelete.Annotations[osacImplementationStrategyAnnotation] = "test-strategy"
+			Expect(fakeClient.Update(ctx, toDelete)).To(Succeed())
+			Expect(fakeClient.Get(ctx, key, toDelete)).To(Succeed())
+
 			// Set deletion timestamp in memory and call handleDelete directly
 			// (fake client doesn't allow setting DeletionTimestamp via Update)
 			now := metav1.Now()
@@ -562,6 +586,15 @@ var _ = Describe("SecurityGroupReconciler", func() {
 			toDelete := &osacv1alpha1.SecurityGroup{}
 			Expect(fakeClient.Get(ctx, key, toDelete)).To(Succeed())
 
+			// Set the implementation-strategy annotation to simulate a provisioned resource.
+			// Without a resolver, the annotation stays empty and deprovisioning is skipped.
+			if toDelete.Annotations == nil {
+				toDelete.Annotations = make(map[string]string)
+			}
+			toDelete.Annotations[osacImplementationStrategyAnnotation] = "test-strategy"
+			Expect(fakeClient.Update(ctx, toDelete)).To(Succeed())
+			Expect(fakeClient.Get(ctx, key, toDelete)).To(Succeed())
+
 			// Set deletion timestamp in memory
 			now := metav1.Now()
 			toDelete.DeletionTimestamp = &now
@@ -592,13 +625,14 @@ var _ = Describe("SecurityGroupReconciler", func() {
 				},
 			}
 			envReconciler := &SecurityGroupReconciler{
-				Client:               k8sClient,
-				APIReader:            k8sClient,
-				Scheme:               k8sClient.Scheme(),
-				NetworkingNamespace:  "default",
-				ProvisioningProvider: envMockProvider,
-				StatusPollInterval:   1 * time.Second,
-				MaxJobHistory:        10,
+				Client:                     k8sClient,
+				APIReader:                  k8sClient,
+				Scheme:                     k8sClient.Scheme(),
+				NetworkingNamespace:        "default",
+				ProvisioningProvider:       envMockProvider,
+				StatusPollInterval:         1 * time.Second,
+				MaxJobHistory:              10,
+				NetworkProvisioningEnabled: true,
 			}
 
 			managedThenUnmanaged := &osacv1alpha1.SecurityGroup{
@@ -655,6 +689,154 @@ var _ = Describe("SecurityGroupReconciler", func() {
 		})
 	})
 
+	Context("subnet readiness gate", func() {
+		It("should requeue when parent VirtualNetwork has no Ready subnets", func() {
+			// Build a client WITHOUT any subnets
+			testScheme := runtime.NewScheme()
+			Expect(osacv1alpha1.AddToScheme(testScheme)).To(Succeed())
+			Expect(scheme.AddToScheme(testScheme)).To(Succeed())
+
+			noSubnetSG := &osacv1alpha1.SecurityGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sg-no-subnets",
+					Namespace: "test-namespace",
+				},
+				Spec: osacv1alpha1.SecurityGroupSpec{
+					VirtualNetwork: "test-vnet-uuid",
+				},
+			}
+			noSubnetClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(vnet, noSubnetSG).
+				WithStatusSubresource(&osacv1alpha1.SecurityGroup{}).
+				Build()
+
+			provisionCalled := false
+			mockProvider.triggerProvisionFunc = func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
+				provisionCalled = true
+				return &provisioning.ProvisionResult{
+					JobID:        "job-should-not-fire",
+					InitialState: osacv1alpha1.JobStatePending,
+				}, nil
+			}
+
+			r := &SecurityGroupReconciler{
+				Client:                     noSubnetClient,
+				APIReader:                  noSubnetClient,
+				Scheme:                     testScheme,
+				NetworkingNamespace:        "test-namespace",
+				ProvisioningProvider:       mockProvider,
+				StatusPollInterval:         1 * time.Second,
+				MaxJobHistory:              10,
+				NetworkProvisioningEnabled: true,
+			}
+
+			key := types.NamespacedName{Name: noSubnetSG.Name, Namespace: noSubnetSG.Namespace}
+
+			// First reconcile adds finalizer
+			_, err := r.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Second reconcile should requeue because no subnets exist
+			result, err := r.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+			Expect(provisionCalled).To(BeFalse())
+		})
+
+		It("should requeue when subnets exist but none are Ready", func() {
+			testScheme := runtime.NewScheme()
+			Expect(osacv1alpha1.AddToScheme(testScheme)).To(Succeed())
+			Expect(scheme.AddToScheme(testScheme)).To(Succeed())
+
+			progressingSubnet := &osacv1alpha1.Subnet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "progressing-subnet",
+					Namespace: "test-namespace",
+					Labels: map[string]string{
+						osacVirtualNetworkIDLabel: "test-vnet-uuid",
+					},
+				},
+				Spec: osacv1alpha1.SubnetSpec{
+					VirtualNetwork: "test-vnet-uuid",
+				},
+			}
+			progressingSG := &osacv1alpha1.SecurityGroup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "sg-progressing-subnet",
+					Namespace: "test-namespace",
+				},
+				Spec: osacv1alpha1.SecurityGroupSpec{
+					VirtualNetwork: "test-vnet-uuid",
+				},
+			}
+			progressingClient := fake.NewClientBuilder().
+				WithScheme(testScheme).
+				WithObjects(vnet, progressingSG, progressingSubnet).
+				WithStatusSubresource(&osacv1alpha1.SecurityGroup{}, &osacv1alpha1.Subnet{}).
+				Build()
+
+			// Set subnet phase to Progressing
+			progressingSubnet.Status.Phase = osacv1alpha1.SubnetPhaseProgressing
+			Expect(progressingClient.Status().Update(ctx, progressingSubnet)).To(Succeed())
+
+			provisionCalled := false
+			mockProvider.triggerProvisionFunc = func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
+				provisionCalled = true
+				return &provisioning.ProvisionResult{
+					JobID:        "job-should-not-fire",
+					InitialState: osacv1alpha1.JobStatePending,
+				}, nil
+			}
+
+			r := &SecurityGroupReconciler{
+				Client:                     progressingClient,
+				APIReader:                  progressingClient,
+				Scheme:                     testScheme,
+				NetworkingNamespace:        "test-namespace",
+				ProvisioningProvider:       mockProvider,
+				StatusPollInterval:         1 * time.Second,
+				MaxJobHistory:              10,
+				NetworkProvisioningEnabled: true,
+			}
+
+			key := types.NamespacedName{Name: progressingSG.Name, Namespace: progressingSG.Namespace}
+
+			// First reconcile adds finalizer
+			_, err := r.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Second reconcile should requeue because subnet is not Ready
+			result, err := r.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(defaultPreconditionRequeueInterval))
+			Expect(provisionCalled).To(BeFalse())
+		})
+
+		It("should proceed to provisioning when at least one subnet is Ready", func() {
+			key := types.NamespacedName{Name: sg.Name, Namespace: sg.Namespace}
+
+			provisionCalled := false
+			mockProvider.triggerProvisionFunc = func(ctx context.Context, resource client.Object) (*provisioning.ProvisionResult, error) {
+				provisionCalled = true
+				return &provisioning.ProvisionResult{
+					JobID:        "job-with-ready-subnet",
+					InitialState: osacv1alpha1.JobStatePending,
+				}, nil
+			}
+
+			// First reconcile adds finalizer
+			_, err := reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+
+			// Second reconcile should proceed because readySubnet exists from BeforeEach
+			_, err = reconciler.Reconcile(ctx, mcreconcile.Request{Request: ctrl.Request{NamespacedName: key}})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(provisionCalled).To(BeTrue())
+		})
+	})
+
 	Context("dispatcher path", func() {
 		It("uses the resolved fabric manager name from the parent VirtualNetwork's NetworkClass", func() {
 			Expect(fakeClient.Create(ctx, newFabricManagerConfigMap("fm-netris", "test-namespace", "netris"))).To(Succeed())
@@ -703,7 +885,8 @@ var _ = Describe("SecurityGroupReconciler", func() {
 
 			updated := &osacv1alpha1.SecurityGroup{}
 			Expect(fakeClient.Get(ctx, key, updated)).To(Succeed())
-			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(defaultSecurityGroupImplementationStrategy))
+			// With no resolver configured, annotation is "" (dispatcher must be configured)
+			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(""))
 		})
 
 		It("returns a reconcile error when the NetworkClass references an unregistered manager", func() {
@@ -751,7 +934,8 @@ var _ = Describe("SecurityGroupReconciler", func() {
 
 			updated := &osacv1alpha1.SecurityGroup{}
 			Expect(fakeClient.Get(ctx, key, updated)).To(Succeed())
-			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(defaultSecurityGroupImplementationStrategy))
+			// Parent VirtualNetwork not found, so networkClassID is empty -> annotation is ""
+			Expect(updated.Annotations[osacImplementationStrategyAnnotation]).To(Equal(""))
 		})
 
 		It("returns an error when multiple VirtualNetworks share the parent uuid label", func() {

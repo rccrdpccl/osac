@@ -53,11 +53,12 @@ type DiskSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	SizeGiB int32 `json:"sizeGiB"`
 
-	// StorageTier is the name of the storage tier for this disk
+	// StorageTier is the name of the storage tier for this disk. Every disk must name a tier.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`
-	// +optional
-	StorageTier string `json:"storageTier,omitempty"`
+	StorageTier string `json:"storageTier"`
 }
 
 // GpuSpec defines GPU passthrough configuration resolved from the InstanceType.
@@ -115,7 +116,7 @@ type ComputeInstanceSpec struct {
 	TemplateID string `json:"templateID"`
 
 	// TemplateParameters allows passing additional template-specific parameters as JSON-encoded key-value pairs.
-	// This complements the explicit fields (cores, memoryGiB, etc.) and is used for:
+	// This complements the explicit fields (vCPUs, memoryGiB, etc.) and is used for:
 	// - Template-specific parameters not covered by explicit fields (e.g., exposed_ports)
 	// - Custom parameters defined by specific templates
 	// +kubebuilder:validation:Optional
@@ -134,17 +135,15 @@ type ComputeInstanceSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="guestOSFamily is immutable"
 	GuestOSFamily string `json:"guestOSFamily,omitempty"`
 
-	// Cores is the number of CPU cores
+	// VCPUs is the number of virtual CPUs
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=128
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="cores is immutable"
-	Cores int32 `json:"cores"`
+	VCPUs int32 `json:"vcpus"`
 
 	// MemoryGiB is the memory in gibibytes
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="memoryGiB is immutable"
 	MemoryGiB int32 `json:"memoryGiB"`
 
 	// BootDisk is the primary boot disk
@@ -341,7 +340,7 @@ type ComputeInstanceStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ci
 // +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.templateID`
-// +kubebuilder:printcolumn:name="Cores",type=integer,JSONPath=`.spec.cores`
+// +kubebuilder:printcolumn:name="vCPUs",type=integer,JSONPath=`.spec.vcpus`
 // +kubebuilder:printcolumn:name="Memory",type=integer,JSONPath=`.spec.memoryGiB`
 // +kubebuilder:printcolumn:name="OS",type=string,JSONPath=`.spec.guestOSFamily`
 // +kubebuilder:printcolumn:name="RunStrategy",type=string,JSONPath=`.spec.runStrategy`

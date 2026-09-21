@@ -28,6 +28,12 @@ const (
 	ConditionCompleted             = "Completed"
 	ConditionAvailable             = "Available"
 	ConditionReady                 = "Ready"
+
+	// CaaS bare-metal worker provisioning conditions (OSAC-2135).
+	ConditionInfraEnvReady                 = "InfraEnvReady"
+	ConditionWorkersFailed                 = "WorkersFailed"
+	ConditionRHCOSImageNotFound            = "RHCOSImageNotFound"
+	ConditionFulfillmentServiceUnavailable = "FulfillmentServiceUnavailable"
 )
 
 // Common reason constants
@@ -35,17 +41,23 @@ const (
 	ReasonInitialized      = "Initialized"
 	ReasonAsExpected       = "AsExpected"
 	ReasonCreated          = "Created"
+	ReasonReady            = "Ready"
 	ReasonProgressing      = "Progressing"
 	ReasonFailed           = "Failed"
 	ReasonDeleting         = "Deleting"
 	ReasonWebhookTriggered = "WebhookTriggered"
 	ReasonWebhookFailed    = "WebhookFailed"
 
-	ReasonTenantNotReady      = "TenantNotReady"
-	ReasonProvisioningStorage = "ProvisioningStorage"
-	ReasonWaitingForVM        = "WaitingForVM"
-	ReasonScheduling          = "Scheduling"
-	ReasonInfrastructureReady = "InfrastructureReady"
-	ReasonProvisioningFailed  = "ProvisioningFailed"
-	ReasonNoManagerConfigured = "NoManagerConfigured"
+	ReasonTenantNotReady          = "TenantNotReady"
+	ReasonProvisioningStorage     = "ProvisioningStorage"
+	ReasonWaitingForVM            = "WaitingForVM"
+	ReasonScheduling              = "Scheduling"
+	ReasonInfrastructureReady     = "InfrastructureReady"
+	ReasonProvisioningFailed      = "ProvisioningFailed"
+	ReasonNoManagerConfigured     = "NoManagerConfigured"
+	ReasonPreparingInfrastructure = "PreparingInfrastructure"
+	ReasonControlPlaneStarting    = "ControlPlaneStarting"
+	ReasonWorkersJoining          = "WorkersJoining"
+	ReasonStageUnknown            = "StageUnknown"
+	ReasonStalled                 = "Stalled"
 )

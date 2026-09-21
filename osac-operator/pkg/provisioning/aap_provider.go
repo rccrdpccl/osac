@@ -31,10 +31,12 @@ type AAPClient interface {
 //   - Prefix-based: templatePrefix is set, and template names are derived from the
 //     resource Kind (e.g., prefix "osac" + Kind "VirtualNetwork" → "osac-create-virtual-network")
 type AAPProvider struct {
-	client              AAPClient
-	provisionTemplate   string
-	deprovisionTemplate string
-	templatePrefix      string
+	client               AAPClient
+	provisionTemplate    string
+	deprovisionTemplate  string
+	templatePrefix       string
+	fulfillmentEndpoint  string
+	fulfillmentIssuerURL string
 }
 
 // NewAAPProvider creates a new AAP provider with explicit template names.
@@ -240,7 +242,7 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, r
 		return "", fmt.Errorf("failed to get template: %w", err)
 	}
 
-	extraVars, err := extractExtraVars(ctx, resource)
+	extraVars, err := p.extractExtraVars(ctx, resource)
 	if err != nil {
 		return "", fmt.Errorf("failed to extract extra vars: %w", err)
 	}
@@ -272,6 +274,23 @@ func (p *AAPProvider) launchTemplate(ctx context.Context, templateName string, r
 	}
 
 	return strconv.Itoa(jobID), nil
+}
+
+// extractExtraVars adds provider-wide tenant CSI configuration to the common
+// resource payload without exposing client credentials.
+func (p *AAPProvider) extractExtraVars(ctx context.Context, resource client.Object) (map[string]any, error) {
+	extraVars, err := extractExtraVars(ctx, resource)
+	if err != nil {
+		return nil, err
+	}
+	if p.fulfillmentEndpoint == "" {
+		return extraVars, nil
+	}
+
+	jobVars := extraVars["osac_job_vars"].(map[string]any)
+	jobVars["fulfillment_endpoint"] = p.fulfillmentEndpoint
+	jobVars["fulfillment_issuer_url"] = p.fulfillmentIssuerURL
+	return extraVars, nil
 }
 
 // GetDeprovisionStatus checks deprovisioning job status via AAP API.
@@ -362,23 +381,18 @@ func extractExtraVars(ctx context.Context, resource client.Object) (map[string]a
 		vars["storage_backend_connections"] = backendConnectionsToExtraVars(conns)
 	}
 
+	if macs := NetworkAttachmentMACsFromContext(ctx); len(macs) > 0 {
+		vars["network_attachment_macs"] = macs
+	}
+
 	return map[string]any{
 		"osac_job_vars": vars,
 	}, nil
 }
 
-// bytesPerGiB converts a gibibyte count to bytes (1 GiB = 2^30 bytes).
-const bytesPerGiB = 1 << 30
-
 // tierDefinitionsToExtraVars converts tier definitions to the AAP-schema-shaped map
 // format osac-aap's storage_provider role expects (storage_provider/meta/
-// argument_specs.yaml). Field names are a deliberate departure from the Go/proto
-// field names: quota_bytes (not QuotaGiB) carries tier.QuotaGiB converted to bytes
-// — the pre-existing static STORAGE_TIERS path already documents its own "quota"
-// field as bytes (see config/base/configmap-storage-operations-ig-example.yaml in
-// osac-aap), so this key is named quota_bytes rather than reusing "quota" to keep
-// the unit unambiguous; a follow-on osac-aap change (OSAC-1992's AC 4/5) is
-// required to read it. max_reads_bw_mbps/max_writes_bw_mbps match the role's
+// argument_specs.yaml). max_reads_bw_mbps/max_writes_bw_mbps match the role's
 // documented example, not the Go struct's MaxReadBandwidthMBs/MaxWriteBandwidthMBs.
 // No qos_policy key — osac-aap derives "<name>-qos" from the tier name it already
 // receives.
@@ -396,7 +410,6 @@ func tierDefinitionsToExtraVars(tiers []TierDefinition) []map[string]any {
 					"max_writes_bw_mbps": tier.QosLimits.MaxWriteBandwidthMBs,
 				},
 			},
-			"quota_bytes": tier.QuotaGiB * bytesPerGiB,
 		}
 	}
 	return result

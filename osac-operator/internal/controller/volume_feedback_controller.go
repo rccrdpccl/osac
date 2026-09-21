@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,14 +27,14 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // VolumeFeedbackReconciler syncs Volume CR status from the hub cluster back
 // to the fulfillment-service via the private Volumes gRPC API. It maps CRD
 // phases to proto states and copies vendor-assigned fields (vendorVolumeID,
-// backend, protocol) so the fulfillment-service inventory stays current.
+// provider, protocol) so the fulfillment-service inventory stays current.
 type VolumeFeedbackReconciler struct {
 	bridge          *feedback.Bridge[*v1alpha1.Volume, *privatev1.Volume]
 	volumeNamespace string
@@ -75,6 +76,9 @@ func NewVolumeFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.ClientCon
 		Save: func(ctx context.Context, remote *privatev1.Volume) error {
 			_, err := volClient.Update(ctx, privatev1.VolumesUpdateRequest_builder{
 				Object: remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{
+					feedbackStatusStatePath, "status.vendor_volume_id", "status.vendor_context", "status.protocol", "status.provider",
+				}},
 			}.Build())
 			return err
 		},
@@ -153,15 +157,20 @@ func syncVolumePhase(ctx context.Context, obj *v1alpha1.Volume, remote *privatev
 	}
 }
 
-// syncVolumeVendorFields copies the vendor-assigned identifiers from the CR
-// status to the proto status so the fulfillment-service inventory reflects
-// the actual storage array state.
+// syncVolumeVendorFields copies the vendor-assigned identifiers (and vendor
+// attach context) from the CR status to the proto status so the
+// fulfillment-service inventory reflects the actual storage array state.
 func syncVolumeVendorFields(ctx context.Context, obj *v1alpha1.Volume, remote *privatev1.Volume) {
 	if obj.Status.VendorVolumeID != "" {
 		remote.GetStatus().SetVendorVolumeId(obj.Status.VendorVolumeID)
 	}
-	if obj.Status.Backend != "" {
-		remote.GetStatus().SetBackend(obj.Status.Backend)
+	if obj.Status.Provider != "" {
+		remote.GetStatus().SetProvider(obj.Status.Provider)
+	}
+	if len(obj.Status.VendorContext) > 0 {
+		remote.GetStatus().SetVendorContext(obj.Status.VendorContext)
+	} else {
+		remote.GetStatus().SetVendorContext(nil)
 	}
 	if obj.Status.Protocol != "" {
 		// Only sync a protocol the switch recognizes. An unrecognized CRD value

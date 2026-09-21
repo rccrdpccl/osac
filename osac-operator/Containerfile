@@ -1,6 +1,6 @@
 # Build context: mono-repo root (not osac-operator/ alone).
 # Invoke with: podman build -f osac-operator/Containerfile .
-FROM registry.access.redhat.com/ubi10/go-toolset:1.26 AS builder
+FROM registry.access.redhat.com/ubi10/go-toolset:1.26.7-1788946935 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -9,6 +9,7 @@ WORKDIR /opt/app-root/src
 # repo (see root .gitignore); `go mod download` below regenerates it inside
 # the build using the go.sum files already copied in per module.
 COPY --chown=1001:1001 go.work ./
+COPY --chown=1001:1001 proto/go.mod proto/go.sum proto/
 COPY --chown=1001:1001 osac-operator/go.mod osac-operator/go.sum osac-operator/
 COPY --chown=1001:1001 osac-operator/api/go.mod osac-operator/api/go.sum osac-operator/api/
 COPY --chown=1001:1001 bare-metal-fulfillment-operator/go.mod bare-metal-fulfillment-operator/go.sum bare-metal-fulfillment-operator/
@@ -17,8 +18,10 @@ COPY --chown=1001:1001 osac-csi-driver/go.mod osac-csi-driver/go.sum osac-csi-dr
 COPY --chown=1001:1001 osac-metering/schema/go.mod osac-metering/schema/go.sum osac-metering/schema/
 COPY --chown=1001:1001 osac-metering/metering-service/go.mod osac-metering/metering-service/go.sum osac-metering/metering-service/
 COPY --chown=1001:1001 osac-metering/adapters/go.mod osac-metering/adapters/go.sum osac-metering/adapters/
+COPY --chown=1001:1001 osac-ui/proxy/go.mod osac-ui/proxy/go.sum osac-ui/proxy/
 RUN cd osac-operator && go mod download
 
+COPY --chown=1001:1001 proto/ proto/
 COPY --chown=1001:1001 osac-operator/ osac-operator/
 COPY --chown=1001:1001 bare-metal-fulfillment-operator/ bare-metal-fulfillment-operator/
 
@@ -26,7 +29,7 @@ WORKDIR /opt/app-root/src/osac-operator
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager cmd/main.go
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o console-proxy cmd/console-proxy/main.go
 
-FROM registry.access.redhat.com/ubi10-minimal:10.2
+FROM registry.access.redhat.com/ubi10-minimal:10.2-1789456728
 COPY --from=builder /opt/app-root/src/osac-operator/manager /usr/local/bin/
 COPY --from=builder /opt/app-root/src/osac-operator/console-proxy /usr/local/bin/
 USER 1001

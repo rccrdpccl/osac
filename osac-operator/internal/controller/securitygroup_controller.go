@@ -58,6 +58,9 @@ type SecurityGroupReconciler struct {
 	// two-manager model isn't configured (no gRPC connection / networking namespace),
 	// in which case the controller always uses the legacy implementation-strategy path.
 	Resolver *dispatcher.Resolver
+	// NetworkProvisioningEnabled controls whether the controller dispatches AAP
+	// provisioning jobs. When false, resources are set to Ready immediately.
+	NetworkProvisioningEnabled bool
 }
 
 // NewSecurityGroupReconciler creates a new reconciler for SecurityGroup resources.
@@ -156,6 +159,14 @@ func (r *SecurityGroupReconciler) handleUpdate(ctx context.Context, sg *v1alpha1
 		sg.Status.Phase = v1alpha1.SecurityGroupPhaseProgressing
 	}
 
+	// When networking provisioning is disabled, skip AAP job dispatch and set Ready
+	// immediately.
+	if !r.NetworkProvisioningEnabled {
+		sg.Status.Phase = v1alpha1.SecurityGroupPhaseReady
+		setReadyConditionTrue(&sg.Status.Conditions)
+		return ctrl.Result{}, nil
+	}
+
 	// Look up the parent VirtualNetwork's NetworkClass to check whether it has a
 	// fabricManager registered (dispatcher path).
 	var networkClassID string
@@ -171,15 +182,37 @@ func (r *SecurityGroupReconciler) handleUpdate(ctx context.Context, sg *v1alpha1
 			sg.Spec.VirtualNetwork, len(vnetList.Items))
 	} else if len(vnetList.Items) == 1 {
 		networkClassID = vnetList.Items[0].Spec.NetworkClass
+
+		// Gate: at least one subnet must be Ready before creating SG ACL rules,
+		// because the ACL fan-out uses per-subnet CIDRs. Subnets don't carry
+		// the VN UUID label — filter by spec.VirtualNetwork instead.
+		subnetList := &v1alpha1.SubnetList{}
+		if err := r.List(ctx, subnetList,
+			client.InNamespace(sg.Namespace),
+		); err != nil {
+			return ctrl.Result{}, err
+		}
+		hasReadySubnet := false
+		for i := range subnetList.Items {
+			if subnetList.Items[i].Spec.VirtualNetwork == sg.Spec.VirtualNetwork &&
+				subnetList.Items[i].Status.Phase == v1alpha1.SubnetPhaseReady {
+				hasReadySubnet = true
+				break
+			}
+		}
+		if !hasReadySubnet {
+			log.Info("no Ready subnets in parent VirtualNetwork, requeueing",
+				"virtualNetwork", vnetList.Items[0].Name)
+			return ctrl.Result{RequeueAfter: defaultPreconditionRequeueInterval}, nil
+		}
 	} else {
 		log.Info("parent VirtualNetwork not found, using legacy implementation strategy", "uuid", sg.Spec.VirtualNetwork)
 	}
 
-	// Legacy fallback value; resolveImplementationStrategy below only uses it when the
-	// dispatcher path isn't available (see doc comment).
-	legacyStrategy := defaultSecurityGroupImplementationStrategy
-
-	implementationStrategy, err := resolveImplementationStrategy(ctx, r.Resolver, "SecurityGroup", networkClassID, legacyStrategy)
+	// resolveImplementationStrategy returns "" when the dispatcher path isn't available
+	// (resolver nil, networkClassID empty, or no manager configured). SecurityGroup
+	// has no resource-level fallback strategy — it exclusively uses the dispatcher.
+	implementationStrategy, err := resolveImplementationStrategy(ctx, r.Resolver, "SecurityGroup", networkClassID, "")
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -231,9 +264,13 @@ func (r *SecurityGroupReconciler) handleDelete(ctx context.Context, sg *v1alpha1
 	}
 
 	// Handle deprovisioning
-	result, err := r.handleDeprovisioning(ctx, sg)
-	if err != nil || result.RequeueAfter > 0 {
-		return result, err
+	if sg.Annotations[osacImplementationStrategyAnnotation] == "" {
+		log.Info("skipping deprovisioning — resource was never provisioned")
+	} else {
+		result, err := r.handleDeprovisioning(ctx, sg)
+		if err != nil || result.RequeueAfter > 0 {
+			return result, err
+		}
 	}
 
 	// Remove finalizer

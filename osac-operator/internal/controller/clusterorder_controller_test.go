@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"time"
 
+	"github.com/go-logr/logr"
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
@@ -27,14 +29,41 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
 )
+
+func readyClusterOrderNodePool(resourceClass string, replicas int32) hypershiftv1beta1.NodePool {
+	return hypershiftv1beta1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: resourceClass}},
+		Status: hypershiftv1beta1.NodePoolStatus{
+			Replicas: replicas,
+			Conditions: []hypershiftv1beta1.NodePoolCondition{
+				{Type: hypershiftv1beta1.NodePoolAllMachinesReadyConditionType, Status: corev1.ConditionTrue},
+				{Type: hypershiftv1beta1.NodePoolReadyConditionType, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
+type hostedClusterListErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c hostedClusterListErrorClient) List(
+	ctx context.Context, list client.ObjectList, opts ...client.ListOption,
+) error {
+	if _, ok := list.(*hypershiftv1beta1.HostedClusterList); ok {
+		return c.err
+	}
+	return c.Client.List(ctx, list, opts...)
+}
 
 var _ = Describe("ClusterOrder Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -456,7 +485,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 
 		ctx := context.Background()
 
-		It("should update conditions but not set Phase to Ready when HostedCluster is ready", func() {
+		It("should set Phase to Ready when HostedCluster is ready", func() {
 			instance := &v1alpha1.ClusterOrder{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-hc-no-phase",
@@ -470,22 +499,129 @@ var _ = Describe("ClusterOrder Controller", func() {
 			hc := &hypershiftv1beta1.HostedCluster{
 				Status: hypershiftv1beta1.HostedClusterStatus{
 					Conditions: []metav1.Condition{
-						{Type: "Available", Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
-						{Type: "Degraded", Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "Ready"},
-						{Type: "ClusterVersionSucceeding", Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
 					},
 				},
 			}
-
 			err := reconciler.handleHostedCluster(ctx, instance, hc)
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing),
-				"handleHostedCluster must not set Phase to Ready — Phase is controlled by provisioning callbacks")
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
 
 			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionControlPlaneAvailable)).To(BeTrue())
 			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionClusterAvailable)).To(BeTrue())
 		})
+
+		It("should finalize Ready after provisioning and live worker readiness", func() {
+			instance := &v1alpha1.ClusterOrder{
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+					ProvisioningJobs: []v1alpha1.JobStatus{{
+						Type:  v1alpha1.JobTypeProvision,
+						State: v1alpha1.JobStateSucceeded,
+					}},
+				},
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{ResourceClass: "worker", NumberOfNodes: 1}},
+				},
+			}
+			hc := &hypershiftv1beta1.HostedCluster{Status: hypershiftv1beta1.HostedClusterStatus{Conditions: []metav1.Condition{
+				{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue},
+				{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue},
+				{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse},
+				{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue},
+			}}}
+			nodePools := []hypershiftv1beta1.NodePool{readyClusterOrderNodePool("worker", 1)}
+
+			Expect(finalizeReadyIfProvisioned(logr.Discard(), instance, hc, nodePools)).To(BeTrue())
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+		})
+
+		It("should finalize Ready through handleHostedCluster", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-hc-finalize-ready", Namespace: "default"},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+					ProvisioningJobs: []v1alpha1.JobStatus{{
+						Type:  v1alpha1.JobTypeProvision,
+						State: v1alpha1.JobStateSucceeded,
+					}},
+				},
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{ResourceClass: "worker", NumberOfNodes: 1}},
+				},
+			}
+			hc := &hypershiftv1beta1.HostedCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-hc-finalize-ready", Namespace: "default"},
+				Status: hypershiftv1beta1.HostedClusterStatus{Conditions: []metav1.Condition{
+					{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue},
+					{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue},
+					{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse},
+					{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue},
+				}},
+			}
+			nodePool := readyClusterOrderNodePool("worker", 1)
+			nodePool.ObjectMeta = metav1.ObjectMeta{
+				Name:      "test-hc-finalize-ready-worker",
+				Namespace: "default",
+				Labels: map[string]string{
+					osacClusterOrderNameLabel: instance.Name,
+					agentResourceClassLabel:   "worker",
+				},
+			}
+			reconciler.Client = fake.NewClientBuilder().
+				WithScheme(k8sClient.Scheme()).
+				WithObjects(&nodePool).
+				Build()
+
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+		})
+
+		DescribeTable("should require every NodePool to match its requested capacity",
+			func(requests []v1alpha1.NodeRequest, nodePools []hypershiftv1beta1.NodePool, expected bool) {
+				Expect(nodePoolsMatchRequests(requests, nodePools)).To(Equal(expected))
+			},
+			Entry("all pools match", []v1alpha1.NodeRequest{
+				{ResourceClass: "gpu", NumberOfNodes: 2},
+				{ResourceClass: "worker", NumberOfNodes: 3},
+			}, []hypershiftv1beta1.NodePool{
+				readyClusterOrderNodePool("gpu", 2), readyClusterOrderNodePool("worker", 3),
+			}, true),
+			Entry("one pool is under capacity", []v1alpha1.NodeRequest{
+				{ResourceClass: "gpu", NumberOfNodes: 2},
+				{ResourceClass: "worker", NumberOfNodes: 3},
+			}, []hypershiftv1beta1.NodePool{
+				readyClusterOrderNodePool("gpu", 1), readyClusterOrderNodePool("worker", 3),
+			}, false),
+			Entry("one pool is over capacity", []v1alpha1.NodeRequest{
+				{ResourceClass: "gpu", NumberOfNodes: 2},
+				{ResourceClass: "worker", NumberOfNodes: 3},
+			}, []hypershiftv1beta1.NodePool{
+				readyClusterOrderNodePool("gpu", 3), readyClusterOrderNodePool("worker", 3),
+			}, false),
+			Entry("duplicate resource classes do not collapse", []v1alpha1.NodeRequest{
+				{ResourceClass: "worker", NumberOfNodes: 1},
+				{ResourceClass: "worker", NumberOfNodes: 5},
+			}, []hypershiftv1beta1.NodePool{
+				readyClusterOrderNodePool("worker", 5),
+			}, false),
+			Entry("duplicate node pool resource classes do not match", []v1alpha1.NodeRequest{
+				{ResourceClass: "worker", NumberOfNodes: 1},
+			}, []hypershiftv1beta1.NodePool{
+				readyClusterOrderNodePool("worker", 1), readyClusterOrderNodePool("worker", 1),
+			}, false),
+			Entry("empty requests and pools do not match", []v1alpha1.NodeRequest{}, []hypershiftv1beta1.NodePool{}, false),
+		)
 
 		It("should not modify Phase when HostedCluster is not yet available", func() {
 			instance := &v1alpha1.ClusterOrder{
@@ -501,8 +637,8 @@ var _ = Describe("ClusterOrder Controller", func() {
 			hc := &hypershiftv1beta1.HostedCluster{
 				Status: hypershiftv1beta1.HostedClusterStatus{
 					Conditions: []metav1.Condition{
-						{Type: "Available", Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "NotReady"},
-						{Type: "Degraded", Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
 					},
 				},
 			}
@@ -511,6 +647,629 @@ var _ = Describe("ClusterOrder Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+		})
+
+		It("should fail closed when a non-terminal order has no HostedCluster", func() {
+			name := "test-hc-absent"
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        name,
+					Namespace:   "default",
+					Annotations: map[string]string{osacManagementStateAnnotation: ManagementStateManual},
+					Finalizers:  []string{osacFinalizer},
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseReady,
+					Conditions: []metav1.Condition{
+						{Type: v1alpha1.ConditionClusterAvailable, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonAsExpected},
+						{Type: v1alpha1.ConditionProgressing, Status: metav1.ConditionFalse, Reason: v1alpha1.ReasonAsExpected},
+					},
+				},
+			}
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: generateNamespaceName(instance)}})
+			})
+
+			_, err := reconciler.handleUpdate(ctx, reconcile.Request{}, instance)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonControlPlaneStarting))
+			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionClusterAvailable)).To(BeTrue())
+		})
+
+		It("should return HostedCluster lookup errors", func() {
+			lookupErr := stderrors.New("hosted cluster list failed")
+			name := "test-hc-lookup-error"
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        name,
+					Namespace:   "default",
+					Annotations: map[string]string{osacManagementStateAnnotation: ManagementStateManual},
+					Finalizers:  []string{osacFinalizer},
+				},
+			}
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: generateNamespaceName(instance)}})
+			})
+
+			reconciler.Client = hostedClusterListErrorClient{Client: k8sClient, err: lookupErr}
+			_, err := reconciler.handleUpdate(ctx, reconcile.Request{}, instance)
+			Expect(err).To(MatchError(lookupErr))
+		})
+
+		It("should set Progressing reason to StageUnknown when HC has no conditions", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-no-conditions",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonStageUnknown))
+		})
+
+		It("should set Progressing reason to PreparingInfrastructure when InfrastructureReady is absent", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-no-infra",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonPreparingInfrastructure))
+		})
+
+		It("should set Progressing reason to PreparingInfrastructure when InfrastructureReady is False", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-infra-false",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonPreparingInfrastructure))
+		})
+
+		It("should set Progressing reason to ControlPlaneStarting when InfrastructureReady is True", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-infra-true",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonControlPlaneStarting))
+		})
+
+		It("should set Progressing reason to ControlPlaneStarting when KubeAPIServerAvailable is True but Available is False", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-kube-true-avail-false",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonControlPlaneStarting))
+		})
+
+		It("should set Progressing reason to ControlPlaneStarting when Available is True but KubeAPIServerAvailable is False", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-avail-true-kube-false",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonControlPlaneStarting))
+		})
+
+		It("should set Progressing reason to WorkersJoining when KubeAPIServerAvailable and Available are True", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-workers-joining",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonWorkersJoining))
+		})
+
+		It("should keep a BMaaS order progressing when the HostedCluster is ready but workers are pending", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-workers-pending",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{
+						NumberOfNodes: 1,
+						BareMetal:     &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.large"},
+					}},
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase:          v1alpha1.ClusterOrderPhaseProgressing,
+					DesiredWorkers: p32(1),
+					CurrentWorkers: p32(1),
+					ReadyWorkers:   p32(0),
+				},
+			}
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+					},
+				},
+			}
+
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+			reconciler.provisioningCallbacks(instance).OnSuccess(provisioning.ProvisionStatus{})
+
+			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionClusterAvailable)).To(BeTrue())
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonWorkersJoining))
+		})
+
+		It("should transition a BMaaS order to Ready when all workers are ready", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-workers-ready",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{
+						NumberOfNodes: 1,
+						BareMetal:     &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.large"},
+					}},
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase:          v1alpha1.ClusterOrderPhaseProgressing,
+					DesiredWorkers: p32(1),
+					CurrentWorkers: p32(1),
+					ReadyWorkers:   p32(1),
+					Workers: []v1alpha1.WorkerStatus{{
+						NodeSet: "compute",
+						Name:    "worker-0",
+						Kind:    "BareMetalInstance",
+						Phase:   "Ready",
+					}},
+				},
+			}
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+					},
+				},
+			}
+
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+			reconciler.provisioningCallbacks(instance).OnSuccess(provisioning.ProvisionStatus{})
+
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+		})
+
+		It("should keep a CaaS order progressing until the HostedCluster is available", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-caas-gate",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+					},
+				},
+			}
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+			callbacks := reconciler.provisioningCallbacks(instance)
+			callbacks.OnSuccess(provisioning.ProvisionStatus{})
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+
+			hc.Status.Conditions = []metav1.Condition{
+				{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+				{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+				{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+				{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+				{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.Now(), Reason: "Ready"},
+			}
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+			callbacks.OnSuccess(provisioning.ProvisionStatus{})
+
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
+		})
+
+		It("should restore a progressing stage when a Ready order becomes unavailable", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-ready-regression",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseReady,
+					Conditions: []metav1.Condition{
+						{Type: v1alpha1.ConditionControlPlaneAvailable, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonAsExpected},
+						{Type: v1alpha1.ConditionClusterAvailable, Status: metav1.ConditionTrue, Reason: v1alpha1.ReasonAsExpected},
+						{Type: v1alpha1.ConditionProgressing, Status: metav1.ConditionFalse, Reason: v1alpha1.ReasonAsExpected},
+						{Type: v1alpha1.ConditionWorkersFailed, Status: metav1.ConditionTrue, Reason: "WorkersRetrying"},
+					},
+				},
+			}
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionFalse, Reason: "NotReady"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionTrue, Reason: "Degraded"},
+					},
+				},
+			}
+
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionTrue))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonControlPlaneStarting))
+			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionControlPlaneAvailable)).To(BeTrue())
+			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionClusterAvailable)).To(BeTrue())
+			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionWorkersFailed)).To(BeTrue())
+		})
+
+		It("should not revive a Failed order when HostedCluster and workers are ready", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-failed-terminal",
+					Namespace: "default",
+				},
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{
+						NumberOfNodes: 1,
+						BareMetal:     &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.large"},
+					}},
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase:          v1alpha1.ClusterOrderPhaseFailed,
+					DesiredWorkers: p32(1),
+					CurrentWorkers: p32(1),
+					ReadyWorkers:   p32(1),
+					Conditions: []metav1.Condition{
+						{Type: v1alpha1.ConditionProgressing, Status: metav1.ConditionFalse, Reason: v1alpha1.ReasonProvisioningFailed},
+					},
+				},
+			}
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, Reason: "Ready"},
+					},
+				},
+			}
+
+			Expect(reconciler.handleHostedCluster(ctx, instance, hc)).To(Succeed())
+
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseFailed))
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonProvisioningFailed))
+		})
+
+		It("should allow sub-stage reason to regress when HC conditions transiently disappear", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-reason-regression",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"Workers Joining", v1alpha1.ReasonWorkersJoining)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonStageUnknown))
+		})
+
+		It("should keep stage conditions with ReasonAsExpected unchanged", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-stage-reasons",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+				"", v1alpha1.ReasonProgressing)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			controlPlaneCreated := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionControlPlaneCreated)
+			Expect(controlPlaneCreated).NotTo(BeNil())
+			Expect(controlPlaneCreated.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+
+			controlPlaneAvailable := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionControlPlaneAvailable)
+			Expect(controlPlaneAvailable).NotTo(BeNil())
+			Expect(controlPlaneAvailable.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+		})
+
+		It("should not overwrite Progressing=False when Phase is Ready", func() {
+			instance := &v1alpha1.ClusterOrder{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hc-phase-ready",
+					Namespace: "default",
+				},
+				Status: v1alpha1.ClusterOrderStatus{
+					Phase: v1alpha1.ClusterOrderPhaseReady,
+				},
+			}
+			instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse,
+				"", v1alpha1.ReasonAsExpected)
+
+			hc := &hypershiftv1beta1.HostedCluster{
+				Status: hypershiftv1beta1.HostedClusterStatus{
+					Conditions: []metav1.Condition{
+						{Type: string(hypershiftv1beta1.InfrastructureReady), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.KubeAPIServerAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterAvailable), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.HostedClusterDegraded), Status: metav1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+						{Type: string(hypershiftv1beta1.ClusterVersionSucceeding), Status: metav1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now().UTC()), Reason: "Ready"},
+					},
+				},
+			}
+
+			err := reconciler.handleHostedCluster(ctx, instance, hc)
+			Expect(err).NotTo(HaveOccurred())
+
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(progressing).NotTo(BeNil())
+			Expect(progressing.Status).To(Equal(metav1.ConditionFalse))
+			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+		})
+	})
+
+	Context("bareMetalWorkersReady", func() {
+		newBMOrder := func() *v1alpha1.ClusterOrder {
+			return &v1alpha1.ClusterOrder{
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{
+						NumberOfNodes: 1,
+						BareMetal:     &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.large"},
+					}},
+				},
+			}
+		}
+
+		It("should reject bare-metal workers when aggregate counts are missing", func() {
+			Expect(bareMetalWorkersReady(newBMOrder())).To(BeFalse())
+		})
+
+		It("should reject bare-metal workers when all aggregate counts are zero", func() {
+			instance := newBMOrder()
+			instance.Status.DesiredWorkers = p32(0)
+			instance.Status.CurrentWorkers = p32(0)
+			instance.Status.ReadyWorkers = p32(0)
+
+			Expect(bareMetalWorkersReady(instance)).To(BeFalse())
+		})
+
+		It("should reject bare-metal workers when current workers are below desired", func() {
+			instance := newBMOrder()
+			instance.Status.DesiredWorkers = p32(2)
+			instance.Status.CurrentWorkers = p32(1)
+			instance.Status.ReadyWorkers = p32(1)
+
+			Expect(bareMetalWorkersReady(instance)).To(BeFalse())
+		})
+
+		It("should reject bare-metal workers when WorkersFailed is true", func() {
+			instance := newBMOrder()
+			instance.Status.DesiredWorkers = p32(1)
+			instance.Status.CurrentWorkers = p32(1)
+			instance.Status.ReadyWorkers = p32(1)
+			instance.SetStatusCondition(v1alpha1.ConditionWorkersFailed, metav1.ConditionTrue, "worker failed", "WorkersRetrying")
+
+			Expect(bareMetalWorkersReady(instance)).To(BeFalse())
 		})
 	})
 
@@ -538,6 +1297,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
 					Replicas: 5,
 				},
@@ -573,6 +1333,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
 					Replicas: 5,
 				},
@@ -587,7 +1348,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 				"spec must not be modified")
 		})
 
-		It("should skip when spec has more than one node request", func() {
+		It("should update the status entry matching the node pool resource class", func() {
 			instance := &v1alpha1.ClusterOrder{
 				Spec: v1alpha1.ClusterOrderSpec{
 					NodeRequests: []v1alpha1.NodeRequest{
@@ -597,17 +1358,33 @@ var _ = Describe("ClusterOrder Controller", func() {
 				},
 			}
 
-			nodePool := &hypershiftv1beta1.NodePool{
-				Status: hypershiftv1beta1.NodePoolStatus{
-					Replicas: 5,
+			nodePools := &hypershiftv1beta1.NodePoolList{Items: []hypershiftv1beta1.NodePool{
+				{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.small"}},
+					Status: hypershiftv1beta1.NodePoolStatus{
+						Replicas: 2,
+					},
 				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
+					Status: hypershiftv1beta1.NodePoolStatus{
+						Replicas: 4,
+					},
+				},
+			}}
+			status := []v1alpha1.NodeRequest{
+				{ResourceClass: "m1.large", NumberOfNodes: 0},
+				{ResourceClass: "m1.small", NumberOfNodes: 0},
 			}
+			instance.Status.NodeRequests = status
 
-			err := reconciler.handleNodePool(ctx, instance, nodePool)
+			err := reconciler.handleNodePools(ctx, instance, nodePools)
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(instance.Status.NodeRequests).To(BeEmpty(),
-				"status.nodeRequests should not be touched when spec has multiple node requests")
+			Expect(instance.Status.NodeRequests).To(ConsistOf(
+				v1alpha1.NodeRequest{ResourceClass: "m1.large", NumberOfNodes: 4},
+				v1alpha1.NodeRequest{ResourceClass: "m1.small", NumberOfNodes: 2},
+			))
 		})
 
 		It("should not modify status when replicas already match", func() {
@@ -625,6 +1402,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
 					Replicas: 5,
 				},
@@ -674,7 +1452,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 							Status:             metav1.ConditionTrue,
 							Reason:             v1alpha1.ReasonProgressing,
 							Message:            "provisioning in progress",
-							LastTransitionTime: metav1.Now(),
+							LastTransitionTime: metav1.NewTime(time.Now().UTC()),
 						},
 					},
 				},
@@ -692,10 +1470,19 @@ var _ = Describe("ClusterOrder Controller", func() {
 			Expect(cond.Message).To(Equal("provisioning in progress"))
 		})
 
-		It("should set Phase=Ready and Progressing=False on OnSuccess", func() {
+		It("should keep BMaaS Phase=Progressing and set WorkersJoining on OnSuccess while workers are pending", func() {
 			instance := &v1alpha1.ClusterOrder{
+				Spec: v1alpha1.ClusterOrderSpec{
+					NodeRequests: []v1alpha1.NodeRequest{{
+						NumberOfNodes: 1,
+						BareMetal:     &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.large"},
+					}},
+				},
 				Status: v1alpha1.ClusterOrderStatus{
-					Phase: v1alpha1.ClusterOrderPhaseProgressing,
+					Phase:          v1alpha1.ClusterOrderPhaseProgressing,
+					DesiredWorkers: p32(1),
+					CurrentWorkers: p32(1),
+					ReadyWorkers:   p32(0),
 				},
 			}
 
@@ -703,14 +1490,14 @@ var _ = Describe("ClusterOrder Controller", func() {
 			callbacks := reconciler.provisioningCallbacks(instance)
 			callbacks.OnSuccess(provisioning.ProvisionStatus{})
 
-			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
 			cond := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
 			Expect(cond).NotTo(BeNil())
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(v1alpha1.ReasonWorkersJoining))
 		})
 
-		It("should clear stale Progressing=False condition on provisioning recovery", func() {
+		It("should keep CaaS orders progressing after provisioning recovery until HostedCluster readiness", func() {
 			instance := &v1alpha1.ClusterOrder{
 				Status: v1alpha1.ClusterOrderStatus{
 					Phase: v1alpha1.ClusterOrderPhaseProgressing,
@@ -720,7 +1507,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 							Status:             metav1.ConditionFalse,
 							Reason:             v1alpha1.ReasonProvisioningFailed,
 							Message:            "previous failure",
-							LastTransitionTime: metav1.Now(),
+							LastTransitionTime: metav1.NewTime(time.Now().UTC()),
 						},
 					},
 				},
@@ -730,11 +1517,11 @@ var _ = Describe("ClusterOrder Controller", func() {
 			callbacks := reconciler.provisioningCallbacks(instance)
 			callbacks.OnSuccess(provisioning.ProvisionStatus{})
 
-			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
 			cond := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
 			Expect(cond).NotTo(BeNil())
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(v1alpha1.ReasonAsExpected))
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(v1alpha1.ReasonProgressing))
 			Expect(cond.Message).To(BeEmpty())
 		})
 	})
@@ -763,6 +1550,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
 					Replicas: 5,
 				},
@@ -798,6 +1586,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
 					Replicas: 5,
 				},
@@ -812,7 +1601,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 				"spec must not be modified")
 		})
 
-		It("should skip when spec has more than one node request", func() {
+		It("should update the status entry matching the node pool resource class", func() {
 			instance := &v1alpha1.ClusterOrder{
 				Spec: v1alpha1.ClusterOrderSpec{
 					NodeRequests: []v1alpha1.NodeRequest{
@@ -823,16 +1612,23 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.small"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
-					Replicas: 5,
+					Replicas: 2,
 				},
+			}
+			instance.Status.NodeRequests = []v1alpha1.NodeRequest{
+				{ResourceClass: "m1.large", NumberOfNodes: 0},
+				{ResourceClass: "m1.small", NumberOfNodes: 0},
 			}
 
 			err := reconciler.handleNodePool(ctx, instance, nodePool)
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(instance.Status.NodeRequests).To(BeEmpty(),
-				"status.nodeRequests should not be touched when spec has multiple node requests")
+			Expect(instance.Status.NodeRequests).To(ConsistOf(
+				v1alpha1.NodeRequest{ResourceClass: "m1.large", NumberOfNodes: 0},
+				v1alpha1.NodeRequest{ResourceClass: "m1.small", NumberOfNodes: 2},
+			))
 		})
 
 		It("should not modify status when replicas already match", func() {
@@ -850,6 +1646,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			}
 
 			nodePool := &hypershiftv1beta1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{agentResourceClassLabel: "m1.large"}},
 				Status: hypershiftv1beta1.NodePoolStatus{
 					Replicas: 5,
 				},
@@ -892,158 +1689,6 @@ var _ = Describe("ClusterOrder Controller", func() {
 			reconcileVIPEndpoints(instance)
 			Expect(instance.Status.ApiEndpoint).To(BeEmpty())
 			Expect(instance.Status.IngressEndpoint).To(BeEmpty())
-		})
-	})
-
-	Context("Agent selection and cleanup", func() {
-		const agentNS = "test-agents"
-
-		var reconciler *ClusterOrderReconciler
-
-		BeforeEach(func() {
-			reconciler = &ClusterOrderReconciler{
-				Client:         k8sClient,
-				apiReader:      k8sClient,
-				Scheme:         k8sClient.Scheme(),
-				AgentNamespace: agentNS,
-			}
-			// Create agent namespace
-			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agentNS}}
-			_ = k8sClient.Create(ctx, ns)
-		})
-
-		createAgent := func(name, resourceClass, serverName string) {
-			agent := &unstructured.Unstructured{}
-			agent.SetGroupVersionKind(agentGVK)
-			agent.SetName(name)
-			agent.SetNamespace(agentNS)
-			agent.SetLabels(map[string]string{
-				agentResourceClassLabel: resourceClass,
-				agentServerNameLabel:    serverName,
-			})
-			Expect(k8sClient.Create(ctx, agent)).To(Succeed())
-			DeferCleanup(func() {
-				_ = k8sClient.Delete(ctx, agent)
-			})
-		}
-
-		It("selects available agents and labels them", func() {
-			createAgent("agent-1", "fc430", "server-01")
-			createAgent("agent-2", "fc430", "server-02")
-			createAgent("agent-3", "fc430", "server-03")
-
-			instance := &v1alpha1.ClusterOrder{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
-				Spec: v1alpha1.ClusterOrderSpec{
-					NodeRequests: []v1alpha1.NodeRequest{
-						{ResourceClass: "fc430", NumberOfNodes: 2},
-					},
-				},
-			}
-
-			result, err := reconciler.reconcileAgentSelection(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-
-			Expect(instance.Status.NodeSets).To(HaveLen(1))
-			Expect(instance.Status.NodeSets[0].Name).To(Equal("fc430"))
-			Expect(instance.Status.NodeSets[0].Agents).To(HaveLen(2))
-
-			// Verify labels were set
-			for _, agentStatus := range instance.Status.NodeSets[0].Agents {
-				agent := &unstructured.Unstructured{}
-				agent.SetGroupVersionKind(agentGVK)
-				Expect(k8sClient.Get(ctx, types.NamespacedName{
-					Name: agentStatus.AgentName, Namespace: agentNS,
-				}, agent)).To(Succeed())
-				Expect(agent.GetLabels()[agentClusterOrderLabel]).To(Equal("test-cluster"))
-			}
-		})
-
-		It("requeues when not enough agents available", func() {
-			createAgent("agent-1", "fc430", "server-01")
-
-			instance := &v1alpha1.ClusterOrder{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
-				Spec: v1alpha1.ClusterOrderSpec{
-					NodeRequests: []v1alpha1.NodeRequest{
-						{ResourceClass: "fc430", NumberOfNodes: 3},
-					},
-				},
-			}
-
-			result, err := reconciler.reconcileAgentSelection(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
-			Expect(instance.Status.NodeSets).To(BeEmpty())
-		})
-
-		It("is idempotent when agents already selected", func() {
-			instance := &v1alpha1.ClusterOrder{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
-				Spec: v1alpha1.ClusterOrderSpec{
-					NodeRequests: []v1alpha1.NodeRequest{
-						{ResourceClass: "fc430", NumberOfNodes: 1},
-					},
-				},
-				Status: v1alpha1.ClusterOrderStatus{
-					NodeSets: []v1alpha1.NodeSetStatus{
-						{Name: "fc430", Agents: []v1alpha1.AgentStatus{
-							{AgentName: "agent-1", HostName: "server-01"},
-						}},
-					},
-				},
-			}
-
-			result, err := reconciler.reconcileAgentSelection(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			Expect(instance.Status.NodeSets).To(HaveLen(1))
-		})
-
-		It("skips when no node requests", func() {
-			instance := &v1alpha1.ClusterOrder{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
-			}
-
-			result, err := reconciler.reconcileAgentSelection(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-		})
-
-		It("cleans up agent labels on deletion", func() {
-			createAgent("agent-1", "fc430", "server-01")
-			createAgent("agent-2", "fc430", "server-02")
-
-			// Label agents as allocated to this cluster
-			for _, name := range []string{"agent-1", "agent-2"} {
-				agent := &unstructured.Unstructured{}
-				agent.SetGroupVersionKind(agentGVK)
-				Expect(k8sClient.Get(ctx, types.NamespacedName{
-					Name: name, Namespace: agentNS,
-				}, agent)).To(Succeed())
-				labels := agent.GetLabels()
-				labels[agentClusterOrderLabel] = "test-cluster"
-				agent.SetLabels(labels)
-				Expect(k8sClient.Update(ctx, agent)).To(Succeed())
-			}
-
-			instance := &v1alpha1.ClusterOrder{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-cluster"},
-			}
-
-			err := reconciler.reconcileAgentCleanup(ctx, instance)
-			Expect(err).NotTo(HaveOccurred())
-
-			// Verify labels were removed
-			for _, name := range []string{"agent-1", "agent-2"} {
-				agent := &unstructured.Unstructured{}
-				agent.SetGroupVersionKind(agentGVK)
-				Expect(k8sClient.Get(ctx, types.NamespacedName{
-					Name: name, Namespace: agentNS,
-				}, agent)).To(Succeed())
-				Expect(agent.GetLabels()).NotTo(HaveKey(agentClusterOrderLabel))
-			}
 		})
 	})
 

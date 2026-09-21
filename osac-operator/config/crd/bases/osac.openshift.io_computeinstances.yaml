@@ -20,8 +20,8 @@ spec:
     - jsonPath: .spec.templateID
       name: Template
       type: string
-    - jsonPath: .spec.cores
-      name: Cores
+    - jsonPath: .spec.vcpus
+      name: vCPUs
       type: integer
     - jsonPath: .spec.memoryGiB
       name: Memory
@@ -79,12 +79,14 @@ spec:
                       type: integer
                     storageTier:
                       description: StorageTier is the name of the storage tier for
-                        this disk
+                        this disk. Every disk must name a tier.
                       maxLength: 63
+                      minLength: 1
                       pattern: ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$
                       type: string
                   required:
                   - sizeGiB
+                  - storageTier
                   type: object
                 type: array
                 x-kubernetes-validations:
@@ -100,24 +102,17 @@ spec:
                     type: integer
                   storageTier:
                     description: StorageTier is the name of the storage tier for this
-                      disk
+                      disk. Every disk must name a tier.
                     maxLength: 63
+                    minLength: 1
                     pattern: ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$
                     type: string
                 required:
                 - sizeGiB
+                - storageTier
                 type: object
                 x-kubernetes-validations:
                 - message: bootDisk is immutable
-                  rule: self == oldSelf
-              cores:
-                description: Cores is the number of CPU cores
-                format: int32
-                maximum: 128
-                minimum: 1
-                type: integer
-                x-kubernetes-validations:
-                - message: cores is immutable
                   rule: self == oldSelf
               gpu:
                 description: Gpu defines GPU passthrough configuration resolved from
@@ -181,9 +176,6 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
-                x-kubernetes-validations:
-                - message: memoryGiB is immutable
-                  rule: self == oldSelf
               networkAttachments:
                 description: |-
                   NetworkAttachments defines multiple NICs when more than one subnet (and optional security groups per NIC) is required.
@@ -275,7 +267,7 @@ spec:
               templateParameters:
                 description: |-
                   TemplateParameters allows passing additional template-specific parameters as JSON-encoded key-value pairs.
-                  This complements the explicit fields (cores, memoryGiB, etc.) and is used for:
+                  This complements the explicit fields (vCPUs, memoryGiB, etc.) and is used for:
                   - Template-specific parameters not covered by explicit fields (e.g., exposed_ports)
                   - Custom parameters defined by specific templates
                 type: string
@@ -296,13 +288,19 @@ spec:
                 x-kubernetes-validations:
                 - message: userDataSecretRef is immutable
                   rule: self == oldSelf
+              vcpus:
+                description: VCPUs is the number of virtual CPUs
+                format: int32
+                maximum: 128
+                minimum: 1
+                type: integer
             required:
             - bootDisk
-            - cores
             - image
             - memoryGiB
             - runStrategy
             - templateID
+            - vcpus
             type: object
             x-kubernetes-validations:
             - message: gpu is immutable

@@ -84,14 +84,14 @@ type VastVendorProvisioner struct {
 	// configNamespace is where the hub "vast-tenant-config-<tenant>" Secrets
 	// live (OSAC_STORAGE_CONFIG_NAMESPACE).
 	configNamespace string
-	// endpoints maps a StorageBackend name to its vendor CSI controller gRPC
+	// endpoints maps a provider routing key to its vendor CSI controller gRPC
 	// endpoint (e.g. "vast" -> "vast-csi-controller.osac-csi-backends.svc:50051").
 	endpoints map[string]string
 	dial      vendorDialer
 }
 
 // NewVastVendorProvisioner constructs a VastVendorProvisioner and fails fast on
-// invalid configuration: at least one backend->endpoint mapping is required so
+// invalid configuration: at least one provider->endpoint mapping is required so
 // the operator errors loudly at startup rather than running degraded and
 // leaving volumes stuck in Progressing.
 func NewVastVendorProvisioner(reader client.Reader, configNamespace string, endpoints map[string]string) (*VastVendorProvisioner, error) {
@@ -102,7 +102,7 @@ func NewVastVendorProvisioner(reader client.Reader, configNamespace string, endp
 		return nil, fmt.Errorf("storage config namespace is required")
 	}
 	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("at least one vendor controller endpoint (backend=endpoint) must be configured")
+		return nil, fmt.Errorf("at least one vendor controller endpoint (provider=endpoint) must be configured")
 	}
 	return &VastVendorProvisioner{
 		reader:          reader,
@@ -124,7 +124,7 @@ type tenantCreds struct {
 
 // CreateVolume provisions a block volume on the vendor array. It reads the
 // per-tenant credentials/config from the hub Secret, resolves the vendor
-// controller endpoint from the backend name, and issues a CSI CreateVolume with
+// controller endpoint from the provider name, and issues a CSI CreateVolume with
 // the credentials in the secrets field. CSI CreateVolume is idempotent, so a
 // retried call for an existing volume returns that volume rather than erroring.
 func (p *VastVendorProvisioner) CreateVolume(ctx context.Context, req VendorCreateVolumeRequest) (VendorCreateVolumeResponse, error) {
@@ -133,7 +133,7 @@ func (p *VastVendorProvisioner) CreateVolume(ctx context.Context, req VendorCrea
 			"vendor provisioner supports only block volumes; protocol %q is not yet implemented", req.Protocol)
 	}
 
-	endpoint, err := p.endpointFor(req.Backend)
+	endpoint, err := p.endpointFor(req.Provider)
 	if err != nil {
 		return VendorCreateVolumeResponse{}, err
 	}
@@ -154,6 +154,8 @@ func (p *VastVendorProvisioner) CreateVolume(ctx context.Context, req VendorCrea
 	// create it.
 	subsystem := fmt.Sprintf("view-%s-%s-%s", req.Tenant, creds.uidHash, req.Tier)
 
+	// Topology is not forwarded to AccessibilityRequirements because VAST is
+	// network-attached storage; node-local placement is only relevant for LVMS.
 	csiReq := &csi.CreateVolumeRequest{
 		Name:               req.Name,
 		CapacityRange:      &csi.CapacityRange{RequiredBytes: req.SizeGiB * bytesPerGiB},
@@ -182,8 +184,11 @@ func (p *VastVendorProvisioner) CreateVolume(ctx context.Context, req VendorCrea
 
 	return VendorCreateVolumeResponse{
 		VendorVolumeID: vol.GetVolumeId(),
-		Backend:        req.Backend,
 		Protocol:       string(v1alpha1.VolumeProtocolBlock),
+		// ControllerPublishVolume needs the same subsystem/tenant_name/vip_pool_* parameters
+		// CreateVolume used -- csiReq.Parameters already has exactly those, so reuse it rather than
+		// re-deriving a second copy that could drift out of sync.
+		VendorContext: csiReq.Parameters,
 	}, nil
 }
 
@@ -191,7 +196,7 @@ func (p *VastVendorProvisioner) CreateVolume(ctx context.Context, req VendorCrea
 // a NotFound response is treated as success so a retried delete of an
 // already-removed volume does not block finalizer removal.
 func (p *VastVendorProvisioner) DeleteVolume(ctx context.Context, req VendorDeleteVolumeRequest) error {
-	endpoint, err := p.endpointFor(req.Backend)
+	endpoint, err := p.endpointFor(req.Provider)
 	if err != nil {
 		return err
 	}
@@ -224,14 +229,14 @@ func (p *VastVendorProvisioner) DeleteVolume(ctx context.Context, req VendorDele
 	return nil
 }
 
-// endpointFor resolves the vendor controller endpoint for a backend name.
-func (p *VastVendorProvisioner) endpointFor(backend string) (string, error) {
-	if backend == "" {
-		return "", fmt.Errorf("volume has no resolved backend; cannot select a vendor controller")
+// endpointFor resolves the vendor controller endpoint for a provider name.
+func (p *VastVendorProvisioner) endpointFor(provider string) (string, error) {
+	if provider == "" {
+		return "", fmt.Errorf("volume has no resolved provider; cannot select a vendor controller")
 	}
-	endpoint, ok := p.endpoints[backend]
+	endpoint, ok := p.endpoints[provider]
 	if !ok {
-		return "", fmt.Errorf("no vendor controller endpoint configured for backend %q", backend)
+		return "", fmt.Errorf("no vendor controller endpoint configured for provider %q", provider)
 	}
 	return endpoint, nil
 }

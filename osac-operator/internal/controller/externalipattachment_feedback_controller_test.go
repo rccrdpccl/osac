@@ -21,6 +21,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -38,7 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
@@ -64,7 +65,10 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 
 		scheme := runtime.NewScheme()
 		Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
-		k8sClient = fake.NewClientBuilder().WithScheme(scheme).Build()
+		k8sClient = fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithStatusSubresource(&v1alpha1.ExternalIP{}, &v1alpha1.ExternalIPAttachment{}).
+			Build()
 
 		mockAttachmentsServer = &mockExternalIPAttachmentsServer{
 			attachments: make(map[string]*privatev1.ExternalIPAttachment),
@@ -135,6 +139,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, cr)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
@@ -152,7 +157,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(controllerutil.ContainsFinalizer(updated, osacExternalIPAttachmentFeedbackFinalizer)).To(BeTrue())
 		})
 
-		It("should sync Phase=Ready to state=READY and set parent ExternalIP attached=true", func() {
+		It("should sync Phase=Ready to state=READY without writing the parent", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -164,6 +169,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				},
 			}
 			attachment.GetSpec().SetExternalIp(&privatev1.ExternalIPLocalReference{Id: parentExternalIPID})
+			attachment.GetSpec().SetComputeInstance(&privatev1.ComputeInstanceLocalReference{Id: "compute-instance-789"})
 			mockAttachmentsServer.addAttachment(attachment)
 
 			parentExternalIP := &privatev1.ExternalIP{
@@ -175,7 +181,16 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				Status: &privatev1.ExternalIPStatus{},
 			}
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
+			transitionTime := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      attachmentName,
@@ -188,7 +203,8 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					ExternalIP: "some-externalip",
 				},
 				Status: v1alpha1.ExternalIPAttachmentStatus{
-					Phase: v1alpha1.ExternalIPAttachmentPhaseReady,
+					Phase:               v1alpha1.ExternalIPAttachmentPhaseReady,
+					StateTransitionTime: &metav1.Time{Time: transitionTime},
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
@@ -204,8 +220,12 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
 			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY))
 
-			Expect(mockExternalIPsServer2.updates).To(HaveLen(1))
-			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttached()).To(BeTrue())
+			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
+			updatedParent := &v1alpha1.ExternalIP{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "parent-externalip", Namespace: attachmentNamespace}, updatedParent)).To(Succeed())
+			Expect(updatedParent.Status.Attached).To(BeTrue())
+			Expect(updatedParent.Status.AttachmentTransitionTime).NotTo(BeNil())
+			Expect(updatedParent.Status.AttachmentTransitionTime.Time.Equal(transitionTime)).To(BeTrue())
 		})
 
 		It("should sync Phase=Failed to state=FAILED", func() {
@@ -238,6 +258,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, cr)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
@@ -251,7 +272,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_FAILED))
 		})
 
-		It("should sync state=DELETING during deletion and clear parent ExternalIP attached", func() {
+		It("should sync state=DELETING during deletion without writing the parent", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -275,7 +296,16 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			}
 			parentExternalIP.GetStatus().SetAttached(true)
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
+			transitionTime := metav1.NewTime(time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC))
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      attachmentName,
@@ -289,7 +319,8 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					ExternalIP: "some-externalip",
 				},
 				Status: v1alpha1.ExternalIPAttachmentStatus{
-					Phase: v1alpha1.ExternalIPAttachmentPhaseDeleting,
+					Phase:               v1alpha1.ExternalIPAttachmentPhaseDeleting,
+					StateTransitionTime: &transitionTime,
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
@@ -306,8 +337,11 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
 			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_DELETING))
 
-			Expect(mockExternalIPsServer2.updates).To(HaveLen(1))
-			Expect(mockExternalIPsServer2.updates[0].GetStatus().GetAttached()).To(BeFalse())
+			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
+			updatedParent := &v1alpha1.ExternalIP{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "parent-externalip", Namespace: attachmentNamespace}, updatedParent)).To(Succeed())
+			Expect(updatedParent.Status.Attached).To(BeFalse())
+			Expect(updatedParent.Status.AttachmentTransitionTime).NotTo(BeNil())
 		})
 
 		It("should sync state=FAILED during deletion when phase is Failed", func() {
@@ -333,6 +367,14 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				Status: &privatev1.ExternalIPStatus{},
 			}
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -404,10 +446,12 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					ExternalIP: "some-externalip",
 				},
 				Status: v1alpha1.ExternalIPAttachmentStatus{
-					Phase: v1alpha1.ExternalIPAttachmentPhaseDeleting,
+					Phase:               v1alpha1.ExternalIPAttachmentPhaseDeleting,
+					StateTransitionTime: &metav1.Time{Time: time.Now().UTC()},
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, cr)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
@@ -487,7 +531,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			Expect(errors.Is(err, ErrExternalIPAttachmentNotFound)).To(BeTrue())
 		})
 
-		It("should not update if status unchanged", func() {
+		It("should sync attached feedback without writing parent attribution", func() {
 			attachment := &privatev1.ExternalIPAttachment{
 				Id: attachmentID,
 				Metadata: &privatev1.Metadata{
@@ -511,6 +555,14 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			}
 			parentExternalIP.GetStatus().SetAttached(true)
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -529,6 +581,7 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, cr)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{
@@ -538,8 +591,39 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(mockAttachmentsServer.updates).To(BeEmpty())
+			Expect(mockAttachmentsServer.updates).To(HaveLen(1))
+			Expect(mockAttachmentsServer.updates[0].GetStatus().GetState()).To(Equal(
+				privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY))
 			Expect(mockExternalIPsServer2.updates).To(BeEmpty())
+		})
+
+		It("should sync attached feedback when the parent ExternalIP ID is empty", func() {
+			attachment := &privatev1.ExternalIPAttachment{
+				Id:       attachmentID,
+				Metadata: &privatev1.Metadata{Name: attachmentName},
+				Spec:     &privatev1.ExternalIPAttachmentSpec{},
+				Status: &privatev1.ExternalIPAttachmentStatus{
+					State: privatev1.ExternalIPAttachmentState_EXTERNAL_IP_ATTACHMENT_STATE_READY,
+				},
+			}
+			attachment.GetSpec().SetComputeInstance(&privatev1.ComputeInstanceLocalReference{Id: "compute-instance-789"})
+			mockAttachmentsServer.addAttachment(attachment)
+
+			cr := &v1alpha1.ExternalIPAttachment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      attachmentName,
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPAttachmentIDLabel: attachmentID},
+				},
+				Spec:   v1alpha1.ExternalIPAttachmentSpec{ExternalIP: ""},
+				Status: v1alpha1.ExternalIPAttachmentStatus{Phase: v1alpha1.ExternalIPAttachmentPhaseReady},
+			}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: attachmentName, Namespace: attachmentNamespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
 		})
 
 		It("should remove feedback finalizer and signal when it is the last finalizer", func() {
@@ -565,6 +649,14 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 				Status: &privatev1.ExternalIPStatus{},
 			}
 			mockExternalIPsServer2.addExternalIP(parentExternalIP)
+			Expect(k8sClient.Create(ctx, &v1alpha1.ExternalIP{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "parent-externalip",
+					Namespace: attachmentNamespace,
+					Labels:    map[string]string{osacExternalIPIDLabel: parentExternalIPID},
+				},
+				Spec: v1alpha1.ExternalIPSpec{Pool: "pool-id"},
+			})).To(Succeed())
 
 			cr := &v1alpha1.ExternalIPAttachment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -579,10 +671,12 @@ var _ = Describe("ExternalIPAttachmentFeedbackController", func() {
 					ExternalIP: "some-externalip",
 				},
 				Status: v1alpha1.ExternalIPAttachmentStatus{
-					Phase: v1alpha1.ExternalIPAttachmentPhaseDeleting,
+					Phase:               v1alpha1.ExternalIPAttachmentPhaseDeleting,
+					StateTransitionTime: &metav1.Time{Time: time.Now().UTC()},
 				},
 			}
 			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			Expect(k8sClient.Status().Update(ctx, cr)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, cr)).To(Succeed())
 
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{

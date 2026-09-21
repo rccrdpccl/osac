@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -27,8 +28,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // SubnetFeedbackReconciler sends updates to the fulfillment service.
@@ -67,7 +68,8 @@ func NewSubnetFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.ClientCon
 		},
 		Save: func(ctx context.Context, remote *privatev1.Subnet) error {
 			_, err := subnetsClient.Update(ctx, privatev1.SubnetsUpdateRequest_builder{
-				Object: remote,
+				Object:     remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{feedbackStatusStatePath, feedbackStatusMessagePath}},
 			}.Build())
 			return err
 		},
@@ -134,6 +136,6 @@ func syncSubnetPhase(ctx context.Context, obj *v1alpha1.Subnet, remote *privatev
 
 func syncSubnetBackendNetworkID(obj *v1alpha1.Subnet, remote *privatev1.Subnet) {
 	if obj.Status.BackendNetworkID != "" {
-		remote.GetStatus().SetMessage(obj.Status.BackendNetworkID)
+		remote.GetStatus().SetMessage(sanitizeFeedbackText(obj.Status.BackendNetworkID))
 	}
 }

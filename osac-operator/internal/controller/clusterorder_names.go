@@ -7,6 +7,7 @@ import (
 )
 
 const (
+	ClusterOrderControllerName          = "clusterorder-controller"
 	subjectKindServiceAccount    string = "ServiceAccount"
 	defaultServiceAccountName    string = "osac"
 	defaultHostedClusterName     string = "cluster"
@@ -23,6 +24,7 @@ const (
 )
 
 var (
+	agentResourceClassLabel           string = "osac.openshift.io/resource_class"
 	osacClusterOrderNameLabel         string = fmt.Sprintf("%s/clusterorder", osacPrefix)
 	osacClusterOrderIDLabel           string = fmt.Sprintf("%s/clusterorder-uuid", osacPrefix)
 	osacFinalizer                     string = fmt.Sprintf("%s/finalizer", osacPrefix)

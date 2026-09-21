@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,8 +27,8 @@ import (
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
-	privatev1 "github.com/osac-project/osac/osac-operator/internal/api/osac/private/v1"
 	"github.com/osac-project/osac/osac-operator/internal/controller/feedback"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 // ExternalIPPoolFeedbackReconciler sends updates to the fulfillment service.
@@ -67,7 +68,8 @@ func NewExternalIPPoolFeedbackReconciler(hubClient clnt.Client, grpcConn *grpc.C
 		},
 		Save: func(ctx context.Context, remote *privatev1.ExternalIPPool) error {
 			_, err := poolClient.Update(ctx, privatev1.ExternalIPPoolsUpdateRequest_builder{
-				Object: remote,
+				Object:     remote,
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{feedbackStatusStatePath}},
 			}.Build())
 			return err
 		},
