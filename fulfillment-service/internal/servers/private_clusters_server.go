@@ -53,21 +53,21 @@ var _ privatev1.ClustersServer = (*PrivateClustersServer)(nil)
 
 type PrivateClustersServer struct {
 	privatev1.UnimplementedClustersServer
-	logger                  *slog.Logger
-	notifier                events.Notifier
-	tenancyLogic            auth.TenancyLogic
-	templatesDao            *dao.GenericDAO[*privatev1.ClusterTemplate]
-	catalogItemsDao         *dao.GenericDAO[*privatev1.ClusterCatalogItem]
-	hostTypesDao            *dao.GenericDAO[*privatev1.HostType]
-	clusterVersionsDao      *dao.GenericDAO[*privatev1.ClusterVersion]
-	subnetsDao              *dao.GenericDAO[*privatev1.Subnet]
-	securityGroupsDao       *dao.GenericDAO[*privatev1.SecurityGroup]
-	externalIPPoolDao       *dao.GenericDAO[*privatev1.ExternalIPPool]
-	externalIPDao           *dao.GenericDAO[*privatev1.ExternalIP]
-	externalIPAttachmentDao *dao.GenericDAO[*privatev1.ExternalIPAttachment]
-	secretsDao              *dao.GenericDAO[*privatev1.Secret]
-	generic                 *GenericServer[*privatev1.Cluster]
-	lifecycle               *externalIPLifecycle
+	logger                    *slog.Logger
+	notifier                  events.Notifier
+	tenancyLogic              auth.TenancyLogic
+	templatesDao              *dao.GenericDAO[*privatev1.ClusterTemplate]
+	catalogItemsDao           *dao.GenericDAO[*privatev1.ClusterCatalogItem]
+	hostTypesDao              *dao.GenericDAO[*privatev1.HostType]
+	clusterVersionsDao        *dao.GenericDAO[*privatev1.ClusterVersion]
+	subnetsDao                *dao.GenericDAO[*privatev1.Subnet]
+	securityGroupsDao         *dao.GenericDAO[*privatev1.SecurityGroup]
+	externalIPPoolDao         *dao.GenericDAO[*privatev1.ExternalIPPool]
+	externalIPDao             *dao.GenericDAO[*privatev1.ExternalIP]
+	externalIPAttachmentDao   *dao.GenericDAO[*privatev1.ExternalIPAttachment]
+	secretsDao                *dao.GenericDAO[*privatev1.Secret]
+	generic                   *GenericServer[*privatev1.Cluster]
+	lifecycle                 *externalIPLifecycle
 	bareMetalInstanceTypesDao *dao.GenericDAO[*privatev1.BareMetalInstanceType]
 }
 
