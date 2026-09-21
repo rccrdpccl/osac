@@ -1,0 +1,253 @@
+from __future__ import annotations
+
+import logging
+import re
+import subprocess
+from collections.abc import Generator
+from typing import Any
+from uuid import uuid4
+
+import pytest
+
+from tests.e2e.core.grpc_client import PRIVATE_API, PUBLIC_API, GRPCClient
+from tests.e2e.core.helpers import assert_grpc_field_violation
+from tests.e2e.core.runner import env
+
+logger = logging.getLogger(__name__)
+
+_ENV_SKIP_PATTERNS = [re.compile(r"no host type"), re.compile(r"no instance type")]
+_FABRIC_MANAGER_SKIP_PATTERN = re.compile(r"require a fabric manager")
+
+# A BareMetalInstance requires at least one authentication method (ssh_public_key or
+# user_data) at create time, otherwise the resulting host would be inaccessible.
+_TEST_SSH_PUBLIC_KEY = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8K1ZuSC7tmzxD5LJJXwkCfStVEjzXWYCFhJaLBxWAn test@example.com"
+)
+
+
+def _create_cluster_or_skip(grpc: GRPCClient, *, catalog_item: str, name: str, version: str) -> str:
+    try:
+        response = grpc.call(
+            service=f"{PUBLIC_API}.Clusters/Create",
+            data={
+                "object": {
+                    "metadata": {"name": name},
+                    "spec": {
+                        "catalog_item": {"name": catalog_item, "shared": True},
+                        "version": {"name": version, "shared": True},
+                    },
+                }
+            },
+        )
+        return response["object"]["id"]
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        for pat in _ENV_SKIP_PATTERNS:
+            if pat.search(output):
+                pytest.skip(f"Cluster creation not viable in this environment: {output.strip()}")
+        raise
+
+
+def _create_bmi_or_skip(grpc: GRPCClient, *, data: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return grpc.call(service=f"{PUBLIC_API}.BareMetalInstances/Create", data=data)
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        if _FABRIC_MANAGER_SKIP_PATTERN.search(output):
+            pytest.skip("BMI creation requires a fabric manager, which is not available in this environment")
+        raise
+
+
+@pytest.fixture(scope="module")
+def cluster_template(private_grpc: GRPCClient) -> str:
+    configured = env("OSAC_CLUSTER_TEMPLATE", "")
+    if configured:
+        return configured
+    response: dict[str, Any] = private_grpc.call(service=f"{PRIVATE_API}.ClusterTemplates/List")
+    items = response.get("items", [])
+    assert items, "No ClusterTemplates found; set OSAC_CLUSTER_TEMPLATE or deploy a template"
+    return items[0]["metadata"]["name"]
+
+
+@pytest.fixture(scope="module")
+def cluster_version(grpc: GRPCClient, private_grpc: GRPCClient) -> Generator[str, None, None]:
+    configured = env("OSAC_CLUSTER_VERSION", "")
+    if configured:
+        yield configured
+        return
+    response: dict[str, Any] = grpc.call(service=f"{PUBLIC_API}.ClusterVersions/List")
+    items = response.get("items", [])
+    if items:
+        yield items[0]["metadata"]["name"]
+        return
+    tag = uuid4().hex[:8]
+    name = f"ref-cv-{tag}"
+    cv_response: dict[str, Any] = private_grpc.call(
+        service=f"{PRIVATE_API}.ClusterVersions/Create",
+        data={
+            "object": {
+                "metadata": {"name": name},
+                "spec": {
+                    "version": f"4.17.{int(tag, 16) % 10000}",
+                    "image": "quay.io/openshift-release-dev/ocp-release:4.17.0-multi",
+                },
+            }
+        },
+    )
+    cv_id = cv_response["object"]["id"]
+    try:
+        yield name
+    finally:
+        try:
+            private_grpc.call(service=f"{PRIVATE_API}.ClusterVersions/Delete", data={"id": cv_id})
+        except subprocess.CalledProcessError:
+            logger.warning("Failed to cleanup ClusterVersion %s", cv_id)
+
+
+@pytest.fixture(scope="module")
+def bmi_template(private_grpc: GRPCClient) -> str:
+    configured = env("OSAC_BMI_TEMPLATE", "")
+    if configured:
+        return configured
+    response: dict[str, Any] = private_grpc.call(service=f"{PRIVATE_API}.BareMetalInstanceTemplates/List")
+    items = response.get("items", [])
+    assert items, "No BareMetalInstanceTemplates found; set OSAC_BMI_TEMPLATE or deploy a template"
+    return items[0]["metadata"]["name"]
+
+
+@pytest.fixture(scope="module")
+def ref_bmi_disk_image(grpc: GRPCClient) -> Generator[str, None, None]:
+    tag = uuid4().hex[:8]
+    name = f"ref-bmi-di-{tag}"
+    disk_image_id = grpc.create_disk_image(name=name, source_ref="oci://quay.io/osac-project/fedora-cloud-bmi:44")
+    try:
+        yield name
+    finally:
+        try:
+            grpc.delete_disk_image(disk_image_id=disk_image_id)
+        except subprocess.CalledProcessError:
+            logger.warning("Failed to cleanup BMI disk image %s", name)
+
+
+class TestClusterBareMetalReferences:
+    """OSAC-3110: Cluster and bare metal resource reference tests."""
+
+    @pytest.mark.requires_caas
+    def test_cluster_provisioning_chain_by_name(
+        self, private_grpc: GRPCClient, grpc: GRPCClient, cluster_template: str, cluster_version: str
+    ):
+        tag = uuid4().hex[:8]
+        cat_name = f"ref-cl-cat-{tag}"
+
+        cat_id = private_grpc.create_cluster_catalog_item(name=cat_name, template=cluster_template, api=PRIVATE_API)
+        cluster_id: str | None = None
+        try:
+            cat_response = grpc.get_cluster_catalog_item(catalog_item_id=cat_id)
+            tmpl_ref = cat_response["object"]["template"]
+            assert tmpl_ref.get("name") == cluster_template
+            assert tmpl_ref.get("id"), "template.id should be auto-populated in catalog item"
+
+            cluster_id = _create_cluster_or_skip(
+                grpc, catalog_item=cat_name, name=f"ref-cl-{tag}", version=cluster_version
+            )
+            cluster = grpc.get_cluster(cluster_id=cluster_id)
+            spec = cluster["object"]["spec"]
+            cat_ref = spec.get("catalog_item", spec.get("catalogItem", {}))
+            assert cat_ref.get("name") == cat_name
+            assert cat_ref.get("id") == cat_id
+        finally:
+            if cluster_id:
+                try:
+                    grpc.call(service=f"{PUBLIC_API}.Clusters/Delete", data={"id": cluster_id})
+                except subprocess.CalledProcessError:
+                    logger.warning("Failed to cleanup cluster %s", cluster_id)
+            try:
+                private_grpc.delete_cluster_catalog_item(catalog_item_id=cat_id, api=PRIVATE_API)
+            except subprocess.CalledProcessError:
+                logger.warning("Failed to cleanup cluster catalog item %s", cat_id)
+
+    @pytest.mark.requires_bmaas
+    def test_baremetal_instance_chain_by_name(
+        self, private_grpc: GRPCClient, grpc: GRPCClient, bmi_template: str, ref_bmi_disk_image: str
+    ):
+        tag = uuid4().hex[:8]
+        cat_name = f"ref-bmi-cat-{tag}"
+
+        cat_id = private_grpc.create_baremetal_instance_catalog_item(
+            name=cat_name, title=cat_name, description="Reference test", template=bmi_template, api=PRIVATE_API
+        )
+        bmi_id: str | None = None
+        try:
+            cat_response: dict[str, Any] = private_grpc.call(
+                service=f"{PRIVATE_API}.BareMetalInstanceCatalogItems/Get", data={"id": cat_id}
+            )
+            tmpl_ref = cat_response["object"]["template"]
+            assert tmpl_ref.get("name") == bmi_template
+            assert tmpl_ref.get("id"), "template.id should be auto-populated in BMI catalog item"
+
+            bmi_response: dict[str, Any] = _create_bmi_or_skip(
+                grpc,
+                data={
+                    "object": {
+                        "metadata": {"name": f"ref-bmi-{tag}"},
+                        "spec": {
+                            "catalog_item": {"name": cat_name, "shared": True},
+                            "disk_image": {"name": ref_bmi_disk_image},
+                            "ssh_public_key": _TEST_SSH_PUBLIC_KEY,
+                        },
+                    }
+                },
+            )
+            bmi_id = bmi_response["object"]["id"]
+            spec = bmi_response["object"]["spec"]
+            cat_ref = spec.get("catalog_item", spec.get("catalogItem", {}))
+            assert cat_ref.get("name") == cat_name
+            assert cat_ref.get("id") == cat_id
+        finally:
+            if bmi_id:
+                try:
+                    grpc.delete_baremetal_instance(bmi_id=bmi_id)
+                except subprocess.CalledProcessError:
+                    logger.warning("Failed to cleanup BMI %s", bmi_id)
+            try:
+                private_grpc.delete_baremetal_instance_catalog_item(item_id=cat_id, api=PRIVATE_API)
+            except subprocess.CalledProcessError:
+                logger.warning("Failed to cleanup BMI catalog item %s", cat_id)
+
+    @pytest.mark.requires_caas
+    def test_cross_tenant_cluster_template_reference(
+        self, private_grpc: GRPCClient, jwt_grpc_tenant1: GRPCClient, cluster_template: str, cluster_version: str
+    ):
+        tag = uuid4().hex[:8]
+        cat_name = f"ref-xt-cl-cat-{tag}"
+
+        cat_id = private_grpc.create_cluster_catalog_item(name=cat_name, template=cluster_template, api=PRIVATE_API)
+        cluster_id: str | None = None
+        try:
+            cluster_id = _create_cluster_or_skip(
+                jwt_grpc_tenant1, catalog_item=cat_name, name=f"ref-xt-cl-{tag}", version=cluster_version
+            )
+            cluster = jwt_grpc_tenant1.get_cluster(cluster_id=cluster_id)
+            spec = cluster["object"]["spec"]
+            cat_ref = spec.get("catalog_item", spec.get("catalogItem", {}))
+            assert cat_ref.get("name") == cat_name
+            assert cat_ref.get("id") == cat_id
+        finally:
+            if cluster_id:
+                try:
+                    jwt_grpc_tenant1.call(service=f"{PUBLIC_API}.Clusters/Delete", data={"id": cluster_id})
+                except subprocess.CalledProcessError:
+                    logger.warning("Failed to cleanup cross-tenant cluster %s", cluster_id)
+            try:
+                private_grpc.delete_cluster_catalog_item(catalog_item_id=cat_id, api=PRIVATE_API)
+            except subprocess.CalledProcessError:
+                logger.warning("Failed to cleanup cross-tenant catalog item %s", cat_id)
+
+    @pytest.mark.requires_caas
+    def test_invalid_cluster_template_name_returns_error(self, private_grpc: GRPCClient):
+        tag = uuid4().hex[:8]
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            private_grpc.create_cluster_catalog_item(
+                name=f"ref-bad-cat-{tag}", template="nonexistent-template", api=PRIVATE_API
+            )
+        assert_grpc_field_violation(exc_info, field_path="template")
