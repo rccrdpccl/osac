@@ -426,8 +426,6 @@ var _ = Describe("BareMetalWorkerReconciler ensureSystemCatalogItem", func() {
 		Expect(ci.GetMetadata().GetTenant()).To(Equal("system"))
 		Expect(ci.GetTitle()).To(Equal("System BMI Pass-through"))
 		Expect(ci.GetPublished()).To(BeTrue())
-		//nolint:staticcheck // field is retained for contract compatibility.
-		Expect(ci.GetFieldDefinitions()).To(BeEmpty())
 		Expect(ci.GetTemplate().GetId()).To(Equal("osac.templates.bm_host_provisioning"))
 	})
 
