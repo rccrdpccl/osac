@@ -1,5 +1,5 @@
 # Kind dev environment -- infrastructure values for osac-infra chart.
-# cert-manager, trust-manager, and envoy gateway are installed as
+# cert-manager, trust-manager, envoy gateway, and Strimzi are installed as
 # separate Helm releases by the root Makefile (install-infra).
 # This values file configures the infra chart templates only.
 
@@ -19,7 +19,10 @@ metallb:
 mce:
   enabled: false
 kafka:
-  enabled: false
+  enabled: true
+  replicas: 1
+  storage:
+    size: 10Gi
 
 # --- Envoy Gateway resources (Gateway, GatewayClass, EnvoyProxy) ---
 envoygateway:
@@ -31,6 +34,20 @@ envoygateway:
 bundledPostgres:
   enabled: true
 
+# --- Bundled OpenBao ---
+# Single-pod ephemeral Vault-compatible secret store for testing. Dev mode --
+# data is lost on restart. Not for production.
+bundledVault:
+  enabled: true
+  devRootToken: "dev-root-token"
+  keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local:8443/realms/osac"
+
+# origin-cli USER is 0; kind has no SCC to allocate a UID.
+cliJobPodSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
 # --- CA issuer ---
 caIssuer:
   enabled: true
@@ -40,6 +57,13 @@ keycloak:
   enabled: true
   hostname: "https://keycloak.keycloak.svc.cluster.local:8443"
   extraPort: 8443
+  # Kind/IT only: disable back-channel TLS verification so KC's OIDC broker
+  # can reach a second KC realm via the cluster-internal self-signed cert.
+  # KC 26+ uses a Quarkus HTTP client whose per-IdP disableTrustManager flag
+  # is not honoured; the SPI-level flag is required instead.
+  extraEnv:
+    - name: KC_SPI_CONNECTIONS_HTTP_CLIENT_DEFAULT_DISABLE_TRUST_MANAGER
+      value: "true"
   # Kind/IT only: seed known passwords for the realm's built-in test users.
   devFixtures:
     enabled: true

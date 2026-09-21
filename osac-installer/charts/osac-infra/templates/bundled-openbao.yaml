@@ -5,11 +5,11 @@ metadata:
   name: openbao-server
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "osac.labels" . | nindent 4 }}
+    {{- include "osac-infra.labels" . | nindent 4 }}
 spec:
   issuerRef:
-    kind: {{ .Values.service.certs.issuerRef.kind }}
-    name: {{ .Values.service.certs.issuerRef.name }}
+    kind: {{ .Values.certs.issuerRef.kind }}
+    name: {{ .Values.certs.issuerRef.name }}
   dnsNames:
   - openbao
   - openbao.{{ .Release.Namespace }}
@@ -25,7 +25,7 @@ metadata:
   name: openbao-config
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "osac.labels" . | nindent 4 }}
+    {{- include "osac-infra.labels" . | nindent 4 }}
 data:
   config.hcl: |
     ui = false
@@ -47,7 +47,7 @@ metadata:
   name: openbao-init
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "osac.labels" . | nindent 4 }}
+    {{- include "osac-infra.labels" . | nindent 4 }}
 data:
   init.sh: |
     #!/usr/bin/env sh
@@ -59,45 +59,51 @@ data:
     done
     echo "OpenBao is ready."
 
-    echo "Creating parent namespace 'osac'..."
-    bao namespace create osac 2>/dev/null || echo "Namespace 'osac' already exists."
+    echo "Creating parent namespace '{{ .Values.bundledVault.vaultNamespace | default "osac" }}'..."
+    bao namespace create {{ .Values.bundledVault.vaultNamespace | default "osac" }} 2>/dev/null || echo "Namespace '{{ .Values.bundledVault.vaultNamespace | default "osac" }}' already exists."
 
     echo "Enabling JWT auth in osac namespace..."
-    bao auth enable -namespace=osac -path=jwt jwt 2>/dev/null || echo "JWT auth already enabled."
+    bao auth enable -namespace={{ .Values.bundledVault.vaultNamespace | default "osac" }} -path=jwt jwt 2>/dev/null || echo "JWT auth already enabled."
 
     echo "Writing lifecycle policy..."
-    bao policy write -namespace=osac lifecycle - <<'POLICY'
+    bao policy write -namespace={{ .Values.bundledVault.vaultNamespace | default "osac" }} lifecycle - <<'POLICY'
     path "sys/namespaces/*" {
-      capabilities = ["create", "read", "update", "delete", "list"]
+      capabilities = ["create", "read", "update", "delete", "list", "sudo"]
     }
     path "sys/namespaces" {
       capabilities = ["list"]
     }
-    path "sys/mounts/*" {
-      capabilities = ["create", "read", "update", "delete"]
+    path "+/sys/mounts/*" {
+      capabilities = ["create", "read", "update", "delete", "sudo"]
     }
-    path "sys/mounts" {
+    path "+/sys/mounts" {
       capabilities = ["read", "list"]
     }
-    path "auth/*" {
+    path "+/sys/policies/*" {
+      capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+    }
+    path "+/sys/auth/*" {
+      capabilities = ["create", "read", "update", "delete", "list", "sudo"]
+    }
+    path "+/auth/*" {
       capabilities = ["create", "read", "update", "delete", "list", "sudo"]
     }
     POLICY
 
-    {{- if .Values.service.vault.keycloakIssuerUrl }}
+    {{- if .Values.bundledVault.keycloakIssuerUrl }}
     echo "Configuring JWT auth with Keycloak OIDC discovery..."
     attempts=0
     max_attempts=30
     until [ $attempts -ge $max_attempts ]; do
-      {{- if .Values.service.certs.caBundle.configMap }}
-      if bao write -namespace=osac auth/jwt/config \
+      {{- if .Values.certs.caBundle.configMap }}
+      if bao write -namespace={{ .Values.bundledVault.vaultNamespace | default "osac" }} auth/jwt/config \
         oidc_discovery_url="${KEYCLOAK_ISSUER_URL}" \
         oidc_discovery_ca_pem=@/vault/ca/bundle.pem \
         default_role="lifecycle"; then
         break
       fi
       {{- else }}
-      if bao write -namespace=osac auth/jwt/config \
+      if bao write -namespace={{ .Values.bundledVault.vaultNamespace | default "osac" }} auth/jwt/config \
         oidc_discovery_url="${KEYCLOAK_ISSUER_URL}" \
         default_role="lifecycle"; then
         break
@@ -112,7 +118,7 @@ data:
       exit 1
     else
       echo "Creating lifecycle role..."
-      bao write -namespace=osac auth/jwt/role/lifecycle \
+      bao write -namespace={{ .Values.bundledVault.vaultNamespace | default "osac" }} auth/jwt/role/lifecycle \
         role_type="jwt" \
         bound_audiences="${KEYCLOAK_AUDIENCE}" \
         user_claim="sub" \
@@ -131,7 +137,7 @@ metadata:
   name: openbao
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "osac.labels" . | nindent 4 }}
+    {{- include "osac-infra.labels" . | nindent 4 }}
 spec:
   selector:
     app: openbao
@@ -147,7 +153,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app: openbao
-    {{- include "osac.labels" . | nindent 4 }}
+    {{- include "osac-infra.labels" . | nindent 4 }}
 spec:
   replicas: 1
   strategy:
@@ -159,11 +165,25 @@ spec:
     metadata:
       labels:
         app: openbao
-        {{- include "osac.labels" . | nindent 8 }}
+        {{- include "osac-infra.labels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
       securityContext:
+        {{- if .Values.bundledVault.podSecurityContext }}
+        {{- toYaml .Values.bundledVault.podSecurityContext | nindent 8 }}
+        {{- else }}
+        # Standard Kubernetes default: explicit numeric UID required because the
+        # OpenBao image uses a named user ("openbao") — Kubernetes cannot satisfy
+        # runAsNonRoot: true without a numeric UID at admission time.
+        # On OpenShift, override podSecurityContext in the profile's instance.yaml
+        # to just {runAsNonRoot: true}; the restricted-v2 SCC allocates the UID.
         runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+        {{- end }}
       volumes:
       - name: server-cert
         secret:
@@ -176,14 +196,22 @@ spec:
         configMap:
           name: openbao-init
           defaultMode: 0755
-      {{- if .Values.service.certs.caBundle.configMap }}
+      {{- if .Values.certs.caBundle.configMap }}
       - name: ca-bundle
         configMap:
-          name: {{ .Values.service.certs.caBundle.configMap }}
+          name: {{ .Values.certs.caBundle.configMap }}
       {{- end }}
       - name: data
         emptyDir: {}
       - name: tmp
+        emptyDir: {}
+      # home-openbao: writable home dir for the openbao user.
+      # The Alpine image sets HOME to / (no explicit home dir) while the UBI
+      # image uses /home/openbao. We map both by setting HOME=/tmp in each
+      # container's env and mounting this emptyDir there, so any HOME-relative
+      # writes (e.g. ~/.vault-token from bao CLI) land in an emptyDir rather
+      # than the read-only root filesystem.
+      - name: home
         emptyDir: {}
       containers:
       - name: server
@@ -209,19 +237,24 @@ spec:
         - name: BAO_ADDR
           value: "https://127.0.0.1:8200"
         - name: BAO_CACERT
-          {{- if .Values.service.certs.caBundle.configMap }}
+          {{- if .Values.certs.caBundle.configMap }}
           value: "/vault/ca/bundle.pem"
           {{- else }}
           value: "/vault/tls/ca.crt"
           {{- end }}
         - name: SKIP_SETCAP
           value: "true"
+        # HOME=/tmp: the Alpine image has no explicit home dir; redirecting HOME
+        # to the already-mounted /tmp emptyDir prevents any HOME-relative writes
+        # from hitting the read-only root filesystem.
+        - name: HOME
+          value: "/tmp"
         volumeMounts:
         - name: server-cert
           mountPath: /vault/tls
         - name: config
           mountPath: /vault/config
-        {{- if .Values.service.certs.caBundle.configMap }}
+        {{- if .Values.certs.caBundle.configMap }}
         - name: ca-bundle
           mountPath: /vault/ca
         {{- end }}
@@ -229,6 +262,8 @@ spec:
           mountPath: /vault/data
         - name: tmp
           mountPath: /tmp
+        - name: home
+          mountPath: /home/openbao
         ports:
         - name: api
           protocol: TCP
@@ -265,26 +300,32 @@ spec:
         - name: BAO_TOKEN
           value: {{ required "bundledVault.devRootToken must be set" .Values.bundledVault.devRootToken | quote }}
         - name: BAO_CACERT
-          {{- if .Values.service.certs.caBundle.configMap }}
+          {{- if .Values.certs.caBundle.configMap }}
           value: "/vault/ca/bundle.pem"
           {{- else }}
           value: "/vault/tls/ca.crt"
           {{- end }}
         - name: KEYCLOAK_ISSUER_URL
-          value: {{ .Values.service.vault.keycloakIssuerUrl | default "" | quote }}
+          value: {{ tpl (.Values.bundledVault.keycloakIssuerUrl | default "") . | quote }}
         - name: KEYCLOAK_AUDIENCE
-          value: {{ .Values.service.vault.keycloakAudience | default "" | quote }}
+          value: {{ .Values.bundledVault.keycloakAudience | default "" | quote }}
+        # HOME=/tmp: ensures HOME-relative writes (e.g. bao CLI token cache) land
+        # on the mounted /tmp emptyDir rather than the read-only root filesystem.
+        - name: HOME
+          value: "/tmp"
         volumeMounts:
         - name: init-script
           mountPath: /scripts
         - name: server-cert
           mountPath: /vault/tls
-        {{- if .Values.service.certs.caBundle.configMap }}
+        {{- if .Values.certs.caBundle.configMap }}
         - name: ca-bundle
           mountPath: /vault/ca
         {{- end }}
         - name: tmp
           mountPath: /tmp
+        - name: home
+          mountPath: /home/openbao
         resources:
           requests:
             cpu: 50m

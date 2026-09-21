@@ -81,6 +81,10 @@ bmf:
     insecureSkipVerify: false
     hostClass: "bcm"
     bmhNamespace: "hardware-inventory"
+  metal3:
+    enabled: false
+    namespace: "hardware-inventory"
+    hostClass: "metal3"
 
 validation:
   enabled: true

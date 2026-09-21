@@ -1,5 +1,18 @@
 # Full CI environment -- instance values for osac chart.
 
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  services:
+    caas:
+      enabled: true
+    vmaas:
+      enabled: true
+    bmaas:
+      enabled: true
+    maas:
+      enabled: true
+
 # --- Operator ---
 operator:
   image:
@@ -17,12 +30,9 @@ operator:
     serverAddress: "fulfillment-internal-api:8001"
     tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
   controllers:
-    clusterOrder: true
-    computeInstance: true
     tenant: true
     networking: true
     storage: true
-    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
@@ -44,7 +54,9 @@ service:
     caBundle:
       configMap: ca-bundle
   auth:
-    issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    # issuerUrl defaults to a global.clusterDomain-backed external route URL
+    # (see charts/osac/values.yaml) -- correct automatically once
+    # install-osac sets --set global.clusterDomain=$(DOMAIN).
     emergencyServiceAccounts:
     - admin
     - osac-operator
@@ -61,7 +73,9 @@ service:
           param: client-secret
   idp:
     provider: keycloak
-    url: https://keycloak.keycloak.svc.cluster.local
+    # url defaults to a global.clusterDomain-backed external route URL (see
+    # charts/osac/values.yaml) -- correct automatically once install-osac
+    # sets --set global.clusterDomain=$(DOMAIN).
     credentials:
     - secret:
         name: fulfillment-controller-credentials
@@ -89,13 +103,13 @@ service:
   log:
     level: debug
   vault:
-    endpoint: "https://openbao.osac.svc.cluster.local:8200"
+    # endpoint and keycloakIssuerUrl both default correctly (see
+    # charts/osac/values.yaml) -- no override needed.
     namespace: osac
     kvMountPath: secret
     lifecycleRole: lifecycle
     lifecycleMountPath: jwt
     keycloakClientId: osac-controller
-    keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local/realms/osac"
     keycloakAudience: osac-api
     caBundle:
       configMap: ca-bundle
@@ -153,7 +167,6 @@ validation:
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
-  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest

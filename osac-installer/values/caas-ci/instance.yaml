@@ -1,5 +1,20 @@
 # CaaS CI environment -- instance values for osac chart.
 
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  services:
+    caas:
+      enabled: true
+    # CaaS-over-BMaaS registers the RHCOS DiskImage through the VMaaS-owned
+    # DiskImages API even though it does not provision VMaaS instances.
+    vmaas:
+      enabled: true
+    bmaas:
+      enabled: true
+    maas:
+      enabled: false
+
 # --- Operator ---
 operator:
   image:
@@ -17,11 +32,11 @@ operator:
     serverAddress: "fulfillment-internal-api:8001"
     tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
   controllers:
-    clusterOrder: true
     computeInstance: false
     tenant: true
     networking: true
     storage: true
+    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
@@ -43,7 +58,9 @@ service:
     caBundle:
       configMap: ca-bundle
   auth:
-    issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    # issuerUrl defaults to a global.clusterDomain-backed external route URL
+    # (see charts/osac/values.yaml) -- correct automatically once
+    # install-osac sets --set global.clusterDomain=$(DOMAIN).
     emergencyServiceAccounts:
     - admin
     - osac-operator
@@ -60,7 +77,9 @@ service:
           param: client-secret
   idp:
     provider: keycloak
-    url: https://keycloak.keycloak.svc.cluster.local
+    # url defaults to a global.clusterDomain-backed external route URL (see
+    # charts/osac/values.yaml) -- correct automatically once install-osac
+    # sets --set global.clusterDomain=$(DOMAIN).
     credentials:
     - secret:
         name: fulfillment-controller-credentials
@@ -88,13 +107,13 @@ service:
   log:
     level: debug
   vault:
-    endpoint: "https://openbao.osac.svc.cluster.local:8200"
+    # endpoint and keycloakIssuerUrl both default correctly (see
+    # charts/osac/values.yaml) -- no override needed.
     namespace: osac
     kvMountPath: secret
     lifecycleRole: lifecycle
     lifecycleMountPath: jwt
     keycloakClientId: osac-controller
-    keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local/realms/osac"
     keycloakAudience: osac-api
     caBundle:
       configMap: ca-bundle
@@ -118,6 +137,9 @@ aap:
   configAsCode:
     manifestSecret: "config-as-code-manifest-ig"
     secret: "config-as-code-ig"
+    # CaaS workers are provisioned on demand. The deprecated import-agent and
+    # BCM pool toggles are intentionally not set in this profile; standalone
+    # BMaaS profiles retain those controls for host-inventory registration.
     # NOTE: e2e's COMPONENT_BUILD_RESULTS image-override step overrides
     # bootstrap.image with this PR's own built image but does not touch
     # eeImage, so the two can diverge at e2e runtime even though they're
@@ -143,11 +165,19 @@ validation:
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
-  enabled: false
+  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest
     pullPolicy: Always
+  env:
+    aapUrl: "http://osac-aap/api/controller"
+    aapInsecureSkipVerify: "true"
+    enableNetworkingProvisioning: "false"
+  metal3:
+    enabled: true
+    namespace: host-inventory
+    hostClass: metal3
 
 # --- Cluster Versions ---
 clusterVersions:

@@ -22,9 +22,30 @@ readonly NIGHTLY_CHART_SLACK_ORDER=(
     osac
 )
 
-# Umbrella and CI values files that override osac-ui subchart .Values.images.ui.
-readonly NIGHTLY_UMBRELLA_UI_VALUES=(
-    osac-installer/charts/osac/values.yaml
+# Every umbrella dependency, mapped "<Chart.yaml dependency name>:<owning
+# component>" -- the owning component is what COMPONENT_VERSIONS (nightly-
+# build.yaml's per-release-cut version map) is keyed by.
+# osac-operator-crds/bare-metal-fulfillment-operator-crds/csi-backends share
+# their owning component's version with their non-crds sibling chart; they
+# have no independent release cadence of their own.
+readonly MONO_REPO_UMBRELLA_DEPENDENCIES=(
+    "osac-operator-crds:osac-operator"
+    "osac-operator:osac-operator"
+    "fulfillment-service:fulfillment-service"
+    "osac-aap:osac-aap"
+    "bare-metal-fulfillment-operator-crds:bare-metal-fulfillment-operator"
+    "bare-metal-fulfillment-operator:bare-metal-fulfillment-operator"
+    "osac-metering:osac-metering"
+    "csi-driver:osac-csi-driver"
+    "csi-backends:osac-csi-driver"
+    "osac-ui:osac-ui"
+)
+
+# CI overlay values files with their own separate floating image tag
+# overrides for mono-repo components (operator/aap/bmf/metering/csiDriver),
+# on top of the umbrella chart's own values.yaml. Not every file overrides
+# every component -- see stamp_ci_overlay_if_present.
+readonly NIGHTLY_CI_OVERLAY_VALUES=(
     osac-installer/values/dev/instance.yaml
     osac-installer/values/vmaas-ci/instance.yaml
     osac-installer/values/bmaas-ci/instance.yaml
@@ -43,59 +64,388 @@ append_chart_source() {
     fi
 }
 
-# Usage: check_osac_ui_image [repo_name]
-# Resolve osac-ui@main HEAD and verify ghcr.io/osac-project/<repo>:sha-<7> exists.
-# Prints the full commit SHA on stdout; fails if the image is not published yet.
-check_osac_ui_image() {
-    local repo="${1:-osac-ui}"
-    local sha tag token safe_repo safe_sha attempt
+# Usage: retag_component_image <image_repo> <source_short_sha> <target_version>
+# Alias-tags the already-built <image_repo>:sha-<source_short_sha> image to
+# <image_repo>:<target_version> via a server-side skopeo copy (no rebuild).
+# <image_repo>:sha-<source_short_sha> is expected to already exist -- every
+# mono-repo component's image-build workflow triggers unconditionally on
+# push to main with no path filter, so a sha-<short> tag for main's current
+# HEAD is reliably present in GHCR by the time nightly runs. If it isn't
+# (e.g. a very recent merge whose build is still in flight), skopeo copy
+# itself fails with a clear "manifest unknown" error under set -euo
+# pipefail -- that failure IS the existence check; no separate pre-flight
+# HEAD request is needed. Fails loudly, no silent fallback, no retry.
+retag_component_image() {
+    local image_repo="$1" source_short_sha="$2" target_version="$3"
+    local source_tag="sha-${source_short_sha}"
+    local safe_repo safe_source safe_target
 
-    if [[ ! "${repo}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-        safe_repo=$(_gha_sanitize_for_message "${repo}")
-        echo "::error::Invalid osac-ui repo name '${safe_repo}' — must match [a-zA-Z0-9._-]+" >&2
+    if [[ ! "${image_repo}" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+        safe_repo=$(_gha_sanitize_for_message "${image_repo}")
+        echo "::error::Invalid image repo '${safe_repo}'" >&2
+        return 1
+    fi
+    if [[ ! "${source_short_sha}" =~ ^[0-9a-f]{7,40}$ ]]; then
+        safe_source=$(_gha_sanitize_for_message "${source_short_sha}")
+        echo "::error::Invalid source SHA '${safe_source}' for ${image_repo}" >&2
+        return 1
+    fi
+    if [[ ! "${target_version}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        safe_target=$(_gha_sanitize_for_message "${target_version}")
+        echo "::error::Invalid target version '${safe_target}' for ${image_repo}" >&2
         return 1
     fi
 
-    for attempt in 1 2 3; do
-        if sha=$(git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=10 \
-            ls-remote "https://github.com/osac-project/${repo}.git" refs/heads/main | cut -f1); then
-            [[ -n "${sha}" ]] && break
+    echo "Retagging ${image_repo}:${source_tag} -> ${image_repo}:${target_version}..."
+    if ! skopeo copy --all \
+        "docker://${image_repo}:${source_tag}" \
+        "docker://${image_repo}:${target_version}"; then
+        safe_repo=$(_gha_sanitize_for_message "${image_repo}")
+        echo "::error::Could not retag ${safe_repo}:${source_tag} -> ${target_version} — source image not found in GHCR yet (its build may still be in flight); failing nightly run rather than silently skipping or falling back to an older commit" >&2
+        return 1
+    fi
+    skopeo inspect "docker://${image_repo}:${target_version}" > /dev/null
+}
+
+# Usage: _component_publish_workflows <component>
+# Prints, one per line, the workflow filenames that a real push of
+# <component>/vX.Y.Z is expected to trigger (each `on: push: tags:
+# '<component>/v*'`) -- the actual image/binary/proto publish for a
+# real, permanent per-component release tag happens in these, not in
+# osac-build-and-publish.yaml's own build/publish jobs (those only ever push
+# provisional sha-<short> images for e2e). Creating the tag is
+# not evidence any of this ran.
+_component_publish_workflows() {
+    local component="$1"
+    case "${component}" in
+        osac-operator) printf '%s\n' build-image.yaml ;;
+        fulfillment-service) printf '%s\n' publish-image.yaml publish-binaries.yaml publish-proto.yaml ;;
+        osac-aap) printf '%s\n' execution-environment.yml ;;
+        bare-metal-fulfillment-operator) printf '%s\n' build-bmf-image.yaml ;;
+        osac-metering) printf '%s\n' build-metering-service-image.yaml build-metering-m360-adapter-image.yaml build-metering-echo-adapter-image.yaml ;;
+        osac-csi-driver) printf '%s\n' publish-csi-driver-image.yaml ;;
+        osac-ui) printf '%s\n' osac-ui-publish-image.yaml ;;
+        *)
+            echo "::error::_component_publish_workflows: unknown component '${component}'" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Usage: wait_for_component_publish_workflow_run <workflow_file> <tag> [timeout_seconds] [interval_seconds]
+# Polls (via `gh run list`) for a run of <workflow_file> whose head branch is
+# the real tag-push ref <tag>, then `gh run watch`es it to a terminal state
+# and requires conclusion == success. Requires GH_TOKEN/GH_REPO in the
+# environment. A tag-push-triggered run doesn't necessarily exist yet the
+# moment its `git push` returns, so this polls rather than checking once.
+# Fails loudly (::error + non-zero) if no matching run ever appears within
+# the timeout, or if it appears but doesn't succeed -- a permanent component
+# tag must never be reported as a successful release when what it's supposed
+# to trigger silently didn't run or failed.
+wait_for_component_publish_workflow_run() {
+    local workflow_file="$1" tag="$2" timeout="${3:-2700}" interval="${4:-15}"
+    local start run_id safe_workflow safe_tag page runs run_count gh_err safe_gh_err
+    local response http_code body curl_exit gh_curl_config remaining connect_timeout quoted_gh_curl_config
+
+    safe_workflow=$(_gha_sanitize_for_message "${workflow_file}")
+    safe_tag=$(_gha_sanitize_for_message "${tag}")
+
+    # GH_TOKEN passed via a curl config file, not `-H "Authorization: Bearer
+    # ${GH_TOKEN}"` directly -- the latter puts the token in this process's
+    # argv, visible to anything else on the same machine (e.g. `ps aux`)
+    # while curl runs. This job's runner is a persistent, reused self-hosted
+    # box, not an ephemeral one, so that exposure window is real.
+    #
+    # Cleanup registered immediately after mktemp -- before chmod or writing
+    # the token -- so a failure in either of those still triggers it, and on
+    # both RETURN and EXIT: RETURN alone only cleans up on a normal function
+    # return, but this job can just as well be killed or cancelled outright
+    # while this function is still running, which EXIT also covers.
+    #
+    # Known limitation, not fixed here: bash's RETURN trap is not truly
+    # function-scoped the way you'd expect -- confirmed empirically that a
+    # RETURN trap set in a called function clobbers a caller's own RETURN
+    # trap permanently, and that `trap -p RETURN` queried from the callee
+    # does not reliably expose the caller's prior trap to save and restore.
+    # Nothing in this file or its caller sets one today (verified), so
+    # there's nothing to clobber right now, but a future caller adding its
+    # own RETURN trap around a call into this function should be aware of
+    # this rather than silently losing it.
+    gh_curl_config=$(mktemp)
+    # Double-quoted so ${gh_curl_config} expands NOW, into a literal path
+    # baked into the registered trap string -- not a variable reference
+    # re-evaluated whenever the trap actually fires. That distinction is
+    # real: gh_curl_config is local to this function, but EXIT fires at
+    # process termination, potentially long after this function (and its
+    # local scope) has already returned. A single-quoted trap referencing
+    # the variable by name hits "unbound variable" under set -u at that
+    # point -- confirmed live, after this exact function otherwise ran
+    # correctly end to end.
+    #
+    # Shell-escaped via printf %q, not hand-wrapped in single quotes --
+    # confirmed a literal single quote in the path (e.g. from an unusual
+    # TMPDIR on this already-nonstandard runner) breaks the naive
+    # '${gh_curl_config}' form with a syntax error when the trap fires,
+    # since the trap string is re-parsed as shell code at that point, not
+    # just substituted literally.
+    printf -v quoted_gh_curl_config '%q' "${gh_curl_config}"
+    trap "rm -f ${quoted_gh_curl_config}" RETURN EXIT
+    chmod 600 "${gh_curl_config}"
+    printf 'header = "Authorization: Bearer %s"\n' "${GH_TOKEN}" > "${gh_curl_config}"
+
+    echo "Waiting up to ${timeout}s for '${safe_workflow}' to start for tag ${safe_tag}..."
+    start=${SECONDS}
+    run_id=""
+    while true; do
+        # Plain curl against the REST API, not `gh run list`/`gh run watch` --
+        # confirmed live: this job's runs-on: osac-ci self-hosted runner does
+        # not have the gh CLI on PATH at all ("gh: command not found"), so
+        # every `gh` call here was failing instantly. That failure was being
+        # swallowed into an empty result, indistinguishable from a genuine
+        # "no match yet", which is exactly why this looked like a silent
+        # 45-minute hang instead of an obvious, immediate error. curl is far
+        # more safely assumed present on any runner than a specific CLI tool.
+        page=1
+        while true; do
+            gh_err=""
+            curl_exit=0
+            # Timeouts derived from the remaining poll budget so a hung
+            # connection (as opposed to a clean failure) can't defeat the
+            # timeout this loop is supposed to guarantee -- without this, a
+            # single curl call that never returns blocks the whole function
+            # indefinitely regardless of how the surrounding loop is bounded.
+            remaining=$(( timeout - (SECONDS - start) ))
+            (( remaining < 5 )) && remaining=5
+            connect_timeout=$(( remaining < 10 ? remaining : 10 ))
+            response=$(curl -sS -w '\n%{http_code}' -K "${gh_curl_config}" \
+                --connect-timeout "${connect_timeout}" --max-time "${remaining}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${GH_REPO}/actions/workflows/${workflow_file}/runs?per_page=100&page=${page}" 2>&1) || curl_exit=$?
+            if (( curl_exit != 0 )); then
+                # Never leave this blank: a command that fails before
+                # printing anything (missing binary, DNS failure, etc.) is
+                # exactly the failure mode that caused the original 45-minute
+                # silent hangs this function exists to prevent -- the exit
+                # code alone must be enough to show something went wrong.
+                gh_err="curl exited ${curl_exit}${response:+: ${response}}"
+                runs='[]'
+            else
+                http_code="${response##*$'\n'}"
+                body="${response%$'\n'*}"
+                if [[ "${http_code}" != "200" ]]; then
+                    gh_err="HTTP ${http_code}: ${body}"
+                    runs='[]'
+                else
+                    # Guards against more than just unparseable JSON: a 200
+                    # response whose .workflow_runs is present but isn't an
+                    # array (a string, object, etc. -- an unexpected but not
+                    # inconceivable API response shape) would otherwise
+                    # produce a non-array `runs`, and the candidate-selection
+                    # `jq` calls below would then fail outright on it
+                    # ("Cannot iterate over string"). Routed through the same
+                    # gh_err/warning/retry path as an actual parse failure
+                    # instead of letting that failure hit set -e unguarded.
+                    runs=$(jq -c '(.workflow_runs // []) as $r | if ($r | type) == "array" then $r else error("workflow_runs is not an array (got \($r | type))") end' \
+                        <<<"${body}" 2>/dev/null) || { gh_err="could not parse response as JSON: ${body}"; runs='[]'; }
+                fi
+            fi
+            # Surfaced, not swallowed: a request failure (network, auth, rate
+            # limit, missing tool) looks identical to "no match yet" unless
+            # logged explicitly -- silently defaulting to an empty list here
+            # made a real failure indistinguishable from a genuine miss in
+            # past runs. Sanitized before interpolation into the workflow
+            # command: the raw error could contain newlines or its own "::"
+            # sequences, which would otherwise break the ::warning:: across
+            # multiple lines or be misread as an unrelated workflow command.
+            if [[ -n "${gh_err}" ]]; then
+                safe_gh_err=$(_gha_sanitize_for_message "${gh_err}")
+                echo "::warning::listing runs for ${safe_workflow} (page ${page}) failed: ${safe_gh_err}" >&2
+            fi
+            run_id=$(jq -r --arg tag "${tag}" \
+                '[.[] | select(.head_branch == $tag and .event == "push")][0].id // empty' \
+                <<<"${runs}")
+            [[ -n "${run_id}" ]] && break
+            run_count=$(jq 'length' <<<"${runs}")
+            # Fewer than a full page means there's nothing more to page
+            # through -- stop for this poll. (Not stopping early based on
+            # each page's oldest created_at vs. this function's own start
+            # time -- clock skew between this self-hosted runner and
+            # GitHub's servers could make that comparison wrong, and this
+            # runner has already shown it isn't a standard environment.
+            # Searching all the way to the page cap is cheap insurance.)
+            (( run_count < 100 )) && break
+            (( page += 1 ))
+            (( page > 10 )) && break
+        done
+        [[ -n "${run_id}" ]] && break
+        if (( SECONDS - start >= timeout )); then
+            echo "::error::${safe_workflow} never started for tag ${safe_tag} within ${timeout}s -- a real push should trigger it, but no matching run appeared; the component tag exists without a real publish" >&2
+            return 1
         fi
-        if (( attempt < 3 )); then
-            echo "  check_osac_ui_image: git ls-remote attempt ${attempt}/3 failed, retrying in 5s..." >&2
-            sleep 5
-        fi
+        sleep "${interval}"
     done
 
-    if [[ -z "${sha}" || ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
-        safe_sha=$(_gha_sanitize_for_message "${sha}")
-        safe_repo=$(_gha_sanitize_for_message "${repo}")
-        echo "::error::Could not resolve ${safe_repo} main HEAD SHA (got: '${safe_sha}')" >&2
+    echo "Found ${safe_workflow} run ${run_id} for tag ${safe_tag}; waiting for it to finish..."
+    # gh run watch replaced with the same plain-curl approach as the listing
+    # above, for the same reason: gh itself is not available on this runner.
+    # Shares `start` (not a fresh timer of its own) with the listing phase,
+    # so "up to ${timeout}s" -- what this function's own opening message
+    # promises -- is the real combined budget for the whole function, not
+    # up to 2x that if a second, independent clock were started here.
+    # Surfaces request failures the same way as the listing phase too -- an
+    # unbounded `while true` here with silently-swallowed curl errors would
+    # just relocate the exact same class of silent hang instead of actually
+    # fixing it.
+    local run_status run_conclusion run_response run_http_code run_body
+    while true; do
+        curl_exit=0
+        remaining=$(( timeout - (SECONDS - start) ))
+        (( remaining < 5 )) && remaining=5
+        connect_timeout=$(( remaining < 10 ? remaining : 10 ))
+        run_response=$(curl -sS -w '\n%{http_code}' -K "${gh_curl_config}" \
+            --connect-timeout "${connect_timeout}" --max-time "${remaining}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GH_REPO}/actions/runs/${run_id}" 2>&1) || curl_exit=$?
+        if (( curl_exit != 0 )); then
+            safe_gh_err=$(_gha_sanitize_for_message "curl exited ${curl_exit}${run_response:+: ${run_response}}")
+            echo "::warning::checking run ${run_id} for ${safe_workflow} failed: ${safe_gh_err}" >&2
+        else
+            run_http_code="${run_response##*$'\n'}"
+            run_body="${run_response%$'\n'*}"
+            if [[ "${run_http_code}" == "200" ]]; then
+                # jq is guarded here (unlike the listing loop's jq calls,
+                # which only ever operate on runs='[]' or an already-parsed
+                # value) because run_body comes straight from the response
+                # body with no prior validation -- a malformed body would
+                # make jq exit non-zero, and this whole script runs under
+                # set -euo pipefail, so an unguarded assignment here would
+                # silently kill the job instead of going through this
+                # function's own error handling.
+                if run_status=$(jq -r '.status // empty' <<<"${run_body}" 2>/dev/null); then
+                    if [[ "${run_status}" == "completed" ]]; then
+                        run_conclusion=$(jq -r '.conclusion // empty' <<<"${run_body}" 2>/dev/null) || run_conclusion=""
+                        break
+                    fi
+                else
+                    safe_gh_err=$(_gha_sanitize_for_message "could not parse response as JSON: ${run_body}")
+                    echo "::warning::checking run ${run_id} for ${safe_workflow} failed: ${safe_gh_err}" >&2
+                fi
+            else
+                safe_gh_err=$(_gha_sanitize_for_message "HTTP ${run_http_code}: ${run_body}")
+                echo "::warning::checking run ${run_id} for ${safe_workflow} failed: ${safe_gh_err}" >&2
+            fi
+        fi
+        if (( SECONDS - start >= timeout )); then
+            echo "::error::${safe_workflow} run ${run_id} for tag ${safe_tag} did not reach a completed status within the remaining ${timeout}s budget (shared with the listing phase)" >&2
+            return 1
+        fi
+        sleep "${interval}"
+    done
+    if [[ "${run_conclusion}" != "success" ]]; then
+        echo "::error::${safe_workflow} run ${run_id} for tag ${safe_tag} did not succeed (conclusion: ${run_conclusion:-unknown}) -- the component tag exists without a completed publish" >&2
+        return 1
+    fi
+    echo "${safe_workflow} run ${run_id} for tag ${safe_tag} completed successfully."
+}
+
+# Usage: verify_component_publish <component> <version>
+# For a component this run just created a real <component>/vX.Y.Z tag for,
+# requires every one of its downstream tag-triggered publish workflows
+# (_component_publish_workflows) to have actually started and succeeded.
+# Requires GH_TOKEN/GH_REPO in the environment.
+verify_component_publish() {
+    local component="$1" version="$2"
+    local tag="${component}/v${version}"
+    local workflow_file workflows
+
+    # Captured into a variable (not piped via process substitution) so an
+    # unknown component's non-zero exit status is actually seen -- a `while
+    # read < <(...)` loop over empty stdout would otherwise iterate zero
+    # times and this function would return success, silently skipping
+    # verification entirely instead of failing loudly.
+    if ! workflows=$(_component_publish_workflows "${component}"); then
         return 1
     fi
 
-    tag="sha-${sha:0:7}"
-    safe_repo=$(_gha_sanitize_for_message "${repo}")
-    if ! token=$(http_json "Could not obtain GHCR token to verify ${safe_repo}:${tag}" 3 5 '.token' \
-        "https://ghcr.io/token?scope=repository:osac-project/${repo}:pull"); then
-        echo "::error::Could not obtain GHCR token to verify ${safe_repo}:${tag}" >&2
-        return 1
-    fi
-    if [[ -z "${token}" || "${token}" == "null" ]]; then
-        echo "::error::GHCR token is empty or null for ${safe_repo}:${tag}" >&2
-        return 1
-    fi
+    while IFS= read -r workflow_file; do
+        [[ -z "${workflow_file}" ]] && continue
+        wait_for_component_publish_workflow_run "${workflow_file}" "${tag}" || return 1
+    done <<< "${workflows}"
+}
 
-    if ! http_retry "${safe_repo} main HEAD ${sha:0:7} has no published image (tag ${tag})" 3 5 \
-        -s -o /dev/null \
-        -H "Authorization: Bearer ${token}" \
-        -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json" \
-        "https://ghcr.io/v2/osac-project/${repo}/manifests/${tag}"; then
-        echo "::error::${safe_repo} main HEAD ${sha:0:7} has no published image (tag ${tag})" >&2
-        return 1
-    fi
+# Usage: stamp_component_image_refs <component> <umbrella_values> <tag_value>
+# Stamps every values.yaml field (the component's own sub-chart plus the
+# umbrella's corresponding field) that references <component>'s image to
+# <tag_value>. Called twice per nightly run with two different tag_values:
+# once in `prepare` with the provisional sha-<short> tag (before the image
+# is even built, so E2E has something consistent to install), and once more
+# in `publish` with the final resolved nightly version (after every test box
+# passes and the image has been promoted via retag_component_image) --
+# publish's call re-stamps the same fields in place before packaging, so the
+# shipped chart's image tag literally equals the chart version. Components
+# with no image of their own (operator-crds, bmf-crds, csi-backends) are not
+# handled here -- there's nothing to stamp.
+stamp_component_image_refs() {
+    local component="$1" umbrella_values="$2" tag_value="$3"
 
-    echo "${sha}"
+    case "${component}" in
+        osac-operator)
+            TAG_VALUE="${tag_value}" yq -i '.image.tag = strenv(TAG_VALUE)' "osac-operator/charts/operator/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" operator image tag "${tag_value}"
+            ;;
+        bare-metal-fulfillment-operator)
+            TAG_VALUE="${tag_value}" yq -i '.image.tag = strenv(TAG_VALUE)' "bare-metal-fulfillment-operator/charts/operator/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" bmf image tag "${tag_value}"
+            ;;
+        fulfillment-service)
+            IMAGE_REF="ghcr.io/osac-project/fulfillment-service:${tag_value}" \
+                yq -i '.images.service = strenv(IMAGE_REF)' "fulfillment-service/charts/service/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" service images service "ghcr.io/osac-project/fulfillment-service:${tag_value}"
+            ;;
+        osac-aap)
+            IMAGE_REF="ghcr.io/osac-project/osac-aap:${tag_value}" \
+                yq -i '.bootstrap.image = strenv(IMAGE_REF)' "osac-aap/charts/aap/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" aap bootstrap image "ghcr.io/osac-project/osac-aap:${tag_value}"
+            # configAsCode.eeImage is the execution-environment image AAP's
+            # config-as-code sync uses (osac-aap/charts/aap/templates/config-as-code-secret.yaml)
+            # -- the same osac-aap image as bootstrap.image above, just a
+            # separate values.yaml field. Previously left at its committed
+            # "" placeholder in every published chart until this was fixed
+            # in OSAC-5183.
+            IMAGE_REF="ghcr.io/osac-project/osac-aap:${tag_value}" \
+                yq -i '.configAsCode.eeImage = strenv(IMAGE_REF)' "osac-aap/charts/aap/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" aap configAsCode eeImage "ghcr.io/osac-project/osac-aap:${tag_value}"
+            ;;
+        osac-metering)
+            TAG_VALUE="${tag_value}" yq -i '.image.tag = strenv(TAG_VALUE)' "osac-metering/charts/osac-metering/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" metering image tag "${tag_value}"
+            # m360Adapter has no umbrella-level override field -- stamp only
+            # the subchart's own values.yaml. Stamped unconditionally even
+            # though disabled by default: cheap, and avoids a stale
+            # provisional/placeholder tag surfacing the moment someone flips
+            # m360Adapter.enabled=true on a nightly install. (echoAdapter's
+            # image block is commented out by default in this chart -- only
+            # the vmaas-ci CI overlay enables and overrides it, stamped
+            # separately.)
+            TAG_VALUE="${tag_value}" yq -i '.m360Adapter.image.tag = strenv(TAG_VALUE)' "osac-metering/charts/osac-metering/values.yaml"
+            ;;
+        osac-csi-driver)
+            TAG_VALUE="${tag_value}" yq -i '.image.tag = strenv(TAG_VALUE)' "osac-csi-driver/charts/csi-driver/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" csiDriver image tag "${tag_value}"
+            ;;
+        osac-ui)
+            # osac-ui/charts/ui/templates/deployment.yaml reads .Values.images.ui.
+            IMAGE_REF="ghcr.io/osac-project/osac-ui:${tag_value}" \
+                yq -i '.images.ui = strenv(IMAGE_REF)' "osac-ui/charts/ui/values.yaml"
+            stamp_umbrella_nested_field "${umbrella_values}" ui images ui "ghcr.io/osac-project/osac-ui:${tag_value}"
+            ;;
+        *)
+            echo "::error::stamp_component_image_refs: unknown component '${component}'" >&2
+            return 1
+            ;;
+    esac
 }
 
 # Strip characters that break or inject GitHub Actions workflow commands.
@@ -139,6 +489,67 @@ read_validated_chart_name() {
     echo "${chart_name}"
 }
 
+# Usage: push_and_sign_chart <chart_tgz_path> <chart_name> <oci_repo>
+# Pushes a packaged chart to <oci_repo> (no oci:// prefix) and signs the
+# resulting OCI artifact keylessly with cosign, using the calling workflow's
+# GitHub Actions OIDC identity (Fulcio/Rekor). Requires cosign already
+# installed on PATH and the calling job to grant permissions: id-token: write.
+# Digest is parsed straight from `helm push`'s own stdout ("Digest:
+# sha256:...") -- skopeo/crane-style inspection doesn't support Helm's OCI
+# artifact media type, so there's no simpler way to resolve it.
+push_and_sign_chart() {
+    local chart_tgz="$1" chart_name="$2" oci_repo="$3"
+    local output digest status=0
+    local output_file
+    output_file=$(mktemp)
+    trap 'rm -f "${output_file}"' RETURN
+
+    # GHCR has been observed to fail the final "Tag" step of an OCI push
+    # with "not found" for a digest it was just handed -- a propagation
+    # delay on the registry side (confirmed live: the identical push
+    # succeeded for every other chart in the same job seconds earlier, and
+    # the next nightly run's identical push succeeded outright). Retry a
+    # few times via the shared retry_command helper before giving up.
+    #
+    # helm's output goes to a file rather than a `local output=$(...)`
+    # capture so retry_command can drive the retry loop itself: a bare
+    # assignment like that makes its exit status the exit status of the
+    # command substitution, which under set -e would abort the function
+    # right here on a failed push, before the "echo output" below ever
+    # runs, silently discarding the one place helm's real error text lives
+    # (confirmed live: a real push failure produced zero diagnostic output,
+    # just "Process completed with exit code 1").
+    retry_command 60 10 bash -c 'helm push "$1" "oci://$2" > "$3" 2>&1' _ \
+        "${chart_tgz}" "${oci_repo}" "${output_file}" || status=$?
+    output=$(cat "${output_file}")
+    echo "${output}"
+    if [[ "${status}" -ne 0 ]]; then
+        echo "::error::helm push failed for ${chart_name} (exit ${status}) -- see output above" >&2
+        return "${status}"
+    fi
+
+    digest=$(grep -oE '^Digest: sha256:[0-9a-f]+' <<<"${output}" | cut -d' ' -f2)
+    if [[ -z "${digest}" ]]; then
+        echo "::error::Could not parse digest from helm push output for ${chart_name}" >&2
+        return 1
+    fi
+
+    # `|| status=$?` (not `if ! cosign ...; then status=$?`) for two
+    # reasons: `!` inverts $? itself, so a `then`-block `status=$?` would
+    # capture the inverted 0/1 boolean, not cosign's real exit code
+    # (confirmed live: that form reported a real signing failure as
+    # status 0); and leaving this as a bare last statement is aborted by
+    # errexit without ever running the RETURN trap above (also confirmed
+    # live -- unlike an explicit `return`, errexit on a function's last
+    # command skips RETURN traps entirely), which would leak output_file.
+    cosign sign --yes "${oci_repo}/${chart_name}@${digest}" || status=$?
+    if [[ "${status}" -ne 0 ]]; then
+        echo "::error::cosign sign failed for ${chart_name} (exit ${status})" >&2
+        rm -f "${output_file}"
+        return "${status}"
+    fi
+}
+
 # Usage: compute_nightly_chart_version <base_tag> <nightly_suffix>
 compute_nightly_chart_version() {
     local base_tag="$1" nightly_suffix="$2"
@@ -146,30 +557,92 @@ compute_nightly_chart_version() {
     printf '%s-%s' "${base_version}" "${nightly_suffix}"
 }
 
-# Usage: osac_ui_nightly_image_ref <image_repo> <short_sha>
-osac_ui_nightly_image_ref() {
-    local image_repo="$1" short_sha="$2"
-    printf '%s:sha-%s' "${image_repo}" "${short_sha}"
-}
+# Usage: stamp_umbrella_nested_field <values_yaml> <top_key> <nested_key> <leaf_key> <new_value> [optional]
+# Awk-based rewrite of a single "<top_key>:\n  <nested_key>:\n    <leaf_key>: <value>"
+# scalar field, preserving every other line byte-for-byte.
+#
+# Uses awk instead of yq -i because yq reformats the entire YAML file on
+# write — removing blank lines and normalizing inline comment spacing from
+# 2 spaces to 1 space before '#'. This causes ct lint's yamllint (which
+# requires 2-space comment padding via ~/.ct/lintconf.yaml) to fail during
+# the nightly publish job. awk preserves all formatting outside the target
+# line.
+#
+# If [optional] is passed as a truthy 6th arg, a field not found in this
+# file is a silent no-op (return 0) instead of a hard error — needed for CI
+# overlay files, where not every environment overrides every component's
+# image. Without it (the umbrella chart's own values.yaml, where every
+# field is a mandatory always-present placeholder), a miss is a hard
+# ::error::/return 1, since that would indicate real corruption.
+stamp_umbrella_nested_field() {
+    local values_yaml="$1" top_key="$2" nested_key="$3" leaf_key="$4" new_value="$5"
+    local optional="${6:-false}"
+    local safe_values_yaml tmp
 
-# Usage: stamp_umbrella_ui_image_ref <values_yaml> <image_ref>
-stamp_umbrella_ui_image_ref() {
-    local values_yaml="$1" image_ref="$2"
-    local safe_values_yaml
     if [[ ! -f "${values_yaml}" ]]; then
         safe_values_yaml=$(_gha_sanitize_for_message "${values_yaml}")
-        echo "::warning title=Missing values file::Values file not found: ${safe_values_yaml} — skipping ui.images.ui stamp" >&2
+        echo "::warning title=Missing values file::Values file not found: ${safe_values_yaml} — skipping ${top_key}.${nested_key}.${leaf_key} stamp" >&2
         return 0
     fi
-    IMAGE_REF="${image_ref}" yq -i '.ui.images.ui = strenv(IMAGE_REF)' "${values_yaml}"
+
+    tmp="$(mktemp)"
+    if ! awk -v top="${top_key}:" -v nested_pat="^[[:space:]]+${nested_key}:" \
+            -v leaf="${leaf_key}" -v val="${new_value}" '
+        BEGIN { in_top=0; in_nested=0; stamped=0; nested_indent="" }
+        $0 == top { in_top=1; in_nested=0; nested_indent=""; print; next }
+        /^[^ #\t]/ && $0 != top { in_top=0; in_nested=0; nested_indent="" }
+        in_top && $0 ~ nested_pat {
+            match($0, /^[[:space:]]+/)
+            nested_indent = substr($0, RSTART, RLENGTH) "  "
+            in_nested=1
+            print
+            next
+        }
+        in_nested && nested_indent != "" && match($0, "^" nested_indent leaf ":[[:space:]]") {
+            print nested_indent leaf ": " val
+            in_nested=0
+            stamped=1
+            next
+        }
+        { print }
+        END { exit(stamped ? 0 : 1) }
+    ' "${values_yaml}" > "${tmp}"; then
+        rm -f "${tmp}"
+        if [[ "${optional}" == true ]]; then
+            return 0
+        fi
+        safe_values_yaml=$(_gha_sanitize_for_message "${values_yaml}")
+        echo "::error::${top_key}.${nested_key}.${leaf_key} not found in ${safe_values_yaml}" >&2
+        return 1
+    fi
+    chmod --reference="${values_yaml}" "${tmp}"
+    mv "${tmp}" "${values_yaml}"
+    if ! grep -qF "${new_value}" "${values_yaml}"; then
+        safe_values_yaml=$(_gha_sanitize_for_message "${values_yaml}")
+        echo "::error::Failed to stamp ${top_key}.${nested_key}.${leaf_key} in ${safe_values_yaml}" >&2
+        return 1
+    fi
 }
 
-# Usage: stamp_umbrella_ui_values <image_ref>
-stamp_umbrella_ui_values() {
-    local image_ref="$1" values_yaml
-    for values_yaml in "${NIGHTLY_UMBRELLA_UI_VALUES[@]}"; do
-        stamp_umbrella_ui_image_ref "${values_yaml}" "${image_ref}"
-    done
+# Usage: stamp_ci_overlay_if_present <values_yaml> <yq_path> <new_value>
+# Stamps an arbitrary-depth field (e.g. .metering.echoAdapter.image.tag) in a
+# CI overlay file (osac-installer/values/*/instance.yaml), only if that path
+# already resolves to a non-null value in the file -- `yq -e <path> <file>`
+# exits non-zero when the path is absent/null, which we use purely as an
+# existence check (its own stdout/stderr is discarded). This avoids yq -i's
+# default auto-vivification behavior, which would otherwise silently create
+# a whole new key structure (e.g. add a `csiDriver:` block) in overlay files
+# that don't already configure that component. Unlike
+# stamp_umbrella_nested_field, this uses yq -i directly (not awk): these CI
+# overlay files are not yamllint/ct-lint-checked anywhere in this pipeline,
+# and changes here only ever live on the ephemeral nightly/* temp branch
+# (never merged, deleted by the cleanup job), so yq's whole-file comment
+# reformatting has no consequence.
+stamp_ci_overlay_if_present() {
+    local values_yaml="$1" yq_path="$2" new_value="$3"
+    if yq -e "${yq_path}" "${values_yaml}" > /dev/null 2>&1; then
+        VALUE="${new_value}" yq -i "${yq_path} = strenv(VALUE)" "${values_yaml}"
+    fi
 }
 
 # Usage: _chart_slack_rank <chart_name>
@@ -262,12 +735,12 @@ _slack_version_cell_linked() {
     printf '%s%*s' "${linked}" "${pad}" ""
 }
 
-# Usage: _build_slack_charts_table <manifest_file> [linked] [repo_owner] [gh_token]
+# Usage: _build_slack_charts_table <manifest_file> [linked] [repo_owner]
+# Reads GH_TOKEN from environment when linked=true.
 _build_slack_charts_table() {
     local manifest_file="$1"
     local linked="${2:-false}"
     local repo_owner="${3:-}"
-    local gh_token="${4:-}"
     local -a names=() versions=() urls=()
     local chart_name version display_name url
     local name_w=5 version_w=7
@@ -277,7 +750,7 @@ _build_slack_charts_table() {
         while read -r chart_name version _short_sha _full_sha; do
             [[ -z "${chart_name}" ]] && continue
             display_name=$(_slack_display_name "${chart_name}")
-            url=$(chart_version_url "${chart_name}" "${version}" "${repo_owner}" "${gh_token}")
+            url=$(chart_version_url "${chart_name}" "${version}" "${repo_owner}")
             names+=("${display_name}")
             versions+=("${version}")
             urls+=("${url}")
@@ -318,46 +791,65 @@ _build_slack_charts_table() {
     printf '%s' "${table}"
 }
 
-# Usage: rewrite_umbrella_osac_ui_dependency <chart_yaml> <ui_version> <oci_repo>
-rewrite_umbrella_osac_ui_dependency() {
-    local chart_yaml="$1" ui_version="$2" oci_repo="$3"
+# Usage: rewrite_umbrella_dependency <chart_yaml> <dep_name> <version> <oci_repo>
+# yamllint is not performed on Chart.yaml. Hence, use of yq is safe here.
+rewrite_umbrella_dependency() {
+    local chart_yaml="$1" dep_name="$2" version="$3" oci_repo="$4"
     local safe_chart_yaml
     if [[ ! -f "${chart_yaml}" ]]; then
         safe_chart_yaml=$(_gha_sanitize_for_message "${chart_yaml}")
         echo "::error::Chart manifest not found: ${safe_chart_yaml}" >&2
         return 1
     fi
-    UI_VERSION="${ui_version}" yq -i \
-        '(.dependencies[] | select(.name == "osac-ui")).version = strenv(UI_VERSION)' \
+    DEP_NAME="${dep_name}" DEP_VERSION="${version}" yq -i \
+        '(.dependencies[] | select(.name == strenv(DEP_NAME))).version = strenv(DEP_VERSION)' \
         "${chart_yaml}"
-    UI_REPO="${oci_repo}" yq -i \
-        '(.dependencies[] | select(.name == "osac-ui")).repository = strenv(UI_REPO)' \
+    DEP_NAME="${dep_name}" DEP_REPO="${oci_repo}" yq -i \
+        '(.dependencies[] | select(.name == strenv(DEP_NAME))).repository = strenv(DEP_REPO)' \
         "${chart_yaml}"
 }
 
-# Usage: rewrite_umbrella_osac_ui_dependency_and_rebuild <chart_yaml> <ui_version> <oci_repo>
-rewrite_umbrella_osac_ui_dependency_and_rebuild() {
-    local chart_yaml="$1" ui_version="$2" oci_repo="$3"
-    local chart_dir
-    chart_dir=$(dirname "${chart_yaml}")
+# Usage: rewrite_umbrella_mono_repo_dependencies <chart_yaml> <oci_repo> <component_versions_json> [skipped_file]
+# Rewrite every umbrella dependency (see MONO_REPO_UMBRELLA_DEPENDENCIES)
+# from its committed file:// path to a pinned oci:// reference, for every
+# dependency whose owning
+# component has a resolved version in component_versions_json (a JSON map
+# of component name -> version, same shape as nightly-build.yaml's
+# COMPONENT_VERSIONS output). A dependency whose owning component has no
+# resolved version is left on its committed file:// path -- mirrors how the
+# nightly build already skips packaging/publishing that component's
+# sub-chart entirely when it has no release tag yet, so there is nothing to
+# point the umbrella at. That's an expected, non-error state (e.g. a
+# brand-new component with no release cut yet), so it's still a ::warning::
+# here, not a failure -- but a raw log warning is easy to miss on an
+# otherwise-green nightly run, so also record it (one "<dep_name> (<component>:
+# no resolved version this run)" line per skip) to skipped_file when given,
+# so a caller can surface it somewhere a human actually looks (see
+# build_slack_skipped_umbrella_dependencies_summary).
+rewrite_umbrella_mono_repo_dependencies() {
+    local chart_yaml="$1" oci_repo="$2" component_versions_json="$3" skipped_file="${4:-}"
+    local entry dep_name component version
 
-    rewrite_umbrella_osac_ui_dependency "${chart_yaml}" "${ui_version}" "${oci_repo}"
-    rm -f "${chart_dir}/Chart.lock"
-    helm dependency build "${chart_dir}/"
+    for entry in "${MONO_REPO_UMBRELLA_DEPENDENCIES[@]}"; do
+        dep_name="${entry%%:*}"
+        component="${entry#*:}"
+        version=$(jq -r --arg k "${component}" '.[$k] // empty' <<<"${component_versions_json}")
+        if [[ -z "${version}" ]]; then
+            echo "::warning::Skipping OCI rewrite for ${dep_name} — no resolved version for ${component} this run (stays on its committed file:// path)" >&2
+            if [[ -n "${skipped_file}" ]]; then
+                printf '%s (%s: no resolved version this run)\n' "${dep_name}" "${component}" >> "${skipped_file}"
+            fi
+            continue
+        fi
+        rewrite_umbrella_dependency "${chart_yaml}" "${dep_name}" "${version}" "${oci_repo}"
+    done
 }
 
-# Usage: stamp_osac_ui_chart <chart_dir> <sub_version> <image_ref>
-stamp_osac_ui_chart() {
-    local chart_dir="$1" sub_version="$2" image_ref="$3"
-    # osac-ui/charts/ui/templates/deployment.yaml reads .Values.images.ui
-    SUB_VERSION="${sub_version}" yq -i '.version = strenv(SUB_VERSION)' "${chart_dir}/Chart.yaml"
-    SUB_VERSION="${sub_version}" yq -i '.appVersion = strenv(SUB_VERSION)' "${chart_dir}/Chart.yaml"
-    IMAGE_REF="${image_ref}" yq -i '.images.ui = strenv(IMAGE_REF)' "${chart_dir}/values.yaml"
-}
-
-# Usage: chart_version_url <chart_name> <version> <repo_owner> <gh_token>
+# Usage: chart_version_url <chart_name> <version> <repo_owner>
+# Reads GH_TOKEN from environment.
 chart_version_url() {
-    local chart_name="$1" version="$2" repo_owner="$3" gh_token="$4"
+    local chart_name="$1" version="$2" repo_owner="$3"
+    local gh_token="${GH_TOKEN:-}"
     local encoded_version response url
 
     if [[ ! "${chart_name}" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -415,15 +907,82 @@ _osac_ui_source_from_manifest() {
     done < "${manifest_file}"
 }
 
-# Usage: build_slack_charts_published_summary <manifest_file> <repo_owner> <gh_token>
+# Usage: build_slack_images_published_summary <images_file>
+# Wraps images.txt's content in a fenced code block for Slack -- same
+# rationale as build_slack_charts_published_summary's table: unfenced,
+# Slack reflows the plain-text list into a proportional font and long
+# image refs wrap awkwardly. This is the one place a nightly's exact,
+# already-promoted image tags show up without downloading the run
+# artifact -- the Slack message a nightly success already sends to
+# everyone, rather than something you have to know to go look for.
+build_slack_images_published_summary() {
+    local images_file="$1"
+    local content truncated last_line_boundary
+
+    if [[ ! -f "${images_file}" ]]; then
+        echo "::warning title=build_slack_images_published_summary::images.txt not found: ${images_file}" >&2
+        return 0
+    fi
+
+    content=$(<"${images_file}")
+    # Slack's own block.text.text limit is 3000 chars; images.txt isn't
+    # expected to get anywhere near that today, but truncate defensively
+    # rather than have the whole Slack API call fail on some future
+    # component explosion. Cut at the last newline at or before the limit
+    # (not a hard byte count) so a truncated message never ends mid-line
+    # with a broken, unusable image reference.
+    if (( ${#content} > 2800 )); then
+        truncated="${content:0:2800}"
+        last_line_boundary="${truncated%$'\n'*}"
+        if [[ "${last_line_boundary}" != "${truncated}" ]]; then
+            truncated="${last_line_boundary}"
+        fi
+        content="${truncated}"$'\n... (truncated -- see the workflow run artifact for the full list)'
+    fi
+
+    printf '*Images published:*\n```\n%s\n```' "${content}"
+}
+
+# Usage: build_slack_skipped_umbrella_dependencies_summary <skipped_file>
+# Surface any umbrella dependency that stayed on its committed file:// path
+# this run (no resolved release tag yet for its owning component -- see
+# rewrite_umbrella_mono_repo_dependencies) in the same Slack message every
+# other nightly success is already posted to, since nothing about a green
+# nightly run otherwise prompts anyone to go looking for this in the raw
+# job logs. Unlike build_slack_images_published_summary, a missing or empty
+# skipped_file is the expected common case (every mono-repo component
+# already has a release tag most nights) -- not a warning, just an empty
+# string so the caller omits this Slack block entirely.
+build_slack_skipped_umbrella_dependencies_summary() {
+    local skipped_file="$1"
+    local content
+
+    if [[ ! -s "${skipped_file}" ]]; then
+        return 0
+    fi
+
+    content=$(<"${skipped_file}")
+    printf ':warning: *Umbrella dependencies still on `file://` this run (no release tag yet):*\n```\n%s\n```' "${content}"
+}
+
+# Usage: build_slack_charts_published_summary <manifest_file> <repo_owner>
+# Reads GH_TOKEN from environment.
 build_slack_charts_published_summary() {
-    local manifest_file="$1" repo_owner="$2" gh_token="$3"
+    local manifest_file="$1" repo_owner="$2"
     local table ui_source
 
-    table=$(_build_slack_charts_table "${manifest_file}" true "${repo_owner}" "${gh_token}")
+    table=$(_build_slack_charts_table "${manifest_file}" true "${repo_owner}")
 
-    # Plain mrkdwn (no code fence): linked version cells use <url|text> markup.
-    printf '*Charts published:*\n%s' "${table}"
+    # Wrapped in a triple-backtick code fence to keep the box-drawing table
+    # monospace-aligned -- unfenced, Slack renders it in a proportional font
+    # and the columns don't line up (confirmed live: a real posted message
+    # without the fence showed a jagged, misaligned table). The fence does
+    # NOT break the <url|text> link markup used for the per-chart GHCR links
+    # -- also confirmed live: an earlier fenced message still rendered the
+    # linked version cell as a real, clickable, underlined link with a
+    # working preview tooltip. Slack supports both at once; the previous
+    # comment here assumed otherwise, which was the actual bug.
+    printf '*Charts published:*\n```\n%s\n```' "${table}"
 
     ui_source=$(_osac_ui_source_from_manifest "${manifest_file}") || true
     if [[ -n "${ui_source}" ]]; then

@@ -1,5 +1,18 @@
 # BMaaS CI environment -- instance values for osac chart.
 
+# --- Service Enablement ---
+global:
+  osacDeploymentId: "ci/osac"
+  services:
+    caas:
+      enabled: false
+    vmaas:
+      enabled: false
+    bmaas:
+      enabled: true
+    maas:
+      enabled: false
+
 # --- Operator ---
 operator:
   image:
@@ -17,12 +30,10 @@ operator:
     serverAddress: "fulfillment-internal-api:8001"
     tokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token"
   controllers:
-    clusterOrder: false
-    computeInstance: false
     tenant: true
     networking: true
+    networkingProvisioning: false
     storage: true
-    bareMetalInstance: true
   hubAccess:
     enabled: true
   tenants:
@@ -44,7 +55,9 @@ service:
     caBundle:
       configMap: ca-bundle
   auth:
-    issuerUrl: https://keycloak.keycloak.svc.cluster.local/realms/osac
+    # issuerUrl defaults to a global.clusterDomain-backed external route URL
+    # (see charts/osac/values.yaml) -- correct automatically once
+    # install-osac sets --set global.clusterDomain=$(DOMAIN).
     emergencyServiceAccounts:
     - admin
     - osac-operator
@@ -61,7 +74,9 @@ service:
           param: client-secret
   idp:
     provider: keycloak
-    url: https://keycloak.keycloak.svc.cluster.local
+    # url defaults to a global.clusterDomain-backed external route URL (see
+    # charts/osac/values.yaml) -- correct automatically once install-osac
+    # sets --set global.clusterDomain=$(DOMAIN).
     credentials:
     - secret:
         name: fulfillment-controller-credentials
@@ -89,13 +104,13 @@ service:
   log:
     level: debug
   vault:
-    endpoint: "https://openbao.osac.svc.cluster.local:8200"
+    # endpoint and keycloakIssuerUrl both default correctly (see
+    # charts/osac/values.yaml) -- no override needed.
     namespace: osac
     kvMountPath: secret
     lifecycleRole: lifecycle
     lifecycleMountPath: jwt
     keycloakClientId: osac-controller
-    keycloakIssuerUrl: "https://keycloak.keycloak.svc.cluster.local/realms/osac"
     keycloakAudience: osac-api
     caBundle:
       configMap: ca-bundle
@@ -150,7 +165,6 @@ validation:
 
 # --- Bare Metal Fulfillment Operator ---
 bmf:
-  enabled: true
   image:
     repository: ghcr.io/osac-project/bare-metal-fulfillment-operator
     tag: latest
@@ -158,11 +172,27 @@ bmf:
   env:
     aapUrl: "http://osac-aap/api/controller"
     aapInsecureSkipVerify: "true"
+    enableNetworkingProvisioning: "false"
+  metal3:
+    enabled: true
+    namespace: host-inventory
+    hostClass: metal3
 
 # --- Hub Access ---
 hubAccess:
   enabled: true
 
+networkManagers:
+  - name: netris
+    role: fabric
+    description: "Netris SDN fabric manager"
+    capabilities: "ipv4"
+
 # --- LVMS StorageBackend registration ---
 lvms:
+  enabled: true
+
+# Bundled PostgreSQL: single-pod ephemeral database for testing.
+# Uses fsync=off — data is lost on restart. Not for production.
+bundledPostgres:
   enabled: true
