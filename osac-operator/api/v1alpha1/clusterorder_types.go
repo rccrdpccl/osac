@@ -106,13 +106,21 @@ type ClusterNetworkAttachment struct {
 }
 
 type NodeRequest struct {
-	// ResourceClass describes the type of node you are requesting
-	// +kubebuilder:validation:Required
-	ResourceClass string `json:"resourceClass"`
+	// ResourceClass describes the type of node you are requesting.
+	//
+	// Retained for backward compatibility; superseded by BareMetal.InstanceType and slated
+	// for removal in OSAC-4154. New callers should set BareMetal instead.
+	// +kubebuilder:validation:Optional
+	ResourceClass string `json:"resourceClass,omitempty"`
 	// NumberOfNodes describes the number of nodes you want of the given resource class
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=1
 	NumberOfNodes int `json:"numberOfNodes"`
+	// BareMetal holds bare-metal-specific configuration for this node set.
+	// When set, this node request targets bare-metal workers.
+	// Mutually exclusive with future platform variants (e.g. Virtual).
+	// +kubebuilder:validation:Optional
+	BareMetal *BareMetalNodeSpec `json:"bareMetal,omitempty"`
 	// FabricInterface is the host NIC name used for tenant network traffic.
 	// When set, IP discovery filters Agent inventory interfaces by this name,
 	// preventing the provisioning NIC address from being returned.
@@ -120,6 +128,30 @@ type NodeRequest struct {
 	// expansion; may also be set explicitly.
 	// +kubebuilder:validation:Optional
 	FabricInterface string `json:"fabricInterface,omitempty"`
+}
+
+// BareMetalNodeSpec holds configuration specific to bare-metal node requests.
+type BareMetalNodeSpec struct {
+	// InstanceType names the BareMetalInstanceType (hardware profile) for the
+	// nodes in this request.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	InstanceType string `json:"instanceType"`
+}
+
+// IsBareMetal reports whether this node request targets bare-metal workers.
+func (nr NodeRequest) IsBareMetal() bool {
+	return nr.BareMetal != nil
+}
+
+// HasBareMetalNodeSet reports whether the ClusterOrder requests any bare-metal node set.
+func (co *ClusterOrder) HasBareMetalNodeSet() bool {
+	for i := range co.Spec.NodeRequests {
+		if co.Spec.NodeRequests[i].IsBareMetal() {
+			return true
+		}
+	}
+	return false
 }
 
 // ClusterOrderPhaseType is a valid value for .status.phase
@@ -214,54 +246,89 @@ type ClusterOrderStatus struct {
 	// +kubebuilder:validation:Optional
 	IngressEndpoint string `json:"ingressEndpoint,omitempty"`
 
-	// NodeSets holds per-node-set networking status, populated by the
-	// operator during agent selection and networking reconciliation.
+	// DesiredWorkers is the total number of workers requested across all node sets.
+	// Populated by the BareMetalWorkerReconciler from Workers.
+	// +kubebuilder:validation:Optional
+	DesiredWorkers *int32 `json:"desiredWorkers,omitempty"`
+
+	// CurrentWorkers is the number of workers in a non-terminal phase
+	// (Provisioning, WaitingForAgent, Binding, or Ready).
+	// Populated by the BareMetalWorkerReconciler.
+	// +kubebuilder:validation:Optional
+	CurrentWorkers *int32 `json:"currentWorkers,omitempty"`
+
+	// ReadyWorkers is the number of workers in the Ready phase.
+	// Populated by the BareMetalWorkerReconciler.
+	// +kubebuilder:validation:Optional
+	ReadyWorkers *int32 `json:"readyWorkers,omitempty"`
+
+	// Workers holds per-worker lifecycle state for CaaS-managed worker resources.
+	// Populated by and owned by the BareMetalWorkerReconciler, which also owns the
+	// aggregate counts above.
 	// +kubebuilder:validation:Optional
 	// +listType=map
 	// +listMapKey=name
-	NodeSets []NodeSetStatus `json:"nodeSets,omitempty"`
+	Workers []WorkerStatus `json:"workers,omitempty"`
 }
 
-// NodeSetStatus holds networking status for a single node set.
-type NodeSetStatus struct {
-	// Name is the node set identifier (matches the ClusterNodeSet key).
+// WorkerStatus holds the lifecycle state of a single CaaS-managed worker resource.
+type WorkerStatus struct {
+	// NodeSet identifies which node set this worker belongs to (e.g. "compute", "gpu").
+	// +kubebuilder:validation:Required
+	NodeSet string `json:"nodeSet"`
+
+	// InstanceType is the BareMetalInstanceType (hardware profile) this worker was
+	// provisioned from. Exposed as the instance_type metric label; sourced from
+	// spec.nodeRequests[].bareMetal.instanceType (not the deprecated resourceClass).
+	// +kubebuilder:validation:Optional
+	InstanceType string `json:"instanceType,omitempty"`
+
+	// Name is the worker slot name (e.g. "bm-cluster-a-worker-0"), unique within the cluster.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// FabricInterface is the host NIC used for tenant network traffic,
-	// resolved from the node set's HostType NetworkInterface list.
-	// +kubebuilder:validation:Optional
-	FabricInterface string `json:"fabricInterface,omitempty"`
-
-	// Agents holds per-agent networking status within this node set.
-	// +kubebuilder:validation:Optional
-	// +listType=map
-	// +listMapKey=agentName
-	Agents []AgentStatus `json:"agents,omitempty"`
-}
-
-// AgentStatus holds networking status for a single agent (bare-metal host)
-// within a node set.
-type AgentStatus struct {
-	// AgentName is the name of the Agent CR, used for NodePool targeting.
+	// Kind of the backing resource (e.g. BareMetalInstance).
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:MinLength=1
-	AgentName string `json:"agentName"`
+	Kind string `json:"kind"`
 
-	// HostName is the bare-metal server name used by the network dispatcher.
-	// Absent when the agent does not carry the netris.server/name label (e.g. CI environments).
+	// ResourceID is the fulfillment-service resource ID of the backing object.
 	// +kubebuilder:validation:Optional
-	HostName string `json:"hostName,omitempty"`
+	ResourceID string `json:"resourceID,omitempty"`
 
-	// SubnetRef is the name of the Subnet CR the agent is connected to.
-	// +kubebuilder:validation:Optional
-	SubnetRef string `json:"subnetRef,omitempty"`
+	// Phase of the worker lifecycle.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=Provisioning;WaitingForAgent;Binding;Ready;Failed;Unbinding;Deleting
+	Phase string `json:"phase"`
 
-	// IPAddress is the agent's IPv4 address on the tenant subnet,
-	// discovered from the Agent CR status after DHCP assignment.
+	// CreationTimestamp is when this worker entry was first created.
+	// +kubebuilder:validation:Required
+	CreationTimestamp metav1.Time `json:"creationTimestamp"`
+
+	// AttemptCount tracks how many times this worker slot has been provisioned.
+	AttemptCount int32 `json:"attemptCount"`
+
+	// LastFailureReason is a machine-readable reason for the last failure
+	// (e.g. AgentRegistrationTimeout).
 	// +kubebuilder:validation:Optional
-	IPAddress string `json:"ipAddress,omitempty"`
+	LastFailureReason string `json:"lastFailureReason,omitempty"`
+
+	// LastFailureMessage is a human-readable description of the last failure.
+	// +kubebuilder:validation:Optional
+	LastFailureMessage string `json:"lastFailureMessage,omitempty"`
+
+	// LastFailureTime is when the last failure occurred.
+	// +kubebuilder:validation:Optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+
+	// NextRetryTime is when the controller will attempt the next retry.
+	// +kubebuilder:validation:Optional
+	NextRetryTime *metav1.Time `json:"nextRetryTime,omitempty"`
+
+	// ReadySince is when the worker first transitioned to Ready after the most recent retry.
+	// Used to determine when attemptCount can be reset after MinHealthyDuration.
+	// +kubebuilder:validation:Optional
+	ReadySince *metav1.Time `json:"readySince,omitempty"`
 }
 
 // +kubebuilder:object:root=true

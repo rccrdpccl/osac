@@ -28,6 +28,12 @@ const (
 	ConditionCompleted             = "Completed"
 	ConditionAvailable             = "Available"
 	ConditionReady                 = "Ready"
+
+	// CaaS bare-metal worker provisioning conditions (OSAC-2135).
+	ConditionInfraEnvReady                 = "InfraEnvReady"
+	ConditionWorkersFailed                 = "WorkersFailed"
+	ConditionRHCOSImageNotFound            = "RHCOSImageNotFound"
+	ConditionFulfillmentServiceUnavailable = "FulfillmentServiceUnavailable"
 )
 
 // Common reason constants

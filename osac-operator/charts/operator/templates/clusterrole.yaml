@@ -5,6 +5,18 @@ metadata:
   labels:
     {{- include "osac-operator.labels" . | nindent 4 }}
 rules:
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
@@ -23,6 +35,7 @@ rules:
   resources:
   - secrets
   verbs:
+  - create
   - get
   - list
   - watch
@@ -32,6 +45,36 @@ rules:
   - services
   verbs:
   - get
+- apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - agents
+  verbs:
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - infraenvs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - update
 - apiGroups:
   - events.k8s.io
   resources:
@@ -43,19 +86,21 @@ rules:
   - hypershift.openshift.io
   resources:
   - hostedclusters
-  - nodepools
+  - hostedcontrolplanes
   verbs:
   - get
   - list
   - watch
-# hostedcontrolplanes: get only — storage controller reads the kubeconfig secret name,
-# no watch/list needed (looked up by name from the ClusterOrder).
 - apiGroups:
   - hypershift.openshift.io
   resources:
-  - hostedcontrolplanes
+  - nodepools
   verbs:
   - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - k8s.ovn.org
   resources:
@@ -79,23 +124,19 @@ rules:
   - list
   - watch
 - apiGroups:
-  - osac.openshift.io
+  - metallb.io
   resources:
-  - baremetalinstances
-  - clusterorders
-  - computeinstances
-  - externalipattachments
-  - externalippools
-  - externalips
-  - natgateways
-  - securitygroups
-  - subnets
-  - tenants
-  - virtualnetworks
-  - volumes
+  - ipaddresspools
   verbs:
   - create
   - delete
+  - get
+  - update
+- apiGroups:
+  - osac.openshift.io
+  resources:
+  - baremetalinstances
+  verbs:
   - get
   - list
   - patch
@@ -121,7 +162,28 @@ rules:
 - apiGroups:
   - osac.openshift.io
   resources:
-  - baremetalinstances/status
+  - clusterorders
+  - computeinstances
+  - externalipattachments
+  - externalippools
+  - externalips
+  - natgateways
+  - securitygroups
+  - subnets
+  - tenants
+  - virtualnetworks
+  - volumes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - osac.openshift.io
+  resources:
   - clusterorders/status
   - computeinstances/status
   - externalipattachments/status
