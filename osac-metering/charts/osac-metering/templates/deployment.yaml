@@ -66,8 +66,6 @@ spec:
               value: {{ include "osac-metering.kafkaClusterNamespace" . }}
             - name: SASL_SECRET
               value: {{ include "osac-metering.kafkaSaslSecretName" . }}
-            - name: CA_SECRET
-              value: {{ include "osac-metering.kafkaCaSecret" . }}
           volumeMounts:
             - name: kafka-secrets
               mountPath: /etc/kafka-secrets
@@ -106,16 +104,16 @@ spec:
               }
 
               wait_for_secret "${SASL_SECRET}" "${SOURCE_NS}"
-              wait_for_secret "${CA_SECRET}" "${SOURCE_NS}"
 
               oc get secret "${SASL_SECRET}" -n "${SOURCE_NS}" -o jsonpath='{.data.password}' | base64 -d > /etc/kafka-secrets/password
-              oc get secret "${CA_SECRET}" -n "${SOURCE_NS}" -o jsonpath='{.data.ca\.crt}' | base64 -d > /etc/kafka-secrets/ca.crt
-              echo "Kafka secrets fetched."
+              echo "Kafka SASL secret fetched."
       containers:
         - name: {{ include "osac-metering.name" . }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            - name: METERING_DEPLOYMENT_ID
+              value: {{ include "osac-metering.osacDeploymentId" . | quote }}
             - name: FULFILLMENT_SERVER_ADDRESS
               value: {{ ((.Values.fulfillment).address) | default (printf "fulfillment-internal-api.%s.svc.cluster.local:8001" .Release.Namespace) | quote }}
             - name: TLS_CA_CERT
@@ -129,11 +127,27 @@ spec:
             - name: KAFKA_BROKERS
               value: {{ include "osac-metering.kafkaBrokers" . | quote }}
             - name: KAFKA_TLS_CA_CERT
-              value: /etc/kafka-secrets/ca.crt
+              value: /etc/ca-bundle/bundle.pem
             - name: KAFKA_SASL_USERNAME
               value: {{ include "osac-metering.kafkaSaslUsername" . | quote }}
             - name: KAFKA_SASL_PASSWORD_FILE
               value: /etc/kafka-secrets/password
+            {{- if include "osac-metering.serviceEnabled" (list . "caas") }}
+            - name: ENABLE_CAAS
+              value: "true"
+            {{- end }}
+            {{- if include "osac-metering.serviceEnabled" (list . "vmaas") }}
+            - name: ENABLE_VMAAS
+              value: "true"
+            {{- end }}
+            {{- if include "osac-metering.serviceEnabled" (list . "bmaas") }}
+            - name: ENABLE_BMAAS
+              value: "true"
+            {{- end }}
+            {{- if include "osac-metering.serviceEnabled" (list . "maas") }}
+            - name: ENABLE_MAAS
+              value: "true"
+            {{- end }}
           volumeMounts:
             - name: kafka-secrets
               mountPath: /etc/kafka-secrets

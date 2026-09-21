@@ -19,8 +19,8 @@ import (
 	. "github.com/onsi/gomega"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
 	"github.com/osac-project/osac-metering/internal/events"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var _ = Describe("ResolveCloudEventType", func() {
@@ -84,38 +84,38 @@ var _ = Describe("ResolveCloudEventType", func() {
 var _ = Describe("ResolveTransitionTime", func() {
 	var (
 		creationTS        *timestamppb.Timestamp
-		deletionTS        *timestamppb.Timestamp
+		eventTimestampTS  *timestamppb.Timestamp
 		stateTransitionTS *timestamppb.Timestamp
 	)
 
 	BeforeEach(func() {
 		creationTS = timestamppb.New(time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC))
-		deletionTS = timestamppb.New(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC))
+		eventTimestampTS = timestamppb.New(time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC))
 		stateTransitionTS = timestamppb.New(time.Date(2026, 7, 1, 11, 30, 0, 0, time.UTC))
 	})
 
 	It("returns creation timestamp for CREATED event type", func() {
 		t, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
-			creationTS, deletionTS, stateTransitionTS, "res-1",
+			eventTimestampTS, creationTS, stateTransitionTS, "res-1",
 		)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(t).To(Equal(creationTS.AsTime()))
 	})
 
-	It("returns deletion timestamp for DELETED event type", func() {
+	It("returns event timestamp for DELETED event type", func() {
 		t, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_DELETED,
-			creationTS, deletionTS, stateTransitionTS, "res-1",
+			eventTimestampTS, creationTS, stateTransitionTS, "res-1",
 		)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(t).To(Equal(deletionTS.AsTime()))
+		Expect(t).To(Equal(eventTimestampTS.AsTime()))
 	})
 
 	It("returns state transition timestamp for UPDATED event type", func() {
 		t, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-			creationTS, deletionTS, stateTransitionTS, "res-1",
+			eventTimestampTS, creationTS, stateTransitionTS, "res-1",
 		)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(t).To(Equal(stateTransitionTS.AsTime()))
@@ -124,7 +124,7 @@ var _ = Describe("ResolveTransitionTime", func() {
 	It("returns ErrUnsupportedEvent for OBJECT_SIGNALED", func() {
 		_, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_SIGNALED,
-			creationTS, deletionTS, stateTransitionTS, "res-1",
+			eventTimestampTS, creationTS, stateTransitionTS, "res-1",
 		)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrUnsupportedEvent)).To(BeTrue())
@@ -133,7 +133,7 @@ var _ = Describe("ResolveTransitionTime", func() {
 	It("returns ErrUnsupportedEvent for unknown event type", func() {
 		_, err := events.ResolveTransitionTime(
 			privatev1.EventType(9999),
-			creationTS, deletionTS, stateTransitionTS, "res-1",
+			eventTimestampTS, creationTS, stateTransitionTS, "res-1",
 		)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrUnsupportedEvent)).To(BeTrue())
@@ -142,16 +142,16 @@ var _ = Describe("ResolveTransitionTime", func() {
 	It("returns ErrDataQuality when creation timestamp is nil for CREATED", func() {
 		_, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_CREATED,
-			nil, deletionTS, stateTransitionTS, "res-1",
+			eventTimestampTS, nil, stateTransitionTS, "res-1",
 		)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
 	})
 
-	It("returns ErrDataQuality when deletion timestamp is nil for DELETED", func() {
+	It("returns ErrDataQuality when event timestamp is nil for DELETED", func() {
 		_, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_DELETED,
-			creationTS, nil, stateTransitionTS, "res-1",
+			nil, creationTS, stateTransitionTS, "res-1",
 		)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
@@ -160,7 +160,7 @@ var _ = Describe("ResolveTransitionTime", func() {
 	It("returns ErrDataQuality when state transition timestamp is nil for UPDATED", func() {
 		_, err := events.ResolveTransitionTime(
 			privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED,
-			creationTS, deletionTS, nil, "res-1",
+			eventTimestampTS, creationTS, nil, "res-1",
 		)
 		Expect(err).To(HaveOccurred())
 		Expect(errors.Is(err, events.ErrDataQuality)).To(BeTrue())
@@ -187,21 +187,31 @@ var _ = Describe("BuildResourceEvents", func() {
 		Expect(result[0].ID()).To(Equal("evt-ci-1"))
 	})
 
+	It("rejects generic decomposition for bare_metal_instance", func() {
+		_, err := events.BuildResourceEvents(
+			events.ResourceTypeBareMetalInstance,
+			map[string]any{"bm_instance_type": "bm-large"},
+			"evt-bmi-1", simpleBuildFn,
+		)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("unsupported resource type for generic event decomposition"))
+	})
+
 	It("decomposes cluster_order into per-component events", func() {
 		dims := map[string]any{
 			"cluster_template": "ocp-ci-small",
 			"components": []any{
 				map[string]any{
-					"node_set":   "_control_plane",
-					"component":  "control_plane",
-					"host_type":  "_control_plane",
-					"node_count": int32(1),
+					"node_set":                "_control_plane",
+					"component":               "control_plane",
+					"baremetal_instance_type": "_control_plane",
+					"node_count":              int32(1),
 				},
 				map[string]any{
-					"node_set":   "gpu-workers",
-					"component":  "worker",
-					"host_type":  "gpu-h100",
-					"node_count": int32(2),
+					"node_set":                "gpu-workers",
+					"component":               "worker",
+					"baremetal_instance_type": "gpu-h100",
+					"node_count":              int32(2),
 				},
 			},
 		}

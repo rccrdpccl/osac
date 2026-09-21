@@ -17,8 +17,8 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
 	"github.com/osac-project/osac-metering/schema"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 var (
@@ -52,8 +52,11 @@ const eventBillableStart = "internal.billable-boundary-crossed"
 // Resource type constants — re-exported from the shared schema module for
 // convenience within this package.
 const (
-	ResourceTypeComputeInstance = schema.ResourceTypeComputeInstance
-	ResourceTypeClusterOrder    = schema.ResourceTypeClusterOrder
+	ResourceTypeComputeInstance   = schema.ResourceTypeComputeInstance
+	ResourceTypeClusterOrder      = schema.ResourceTypeClusterOrder
+	ResourceTypeExternalIP        = schema.ResourceTypeExternalIP
+	ResourceTypeNATGateway        = schema.ResourceTypeNATGateway
+	ResourceTypeBareMetalInstance = schema.ResourceTypeBareMetalInstance
 )
 
 // StateEmpty is the empty previous state for initial transitions.
@@ -116,10 +119,12 @@ func ResolveCloudEventType(table TransitionTable, eventType privatev1.EventType,
 }
 
 // ResolveTransitionTime selects the appropriate timestamp for a given event type.
-func ResolveTransitionTime(eventType privatev1.EventType, creation, deletion, stateTransition *timestamppb.Timestamp, resourceID string) (time.Time, error) {
+// Deleted events use the top-level event timestamp because it marks the final
+// deletion boundary, after all finalizers have completed.
+func ResolveTransitionTime(eventType privatev1.EventType, eventTimestamp, creation, stateTransition *timestamppb.Timestamp, resourceID string) (time.Time, error) {
 	timestamps := map[privatev1.EventType]*timestamppb.Timestamp{
 		privatev1.EventType_EVENT_TYPE_OBJECT_CREATED: creation,
-		privatev1.EventType_EVENT_TYPE_OBJECT_DELETED: deletion,
+		privatev1.EventType_EVENT_TYPE_OBJECT_DELETED: eventTimestamp,
 		privatev1.EventType_EVENT_TYPE_OBJECT_UPDATED: stateTransition,
 	}
 
@@ -147,9 +152,16 @@ func singleEvent(dims map[string]any, baseID string, buildFn EventBuilder) ([]cl
 	return []cloudevents.Event{ce}, nil
 }
 
+func unsupportedGenericDecomposition(_ map[string]any, _ string, _ EventBuilder) ([]cloudevents.Event, error) {
+	return nil, fmt.Errorf("unsupported resource type for generic event decomposition: %s", ResourceTypeBareMetalInstance)
+}
+
 var resourceDecomposers = map[string]EventDecomposer{
-	ResourceTypeComputeInstance: singleEvent,
-	ResourceTypeClusterOrder:    DecomposeClusterEvents,
+	ResourceTypeComputeInstance:   singleEvent,
+	ResourceTypeClusterOrder:      DecomposeClusterEvents,
+	ResourceTypeExternalIP:        singleEvent,
+	ResourceTypeNATGateway:        singleEvent,
+	ResourceTypeBareMetalInstance: unsupportedGenericDecomposition,
 }
 
 // BuildResourceEvents dispatches event building to the correct decomposer

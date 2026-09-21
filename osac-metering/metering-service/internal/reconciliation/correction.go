@@ -76,8 +76,11 @@ func buildCorrectionEvents(
 	interval *AffectedInterval,
 	now time.Time,
 ) ([]cloudevents.Event, error) {
-	baseID := fmt.Sprintf("correction/%s/%s/%s/%s/%s", resourceID, reason, projectionState, sourceState,
-		correctionFingerprint(billingDimensions, interval))
+	fingerprint, err := correctionFingerprint(resourceType, billingDimensions, interval)
+	if err != nil {
+		return nil, fmt.Errorf("building correction identity: %w", err)
+	}
+	baseID := fmt.Sprintf("correction/%s/%s/%s/%s/%s", resourceID, reason, projectionState, sourceState, fingerprint)
 	buildFn := func(dims map[string]any, eventID string) (cloudevents.Event, error) {
 		ce, err := buildCorrectionEvent(resourceID, resourceType, tenantID, projectID,
 			reason, projectionState, sourceState, dims, interval, now)
@@ -99,14 +102,47 @@ func buildCorrectionEvents(
 // producing the SAME ID so it dedups as the design intends ("duplicate
 // corrections... are acceptable"), while a genuinely different discrepancy
 // must not collide with a prior one and get silently dropped.
-func correctionFingerprint(billingDimensions map[string]any, interval *AffectedInterval) string {
-	enc, _ := json.Marshal(struct {
+func correctionFingerprint(resourceType string, billingDimensions map[string]any, interval *AffectedInterval) (string, error) {
+	canonicalDimensions, err := canonicalCorrectionDimensions(resourceType, billingDimensions)
+	if err != nil {
+		return "", err
+	}
+	enc, err := json.Marshal(struct {
 		Dims     map[string]any    `json:"dims"`
 		Interval *AffectedInterval `json:"interval,omitempty"`
-	}{billingDimensions, interval})
+	}{canonicalDimensions, interval})
+	if err != nil {
+		return "", fmt.Errorf("marshalling canonical correction content: %w", err)
+	}
 	h := fnv.New64a()
-	_, _ = h.Write(enc)
-	return fmt.Sprintf("%x", h.Sum64())
+	if _, err := h.Write(enc); err != nil {
+		return "", fmt.Errorf("hashing canonical correction content: %w", err)
+	}
+	return fmt.Sprintf("%x", h.Sum64()), nil
+}
+
+func canonicalCorrectionDimensions(resourceType string, billingDimensions map[string]any) (map[string]any, error) {
+	if resourceType != events.ResourceTypeClusterOrder {
+		return billingDimensions, nil
+	}
+
+	components, err := events.DecomposeClusterComponents(billingDimensions)
+	if err != nil {
+		return nil, err
+	}
+
+	canonical := make(map[string]any, len(billingDimensions))
+	for key, value := range billingDimensions {
+		if key != "components" {
+			canonical[key] = value
+		}
+	}
+	canonicalComponents := make([]any, 0, len(components))
+	for _, component := range components {
+		canonicalComponents = append(canonicalComponents, component.FlatBillingDimensions())
+	}
+	canonical["components"] = canonicalComponents
+	return canonical, nil
 }
 
 func buildCorrectionEvent(

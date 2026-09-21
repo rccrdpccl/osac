@@ -38,13 +38,13 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
 	"github.com/osac-project/osac-metering/internal/database"
 	"github.com/osac-project/osac-metering/internal/heartbeat"
 	kafkapub "github.com/osac-project/osac-metering/internal/kafka"
 	"github.com/osac-project/osac-metering/internal/projection"
 	"github.com/osac-project/osac-metering/internal/reconciliation"
 	"github.com/osac-project/osac-metering/internal/watch"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type config struct {
@@ -56,10 +56,16 @@ type config struct {
 	dbURLFile              string
 	heartbeatInterval      time.Duration
 	reconciliationInterval time.Duration
+	deploymentID           string
+	enableCaaS             bool
+	enableVMaaS            bool
+	enableBMaaS            bool
+	enableMaaS             bool
 }
 
 func main() {
 	cfg := configFromEnv()
+	cfg.enableAllIfNoneSet()
 	if err := cfg.validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
 		os.Exit(2)
@@ -91,6 +97,23 @@ func configFromEnv() *config {
 		dbURLFile:              envOrDefault("DB_URL_FILE", "/etc/metering/db"),
 		heartbeatInterval:      parseDurationOrDefault(os.Getenv("HEARTBEAT_INTERVAL"), 60*time.Second),
 		reconciliationInterval: parseDurationOrDefault(os.Getenv("RECONCILIATION_INTERVAL"), 60*time.Minute),
+		deploymentID:           os.Getenv("METERING_DEPLOYMENT_ID"),
+		enableCaaS:             envBool("ENABLE_CAAS"),
+		enableVMaaS:            envBool("ENABLE_VMAAS"),
+		enableBMaaS:            envBool("ENABLE_BMAAS"),
+		enableMaaS:             envBool("ENABLE_MAAS"),
+	}
+}
+
+func envBool(key string) bool {
+	return strings.EqualFold(os.Getenv(key), "true")
+}
+
+func (c *config) enableAllIfNoneSet() {
+	if !c.enableCaaS && !c.enableVMaaS && !c.enableBMaaS && !c.enableMaaS {
+		c.enableCaaS = true
+		c.enableVMaaS = true
+		c.enableMaaS = true
 	}
 }
 
@@ -116,6 +139,9 @@ func (c *config) validate() error {
 	}
 	if c.dbURLFile == "" {
 		return fmt.Errorf("DB_URL_FILE is required")
+	}
+	if c.deploymentID == "" {
+		return fmt.Errorf("METERING_DEPLOYMENT_ID is required")
 	}
 	return nil
 }
@@ -182,9 +208,8 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 	defer dbPool.Close()
 	logger.Info("database pool connected", "urlFile", cfg.dbURLFile)
 
-	dbTool := database.NewTool(logger, dbURL)
-	if err := dbTool.Migrate(ctx); err != nil {
-		return fmt.Errorf("running database migrations: %w", err)
+	if err := database.InitializeSchema(ctx, dbPool); err != nil {
+		return fmt.Errorf("initializing database schema: %w", err)
 	}
 
 	store := projection.NewPostgresStore(dbPool)
@@ -205,9 +230,30 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 
 	publisher := kafkapub.NewPublisher(producer)
 
-	computeClient := privatev1.NewComputeInstancesClient(grpcConn)
-	clusterClient := privatev1.NewClustersClient(grpcConn)
+	logger.Info("service enablement",
+		"caas", cfg.enableCaaS,
+		"vmaas", cfg.enableVMaaS,
+		"bmaas", cfg.enableBMaaS,
+		"maas", cfg.enableMaaS,
+	)
+
+	var computeClient privatev1.ComputeInstancesClient
+	var clusterClient privatev1.ClustersClient
+	if cfg.enableVMaaS {
+		computeClient = privatev1.NewComputeInstancesClient(grpcConn)
+	}
+	if cfg.enableCaaS {
+		clusterClient = privatev1.NewClustersClient(grpcConn)
+	}
+	externalIPClient := privatev1.NewExternalIPsClient(grpcConn)
+	natGatewayClient := privatev1.NewNATGatewaysClient(grpcConn)
+	externalIPPoolClient := privatev1.NewExternalIPPoolsClient(grpcConn)
 	reconciler := reconciliation.NewReconciler(computeClient, clusterClient, store, publisher, logger, cfg.heartbeatInterval)
+	reconciler.SetNetworkingClients(externalIPClient, natGatewayClient, externalIPPoolClient, cfg.deploymentID)
+	pools, err := reconciliation.LoadExternalIPPools(ctx, externalIPPoolClient)
+	if err != nil {
+		return fmt.Errorf("loading external IP pool families: %w", err)
+	}
 
 	logger.Info("running startup reconciliation")
 	if err := reconciler.Reconcile(ctx); err != nil {
@@ -237,6 +283,10 @@ func run(ctx context.Context, logger logr.Logger, cfg *config) error {
 
 	eventsClient := privatev1.NewEventsClient(grpcConn)
 	consumer := watch.NewConsumer(eventsClient, publisher, store, logger)
+	consumer.Filter = watch.BuildFilter(cfg.enableVMaaS, cfg.enableCaaS, cfg.enableBMaaS)
+	consumer.DeploymentID = cfg.deploymentID
+	consumer.ExternalIPPoolClient = externalIPPoolClient
+	consumer.ExternalIPPools = pools
 	err = consumer.Run(ctx)
 	runCancel()
 	wg.Wait()

@@ -10,6 +10,7 @@ in compliance with the License. You may obtain a copy of the License at
 package reconciliation
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -78,6 +79,40 @@ func TestBuildSyntheticHeartbeatsStableIDAcrossRetryOfSameGap(t *testing.T) {
 	}
 	if first[0].ID() != second[0].ID() {
 		t.Errorf("expected the same CloudEvent ID for two attempts at closing the same unresolved gap (LastHeartbeatAt unchanged), got %q and %q", first[0].ID(), second[0].ID())
+	}
+}
+
+func TestBuildSyntheticHeartbeatsBMaaSUsesIndependentMeters(t *testing.T) {
+	allocationSince := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)
+	consumptionSince := time.Date(2026, 1, 1, 11, 30, 0, 0, time.UTC)
+	ps := projection.ResourceState{
+		ResourceID:   "bmi-1",
+		ResourceType: events.ResourceTypeBareMetalInstance,
+		CurrentState: "RUNNING",
+		BMaaSMeterState: projection.BMaaSMeterState{
+			Allocation:  projection.MeterState{ActiveSince: &allocationSince},
+			Consumption: projection.MeterState{ActiveSince: &consumptionSince},
+		},
+		BillingDimensions: map[string]any{"bm_instance_type": "gpu-large"},
+	}
+
+	got, err := buildSyntheticHeartbeats(ps, time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected allocation and consumption heartbeats, got %d", len(got))
+	}
+
+	for i, meterType := range []string{events.BMaaSMeterAllocation, events.BMaaSMeterConsumption} {
+		var data map[string]any
+		if err := json.Unmarshal(got[i].Data(), &data); err != nil {
+			t.Fatalf("heartbeat %d data: %v", i, err)
+		}
+		dims := data["billing_dimensions"].(map[string]any)
+		if dims["meter_type"] != meterType {
+			t.Errorf("heartbeat %d meter_type = %v, want %q", i, dims["meter_type"], meterType)
+		}
 	}
 }
 
@@ -153,11 +188,79 @@ func TestBuildCorrectionEventsSameDimensionsGetSameID(t *testing.T) {
 	}
 }
 
+func TestBuildCorrectionEventsCanonicalizesAdjustmentOrder(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	firstOrder := map[string]any{
+		"cluster_template": "ocp-ci-small",
+		"release_image":    "4.17.0",
+		"components": []any{
+			map[string]any{
+				"node_set":                "_control_plane",
+				"component":               "control_plane",
+				"baremetal_instance_type": "_control_plane",
+				"node_count":              int32(1),
+			},
+			map[string]any{
+				"node_set":                "gpu-workers",
+				"component":               "worker",
+				"baremetal_instance_type": "gpu-h100",
+				"node_count":              int32(2),
+			},
+		},
+	}
+	secondOrder := map[string]any{
+		"components": []any{
+			map[string]any{
+				"node_count":              int32(2),
+				"baremetal_instance_type": "gpu-h100",
+				"component":               "worker",
+				"node_set":                "gpu-workers",
+			},
+			map[string]any{
+				"node_count":              int32(1),
+				"baremetal_instance_type": "_control_plane",
+				"component":               "control_plane",
+				"node_set":                "_control_plane",
+			},
+		},
+		"release_image":    "4.17.0",
+		"cluster_template": "ocp-ci-small",
+	}
+
+	first, err := buildCorrectionEvents("cluster-1", events.ResourceTypeClusterOrder, "tenant-1", "",
+		BillingDimensionsDrift, "READY", "READY", firstOrder, nil, now)
+	if err != nil {
+		t.Fatalf("first correction: unexpected error: %v", err)
+	}
+	replay, err := buildCorrectionEvents("cluster-1", events.ResourceTypeClusterOrder, "tenant-1", "",
+		BillingDimensionsDrift, "READY", "READY", secondOrder, nil, now)
+	if err != nil {
+		t.Fatalf("replayed correction: unexpected error: %v", err)
+	}
+
+	if len(first) != 2 || len(replay) != 2 {
+		t.Fatalf("expected two adjustment events per correction, got %d and %d", len(first), len(replay))
+	}
+	for i := range first {
+		if first[i].ID() != replay[i].ID() {
+			t.Errorf("semantic correction adjustment %d changed provider identity across order-only replay: %q != %q", i, first[i].ID(), replay[i].ID())
+		}
+	}
+}
+
 func TestTransientCheckersCoversAllBillabilityCheckerKeys(t *testing.T) {
 	for resourceType := range billabilityCheckers {
 		if _, ok := transientCheckers[resourceType]; !ok {
 			t.Errorf("billabilityCheckers has resource type %q but transientCheckers does not — "+
 				"transient states for this type will silently pass through as CurrentState", resourceType)
+		}
+	}
+}
+
+func TestCorrectionResourceTypesIncludesNetworking(t *testing.T) {
+	for _, resourceType := range []string{events.ResourceTypeExternalIP, events.ResourceTypeNATGateway} {
+		if _, ok := correctionResourceTypes[resourceType]; !ok {
+			t.Errorf("corrections do not support networking resource type %q", resourceType)
 		}
 	}
 }

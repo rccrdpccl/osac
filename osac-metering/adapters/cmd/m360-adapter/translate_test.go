@@ -16,6 +16,7 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
 	"github.com/osac-project/osac-metering/adapters"
 )
 
@@ -193,11 +194,11 @@ var _ = Describe("translateEvent", func() {
 				"tenant-acme",
 				"project-ml",
 				map[string]any{
-					"cluster_template": "ocp-ci-small",
-					"release_image":    "quay.io/openshift-release-dev/ocp-release:4.17.0-x86_64",
-					"component":        "control_plane",
-					"host_type":        "_control_plane",
-					"node_count":       1,
+					"cluster_template":        "ocp-ci-small",
+					"release_image":           "quay.io/openshift-release-dev/ocp-release:4.17.0-x86_64",
+					"component":               "control_plane",
+					"baremetal_instance_type": "_control_plane",
+					"node_count":              1,
 				},
 			)
 
@@ -207,6 +208,8 @@ var _ = Describe("translateEvent", func() {
 			Expect(endpoint).To(Equal("/caas/event"))
 			Expect(payload["cluster_template"]).To(Equal("ocp-ci-small"))
 			Expect(payload["component"]).To(Equal("control_plane"))
+			Expect(payload["baremetal_instance_type"]).To(Equal("_control_plane"))
+			Expect(payload).NotTo(HaveKey("host_type"))
 			Expect(payload["node_count"]).To(BeEquivalentTo(1))
 		})
 	})
@@ -243,6 +246,44 @@ var _ = Describe("translateEvent", func() {
 			Expect(payload["provider"]).To(Equal("anthropic"))
 			Expect(payload["prompt_tokens"]).To(BeEquivalentTo(1500))
 			Expect(payload["total_tokens"]).To(BeEquivalentTo(2300))
+		})
+	})
+
+	Describe("networking events", func() {
+		It("translates an ExternalIP event to the networking endpoint", func() {
+			ce := buildCloudEvent(
+				"ce-ip-001", "osac.resource.started.v1", "ip-001", "external_ip",
+				"tenant-acme", "project-net", map[string]any{
+					"deployment": "installation-a",
+					"pool":       "pool-1",
+					"ip_family":  "ipv4",
+					"attached":   false,
+				},
+			)
+
+			endpoint, payload, err := translateEvent(ce)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(endpoint).To(Equal("/networking/event"))
+			Expect(payload["resource_type"]).To(Equal("external_ip"))
+			Expect(payload["ip_family"]).To(Equal("ipv4"))
+		})
+
+		It("translates a NATGateway event to the networking endpoint", func() {
+			ce := buildCloudEvent(
+				"ce-nat-001", "osac.resource.started.v1", "nat-001", "nat_gateway",
+				"tenant-acme", "project-net", map[string]any{
+					"deployment":      "installation-a",
+					"virtual_network": "vnet-1",
+					"external_ip":     "ip-001",
+				},
+			)
+
+			endpoint, payload, err := translateEvent(ce)
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(endpoint).To(Equal("/networking/event"))
+			Expect(payload["resource_type"]).To(Equal("nat_gateway"))
 		})
 	})
 

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 const ComputeInstanceStatePrefix = "COMPUTE_INSTANCE_STATE_"
@@ -140,8 +140,8 @@ func (m *computeInstanceMapper) IsBillable() bool {
 	return false
 }
 
-func (m *computeInstanceMapper) BillingDimensionsMap() map[string]any {
-	return ComputeInstanceBillingDimensions(m.ci)
+func (m *computeInstanceMapper) BillingDimensionsMap() (map[string]any, error) {
+	return ComputeInstanceBillingDimensions(m.ci), nil
 }
 
 func ComputeInstanceBillingDimensions(ci *privatev1.ComputeInstance) map[string]any {
@@ -221,10 +221,10 @@ func (m *computeInstanceMapper) CloudEventType(eventType privatev1.EventType, pr
 	return ResolveCloudEventType(computeInstanceTransitions, eventType, previousState, m.CurrentState())
 }
 
-func (m *computeInstanceMapper) TransitionTime(eventType privatev1.EventType) (time.Time, error) {
-	return ResolveTransitionTime(eventType,
+func (m *computeInstanceMapper) TransitionTime(event *privatev1.Event, _ string) (time.Time, error) {
+	return ResolveTransitionTime(event.GetType(),
+		event.GetTimestamp(),
 		m.ci.GetMetadata().GetCreationTimestamp(),
-		m.ci.GetMetadata().GetDeletionTimestamp(),
 		m.ci.GetStatus().GetStateTransitionTime(),
 		m.ci.GetId())
 }

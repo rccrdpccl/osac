@@ -15,6 +15,10 @@
 {{- end }}
 {{- end -}}
 
+{{- define "osac-metering.osacDeploymentId" -}}
+{{- .Values.global.osacDeploymentId -}}
+{{- end -}}
+
 {{- define "osac-metering.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 app.kubernetes.io/name: {{ include "osac-metering.name" . }}
@@ -39,10 +43,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- .Values.kafka.brokers | default "osac-kafka-kafka-bootstrap.osac-kafka.svc.cluster.local:9093" }}
 {{- end -}}
 
-{{- define "osac-metering.kafkaCaSecret" -}}
-{{- .Values.kafka.caSecret | default "osac-kafka-cluster-ca-cert" }}
-{{- end -}}
-
 {{- define "osac-metering.kafkaTopic" -}}
 osac.metering.lifecycle
 {{- end -}}
@@ -58,3 +58,26 @@ osac-metering
 {{- define "osac-metering.kafkaReplicas" -}}
 3
 {{- end -}}
+
+{{/*
+Check if a service tier is enabled via global.services.<key>.enabled.
+Args: list of [context, serviceKey]
+Falls back to true when global.services is not set.
+Returns non-empty string for enabled, empty for disabled (for use in {{- if include ... }}).
+*/}}
+{{- define "osac-metering.serviceEnabled" -}}
+{{- $ctx := index . 0 -}}
+{{- $svcKey := index . 1 -}}
+{{- $enabled := true -}}
+{{- if $ctx.Values.global -}}
+{{- if $ctx.Values.global.services -}}
+{{- $svc := index $ctx.Values.global.services $svcKey -}}
+{{- if $svc -}}
+{{- if hasKey $svc "enabled" -}}
+{{- $enabled = $svc.enabled -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $enabled -}}true{{- end -}}
+{{- end }}

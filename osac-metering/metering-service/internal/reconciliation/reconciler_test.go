@@ -12,11 +12,12 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
-	privatev1 "github.com/osac-project/osac-metering/internal/api/osac/private/v1"
 	"github.com/osac-project/osac-metering/internal/events"
 	"github.com/osac-project/osac-metering/internal/projection"
 	"github.com/osac-project/osac-metering/internal/reconciliation"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
 type mockComputeClient struct {
@@ -161,7 +162,7 @@ func makeCI(id, tenant, state string, version int32) *privatev1.ComputeInstance 
 		Spec: &privatev1.ComputeInstanceSpec{
 			InstanceType: &privatev1.InstanceTypeReference{Name: instanceType},
 			DiskImage:    &privatev1.DiskImageReference{Name: "rhel-9"},
-			BootDisk:     &privatev1.ComputeInstanceDisk{SizeGib: 50},
+			BootDisk:     &privatev1.ComputeInstanceDisk{SizeGib: proto.Int32(50)},
 		},
 		Status: &privatev1.ComputeInstanceStatus{State: ciState},
 	}
@@ -234,6 +235,32 @@ var _ = Describe("Reconciler", func() {
 			store.mu.Lock()
 			defer store.mu.Unlock()
 			Expect(store.states).ToNot(HaveKey("vm-gone"))
+		})
+
+		It("does not delete BMaaS projections without a BMI List client", func() {
+			store := newMockStore()
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			store.states["bmi-preserved"] = projection.ResourceState{
+				ResourceID:        "bmi-preserved",
+				ResourceType:      events.ResourceTypeBareMetalInstance,
+				TenantID:          "tenant-1",
+				CurrentState:      "RUNNING",
+				IsBillable:        true,
+				BillableSince:     &now,
+				LastHeartbeatAt:   &now,
+				BillingDimensions: map[string]any{"bm_instance_type": "bmi-type-gpu-large"},
+			}
+			pub := &mockPublisher{}
+			recon := reconciliation.NewReconciler(nil, nil, store, pub, logr.Discard(), 60*time.Second)
+
+			Expect(recon.Reconcile(ctx)).To(Succeed())
+
+			pub.mu.Lock()
+			defer pub.mu.Unlock()
+			Expect(pub.published).To(BeEmpty())
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			Expect(store.states).To(HaveKey("bmi-preserved"))
 		})
 
 		It("detects state_drift when states differ", func() {
@@ -579,7 +606,7 @@ var _ = Describe("Reconciler", func() {
 						Spec: &privatev1.ComputeInstanceSpec{
 							InstanceType: &privatev1.InstanceTypeReference{Name: instanceType},
 							DiskImage:    &privatev1.DiskImageReference{Name: "rhel-9"},
-							BootDisk:     &privatev1.ComputeInstanceDisk{SizeGib: 50},
+							BootDisk:     &privatev1.ComputeInstanceDisk{SizeGib: proto.Int32(50)},
 						},
 						Status: &privatev1.ComputeInstanceStatus{
 							State: privatev1.ComputeInstanceState_COMPUTE_INSTANCE_STATE_RUNNING,
@@ -856,7 +883,7 @@ var _ = Describe("Reconciler", func() {
 					Template: &privatev1.ClusterTemplateReference{Name: "ocp-ci-small"},
 					Version:  &privatev1.ClusterVersionReference{Id: "4.17.0", Name: "4.17.0"},
 					NodeSets: map[string]*privatev1.ClusterNodeSet{
-						"gpu-workers": {HostType: &privatev1.HostTypeReference{Name: "gpu-h100"}, Size: 2},
+						"gpu-workers": {BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu-h100"}, Size: proto.Int32(2)},
 					},
 				},
 				Status: &privatev1.ClusterStatus{State: state},
@@ -888,7 +915,7 @@ var _ = Describe("Reconciler", func() {
 					Expect(data["resource_type"]).To(Equal(events.ResourceTypeClusterOrder))
 					bd := data["billing_dimensions"].(map[string]any)
 					Expect(bd).To(HaveKey("component"))
-					Expect(bd).To(HaveKey("host_type"))
+					Expect(bd).To(HaveKey("baremetal_instance_type"))
 					Expect(bd).NotTo(HaveKey("components"))
 				}
 			}
@@ -923,8 +950,8 @@ var _ = Describe("Reconciler", func() {
 					"cluster_template": "ocp-ci-small",
 					"release_image":    "4.17.0",
 					"components": []any{
-						map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": float64(1)},
-						map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": float64(2)},
+						map[string]any{"node_set": "_control_plane", "component": "control_plane", "baremetal_instance_type": "_control_plane", "node_count": float64(1)},
+						map[string]any{"node_set": "gpu-workers", "component": "worker", "baremetal_instance_type": "gpu-h100", "node_count": float64(2)},
 					},
 				},
 			}
@@ -969,8 +996,8 @@ var _ = Describe("Reconciler", func() {
 				BillingDimensions: map[string]any{
 					"cluster_template": "ocp-ci-small",
 					"components": []any{
-						map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": float64(1)},
-						map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": float64(2)},
+						map[string]any{"node_set": "_control_plane", "component": "control_plane", "baremetal_instance_type": "_control_plane", "node_count": float64(1)},
+						map[string]any{"node_set": "gpu-workers", "component": "worker", "baremetal_instance_type": "gpu-h100", "node_count": float64(2)},
 					},
 				},
 			}
@@ -1074,8 +1101,8 @@ var _ = Describe("Reconciler", func() {
 					"cluster_template": "ocp-ci-small",
 					"release_image":    "4.17.0",
 					"components": []any{
-						map[string]any{"node_set": "_control_plane", "component": "control_plane", "host_type": "_control_plane", "node_count": float64(1)},
-						map[string]any{"node_set": "gpu-workers", "component": "worker", "host_type": "gpu-h100", "node_count": float64(2)},
+						map[string]any{"node_set": "_control_plane", "component": "control_plane", "baremetal_instance_type": "_control_plane", "node_count": float64(1)},
+						map[string]any{"node_set": "gpu-workers", "component": "worker", "baremetal_instance_type": "gpu-h100", "node_count": float64(2)},
 					},
 				},
 			}
