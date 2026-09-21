@@ -19,6 +19,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - metal3.io
+  resources:
+  - hardwaredata
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - osac.openshift.io
   resources:
   - baremetalinstances
@@ -47,6 +55,16 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - osac.openshift.io
+  resources:
+  - externalipattachments
+  - externalips
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
 - apiGroups:
   - osac.openshift.io
   resources:

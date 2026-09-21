@@ -17,18 +17,24 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
 
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/api/v1alpha1"
@@ -57,13 +63,25 @@ func createMetal3BMH(name string, labels map[string]string, opStatus metal3api.O
 
 	// Status is a subresource — Create does not persist it. Re-set and update
 	// separately so envtest stores the desired operational/provisioning state.
-	// HardwareDetails is required so FindFreeHost does not skip this host.
 	bmh.Status.OperationalStatus = opStatus
 	bmh.Status.Provisioning.State = provState
-	bmh.Status.HardwareDetails = &metal3api.HardwareDetails{
-		NIC: []metal3api.NIC{{MAC: "aa:bb:cc:dd:ee:01"}},
-	}
 	ExpectWithOffset(1, k8sClient.Status().Update(ctx, bmh)).To(Succeed())
+
+	// NIC inventory is sourced from the companion HardwareData resource (same
+	// name/namespace as the BMH), so create it — without NIC data FindFreeHost
+	// skips the host.
+	hd := &metal3api.HardwareData{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: metal3TestNS,
+		},
+		Spec: metal3api.HardwareDataSpec{
+			HardwareDetails: &metal3api.HardwareDetails{
+				NIC: []metal3api.NIC{{MAC: "aa:bb:cc:dd:ee:01"}},
+			},
+		},
+	}
+	ExpectWithOffset(1, k8sClient.Create(ctx, hd)).To(Succeed())
 	return bmh
 }
 
@@ -76,56 +94,31 @@ func newMetal3Reconciler() *BareMetalInstanceReconciler {
 		invClient,
 		mgmtClient,
 		nil, // provisioning provider
-		0, 0, 0, 0,
+		nil, // networking provider
+		nil, // IP discovery provider
+		nil, // AAP client
+		0, 0, 0, 0, 0,
 	)
 }
 
+// These are thin, namespace-bound aliases over the shared integration helpers
+// in baremetalinstance_integration_helpers_test.go.
+
 func reconcileN(reconciler *BareMetalInstanceReconciler, name string, n int) ctrl.Result {
-	var result ctrl.Result
-	for range n {
-		var err error
-		result, err = reconciler.Reconcile(ctx, ctrl.Request{
-			NamespacedName: types.NamespacedName{Name: name, Namespace: metal3TestNS},
-		})
-		ExpectWithOffset(1, err).NotTo(HaveOccurred())
-	}
-	return result
+	return reconcileInNS(reconciler, metal3TestNS, name, n)
 }
 
-func getBMI(name string) *v1alpha1.BareMetalInstance {
-	bmi := &v1alpha1.BareMetalInstance{}
-	ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: metal3TestNS}, bmi)).To(Succeed())
-	return bmi
-}
+func getBMI(name string) *v1alpha1.BareMetalInstance { return getBMIInNS(metal3TestNS, name) }
 
-func getBMH(name string) *metal3api.BareMetalHost {
-	bmh := &metal3api.BareMetalHost{}
-	ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: metal3TestNS}, bmh)).To(Succeed())
-	return bmh
-}
+func getBMH(name string) *metal3api.BareMetalHost { return getBMHInNS(metal3TestNS, name) }
 
-// cleanupBMI removes a BareMetalInstance, stripping finalizers first since no
-// controller is running in envtest to handle them.
-func cleanupBMI(name string) {
-	bmi := &v1alpha1.BareMetalInstance{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: metal3TestNS}, bmi); err != nil {
-		ExpectWithOffset(1, client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-		return
-	}
-	if len(bmi.Finalizers) > 0 {
-		bmi.Finalizers = nil
-		ExpectWithOffset(1, k8sClient.Update(ctx, bmi)).To(Succeed())
-	}
-	ExpectWithOffset(1, client.IgnoreNotFound(k8sClient.Delete(ctx, bmi))).NotTo(HaveOccurred())
-}
+func cleanupBMI(name string) { cleanupBMIInNS(metal3TestNS, name) }
 
 func cleanupBMH(name string) {
-	bmh := &metal3api.BareMetalHost{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: metal3TestNS}, bmh); err != nil {
-		ExpectWithOffset(1, client.IgnoreNotFound(err)).NotTo(HaveOccurred())
-		return
-	}
-	ExpectWithOffset(1, client.IgnoreNotFound(k8sClient.Delete(ctx, bmh))).NotTo(HaveOccurred())
+	hd := &metal3api.HardwareData{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: metal3TestNS}}
+	ExpectWithOffset(1, client.IgnoreNotFound(k8sClient.Delete(ctx, hd))).NotTo(HaveOccurred())
+
+	cleanupBMHInNS(metal3TestNS, name)
 }
 
 var _ = Describe("BareMetalInstance Metal3 Integration", func() {
@@ -156,7 +149,9 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 			bmi := &v1alpha1.BareMetalInstance{
 				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
 				Spec: v1alpha1.BareMetalInstanceSpec{
-					HostType:   "gpu-node",
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "gpu-node"},
+					},
 					TemplateID: shared.OsacNoopTemplate,
 				},
 			}
@@ -204,7 +199,9 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 			bmi := &v1alpha1.BareMetalInstance{
 				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
 				Spec: v1alpha1.BareMetalInstanceSpec{
-					HostType:    "compute",
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "compute"},
+					},
 					TemplateID:  shared.OsacNoopTemplate,
 					RunStrategy: v1alpha1.RunStrategyAlways,
 				},
@@ -248,6 +245,97 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 		})
 	})
 
+	Describe("Management finalizer conflict handling", func() {
+		const bmiName = "conflict-test-bmi"
+		const bmhName = "conflict-test-bmh"
+
+		AfterEach(func() {
+			cleanupBMI(bmiName)
+			cleanupBMH(bmhName)
+		})
+
+		// A conflict on the Update that adds the management finalizer is routine
+		// (concurrent modification / lagging cache read), not a real failure. It
+		// must requeue for retry, never mark the instance Failed — Failed is a
+		// no-requeue terminal state, so treating a transient conflict as Failed
+		// would permanently strand the instance.
+		It("should requeue without marking the instance Failed when the management finalizer add conflicts", func() {
+			createMetal3BMH(bmhName, map[string]string{
+				inventory.Metal3HostTypeLabel: "compute",
+			}, metal3api.OperationalStatusOK, metal3api.StateAvailable)
+
+			bmi := &v1alpha1.BareMetalInstance{
+				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
+				Spec: v1alpha1.BareMetalInstanceSpec{
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{
+							"type": "compute",
+						},
+					},
+					TemplateID:  shared.OsacNoopTemplate,
+					RunStrategy: v1alpha1.RunStrategyAlways,
+				},
+			}
+			Expect(k8sClient.Create(ctx, bmi)).To(Succeed())
+
+			// Inject exactly one conflict, on the Update that carries the management
+			// finalizer. Inventory/management backends keep using the raw client, so
+			// only the finalizer-add write is affected.
+			baseClient, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+			Expect(err).NotTo(HaveOccurred())
+
+			conflictInjected := false
+			conflictClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+					if !conflictInjected {
+						if inst, ok := obj.(*v1alpha1.BareMetalInstance); ok &&
+							controllerutil.ContainsFinalizer(inst, BareMetalInstanceManagementFinalizer) {
+							conflictInjected = true
+							return apierrors.NewConflict(
+								schema.GroupResource{Group: "osac.openshift.io", Resource: "baremetalinstances"},
+								inst.Name, fmt.Errorf("the object has been modified"))
+						}
+					}
+					return c.Update(ctx, obj, opts...)
+				},
+			})
+
+			reconciler := NewBareMetalInstanceReconciler(
+				conflictClient,
+				k8sClient.Scheme(),
+				inventory.NewMetal3ClientForTest(k8sClient, metal3TestNS, metal3HostClass),
+				management.NewMetal3ClientForTest(k8sClient, metal3TestNS),
+				nil, nil, nil, nil,
+				0, 0, 0, 0, 0,
+			)
+
+			// Allocation (finalizer, find, assign) — no conflict yet.
+			reconcileN(reconciler, bmiName, 3)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Spec.HostClass).To(Equal(metal3HostClass))
+
+			// This reconcile adds the management finalizer; the injected conflict
+			// makes the Update fail. Reconcile must surface the error (→ requeue)
+			// and leave the phase un-Failed.
+			_, err = reconciler.Reconcile(ctx, ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: bmiName, Namespace: metal3TestNS},
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsConflict(err)).To(BeTrue())
+			Expect(conflictInjected).To(BeTrue())
+
+			bmi = getBMI(bmiName)
+			Expect(bmi.Status.Phase).NotTo(Equal(v1alpha1.BareMetalInstancePhaseFailed))
+
+			// Retry (no further injected conflicts): the finalizer is added and the
+			// instance recovers instead of being stuck in Failed.
+			reconcileN(reconciler, bmiName, 1)
+			bmi = getBMI(bmiName)
+			Expect(bmi.Finalizers).To(ContainElement(BareMetalInstanceManagementFinalizer))
+			Expect(bmi.Status.Phase).NotTo(Equal(v1alpha1.BareMetalInstancePhaseFailed))
+		})
+	})
+
 	Describe("Deallocation flow", func() {
 		const bmiName = "dealloc-test-bmi"
 		const bmhName = "dealloc-test-bmh"
@@ -265,7 +353,9 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 			bmi := &v1alpha1.BareMetalInstance{
 				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
 				Spec: v1alpha1.BareMetalInstanceSpec{
-					HostType:   "storage",
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"type": "storage"},
+					},
 					TemplateID: shared.OsacNoopTemplate,
 				},
 			}
@@ -315,7 +405,9 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 				bmi := &v1alpha1.BareMetalInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
 					Spec: v1alpha1.BareMetalInstanceSpec{
-						HostType:   "nonexistent-type",
+						Selector: v1alpha1.HostSelectorSpec{
+							HostSelector: map[string]string{"type": "nonexistent-type"},
+						},
 						TemplateID: shared.OsacNoopTemplate,
 					},
 				}
@@ -358,7 +450,9 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 				bmi := &v1alpha1.BareMetalInstance{
 					ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
 					Spec: v1alpha1.BareMetalInstanceSpec{
-						HostType:       "contested",
+						Selector: v1alpha1.HostSelectorSpec{
+							HostSelector: map[string]string{"type": "contested"},
+						},
 						TemplateID:     shared.OsacNoopTemplate,
 						ExternalHostID: metal3TestNS + "/" + bmhName,
 					},
@@ -407,7 +501,7 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 				}
 				miniCfg, err := miniEnv.Start()
 				Expect(err).NotTo(HaveOccurred())
-				defer func() { _ = miniEnv.Stop() }()
+				DeferCleanup(func() { _ = miniEnv.Stop() })
 
 				dc, err := discovery.NewDiscoveryClientForConfig(miniCfg)
 				Expect(err).NotTo(HaveOccurred())
@@ -435,7 +529,9 @@ var _ = Describe("BareMetalInstance Metal3 Integration", func() {
 			bmi := &v1alpha1.BareMetalInstance{
 				ObjectMeta: metav1.ObjectMeta{Name: bmiName, Namespace: metal3TestNS},
 				Spec: v1alpha1.BareMetalInstanceSpec{
-					HostType:   "gpu-node",
+					Selector: v1alpha1.HostSelectorSpec{
+						HostSelector: map[string]string{"osac.openshift.io/host-type": "gpu-node"},
+					},
 					TemplateID: shared.OsacNoopTemplate,
 				},
 			}

@@ -91,7 +91,9 @@ metadata:
   name: %s
   namespace: %s
 spec:
-  hostType: %s
+  selector:
+    hostSelector:
+      hostType: %s
   externalHostID: ""
   templateID: noop
   runStrategy: %s

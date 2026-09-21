@@ -19,8 +19,9 @@ package v1alpha1
 import (
 	"strings"
 
-	opv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	opv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
 
 // BareMetalInstanceRunStrategy controls the desired power state of a BareMetalInstance.
@@ -68,10 +69,6 @@ type BareMetalNetworkAttachment struct {
 
 // BareMetalInstanceSpec defines the desired state of BareMetalInstance.
 type BareMetalInstanceSpec struct {
-	// HostType is the resource class/type of the host.
-	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="field is immutable"
-	HostType string `json:"hostType"`
 	// ExternalHostID is the host ID from external inventory (used by Host Management Operator as node identifier).
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Type=string
@@ -82,11 +79,10 @@ type BareMetalInstanceSpec struct {
 	ExternalHostName string `json:"externalHostName,omitempty"`
 	// HostClass is host management backend class (e.g. openstack).
 	HostClass string `json:"hostClass,omitempty"`
-	// Selector defines additional host selection filters.
-	// hostSelector accepts arbitrary key/value selectors such as managedBy or topology.
-	// +kubebuilder:validation:Optional
+	// Selector defines host selection filters. HostSelector is required for label-based host selection.
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="field is immutable"
-	Selector HostSelectorSpec `json:"selector,omitempty"`
+	Selector HostSelectorSpec `json:"selector"`
 	// InventoryLabels are labels to be applied to the host in the inventory system.
 	// These labels are non-persistent and will be removed when the BareMetalInstance is deleted.
 	// +kubebuilder:validation:Optional
@@ -177,6 +173,23 @@ const (
 	// Set condition status True on success.
 	// Set condition status False with reason Progressing or TemplateFailed while not complete.
 	HostConditionDeprovisionTemplateComplete BareMetalInstanceConditionType = "DeprovisionTemplateComplete"
+
+	// HostConditionNetworkAttachmentsReady indicates all network attachments are provisioned.
+	HostConditionNetworkAttachmentsReady BareMetalInstanceConditionType = "NetworkAttachmentsReady"
+
+	// HostConditionIPDiscoveryComplete indicates DHCP lease discovery has completed.
+	HostConditionIPDiscoveryComplete BareMetalInstanceConditionType = "IPDiscoveryComplete"
+
+	// HostConditionNetworkHandoffComplete is set True once the fabric port has been
+	// moved to the tenant network AND the post-provision reboot has completed, so the
+	// OS has re-DHCPed on the tenant network. IP discovery and Ready gate on this.
+	HostConditionNetworkHandoffComplete BareMetalInstanceConditionType = "NetworkHandoffComplete"
+
+	// HostConditionNetworkOffboardComplete is set True during deletion once the
+	// host has been powered off (while still on the tenant network) and the fabric
+	// port has been moved back to the provisioning network. This ensures tenant
+	// workloads never run on the provisioning network.
+	HostConditionNetworkOffboardComplete BareMetalInstanceConditionType = "NetworkOffboardComplete"
 )
 
 // Host condition reason values
@@ -199,17 +212,31 @@ const (
 	// HostConditionReasonPowerSyncFailed indicates a restart has failed
 	HostConditionReasonPowerSyncFailed = "PowerSyncFailed"
 
-	// HostConditionReasonPowerSyncRequired indicates a restart is required
-	// Reserved for future use — not set by any current code path
+	// HostConditionReasonPowerSyncRequired indicates a restart is still required but
+	// has not been triggered yet — the host was busy transitioning when the restart
+	// was attempted, so the reconciler backs off and retries. It is a benign
+	// in-progress reason (not a failure) and, unlike Progressing, does not mark a
+	// restart as already in flight, so the reconciler keeps re-triggering until a real
+	// restart is initiated. Set by triggerRestart on management.ErrTransitioning.
 	HostConditionReasonPowerSyncRequired = "PowerSyncRequired"
+
+	// HostConditionReasonNoMatchingHosts indicates no hosts match the selector labels
+	HostConditionReasonNoMatchingHosts = "NoMatchingHosts"
+
+	// HostConditionReasonInvalidSelector indicates the host selector is missing or empty.
+	HostConditionReasonInvalidSelector = "InvalidSelector"
 )
 
-// HostSelectorSpec defines additional host selection constraints.
+// HostSelectorSpec defines host selection constraints.
 type HostSelectorSpec struct {
 	// HostSelector is a map of arbitrary selector key/value pairs
-	// (for example managedBy, topology, rack, zone).
-	// +kubebuilder:validation:Optional
-	HostSelector map[string]string `json:"hostSelector,omitempty"`
+	// (for example managedBy, topology, rack, zone). Required for label-based host selection.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinProperties=1
+	// +kubebuilder:validation:XValidation:rule="self.all(key, !key.contains(' '))",message="selector keys must not contain spaces"
+	// +kubebuilder:validation:XValidation:rule="self.all(key, self[key] != '')",message="selector values must not be empty"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(key, key == 'provisionState')",message="provisionState is a reserved key and cannot be set in hostSelector"
+	HostSelector map[string]string `json:"hostSelector"`
 }
 
 // BareMetalNICStatus holds the MAC address of a single physical network interface.
@@ -257,6 +284,12 @@ type BareMetalInstanceStatus struct {
 	// Limited to the last N jobs (configurable via OSAC_MAX_JOB_HISTORY, default 10)
 	// +kubebuilder:validation:Optional
 	ProvisioningJobs []opv1alpha1.JobStatus `json:"provisioningJobs,omitempty"`
+	// NetworkingJobs tracks the history of network attachment provisioning/deprovisioning.
+	// +kubebuilder:validation:Optional
+	NetworkingJobs []opv1alpha1.JobStatus `json:"networkingJobs,omitempty"`
+	// IPDiscoveryJobs tracks the history of DHCP lease discovery operations.
+	// +kubebuilder:validation:Optional
+	IPDiscoveryJobs []opv1alpha1.JobStatus `json:"ipDiscoveryJobs,omitempty"`
 	// Conditions holds an array of metav1.Condition describing host state.
 	// +kubebuilder:validation:Optional
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type" protobuf:"bytes,1,rep,name=conditions"`
@@ -280,6 +313,21 @@ type BareMetalInstanceStatus struct {
 	Hardware *BareMetalHardware `json:"hardware,omitempty"`
 }
 
+// PrimaryIPAddress returns the IP address of the primary network attachment,
+// or empty string if not yet discovered.
+func (h *BareMetalInstance) PrimaryIPAddress() string {
+	for _, nas := range h.Status.NetworkAttachmentStatuses {
+		if nas.Primary && nas.IPAddress != "" {
+			return nas.IPAddress
+		}
+	}
+	// Single attachment is implicitly primary
+	if len(h.Status.NetworkAttachmentStatuses) == 1 {
+		return h.Status.NetworkAttachmentStatuses[0].IPAddress
+	}
+	return ""
+}
+
 // GetPoolID returns the owning BareMetalPool UID if the BareMetalInstance is owned by a BareMetalPool.
 func (h *BareMetalInstance) GetPoolID() (string, bool) {
 	for _, ownerReference := range h.OwnerReferences {
@@ -297,7 +345,6 @@ func (h *BareMetalInstance) GetPoolID() (string, bool) {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=bmi
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="HostType",type=string,JSONPath=`.spec.hostType`
 // +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.templateID`
 // +kubebuilder:printcolumn:name="HostClass",type=string,JSONPath=`.spec.hostClass`
 // +kubebuilder:printcolumn:name="ExternalHostID",type=string,JSONPath=`.spec.externalHostID`

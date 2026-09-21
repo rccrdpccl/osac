@@ -1,0 +1,23 @@
+{{- if .Values.metal3.enabled }}
+{{- if and .Values.bcm.enabled .Values.metal3.enabled }}
+{{- fail "bcm.enabled and metal3.enabled are mutually exclusive" }}
+{{- end }}
+{{- if not .Values.metal3.namespace }}
+{{- fail "metal3.enabled is true but metal3.namespace is not set" }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.secrets.managementConfig }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  management.yaml: |
+    name: metal3-management
+    type: metal3
+    options:
+      metal3:
+        namespace: {{ .Values.metal3.namespace | quote }}
+{{- end }}

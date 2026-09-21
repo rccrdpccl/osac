@@ -49,6 +49,10 @@ var (
 	// hostTypeLabelKey is the label key used to identify the host type
 	HostTypeLabelKey string = fmt.Sprintf("%s/host-type", shared.OsacPrefix)
 
+	// HostTypeAnnotationKey is the annotation key that records a BareMetalInstance's
+	// host type for label-based selection (set at creation, read when grouping).
+	HostTypeAnnotationKey string = fmt.Sprintf("%s/host-type", shared.OsacPrefix)
+
 	// BareMetalPoolTemplateIDAnnotationKey is the annotation key used to store the BareMetalPool template ID
 	BareMetalPoolTemplateIDAnnotationKey string = fmt.Sprintf("%s/templateID", shared.OsacPrefix)
 )

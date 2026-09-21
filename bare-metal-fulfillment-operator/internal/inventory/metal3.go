@@ -25,13 +25,17 @@ import (
 
 	metal3api "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/baremetalhost"
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/shared"
 )
 
@@ -136,21 +140,58 @@ func validateBareMetalHostCRD(restConfig *rest.Config) error {
 	return nil
 }
 
+// validateMetal3MatchExpressions validates matchExpressions for the Metal3 backend.
+// Keys and values become BareMetalHost label selectors, so they must satisfy the
+// Kubernetes label syntax:
+// https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set
+func validateMetal3MatchExpressions(matchExpressions map[string]string) error {
+	for key, value := range matchExpressions {
+		if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+			return fmt.Errorf("invalid matchExpression: key %q is not a valid label key: %s", key, strings.Join(errs, "; "))
+		}
+
+		if value == "" {
+			return fmt.Errorf("invalid matchExpression: empty value not allowed for key %q", key)
+		}
+
+		if errs := validation.IsValidLabelValue(value); len(errs) > 0 {
+			return fmt.Errorf("invalid matchExpression: value %q for key %q is not a valid label value: %s", value, key, strings.Join(errs, "; "))
+		}
+	}
+	return nil
+}
+
 func (m *Metal3Client) FindFreeHost(ctx context.Context, matchExpressions map[string]string) (*Host, error) {
+	if err := validateMetal3MatchExpressions(matchExpressions); err != nil {
+		return nil, err
+	}
+
 	log := ctrllog.FromContext(ctx)
 	log.Info("Finding free Metal3 host", "namespace", m.namespace)
 
-	listOpts := make([]client.ListOption, 0, 2)
-	listOpts = append(listOpts, client.InNamespace(m.namespace))
+	listOpts := []client.ListOption{client.InNamespace(m.namespace)}
 
+	// Build label selector from all matchExpressions except specially handled keys
 	matchLabels := map[string]string{}
-	if hostType, ok := matchExpressions["hostType"]; ok && hostType != "" {
-		matchLabels[Metal3HostTypeLabel] = hostType
+	for key, value := range matchExpressions {
+		// Skip keys that have special client-side handling
+		if key == "managedBy" || key == "provisionState" {
+			continue
+		}
+
+		// Handle legacy type/hostType mapping for backward compatibility
+		if key == "hostType" || key == "type" {
+			matchLabels[Metal3HostTypeLabel] = value
+		} else {
+			// Pass all other labels directly as BareMetalHost labels
+			matchLabels[key] = value
+		}
 	}
 	if len(matchLabels) > 0 {
 		listOpts = append(listOpts, client.MatchingLabels(matchLabels))
 	}
 
+	// Handle managedBy specially (client-side filtering, not BareMetalHost label)
 	matchManagedBy := matchExpressions["managedBy"]
 	if matchManagedBy == "" {
 		matchManagedBy = shared.OsacDefaultManagedByValue
@@ -159,6 +200,22 @@ func (m *Metal3Client) FindFreeHost(ctx context.Context, matchExpressions map[st
 	bmhList := &metal3api.BareMetalHostList{}
 	if err := m.client.List(ctx, bmhList, listOpts...); err != nil {
 		return nil, fmt.Errorf("failed to list BareMetalHosts: %w", err)
+	}
+
+	// HardwareData is the preferred NIC-data source, but the CRD is absent on
+	// older Metal3 installs. Treat a missing CRD (NoMatchError) as "no
+	// HardwareData present" and fall back to BareMetalHost.Status.HardwareDetails
+	// via ResolveHardwareDetails below, rather than failing host selection.
+	hardwareDataByName := map[string]*metal3api.HardwareData{}
+	hdList := &metal3api.HardwareDataList{}
+	if err := m.client.List(ctx, hdList, client.InNamespace(m.namespace)); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return nil, fmt.Errorf("failed to list HardwareData: %w", err)
+		}
+		log.V(1).Info("HardwareData CRD not installed; falling back to BareMetalHost.Status.HardwareDetails")
+	}
+	for i := range hdList.Items {
+		hardwareDataByName[hdList.Items[i].Name] = &hdList.Items[i]
 	}
 
 	candidates := make([]metal3api.BareMetalHost, 0, len(bmhList.Items))
@@ -175,12 +232,13 @@ func (m *Metal3Client) FindFreeHost(ctx context.Context, matchExpressions map[st
 			continue
 		}
 
-		if bmh.Annotations["inspect.metal3.io"] == "disabled" {
+		if bmh.InspectionDisabled() {
 			log.V(1).Info("Skipping BareMetalHost: hardware inspection disabled", "host", bmh.Name)
 			continue
 		}
 
-		if bmh.Status.HardwareDetails == nil || len(bmh.Status.HardwareDetails.NIC) == 0 {
+		details := baremetalhost.ResolveHardwareDetails(hardwareDataByName[bmh.Name], &bmh)
+		if details == nil || len(details.NIC) == 0 {
 			log.Error(nil, "Skipping BareMetalHost: available but NIC inventory is missing — host may be misconfigured or inspection incomplete", "host", bmh.Name)
 			continue
 		}
@@ -269,20 +327,49 @@ func (m *Metal3Client) GetHostNICs(ctx context.Context, inventoryHostID string) 
 		return nil, err
 	}
 
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	// HardwareData is the preferred NIC-data source. A NotFound (no HardwareData
+	// for this host) or a NoMatchError (CRD absent on older Metal3) both mean we
+	// fall back to BareMetalHost.Status.HardwareDetails below.
+	hd := &metal3api.HardwareData{}
+	if err := m.client.Get(ctx, key, hd); err != nil {
+		if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+			return nil, fmt.Errorf("failed to get HardwareData %s: %w", inventoryHostID, err)
+		}
+		hd = nil
+	}
+
+	if hd != nil {
+		if nics := metal3HostNICs(baremetalhost.ResolveHardwareDetails(hd, nil)); len(nics) > 0 {
+			return nics, nil
+		}
+	}
+
 	bmh := &metal3api.BareMetalHost{}
-	if err := m.client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, bmh); err != nil {
+	if err := m.client.Get(ctx, key, bmh); err != nil {
 		return nil, fmt.Errorf("failed to get BareMetalHost %s: %w", inventoryHostID, err)
 	}
 
-	if bmh.Status.HardwareDetails == nil || len(bmh.Status.HardwareDetails.NIC) == 0 {
+	nics := metal3HostNICs(baremetalhost.ResolveHardwareDetails(hd, bmh))
+	if len(nics) == 0 {
 		return nil, fmt.Errorf("BareMetalHost %s has no NIC inventory despite being allocated", inventoryHostID)
 	}
+	return nics, nil
+}
 
-	nics := make([]HostNIC, 0, len(bmh.Status.HardwareDetails.NIC))
-	for _, n := range bmh.Status.HardwareDetails.NIC {
+func metal3HostNICs(details *metal3api.HardwareDetails) []HostNIC {
+	if details == nil || len(details.NIC) == 0 {
+		return nil
+	}
+	nics := make([]HostNIC, 0, len(details.NIC))
+	for _, n := range details.NIC {
+		if n.MAC == "" {
+			continue
+		}
 		nics = append(nics, HostNIC{MAC: strings.ToLower(n.MAC)})
 	}
-	return nics, nil
+	return nics
 }
 
 func (m *Metal3Client) UnassignHost(ctx context.Context, inventoryHostID string, labels []string) error {
@@ -342,5 +429,6 @@ func bmhToHost(bmh *metal3api.BareMetalHost, hostClass string) *Host {
 		HostClass:           hostClass,
 		ProvisionState:      string(bmh.Status.Provisioning.State),
 		ManagedBy:           managedBy,
+		Ready:               true, // Metal3 BMHs are pre-existing, immediately usable
 	}
 }

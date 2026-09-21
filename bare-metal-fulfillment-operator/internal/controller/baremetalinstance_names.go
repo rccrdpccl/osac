@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
 	"github.com/osac-project/osac/osac-operator/pkg/provisioning"
 
 	"github.com/osac-project/osac/bare-metal-fulfillment-operator/internal/shared"
@@ -40,6 +42,14 @@ const (
 
 	// DefaultProvisionPollIntervalDuration is the default interval to poll provisioning job status
 	DefaultProvisionPollIntervalDuration = provisioning.DefaultStatusPollInterval
+
+	// DefaultHostReadinessPollIntervalDuration is the default interval to poll a reserved
+	// inventory host's readiness for provisioning (see inventory.Host.Ready).
+	DefaultHostReadinessPollIntervalDuration = 30 * time.Second
+
+	autoCreatedLabel         = shared.OsacPrefix + "/auto-created"
+	autoCreatedForLabel      = shared.OsacPrefix + "/auto-created-for"
+	bareMetalInstanceIDLabel = shared.OsacPrefix + "/baremetalinstance-uuid"
 )
 
 var (
@@ -48,4 +58,17 @@ var (
 
 	// BareMetalInstanceManagementFinalizer is the finalizer for management operations
 	BareMetalInstanceManagementFinalizer string = fmt.Sprintf("%s/baremetalinstance", shared.OsacPrefix)
+
+	// BareMetalInstanceNetworkingFinalizer is the finalizer for network attachment cleanup
+	BareMetalInstanceNetworkingFinalizer string = fmt.Sprintf("%s/baremetalinstance-networking", shared.OsacPrefix)
+
+	// BareMetalInstanceCleanupFinalizer is the finalizer for auto-provisioned ExternalIP cleanup
+	BareMetalInstanceCleanupFinalizer string = fmt.Sprintf("%s/baremetalinstance-cleanup", shared.OsacPrefix)
+
+	externalIPAttachmentGVK = schema.GroupVersionKind{
+		Group: "osac.openshift.io", Version: "v1alpha1", Kind: "ExternalIPAttachment",
+	}
+	externalIPGVK = schema.GroupVersionKind{
+		Group: "osac.openshift.io", Version: "v1alpha1", Kind: "ExternalIP",
+	}
 )
