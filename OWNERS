@@ -27,6 +27,7 @@ filters:
     - amito
     - danielerez
     - htayrie-rh
+    - ibengal
     - minmzzhang
     - slintes
     - clobrano
@@ -34,6 +35,8 @@ filters:
     - udis
     - ItzikEzra-rh
     - carbonin
+    - maorfr
+    - tchughesiv
     reviewers:
     - jhernand
     - adriengentil
@@ -61,6 +64,7 @@ filters:
     - amito
     - danielerez
     - htayrie-rh
+    - ibengal
     - minmzzhang
     - slintes
     - clobrano
@@ -68,3 +72,5 @@ filters:
     - udis
     - ItzikEzra-rh
     - carbonin
+    - maorfr
+    - tchughesiv

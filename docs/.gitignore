@@ -1,0 +1,4 @@
+# AI workflow artifacts
+.planning/
+.artifacts/
+*.gsd

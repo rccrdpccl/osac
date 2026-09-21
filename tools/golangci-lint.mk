@@ -12,7 +12,7 @@
 # scoped to one.
 GOLANGCI_LINT_BIN ?= $(shell git rev-parse --show-toplevel)/tools/bin
 GOLANGCI_LINT = $(GOLANGCI_LINT_BIN)/golangci-lint
-GOLANGCI_LINT_VERSION ?= v2.12.1
+GOLANGCI_LINT_VERSION ?= v2.13.2
 
 $(GOLANGCI_LINT_BIN):
 	mkdir -p $(GOLANGCI_LINT_BIN)

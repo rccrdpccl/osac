@@ -1,0 +1,4 @@
+# GitHub fork-name mappings: "upstream-repo:your-fork-name"
+# Copy to tools/fork-overrides.sh (gitignored) and uncomment/add entries.
+#
+# FORK_OVERRIDE_PAIRS=("enhancement-proposals:my-ep-fork")

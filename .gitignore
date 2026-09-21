@@ -1,11 +1,45 @@
 # AI workflows and skills (installed by tools/bootstrap.sh)
 skills/
 .ai-workflows/
-.claude/skills
-.claude/commands
-.claude/agents
+# Interactive clone populated by tools/bootstrap.sh. A later pin may occupy
+# this path and drop the ignore.
+.osac-ai-skills/
+
+# Skill-relative sibling checkouts (tools/bootstrap.sh).
+# osac-test-infra/ and osac-docs/ are kept so leftover clones from older
+# bootstrap runs are not committed; bootstrap no longer creates either
+# (E2E is tests/e2e/; docs content is in-tree under docs/). osac-ui/ was
+# removed from this list once it stopped being a sibling checkout and
+# became real tracked content in this repo -- this entry would otherwise
+# silently gitignore any new file created under it.
+enhancement-proposals/
+osac-ux/
+osac-test-infra/
+osac-docs/
+
+# Local GitHub fork-name mappings (see tools/fork-overrides.sh.example).
+/tools/fork-overrides.sh
+
+# Harness output and osac-ai-skills fan-out. Keep repo-local Claude settings
+# and hook *scripts* tracked; fan-out only adds .claude/hooks/README.md.
+.claude/*
+!.claude/hooks/
+!.claude/settings.json
+.claude/hooks/README.md
 .cursor/
 .gemini/
+.opencode/
+# Codex skill-discovery umbrella (.agents/skills -> ../skills), materialized by
+# tools/link-agent-skills.sh --codex; generated output, never committed.
+.agents/
+
+# Per-worktree agent context (Jira summary written by osac-new-worktree).
+.ai-context/
+
+# Shared design/prd guidance (fan-out). No repo-local files in these trees —
+# ignore the directories so new shared names do not require a gitignore bump.
+.design/
+.prd/
 
 # graphify knowledge-graph output -- fetched from the published CI bundle
 # (see .github/workflows/graphify-brain-refresh.yaml), never committed.
@@ -66,9 +100,14 @@ Thumbs.db
 *.crt
 
 # Local dev artifacts
+.worktrees/
 .artifacts
 .artifacts/
 __pycache__
+
+# proto (shared proto sources + generated Go)
+/proto/.buf
+/proto/bin
 
 # fulfillment-service
 /fulfillment-service/bin

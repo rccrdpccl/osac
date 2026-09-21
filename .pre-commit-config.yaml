@@ -18,7 +18,13 @@ repos:
     - id: check-case-conflict
     - id: check-json
     - id: check-symlinks
+    # docs/guides/admin/bcm-backend.md shows a YAML config example with a
+    # placeholder PEM block (literal "..." body between real BEGIN/END
+    # PRIVATE KEY markers, no actual key material) -- the hook only pattern-
+    # matches those markers, so it flags this documentation example every
+    # run without excluding it.
     - id: detect-private-key
+      exclude: ^docs/guides/admin/bcm-backend\.md$
 
 - repo: https://github.com/gitleaks/gitleaks
   rev: v8.30.1
@@ -39,7 +45,7 @@ repos:
       files: \.(yaml|yml)$
       types: [file, yaml]
       entry: yamllint --strict
-      exclude: ^(fulfillment-service/(charts|it/charts)/.*/templates/|osac-operator/(charts/.*/templates/|config/)|bare-metal-fulfillment-operator/(charts/.*/templates/|config/)|osac-csi-driver/charts/.*/templates/)
+      exclude: ^(fulfillment-service/(charts|it/charts)/.*/templates/|osac-operator/(charts/.*/templates/|config/)|bare-metal-fulfillment-operator/(charts/.*/templates/|config/)|osac-csi-driver/charts/.*/templates/|osac-ui/charts/.*/templates/)
 
 - repo: local
   hooks:
@@ -49,11 +55,11 @@ repos:
     language: system
     files: ^fulfillment-service/.*\.go$
     entry: bash -c "cd fulfillment-service && uv run dev.py lint go"
-  - id: fulfillment-service-buf-lint
+  - id: proto-buf-lint
     pass_filenames: false
-    name: fulfillment-service buf-lint
+    name: proto buf-lint
     language: system
-    files: ^fulfillment-service/.*\.proto$
+    files: ^proto/.*\.proto$
     entry: bash -c "cd fulfillment-service && uv run dev.py lint proto"
   - id: osac-operator-golangci-lint
     pass_filenames: false
