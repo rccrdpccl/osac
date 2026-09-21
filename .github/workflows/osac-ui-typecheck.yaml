@@ -1,0 +1,46 @@
+name: Typecheck
+
+# Carried over as-is from osac-ui's own standalone repo at merge time, only
+# relocated (osac-ui/-prefixed paths) and path-scoped so it runs only on
+# osac-ui changes -- not yet wired into this repo's own CI conventions.
+# That's a follow-up, not this move.
+on:
+  pull_request:
+    paths:
+      - 'osac-ui/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+          package_json_file: osac-ui/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: osac-ui/package.json
+          cache: pnpm
+          cache-dependency-path: osac-ui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: osac-ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Run typecheck
+        working-directory: osac-ui
+        run: pnpm run typecheck

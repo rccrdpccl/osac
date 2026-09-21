@@ -8,6 +8,9 @@ on:
       - 'bare-metal-fulfillment-operator/charts/**/values.yaml'
       - 'osac-installer/charts/**/values.yaml'
       - 'osac-aap/charts/**/values.yaml'
+      - 'osac-metering/charts/**/values.yaml'
+      - 'osac-csi-driver/charts/**/values.yaml'
+      - 'osac-ui/charts/**/values.yaml'
       - '.github/scripts/check-floating-tags.sh'
       - '.github/workflows/check-floating-tags.yaml'
 
@@ -26,7 +29,7 @@ jobs:
     outputs:
       changes: ${{ steps.filter.outputs.changes || '[]' }}
     steps:
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         if: github.event_name == 'pull_request'
         id: filter
         with:
@@ -49,6 +52,14 @@ jobs:
               - '.github/workflows/check-floating-tags.yaml'
             osac-aap:
               - 'osac-aap/charts/**/values.yaml'
+              - '.github/scripts/check-floating-tags.sh'
+              - '.github/workflows/check-floating-tags.yaml'
+            osac-metering:
+              - 'osac-metering/charts/**/values.yaml'
+              - '.github/scripts/check-floating-tags.sh'
+              - '.github/workflows/check-floating-tags.yaml'
+            osac-csi-driver:
+              - 'osac-csi-driver/charts/**/values.yaml'
               - '.github/scripts/check-floating-tags.sh'
               - '.github/workflows/check-floating-tags.yaml'
 

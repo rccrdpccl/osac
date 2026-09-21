@@ -26,15 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
 
       - name: "Set up Python"
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version-file: "osac-aap/pyproject.toml"
 
@@ -57,9 +59,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/osac-aap/')
         run: |
           version="${GITHUB_REF_NAME#osac-aap/}"
-          # Same SemVer rule as publish-charts.yaml's guard job -- rejects build
-          # metadata (+...) and validates the core/prerelease shape before it's
-          # trusted as an image tag.
+          # Rejects build metadata (+...) and validates the core/prerelease
+          # shape before it's trusted as an image tag.
           semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.((0|[1-9][0-9]*)|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
           if ! [[ "${version}" =~ ${semver_re} ]]; then
             echo "::error::Tag '${GITHUB_REF_NAME}' is not a valid semver release tag"
@@ -76,7 +77,7 @@ jobs:
       - name: Extract metadata (tags, labels)
         if: github.event_name != 'pull_request'
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6
         with:
           # Hardcoded rather than ghcr.io/${{ github.repository }}: that now
           # resolves to ghcr.io/osac-project/osac for every component's build
@@ -101,9 +102,45 @@ jobs:
           echo ${{ secrets.GITHUB_TOKEN }} | podman login --username ${{ github.actor }} --password-stdin ghcr.io
 
       - name: Push execution environment image
+        id: push
         if: github.event_name != 'pull_request'
         run: |
+          # Every tag below points at the one locally-built "osac-ee" image, so
+          # they all resolve to the same digest -- pushing captures it once
+          # (from the last tag pushed) for the cosign step to sign by digest.
           for tag in $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' '); do
             podman tag "osac-ee" "${tag}"
-            podman push "${tag}"
+            podman push --digestfile=digest.txt "${tag}"
           done
+          echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
+
+  # Signing gets its own job, granted id-token: write only here, rather than
+  # on build-execution-environment -- that job also runs (build-only, no
+  # push) on pull_request with PR-controlled execution-environment.yaml
+  # content, so it must never hold the OIDC permission that mints Fulcio
+  # signing certs.
+  sign-execution-environment:
+    needs: build-execution-environment
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log into registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign image with cosign
+        uses: ./.github/actions/cosign-sign-image
+        with:
+          image: ghcr.io/osac-project/osac-aap@${{ needs.build-execution-environment.outputs.digest }}

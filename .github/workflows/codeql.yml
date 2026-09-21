@@ -4,6 +4,8 @@ name: CodeQL
 on:
   pull_request:
     branches: [main]
+  # Invoked as a parallel "box" by nightly-build.yaml.
+  workflow_call:
 
 jobs:
   analyze:
@@ -21,6 +23,8 @@ jobs:
         include:
           - language: go
             build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
           - language: python
             build-mode: none
 
@@ -47,7 +51,7 @@ jobs:
       # itself completing successfully (i.e. no build/scan error); reviewing
       # new findings in the Security tab remains a manual step. Bump this SHA
       # when github/codeql-action needs to be updated.
-      - uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38  # v4.37.4
+      - uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -67,6 +71,6 @@ jobs:
           (cd osac-operator/api && go build ./...)
           (cd bare-metal-fulfillment-operator && go build ./...)
 
-      - uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38  # v4.37.4
+      - uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
         with:
           category: "/language:${{ matrix.language }}"

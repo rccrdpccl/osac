@@ -3,9 +3,13 @@
 #
 # This file configures fullsend for per-repo installation mode.
 # See ADR 0033 for details.
+# `roles: []` is a no-op in fullsend's dispatch script (empty list parses to
+# an empty string, which is treated the same as roles being unset — i.e.
+# unrestricted). Use a role name that never matches a real stage to disable
+# fullsend for this repo.
 version: "1"
 roles:
-    - review
+    - disabled
 allowed_remote_resources:
     - https://raw.githubusercontent.com/fullsend-ai/fullsend/
     - https://raw.githubusercontent.com/fullsend-ai/agents/

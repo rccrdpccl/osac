@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
     - main
+  merge_group:
   workflow_dispatch:
   # 2x/day (every 12h). Offset 47 minutes past the hour, not on the hour --
   # GitHub Actions' shared cron scheduler queues everyone's on-the-hour
@@ -13,10 +14,8 @@ on:
   # don't all land on the same offset simultaneously.
   schedule:
     - cron: '47 */12 * * *'
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Invoked as a parallel "box" by nightly-build.yaml.
+  workflow_call:
 
 permissions:
   contents: read
@@ -26,12 +25,24 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       pull-requests: read
     outputs:
-      should-run: ${{ github.event_name != 'pull_request' || steps.filter.outputs.code == 'true' }}
+      # Same ignore list for pull_request and merge_group. schedule /
+      # workflow_dispatch always run. Job-level `if:` skip reports success
+      # so docs-only PRs (and merge groups) are not blocked.
+      should-run: ${{ (github.event_name != 'pull_request' && github.event_name != 'merge_group') || steps.filter.outputs.code == 'true' }}
+      concurrency-key: ${{ steps.concurrency-key.outputs.key }}
     steps:
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
-        if: github.event_name == 'pull_request'
+      # dorny/paths-filter uses git diff on merge_group (not the PR Files API),
+      # so the repo must be checked out with enough history for base..head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: github.event_name == 'merge_group'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         id: filter
         with:
           predicate-quantifier: 'every'
@@ -48,6 +59,52 @@ jobs:
               - '!.design/**'
               - '!.skillsaw.yaml'
               - '!.pre-commit-config.yaml'
+              # osac-ui has its own dedicated test/lint/typecheck workflows
+              # (osac-ui-*.yaml), scoped to osac-ui/** -- without this, an
+              # osac-ui-only change would still trip this blanket filter and
+              # run every job below, none of which touch osac-ui at all.
+              - '!osac-ui/**'
+      # A job-level `concurrency:` block can reference `needs.*.outputs.*`,
+      # unlike a workflow-level one (removed above), which is evaluated
+      # before any job runs and so cannot depend on a computed value -- this
+      # is why the key is computed here and consumed by each test job's own
+      # concurrency block below.
+      #
+      # github.sha (the merge-preview commit) changes on every GitHub
+      # merge-queue rebase, so keying on it -- as the removed workflow-level
+      # block did -- can never collapse a stale rerun from an earlier rebase
+      # of the same PR. github.ref_name is stable enough to extract from:
+      # for merge_group it's gh-readonly-queue/<base>/pr-<number>-<sha>, and
+      # the pr-<number> segment stays constant across rebases -- confirmed
+      # against this repo's own run history (gh api
+      # .../actions/runs?event=merge_group): PR #503 was requeued at
+      # .../pr-503-b2986acb...61 and .../pr-503-f05965f9...53 sixteen
+      # minutes apart, PR #307 similarly at .../pr-307-18b1c7ed...58 and
+      # .../pr-307-0c86346b...c1 -- both pairs extract to the same
+      # "pr-<number>" despite the trailing sha differing every time.
+      - name: Compute stable per-PR concurrency key
+        id: concurrency-key
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            KEY="pr-${PR_NUMBER}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            # tail -1 takes the rightmost match, in case the base branch
+            # name itself happens to contain a pr-<digits> substring. The
+            # `|| true` plus empty-check fallback covers a ref that doesn't
+            # match this shape at all -- GitHub Actions runs `run:` steps
+            # with `set -eo pipefail`, so an unmatched grep would otherwise
+            # abort this step and skip every downstream test job via `needs`.
+            KEY=$(echo "${REF_NAME}" | grep -oE 'pr-[0-9]+' | tail -1 || true)
+            [[ -z "${KEY}" ]] && KEY="run-${RUN_ID}"
+          else
+            KEY="run-${RUN_ID}"
+          fi
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
 
   # fulfillment-service, osac-operator, and bare-metal-fulfillment-operator now
   # all follow the same Kind cluster + root Makefile step sequence (only the
@@ -60,6 +117,9 @@ jobs:
     name: Run integration test (fulfillment-service)
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
+    concurrency:
+      group: integration-fulfillment-service-${{ needs.changes.outputs.concurrency-key }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 75  # ginkgo --timeout 1h (Makefile) + ~15m for install/setup/log-collection
     steps:
@@ -74,7 +134,7 @@ jobs:
       with:
         install_only: true
     - name: Install Helm
-      uses: azure/setup-helm@v4
+      uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
     - name: Install ginkgo
       run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
     - name: Install infrastructure on Kind
@@ -114,6 +174,9 @@ jobs:
     name: Run integration test (osac-operator)
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
+    concurrency:
+      group: integration-osac-operator-${{ needs.changes.outputs.concurrency-key }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45  # ginkgo --timeout 30m (Makefile) + ~15m for install/setup/log-collection
     steps:
@@ -133,7 +196,7 @@ jobs:
           install_only: true
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
 
       - name: Install ginkgo
         run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
@@ -165,6 +228,9 @@ jobs:
     name: Run integration test (bare-metal-fulfillment-operator)
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
+    concurrency:
+      group: integration-bare-metal-fulfillment-operator-${{ needs.changes.outputs.concurrency-key }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45  # ginkgo --timeout 30m (Makefile) + ~15m for install/setup/log-collection
     steps:
@@ -184,7 +250,7 @@ jobs:
           install_only: true
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
 
       - name: Install ginkgo
         run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.32.0  # keep in sync with go.mod's github.com/onsi/ginkgo/v2 version
@@ -222,6 +288,9 @@ jobs:
     name: Run integration test (osac-aap)
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
+    concurrency:
+      group: integration-osac-aap-${{ needs.changes.outputs.concurrency-key }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -250,6 +319,11 @@ jobs:
           cluster_name: osac-test
           install_only: true
 
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        with:
+          version: v3.21.4
+
       - name: Run integration tests
         working-directory: osac-aap
         run: uv run make test
@@ -268,98 +342,118 @@ jobs:
     name: Run integration test (osac-installer)
     needs: changes
     if: needs.changes.outputs.should-run == 'true'
+    concurrency:
+      group: integration-osac-installer-${{ needs.changes.outputs.concurrency-key }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
-      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
       with:
         persist-credentials: false
 
     - name: Set up Helm
       uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
       with:
-        version: v3.17.0
+        version: v3.22.0
 
-    - name: Create Kind cluster
+    - name: Install Kind
       uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc  # v1
       with:
-        cluster_name: osac-integration
-
-    - name: Install cert-manager
-      run: |
-        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml
-        kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
-        kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
-        kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
-
-    - name: Build chart dependencies
-      working-directory: osac-installer
-      run: helm dependency build charts/osac/
+        install_only: true
 
     - name: Lint charts
       working-directory: osac-installer
       run: |
+        helm dependency build charts/osac/
         helm lint charts/osac-deps/
         helm lint charts/osac-infra/ --values values/dev/infra.yaml
-        helm lint charts/osac/ --values values/dev/instance.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local
+        helm lint charts/osac/ --values values/dev/kind-instance.yaml
 
     - name: Template charts (dry-run validation)
       working-directory: osac-installer
       run: |
         helm template osac-deps charts/osac-deps/ --values values/dev/infra.yaml
-        helm template osac-infra charts/osac-infra/ --values values/dev/infra.yaml
-        helm template osac charts/osac/ --values values/dev/instance.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local
+        helm template osac-infra charts/osac-infra/ --values values/dev/infra.yaml \
+          --set trustManager.upstream.enabled=true
+        helm template osac charts/osac/ --values values/dev/kind-instance.yaml
+
+    # Same real command (and cluster: `make install-infra` creates its own
+    # Kind cluster, config, cert-manager/trust-manager/envoy-gateway/osac-infra
+    # install in one shot) fulfillment-service's and osac-operator's jobs in
+    # this same file already use successfully -- rather than hand-reimplementing
+    # the same sequence in workflow YAML, which is exactly how this job drifted
+    # out of sync with the real deployment path in the first place (missing
+    # trust-manager/envoy-gateway installs, wrong values file).
+    - name: Install infrastructure on Kind
+      env:
+        CONTAINER_TOOL: docker
+      run: make -C osac-installer install-infra PLATFORM=kind PROFILE=dev NS=osac
+
+    - name: Build fulfillment-service image from PR
+      env:
+        CONTAINER_TOOL: docker
+      run: |
+        docker build -t localhost/fulfillment-service:it -f fulfillment-service/Containerfile .
+        kind load docker-image localhost/fulfillment-service:it --name osac-dev
 
     - name: Deploy charts
-      continue-on-error: true
-      working-directory: osac-installer
-      run: |
-        helm install osac-infra charts/osac-infra/ \
-          --namespace osac \
-          --create-namespace \
-          --values values/dev/infra.yaml \
-          --timeout 5m \
-          --wait
-        helm install osac charts/osac/ \
-          --namespace osac \
-          --values values/dev/instance.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
-          --set validation.enabled=false \
-          --set aap.bootstrap.enabled=false \
-          --set aap.aap.instance.enabled=false \
-          --set dbMigrate.enabled=false \
-          --timeout 10m \
-          --wait
+      env:
+        CONTAINER_TOOL: docker
+      run: >-
+        make -C osac-installer install-osac PLATFORM=kind PROFILE=dev NS=osac
+        EXTRA_HELM_ARGS="--set service.images.service=localhost/fulfillment-service:it"
 
-    - name: Check deployed resources
+    - name: Collect diagnostic logs
       if: always()
       run: |
-        echo "=== Pods ==="
-        kubectl get pods -n osac
-        echo "=== Deployments ==="
-        kubectl get deployments -n osac
-        echo "=== Services ==="
-        kubectl get services -n osac
-        echo "=== Helm releases ==="
-        helm list -n osac
+        export KUBECONFIG="$HOME/.kube/osac-dev-kind.kubeconfig"
+        mkdir -p osac-installer/logs
 
+        echo "=== Pods ==="
+        kubectl get pods -n osac -o wide | tee osac-installer/logs/pods.txt
+        echo ""
+
+        echo "=== Collecting pod logs to files ==="
+        for pod in $(kubectl get pods -n osac -o jsonpath='{.items[*].metadata.name}'); do
+          echo "Collecting logs for $pod..."
+          kubectl logs -n osac "$pod" --all-containers --tail=500 --prefix > "osac-installer/logs/${pod}.log" 2>&1 || echo "Failed to get logs for $pod"
+          # Also get previous container logs if pod crashed
+          kubectl logs -n osac "$pod" --all-containers --previous --tail=500 --prefix > "osac-installer/logs/${pod}-previous.log" 2>&1 || true
+        done
+
+        echo "=== Deployments ==="
+        kubectl get deployments -n osac -o wide | tee osac-installer/logs/deployments.txt
+        echo ""
+
+        echo "=== Services ==="
+        kubectl get services -n osac | tee osac-installer/logs/services.txt
+        echo ""
+
+        echo "=== Events ==="
+        kubectl get events -n osac --sort-by='.lastTimestamp' | tee osac-installer/logs/events.txt
+        echo ""
+
+        echo "=== Helm releases ==="
+        helm list -n osac | tee osac-installer/logs/helm-releases.txt
+
+        echo "=== Pod descriptions ==="
+        kubectl describe pods -n osac > osac-installer/logs/pod-descriptions.txt 2>&1
+
+    - if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+      with:
+        name: osac-installer-logs
+        path: osac-installer/logs
+        retention-days: 1
+
+    # make install-osac is `helm upgrade --install` -- invoking it again
+    # against an unchanged values file/chart IS the real idempotency test,
+    # using the same real command as the initial deploy above rather than a
+    # hand-copied `helm upgrade` invocation that could drift from it.
     - name: Test idempotency (helm upgrade with no changes)
-      continue-on-error: true
-      working-directory: osac-installer
-      run: |
-        helm upgrade osac charts/osac/ \
-          --namespace osac \
-          --values values/dev/instance.yaml \
-          --set service.externalHostname=fulfillment-api.osac.svc.cluster.local \
-          --set service.internalHostname=fulfillment-internal-api.osac.svc.cluster.local \
-          --set validation.enabled=false \
-          --set aap.bootstrap.enabled=false \
-          --set aap.aap.instance.enabled=false \
-          --set dbMigrate.enabled=false \
-          --timeout 10m \
-          --wait
+      env:
+        CONTAINER_TOOL: docker
+      run: >-
+        make -C osac-installer install-osac PLATFORM=kind PROFILE=dev NS=osac
+        EXTRA_HELM_ARGS="--set service.images.service=localhost/fulfillment-service:it"
