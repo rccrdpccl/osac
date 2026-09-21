@@ -1,6 +1,6 @@
 # Build context: mono-repo root (not osac-csi-driver/ alone).
 # Invoke with: podman build -f osac-csi-driver/Containerfile .
-FROM registry.access.redhat.com/ubi10/go-toolset:1.26 AS builder
+FROM registry.access.redhat.com/ubi10/go-toolset:1.26.7-1788946935 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -9,6 +9,7 @@ WORKDIR /opt/app-root/src
 # repo (see root .gitignore); `go mod download` below regenerates it inside
 # the build using the go.sum files already copied in per module.
 COPY --chown=1001:1001 go.work ./
+COPY --chown=1001:1001 proto/go.mod proto/go.sum proto/
 COPY --chown=1001:1001 osac-csi-driver/go.mod osac-csi-driver/go.sum osac-csi-driver/
 COPY --chown=1001:1001 fulfillment-service/go.mod fulfillment-service/go.sum fulfillment-service/
 COPY --chown=1001:1001 bare-metal-fulfillment-operator/go.mod bare-metal-fulfillment-operator/go.sum bare-metal-fulfillment-operator/
@@ -17,8 +18,10 @@ COPY --chown=1001:1001 osac-operator/api/go.mod osac-operator/api/go.sum osac-op
 COPY --chown=1001:1001 osac-metering/schema/go.mod osac-metering/schema/go.sum osac-metering/schema/
 COPY --chown=1001:1001 osac-metering/metering-service/go.mod osac-metering/metering-service/go.sum osac-metering/metering-service/
 COPY --chown=1001:1001 osac-metering/adapters/go.mod osac-metering/adapters/go.sum osac-metering/adapters/
+COPY --chown=1001:1001 osac-ui/proxy/go.mod osac-ui/proxy/go.sum osac-ui/proxy/
 RUN cd osac-csi-driver && go mod download
 
+COPY --chown=1001:1001 proto/ proto/
 COPY --chown=1001:1001 osac-csi-driver/ osac-csi-driver/
 
 WORKDIR /opt/app-root/src/osac-csi-driver
@@ -28,7 +31,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -a -buildvcs=false -ldflags "-X main.version=${VERSION} -X main.gitCommit=${GIT_COMMIT}" \
     -o osac-csi-driver ./cmd/osac-csi-driver
 
-FROM registry.access.redhat.com/ubi10-minimal:10.2
+FROM registry.access.redhat.com/ubi10-minimal:10.2-1789456728
 COPY --from=builder /opt/app-root/src/osac-csi-driver/osac-csi-driver /usr/local/bin/
 USER 1001
 ENTRYPOINT ["/usr/local/bin/osac-csi-driver"]

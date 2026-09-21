@@ -22,12 +22,19 @@ type VolumeInfo struct {
 	VendorVolumeID string
 	Protocol       string
 	CapacityBytes  int64
+
+	// VendorContext holds backend-specific attach parameters (for example VAST's "subsystem" and
+	// "vip_pool_name") needed by the vendor CSI controller's ControllerPublishVolume. Opaque to
+	// this driver: set by the osac-operator at provisioning time and merged unchanged into
+	// CreateVolume's CSI VolumeContext response so Kubernetes replays it on later attach calls.
+	VendorContext map[string]string
 }
 
 // CreateVolumeParams are the parameters for creating a volume through the
 // fulfillment service.
 type CreateVolumeParams struct {
 	Tenant     string
+	Project    string
 	Tier       string
 	SizeBytes  int64
 	AccessMode string
@@ -35,9 +42,13 @@ type CreateVolumeParams struct {
 	PVCRef     string
 }
 
-// ListVolumesParams are the filter parameters for listing volumes.
+// ListVolumesParams are the filter parameters for listing volumes. Non-nil
+// tenant and project filters select their scopes explicitly, including the
+// tenant default project represented by an empty project string.
 type ListVolumesParams struct {
-	NameFilter string
+	NameFilter    string
+	TenantFilter  *string
+	ProjectFilter *string
 }
 
 // VolumeClient is the interface for managing volumes through the OSAC
