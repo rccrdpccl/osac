@@ -553,6 +553,7 @@ func (r *ClusterOrderReconciler) handleHostedCluster(ctx context.Context, instan
 	// was accepted. Derive terminal readiness from the live HostedCluster and
 	// NodePool observations in this reconcile.
 	finalizeReadyIfProvisioned(log, instance, hc, nodePools.Items)
+	r.reconcileClusterOrderReadiness(instance, hc)
 	return nil
 }
 
@@ -586,6 +587,36 @@ func bareMetalWorkersReady(instance *v1alpha1.ClusterOrder) bool {
 	}
 	return *instance.Status.ReadyWorkers >= *instance.Status.DesiredWorkers &&
 		*instance.Status.CurrentWorkers >= *instance.Status.DesiredWorkers
+}
+
+func (r *ClusterOrderReconciler) reconcileClusterOrderReadiness(
+	instance *v1alpha1.ClusterOrder,
+	hostedCluster *hypershiftv1beta1.HostedCluster,
+) {
+	if hostedCluster == nil {
+		return
+	}
+	if instance.Status.Phase == v1alpha1.ClusterOrderPhaseFailed ||
+		instance.Status.Phase == v1alpha1.ClusterOrderPhaseDeleting {
+		return
+	}
+	if !hostedClusterControlPlaneIsAvailable(hostedCluster) || !hostedClusterIsReady(hostedCluster) {
+		instance.Status.Phase = v1alpha1.ClusterOrderPhaseProgressing
+		r.setProgressingStage(instance, deriveProvisioningSubStage(hostedCluster))
+		return
+	}
+
+	instance.SetStatusCondition(v1alpha1.ConditionClusterAvailable, metav1.ConditionTrue, "", v1alpha1.ReasonAsExpected)
+
+	if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
+		instance.Status.Phase = v1alpha1.ClusterOrderPhaseProgressing
+		instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+			humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
+		return
+	}
+
+	instance.Status.Phase = v1alpha1.ClusterOrderPhaseReady
+	instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 }
 
 func (r *ClusterOrderReconciler) setProgressingStage(instance *v1alpha1.ClusterOrder, stage string) {
@@ -878,11 +909,6 @@ func finalizeReadyIfProvisioned(log logr.Logger, instance *v1alpha1.ClusterOrder
 	if !hostedClusterAndNodePoolsAreReady(instance, hc, nodePools) {
 		return false
 	}
-	if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
-		log.Info("cluster order readiness blocked by bare metal workers not ready")
-		return false
-	}
-
 	instance.Status.Phase = v1alpha1.ClusterOrderPhaseReady
 	instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionFalse, "", v1alpha1.ReasonAsExpected)
 	return true
@@ -1094,9 +1120,18 @@ func (r *ClusterOrderReconciler) provisioningCallbacks(instance *v1alpha1.Cluste
 			}
 		},
 		OnSuccess: func(_ provisioning.ProvisionStatus) {
-			// Job success only records the provisioning result. The live
-			// HostedCluster and NodePool observations determine the phase and
-			// detailed progressing reason.
+			if instance.Status.Phase != v1alpha1.ClusterOrderPhaseProgressing {
+				return
+			}
+			if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
+				instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
+					humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
+				return
+			}
+			progressing := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			if progressing == nil || progressing.Status != metav1.ConditionTrue {
+				instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue, "", v1alpha1.ReasonProgressing)
+			}
 		},
 	}
 }

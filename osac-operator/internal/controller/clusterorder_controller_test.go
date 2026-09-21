@@ -508,8 +508,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			err := reconciler.handleHostedCluster(ctx, instance, hc)
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing),
-				"handleHostedCluster must not set Phase to Ready — Phase is controlled by live resource observations")
+			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseReady))
 
 			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionControlPlaneAvailable)).To(BeTrue())
 			Expect(instance.IsStatusConditionTrue(v1alpha1.ConditionClusterAvailable)).To(BeTrue())
@@ -1471,7 +1470,7 @@ var _ = Describe("ClusterOrder Controller", func() {
 			Expect(cond.Message).To(Equal("provisioning in progress"))
 		})
 
-		It("should leave readiness status to live resource observation on OnSuccess", func() {
+		It("should keep BMaaS Phase=Progressing and set WorkersJoining on OnSuccess while workers are pending", func() {
 			instance := &v1alpha1.ClusterOrder{
 				Spec: v1alpha1.ClusterOrderSpec{
 					NodeRequests: []v1alpha1.NodeRequest{{
@@ -1492,10 +1491,13 @@ var _ = Describe("ClusterOrder Controller", func() {
 			callbacks.OnSuccess(provisioning.ProvisionStatus{})
 
 			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
-			Expect(instance.Status.Conditions).To(BeEmpty())
+			cond := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(v1alpha1.ReasonWorkersJoining))
 		})
 
-		It("should not overwrite an existing progressing condition on provisioning success", func() {
+		It("should keep CaaS orders progressing after provisioning recovery until HostedCluster readiness", func() {
 			instance := &v1alpha1.ClusterOrder{
 				Status: v1alpha1.ClusterOrderStatus{
 					Phase: v1alpha1.ClusterOrderPhaseProgressing,
@@ -1518,9 +1520,9 @@ var _ = Describe("ClusterOrder Controller", func() {
 			Expect(instance.Status.Phase).To(Equal(v1alpha1.ClusterOrderPhaseProgressing))
 			cond := apimeta.FindStatusCondition(instance.Status.Conditions, v1alpha1.ConditionProgressing)
 			Expect(cond).NotTo(BeNil())
-			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(v1alpha1.ReasonProvisioningFailed))
-			Expect(cond.Message).To(Equal("previous failure"))
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(v1alpha1.ReasonProgressing))
+			Expect(cond.Message).To(BeEmpty())
 		})
 	})
 
