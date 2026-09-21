@@ -1,0 +1,82 @@
+//
+// Copyright (c) 2026 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.public.v1;
+
+import "buf/validate/validate.proto";
+import "osac/public/v1/metadata_type.proto";
+import "osac/public/v1/secret_type.proto";
+
+// A tenant groups resources and users for a customer or business unit.
+//
+// buf:lint:ignore OSAC_OBJECT_SHAPE
+message Tenant {
+  // Unique identifier of the tenant.
+  string id = 1;
+  Metadata metadata = 2;
+  TenantSpec spec = 3;
+}
+
+message TenantSpec {
+  // List of e-mail domains associated with this tenant.
+  //
+  // These are used to automatically redirect users to the correct identity provider during login. Each domain must be a
+  // valid DNS hostname with only lowercase labels, for example `example.com` or `corp.example.org`. Uppercase letters
+  // are rejected. Domains must be globally unique across all tenants.
+  //
+  // Validation rules:
+  // - Each domain must be non-empty and at most 253 characters
+  // - Must be a DNS hostname (not an IP address)
+  // - Must have at least two labels (e.g., "example.com", not just "example")
+  // - Each label must be a valid DNS label:
+  //   - Max 63 characters
+  //   - Lowercase letters (a-z), digits (0-9), and hyphens (-) only
+  //   - Must start and end with alphanumeric characters
+  // - No duplicate domains in the list
+  repeated string domains = 1 [(buf.validate.field).repeated = {
+    unique: true,
+    items: {
+      string: {
+        min_len: 1,
+        max_len: 253
+      },
+      cel: [
+        {
+          id: "not_ip_address",
+          message: "must be a DNS hostname, not an IP address",
+          expression: "!this.matches('^[0-9.]+$') && !this.matches('^[0-9a-f:]+$')"
+        },
+        {
+          id: "min_two_labels",
+          message: "must have at least two labels (e.g., 'example.com')",
+          expression: "this.contains('.')"
+        },
+        {
+          id: "valid_dns_labels",
+          message: "all labels must be valid DNS labels (lowercase a-z/0-9/hyphen, max 63 chars, alphanumeric start/end)",
+          expression: "this.split('.').all(label, label.size() > 0 && label.size() <= 63 && label.matches('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'))"
+        }
+      ]
+    }
+  }];
+
+  // Reference to a Secret resource containing break-glass account credentials.
+  //
+  // On Create the system generates break-glass credentials and returns them in status. The
+  // reconciler then stores them as a Secret and sets this field. Callers may also set it to an
+  // existing Secret; the referenced Secret must exist. The secret data must contain `username` and
+  // `password` entries.
+  SecretLocalReference break_glass_credentials_secret = 2;
+}

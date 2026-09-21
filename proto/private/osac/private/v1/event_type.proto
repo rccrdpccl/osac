@@ -1,0 +1,135 @@
+//
+// Copyright (c) 2025 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.private.v1;
+
+import "cleanapi/cleanapi.proto";
+import "google/protobuf/timestamp.proto";
+import "osac/private/v1/add_on_operator_type.proto";
+import "osac/private/v1/baremetal_instance_catalog_item_type.proto";
+import "osac/private/v1/baremetal_instance_template_type.proto";
+import "osac/private/v1/baremetal_instance_type.proto";
+import "osac/private/v1/cluster_catalog_item_type.proto";
+import "osac/private/v1/cluster_template_type.proto";
+import "osac/private/v1/cluster_version_type.proto";
+import "osac/private/v1/cluster_type.proto";
+import "osac/private/v1/compute_instance_catalog_item_type.proto";
+import "osac/private/v1/compute_instance_template_type.proto";
+import "osac/private/v1/compute_instance_type.proto";
+import "osac/private/v1/disk_image_type.proto";
+import "osac/private/v1/external_ip_attachment_type.proto";
+import "osac/private/v1/external_ip_pool_type.proto";
+import "osac/private/v1/external_ip_type.proto";
+import "osac/private/v1/host_type_type.proto";
+import "osac/private/v1/hub_type.proto";
+import "osac/private/v1/identity_provider_type.proto";
+import "osac/private/v1/instance_type_type.proto";
+import "osac/private/v1/nat_gateway_type.proto";
+import "osac/private/v1/network_class_type.proto";
+import "osac/private/v1/project_membership_type.proto";
+import "osac/private/v1/project_type.proto";
+import "osac/private/v1/tenant_type.proto";
+import "osac/private/v1/role_binding_type.proto";
+import "osac/private/v1/role_type.proto";
+import "osac/private/v1/secret_type.proto";
+import "osac/private/v1/security_group_type.proto";
+import "osac/private/v1/storage_backend_type.proto";
+import "osac/private/v1/storage_tier_type.proto";
+import "osac/private/v1/subnet_type.proto";
+import "osac/private/v1/user_type.proto";
+import "osac/private/v1/virtual_network_type.proto";
+import "osac/private/v1/volume_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
+// Represents events delivered by the server.
+message Event {
+  // Unique identifier of the event.
+  string id = 1;
+
+  // Type of event.
+  EventType type = 2;
+
+  // Time at which the event was generated.
+  //
+  // For EVENT_TYPE_OBJECT_DELETED, this is the authoritative deletion boundary: the time at which the object had no
+  // remaining finalizers and the deletion event was generated. It is distinct from Metadata.deletion_timestamp, which
+  // records when deletion was requested.
+  google.protobuf.Timestamp timestamp = 36;
+
+  // Payload of the event.
+  oneof payload {
+    BareMetalInstance bare_metal_instance = 3;
+    Cluster cluster = 4;
+    ClusterTemplate cluster_template = 5;
+    ClusterVersion cluster_version = 6;
+    ComputeInstance compute_instance = 7;
+    ComputeInstanceTemplate compute_instance_template = 8;
+    DiskImage disk_image = 9;
+    HostType host_type = 10;
+    InstanceType instance_type = 11;
+    Project project = 12;
+    Role role = 13;
+    RoleBinding role_binding = 14;
+    Secret secret = 15;
+    Tenant tenant = 16;
+    Hub hub = 17 [(cleanapi.field).private = true];
+    NetworkClass network_class = 18 [(cleanapi.field).private = true];
+    Subnet subnet = 19 [(cleanapi.field).private = true];
+    VirtualNetwork virtual_network = 20 [(cleanapi.field).private = true];
+    SecurityGroup security_group = 21 [(cleanapi.field).private = true];
+    User user = 22 [(cleanapi.field).private = true];
+    ClusterCatalogItem cluster_catalog_item = 23 [(cleanapi.field).private = true];
+    ComputeInstanceCatalogItem compute_instance_catalog_item = 24 [(cleanapi.field).private = true];
+    BareMetalInstanceTemplate bare_metal_instance_template = 25 [(cleanapi.field).private = true];
+    BareMetalInstanceCatalogItem bare_metal_instance_catalog_item = 26 [(cleanapi.field).private = true];
+    StorageBackend storage_backend = 27 [(cleanapi.field).private = true];
+    IdentityProvider identity_provider = 28 [(cleanapi.field).private = true];
+    ProjectMembership project_membership = 29 [(cleanapi.field).private = true];
+    ExternalIPPool external_ip_pool = 30 [(cleanapi.field).private = true];
+    ExternalIP external_ip = 31 [(cleanapi.field).private = true];
+    ExternalIPAttachment external_ip_attachment = 32 [(cleanapi.field).private = true];
+    NATGateway nat_gateway = 33 [(cleanapi.field).private = true];
+    StorageTier storage_tier = 34 [(cleanapi.field).private = true];
+    Volume volume = 35 [(cleanapi.field).private = true];
+    AddOnOperator add_on_operator = 37 [(cleanapi.field).private = true];
+  }
+
+}
+
+enum EventType {
+  // Unspecified means that the even type is unknown.
+  EVENT_TYPE_UNSPECIFIED = 0;
+
+  // Means that a new object has been created.
+  //
+  // The payload will contain the representation of the object.
+  EVENT_TYPE_OBJECT_CREATED = 1;
+
+  // Means that an existing object has been modified.
+  //
+  // The payload will contain the updated representation of the object.
+  EVENT_TYPE_OBJECT_UPDATED = 2;
+
+  // Means that an object has been deleted.
+  //
+  // The payload will contain the representation of the object right before it was deleted.
+  EVENT_TYPE_OBJECT_DELETED = 3;
+
+  // Means that something has changed that may require reconciling the state of the object.
+  //
+  // The payload will contain the current representation of the object.
+  EVENT_TYPE_OBJECT_SIGNALED = 4 [(cleanapi.value).private = true];
+}

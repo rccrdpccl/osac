@@ -1,0 +1,107 @@
+//
+// Copyright (c) 2025 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.private.v1;
+
+import "buf/validate/validate.proto";
+import "cleanapi/cleanapi.proto";
+import "google/api/field_behavior.proto";
+import "osac/private/v1/cluster_template_type.proto";
+import "osac/private/v1/field_policy_type.proto";
+import "osac/private/v1/metadata_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
+// A cluster catalog item defines a curated infrastructure offering that references an underlying cluster template.
+// Admins control typed resource-field and template-parameter policies, including locked values and defaults.
+//
+// buf:lint:ignore OSAC_OBJECT_SHAPE
+message ClusterCatalogItem {
+  // Unique identifier of the catalog item.
+  string id = 1;
+
+  Metadata metadata = 2;
+
+  // Human friendly short description of the catalog item, suitable for displaying in one single line on a UI or CLI.
+  string title = 3;
+
+  // Human friendly long description of the catalog item, using Markdown format.
+  string description = 4;
+
+  // Reference to the underlying cluster template that this catalog item references.
+  ClusterTemplateReference template = 5 [
+    (google.api.field_behavior) = REQUIRED,
+    (google.api.field_behavior) = IMMUTABLE,
+    (buf.validate.field).required = true
+  ];
+
+  // Whether this catalog item is published.
+  bool published = 6;
+
+  reserved 7, 8;
+  reserved "tenant", "field_definitions";
+
+  // Policies that govern template parameters during resource creation.
+  map<string, TemplateParameterPolicy> template_parameters = 9;
+
+  // Policies that govern cluster fields during resource creation.
+  ClusterCatalogItemFields fields = 10;
+}
+
+// Groups the policies for governable cluster fields.
+message ClusterCatalogItemFields {
+  ClusterVersionReferenceFieldPolicy version = 1;
+  StringFieldPolicy ssh_public_key = 2;
+  SecretReferenceFieldPolicy pull_secret_secret = 3;
+  ClusterNetworkFieldPolicies network = 4;
+  ClusterNodeSetMapPolicy node_sets = 5;
+  BoolFieldPolicy auto_external_ip_attachment = 6;
+  // Policy for the cluster's subnet and security-group attachment.
+  ClusterNetworkAttachmentFieldPolicy network_attachment = 7;
+}
+
+// Defines whether the complete cluster node-set map is locked or editable.
+message ClusterNodeSetMapPolicy {
+  oneof behavior {
+    option (buf.validate.oneof).required = true;
+
+    ClusterNodeSetMap locked = 1;
+    EditableClusterNodeSetMap editable = 2;
+  }
+}
+
+// Wraps the cluster node-set map for use in a field policy.
+message ClusterNodeSetMap {
+  map<string, ClusterTemplateNodeSet> items = 1;
+}
+
+// Configures an editable cluster node-set map.
+message EditableClusterNodeSetMap {
+  ClusterNodeSetMap default_value = 1;
+}
+
+// Groups policies for governable cluster network fields.
+message ClusterNetworkFieldPolicies {
+  StringFieldPolicy pod_cidr = 1;
+  StringFieldPolicy service_cidr = 2;
+}
+
+// Reference to a ClusterCatalogItem resource.
+message ClusterCatalogItemReference {
+  string id = 1;
+  string name = 2;
+  string project = 3;
+  bool shared = 4;
+}

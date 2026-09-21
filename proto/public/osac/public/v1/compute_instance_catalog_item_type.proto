@@ -1,0 +1,85 @@
+//
+// Copyright (c) 2025 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.public.v1;
+
+import "buf/validate/validate.proto";
+import "google/api/field_behavior.proto";
+import "osac/public/v1/compute_instance_template_type.proto";
+import "osac/public/v1/field_policy_type.proto";
+import "osac/public/v1/metadata_type.proto";
+
+// A compute instance catalog item defines a curated infrastructure offering that references an underlying compute
+// instance template. Admins control typed resource-field and template-parameter policies, including locked values and defaults.
+//
+// buf:lint:ignore OSAC_OBJECT_SHAPE
+message ComputeInstanceCatalogItem {
+  // Unique identifier of the catalog item.
+  string id = 1;
+
+  Metadata metadata = 2;
+
+  // Human friendly short description of the catalog item, suitable for displaying in one single line on a UI or CLI.
+  string title = 3;
+
+  // Human friendly long description of the catalog item, using Markdown format.
+  string description = 4;
+
+  // Reference to the underlying compute instance template that this catalog item references.
+  ComputeInstanceTemplateReference template = 5 [
+    (google.api.field_behavior) = REQUIRED,
+    (google.api.field_behavior) = IMMUTABLE,
+    (buf.validate.field).required = true
+  ];
+
+  // Whether this catalog item is published.
+  bool published = 6;
+
+  reserved 7, 8;
+  reserved "tenant", "field_definitions";
+
+  // Policies that govern template parameters during resource creation.
+  map<string, TemplateParameterPolicy> template_parameters = 9;
+
+  // Policies that govern compute instance fields during resource creation.
+  ComputeInstanceCatalogItemFields fields = 10;
+}
+
+// Groups the policies for governable compute instance fields.
+message ComputeInstanceCatalogItemFields {
+  DiskImageReferenceFieldPolicy disk_image = 1;
+  InstanceTypeReferenceFieldPolicy instance_type = 2;
+  StringFieldPolicy ssh_public_key = 3;
+  ComputeInstanceBootDiskFieldPolicies boot_disk = 4;
+  ComputeInstanceRunStrategyFieldPolicy run_strategy = 5;
+  StringFieldPolicy user_data = 6;
+  ComputeNetworkAttachmentListFieldPolicy network_attachments = 7;
+  BoolFieldPolicy auto_external_ip_attachment = 8;
+  ComputeInstanceDiskListFieldPolicy additional_disks = 9;
+}
+
+// Groups policies for governable compute instance boot disk fields.
+message ComputeInstanceBootDiskFieldPolicies {
+  Int32FieldPolicy size_gib = 1;
+  StorageTierReferenceFieldPolicy storage_tier = 2;
+}
+
+// Reference to a ComputeInstanceCatalogItem resource.
+message ComputeInstanceCatalogItemReference {
+  string id = 1;
+  string name = 2;
+  string project = 3;
+  bool shared = 4;
+}

@@ -1,0 +1,53 @@
+//
+// Copyright (c) 2025 Red Hat, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+//
+
+syntax = "proto3";
+
+package osac.private.v1;
+
+import "cleanapi/cleanapi.proto";
+import "google/api/field_behavior.proto";
+import "osac/private/v1/security_group_type.proto";
+import "osac/private/v1/subnet_type.proto";
+
+option (cleanapi.file).package = "osac.public.v1";
+
+// Network attachment for a bare metal instance NIC.
+// Groups a subnet with security groups and a physical interface binding.
+message BareMetalNetworkAttachment {
+  // Reference to the Subnet. Must reference a Subnet in READY state.
+  SubnetLocalReference subnet = 1 [(google.api.field_behavior) = IMMUTABLE];
+
+  // References to the SecurityGroups applied on this NIC.
+  // Each must be READY and belong to the same VirtualNetwork as the subnet.
+  repeated SecurityGroupLocalReference security_groups = 2;
+
+  // Physical interface name from the HostType's NetworkInterface list.
+  // When omitted on a single-attachment instance, the system selects the first fabric-role interface.
+  optional string interface = 3 [(google.api.field_behavior) = IMMUTABLE];
+
+  // Designates this attachment as the default gateway for multi-NIC instances.
+  // When omitted on a single-attachment instance, that attachment is implicitly primary.
+  optional bool primary = 4 [(google.api.field_behavior) = IMMUTABLE];
+}
+
+// Run strategy for the bare metal instance.
+enum BareMetalInstanceRunStrategy {
+  BARE_METAL_INSTANCE_RUN_STRATEGY_UNSPECIFIED = 0;
+
+  // The instance is kept powered on.
+  BARE_METAL_INSTANCE_RUN_STRATEGY_ALWAYS = 1;
+
+  // The instance is powered off.
+  BARE_METAL_INSTANCE_RUN_STRATEGY_HALTED = 2;
+}
