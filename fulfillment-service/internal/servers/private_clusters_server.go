@@ -1245,6 +1245,29 @@ func (s *PrivateClustersServer) applyClusterTemplate(ctx context.Context, cluste
 	return nil
 }
 
+// convertTemplateNodeSets copies Template node sets into resource node sets, preserving names and nil entries.
+// HostType and BareMetalInstanceType references are cloned and sizes gain explicit presence; resolution and
+// compatibility checks run later.
+func convertTemplateNodeSets(value map[string]*privatev1.ClusterTemplateNodeSet) map[string]*privatev1.ClusterNodeSet {
+	if value == nil {
+		return nil
+	}
+	result := make(map[string]*privatev1.ClusterNodeSet, len(value))
+	for name, nodeSet := range value {
+		if nodeSet == nil {
+			result[name] = nil
+			continue
+		}
+		size := nodeSet.GetSize()
+		result[name] = privatev1.ClusterNodeSet_builder{
+			HostType:              cloneMessage(nodeSet.GetHostType()),
+			BaremetalInstanceType: cloneMessage(nodeSet.GetBaremetalInstanceType()),
+			Size:                  &size,
+		}.Build()
+	}
+	return result
+}
+
 // processAndValidateNodeSets handles node set merging, validation, and BareMetalInstanceType resolution.
 // NodeSets belong to the Cluster/ClusterOrder, not the template. If user provides node sets, they are
 // validated directly by BareMetalInstanceType, not against the template.
