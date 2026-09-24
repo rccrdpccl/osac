@@ -480,6 +480,27 @@ func (s *PrivateClustersServer) Update(ctx context.Context,
 		if err := validateClusterTemplateImmutability(current, candidate, request.GetUpdateMask()); err != nil {
 			return err
 		}
+		if s.updateAffectsNodeSets(request.GetUpdateMask()) {
+			for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
+				if existing := current.GetSpec().GetNodeSets()[name]; existing != nil &&
+					(refKey(existing.GetBaremetalInstanceType()) == refKey(nodeSet.GetBaremetalInstanceType()) ||
+						(s.isUpdatingOnlySizes(request.GetUpdateMask()) && refKey(nodeSet.GetBaremetalInstanceType()) == "")) {
+					// ID-only and size-only updates must not discard the resolved name used by the reconciler.
+					nodeSet.SetBaremetalInstanceType(cloneMessage(existing.GetBaremetalInstanceType()))
+					continue
+				}
+				if key := refKey(nodeSet.GetBaremetalInstanceType()); key != "" {
+					bmit, err := s.lookupBareMetalInstanceType(ctx, key)
+					if err != nil {
+						return err
+					}
+					nodeSet.SetBaremetalInstanceType(privatev1.BareMetalInstanceTypeReference_builder{
+						Id:   bmit.GetId(),
+						Name: bmit.GetMetadata().GetName(),
+					}.Build())
+				}
+			}
+		}
 		if updateIncludesField(request.GetUpdateMask(), "spec.ssh_public_key") {
 			if key := candidate.GetSpec().GetSshPublicKey(); key != "" {
 				if err := validateOpenSSHPublicKey(key); err != nil {

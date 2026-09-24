@@ -919,6 +919,7 @@ var _ = Describe("Clusters server", func() {
 			object = updateResponse.GetObject()
 			nodeSet := object.GetSpec().GetNodeSets()["compute"]
 			Expect(nodeSet.GetBaremetalInstanceType().GetId()).To(Equal("bmit_standard"))
+			Expect(nodeSet.GetBaremetalInstanceType().GetName()).To(Equal("test-bmit-standard"))
 			Expect(nodeSet.GetSize()).To(BeNumerically("==", 4))
 
 			// Get and verify:
@@ -929,6 +930,7 @@ var _ = Describe("Clusters server", func() {
 			object = getResponse.GetObject()
 			nodeSet = object.GetSpec().GetNodeSets()["compute"]
 			Expect(nodeSet.GetBaremetalInstanceType().GetId()).To(Equal("bmit_standard"))
+			Expect(nodeSet.GetBaremetalInstanceType().GetName()).To(Equal("test-bmit-standard"))
 			Expect(nodeSet.GetSize()).To(BeNumerically("==", 4))
 		})
 
@@ -1206,6 +1208,7 @@ var _ = Describe("Clusters server", func() {
 			verify := func(object *publicv1.Cluster) {
 				Expect(object.GetSpec().GetTemplate().GetId()).To(Equal("my_template"))
 				computeNodeSet := object.GetSpec().GetNodeSets()["compute"]
+				Expect(computeNodeSet.GetBaremetalInstanceType().GetName()).To(Equal("test-bmit-standard"))
 				Expect(computeNodeSet.GetSize()).To(BeNumerically("==", 4))
 				gpuNodeSet := object.GetSpec().GetNodeSets()["gpu"]
 				Expect(gpuNodeSet.GetSize()).To(BeNumerically("==", 1))
@@ -1260,6 +1263,7 @@ var _ = Describe("Clusters server", func() {
 			object = updateResponse.GetObject()
 			Expect(object.GetSpec().GetNodeSets()).To(HaveLen(1))
 			Expect(object.GetSpec().GetNodeSets()).To(HaveKey("compute"))
+			Expect(object.GetSpec().GetNodeSets()["compute"].GetBaremetalInstanceType().GetName()).To(Equal("test-bmit-standard"))
 			Expect(object.GetSpec().GetNodeSets()).ToNot(HaveKey("gpu"))
 
 			// Get and verify the node set was removed:
@@ -1271,6 +1275,43 @@ var _ = Describe("Clusters server", func() {
 			Expect(object.GetSpec().GetNodeSets()).To(HaveLen(1))
 			Expect(object.GetSpec().GetNodeSets()).To(HaveKey("compute"))
 			Expect(object.GetSpec().GetNodeSets()).ToNot(HaveKey("gpu"))
+		})
+
+		It("Resolves an added node set's bare metal instance type on update", func() {
+			created, err := server.Create(ctx, publicv1.ClustersCreateRequest_builder{
+				Object: publicv1.Cluster_builder{
+					Metadata: publicv1.Metadata_builder{Name: "test-cluster"}.Build(),
+					Spec: publicv1.ClusterSpec_builder{
+						Template: publicv1.ClusterTemplateReference_builder{Id: "my_template"}.Build(),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+
+			updated, err := server.Update(ctx, publicv1.ClustersUpdateRequest_builder{
+				Object: publicv1.Cluster_builder{
+					Id: created.GetObject().GetId(),
+					Spec: publicv1.ClusterSpec_builder{
+						NodeSets: map[string]*publicv1.ClusterNodeSet{
+							"compute": publicv1.ClusterNodeSet_builder{
+								BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "bmit_standard"}.Build(),
+								Size:                  proto.Int32(3),
+							}.Build(),
+							"gpu": publicv1.ClusterNodeSet_builder{
+								BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "bmit_gpu"}.Build(),
+								Size:                  proto.Int32(1),
+							}.Build(),
+							"extra": publicv1.ClusterNodeSet_builder{
+								BaremetalInstanceType: publicv1.BareMetalInstanceTypeReference_builder{Id: "bmit_standard"}.Build(),
+								Size:                  proto.Int32(2),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(updated.GetObject().GetSpec().GetNodeSets()["extra"].GetBaremetalInstanceType().GetName()).To(Equal("test-bmit-standard"))
 		})
 
 		It("Sets name when creating", func() {
