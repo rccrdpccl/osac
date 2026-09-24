@@ -50,14 +50,14 @@ Ansible job; you can list the ones available in your environment:
 ```bash
 osac get clustertemplates
 osac get clustertemplates <id> -o yaml
-osac get hosttypes
+osac get baremetalinstancetypes
 osac get clusterversions
 ```
 
 For the cluster example below, assume the administrator has installed a `sandbox` template and
 its provisioning workflow. It defines optional `vpc_id` and `vlan` parameters with defaults. Its
-`fc430` HostType (hardware type) must already exist in the shared tenant. A node set groups machines
-of the same hardware type; the `workers` node set below starts with one `fc430` machine:
+`fc430` BareMetalInstanceType (hardware profile) must already exist in the shared tenant.
+A node set groups machines of the same hardware type; the `workers` node set below starts with one `fc430` machine:
 
 ```yaml
 '@type': type.googleapis.com/osac.private.v1.ClusterTemplate
@@ -69,7 +69,7 @@ title: Sandbox Cluster
 description: Small sandbox cluster template with networking parameters.
 node_sets:
   workers:
-    host_type:
+    baremetal_instance_type:
       name: fc430
       shared: true
     size: 1
@@ -118,7 +118,7 @@ fields:
       default_value:
         items:
           workers:
-            host_type:
+            baremetal_instance_type:
               name: fc430
               shared: true
             size: 1
@@ -284,7 +284,7 @@ fields; in YAML, write them as nested mappings.
 | `version` | `--version` | ClusterVersion reference for the OpenShift release |
 | `network.pod_cidr` | `--pod-cidr` | Pod network CIDR (system default: `10.128.0.0/14`) |
 | `network.service_cidr` | `--service-cidr` | Service network CIDR (system default: `172.30.0.0/16`) |
-| `node_sets` | — | Policy for the complete node-set map, including sizes and HostType references |
+| `node_sets` | — | Policy for the complete node-set map, including sizes and BareMetalInstanceType references |
 | `network_attachment` | — | Subnet and security-group attachment |
 | `auto_external_ip_attachment` | — | Whether to provision external IP attachments automatically |
 
@@ -343,9 +343,9 @@ only for policies; resource lists do not use it.
 Cluster `node_sets` policies apply to the complete map, also under `items`. If the user supplies a
 nonempty map, omitted template node sets are not added. Each supplied node set needs a positive size.
 
-For a node set that exists in the template, users can omit the HostType to inherit it. They cannot
-choose a different HostType for that node set. New node sets are allowed if they specify a valid
-HostType.
+For a node set that exists in the template, users can omit the BareMetalInstanceType to inherit it.
+They cannot choose a different BareMetalInstanceType for that node set. New node sets must specify
+a valid BareMetalInstanceType.
 
 When the user omits the map or supplies an empty one, the catalog's locked map or default is used.
 If neither is set, the template's node sets are used.

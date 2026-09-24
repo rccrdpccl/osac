@@ -27,7 +27,6 @@ import "osac/public/v1/cluster_template_type.proto";
 import "osac/public/v1/cluster_version_type.proto";
 import "osac/public/v1/condition_status_type.proto";
 import "osac/public/v1/metadata_type.proto";
-import "osac/public/v1/host_type_type.proto";
 import "osac/public/v1/secret_type.proto";
 
 // Contains the details of the cluster.
@@ -96,13 +95,11 @@ message ClusterSpec {
 
   // Desired node sets of the cluster.
   //
-  // This will be automatically set by the system when the cluster is initially created, according to the template
-  // selected by the user, and can be later modified to change the size.
+  // Defaults come from the selected template when the cluster is created. Users may later change the size.
   //
   // The key of the map is the unique identifier of the node set for this cluster.
   //
-  // For example, a cluster created with two different node sets, one for nodes without GPUs and another for nodes with
-  // GPUs could be represented like this:
+  // For example, a cluster with CPU and GPU node sets could be represented like this:
   //
   // ```json
   // {
@@ -110,11 +107,11 @@ message ClusterSpec {
   //   "spec": {
   //     "node_sets": {
   //       "compute": {
-  //         "host_type": "acme_1tb",
+  //         "baremetal_instance_type": {"name": "acme-1tb"},
   //         "size": 3
   //       },
   //       "gpu": {
-  //         "host_type": "acme_1tb_h100",
+  //         "baremetal_instance_type": {"name": "acme-1tb-h100"},
   //         "size": 3
   //       }
   //     }
@@ -123,11 +120,11 @@ message ClusterSpec {
   //     "state": "CLUSTER_STATE_READY",
   //     "node_sets": {
   //       "compute": {
-  //         "host_type": "acme_1tb",
+  //         "baremetal_instance_type": {"name": "acme-1tb"},
   //         "size": 3
   //       },
   //       "gpu": {
-  //         "host_type": "acme_1tb_h100",
+  //         "baremetal_instance_type": {"name": "acme-1tb-h100"},
   //         "size": 3
   //       }
   //     }
@@ -135,7 +132,7 @@ message ClusterSpec {
   // }
   // ```
   //
-  // The user will not be allowed to change the `host_type` field.
+  // The user cannot change `baremetal_instance_type` on an existing node set.
   //
   // The user will be allowed to add new node sets.
   //
@@ -375,13 +372,10 @@ enum ClusterConditionType {
   CLUSTER_CONDITION_TYPE_WORKER_PROVISIONING_BLOCKED = 6;
 }
 
-// Defines a set of nodes that are part of the cluster, all of them of the same type of host.
+// Defines a set of cluster nodes sharing the same bare metal instance type.
 message ClusterNodeSet {
-  // Identifier of the type of hosts that are part of the set.
-  //
-  // Retained for backward compatibility; superseded by baremetal_instance_type and slated
-  // for removal in OSAC-4154. New node sets should set baremetal_instance_type.
-  HostTypeReference host_type = 1;
+  reserved 1;
+  reserved "host_type";
 
   // Number of nodes of the set.
   optional int32 size = 2 [(buf.validate.field).int32.gt = 0];

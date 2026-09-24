@@ -66,18 +66,23 @@ var _ = Describe("Private clusters server", func() {
 	Describe("node-set validation", func() {
 		It("validates the resolved node-set map", func() {
 			size := int32(2)
-			hostType := privatev1.HostTypeReference_builder{Id: "worker"}.Build()
 			valid := map[string]*privatev1.ClusterNodeSet{
-				"workers": privatev1.ClusterNodeSet_builder{Size: &size, HostType: hostType}.Build(),
+				"workers": privatev1.ClusterNodeSet_builder{
+					Size:                  &size,
+					BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "worker"}.Build(),
+				}.Build(),
 			}
 			Expect(validateClusterNodeSetMap(valid)).To(Succeed())
+			Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{Size: &size}.Build(),
+			})).To(MatchError("bare metal instance type for node set 'workers' is required"))
 			Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
 				"workers": nil,
 			})).To(MatchError("node set 'workers' must not be null"))
 
 			zero := int32(0)
 			Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
-				"workers": privatev1.ClusterNodeSet_builder{Size: &zero, HostType: hostType}.Build(),
+				"workers": privatev1.ClusterNodeSet_builder{Size: &zero}.Build(),
 			})).To(MatchError("size for node set 'workers' should be greater than zero, but it is 0"))
 		})
 	})

@@ -44,13 +44,13 @@ var _ privatev1.ClusterCatalogItemsServer = (*PrivateClusterCatalogItemsServer)(
 
 type PrivateClusterCatalogItemsServer struct {
 	privatev1.UnimplementedClusterCatalogItemsServer
-	templatesDao       *dao.GenericDAO[*privatev1.ClusterTemplate]
-	clusterVersionsDao *dao.GenericDAO[*privatev1.ClusterVersion]
-	secretsDao         *dao.GenericDAO[*privatev1.Secret]
-	subnetsDao         *dao.GenericDAO[*privatev1.Subnet]
-	securityGroupsDao  *dao.GenericDAO[*privatev1.SecurityGroup]
-	generic            *GenericServer[*privatev1.ClusterCatalogItem]
-	hostTypesDao       *dao.GenericDAO[*privatev1.HostType]
+	templatesDao              *dao.GenericDAO[*privatev1.ClusterTemplate]
+	clusterVersionsDao        *dao.GenericDAO[*privatev1.ClusterVersion]
+	secretsDao                *dao.GenericDAO[*privatev1.Secret]
+	subnetsDao                *dao.GenericDAO[*privatev1.Subnet]
+	securityGroupsDao         *dao.GenericDAO[*privatev1.SecurityGroup]
+	generic                   *GenericServer[*privatev1.ClusterCatalogItem]
+	bareMetalInstanceTypesDao *dao.GenericDAO[*privatev1.BareMetalInstanceType]
 }
 
 func NewPrivateClusterCatalogItemsServer() *PrivateClusterCatalogItemsServerBuilder {
@@ -160,7 +160,7 @@ func (b *PrivateClusterCatalogItemsServerBuilder) Build() (result *PrivateCluste
 		return
 	}
 
-	hostTypesDao, err := dao.NewGenericDAO[*privatev1.HostType]().
+	bareMetalInstanceTypesDao, err := dao.NewGenericDAO[*privatev1.BareMetalInstanceType]().
 		SetLogger(b.logger).
 		SetTenancyLogic(b.tenancyLogic).
 		SetMetricsRegisterer(b.metricsRegisterer).
@@ -169,13 +169,13 @@ func (b *PrivateClusterCatalogItemsServerBuilder) Build() (result *PrivateCluste
 		return
 	}
 	result = &PrivateClusterCatalogItemsServer{
-		hostTypesDao:       hostTypesDao,
-		templatesDao:       templatesDao,
-		clusterVersionsDao: clusterVersionsDao,
-		secretsDao:         secretsDao,
-		subnetsDao:         subnetsDao,
-		securityGroupsDao:  securityGroupsDao,
-		generic:            generic,
+		bareMetalInstanceTypesDao: bareMetalInstanceTypesDao,
+		templatesDao:              templatesDao,
+		clusterVersionsDao:        clusterVersionsDao,
+		secretsDao:                secretsDao,
+		subnetsDao:                subnetsDao,
+		securityGroupsDao:         securityGroupsDao,
+		generic:                   generic,
 	}
 	return
 }
@@ -230,7 +230,7 @@ func (s *PrivateClusterCatalogItemsServer) prepareCatalogItemCandidate(
 	if err != nil {
 		return err
 	}
-	if err := validateAndCanonicalizeClusterCatalogItemPolicies(ctx, candidate, template, s.hostTypesDao, s.clusterVersionsDao, s.secretsDao, s.subnetsDao, s.securityGroupsDao); err != nil {
+	if err := validateAndCanonicalizeClusterCatalogItemPolicies(ctx, candidate, template, s.bareMetalInstanceTypesDao, s.clusterVersionsDao, s.secretsDao, s.subnetsDao, s.securityGroupsDao); err != nil {
 		return err
 	}
 	return nil
@@ -240,7 +240,7 @@ func (s *PrivateClusterCatalogItemsServer) prepareCatalogItemCandidate(
 // starts in the item's tenant/project; project or shared selectors can choose another scope.
 // It stores the Template's actual ID/name/scope, checks parameter policies against that
 // Template, and forbids changing the Template on Update. The resolved Template also supplies
-// the allowed HostTypes for node-set policies.
+// the allowed bare metal instance types for node-set policies.
 func (s *PrivateClusterCatalogItemsServer) validateAndCanonicalizeTemplate(
 	ctx context.Context, current *privatev1.ClusterCatalogItem, candidate *privatev1.ClusterCatalogItem,
 ) (*privatev1.ClusterTemplate, error) {

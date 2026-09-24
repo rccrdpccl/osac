@@ -23,6 +23,7 @@ import (
 
 	hypershiftv1beta1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -478,13 +479,12 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 		}
 
 		var nodeSetID string
+		var instanceType *privatev1.BareMetalInstanceTypeReference
 		for candidateNodeSetID, candidateNodeSet := range remote.GetSpec().GetNodeSets() {
-			candidateResourceClass := candidateNodeSet.GetBaremetalInstanceType().GetName()
-			if candidateResourceClass == "" {
-				candidateResourceClass = candidateNodeSet.GetHostType().GetName()
-			}
-			if candidateResourceClass == resourceClass {
+			candidateType := candidateNodeSet.GetBaremetalInstanceType()
+			if resourceClass != "" && candidateType.GetName() == resourceClass {
 				nodeSetID = candidateNodeSetID
+				instanceType = candidateType
 				break
 			}
 		}
@@ -500,17 +500,10 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 		}
 		nodeSet := nodeSets[nodeSetID]
 		if nodeSet == nil {
-			builder := privatev1.ClusterNodeSet_builder{}
-			if nodeRequest.BareMetal != nil && nodeRequest.BareMetal.InstanceType != "" {
-				builder.BaremetalInstanceType = privatev1.BareMetalInstanceTypeReference_builder{
-					Name: nodeRequest.BareMetal.InstanceType,
-				}.Build()
-			} else {
-				builder.HostType = privatev1.HostTypeReference_builder{Name: resourceClass}.Build()
-			}
-			nodeSet = builder.Build()
+			nodeSet = privatev1.ClusterNodeSet_builder{}.Build()
 			nodeSets[nodeSetID] = nodeSet
 		}
+		nodeSet.SetBaremetalInstanceType(proto.Clone(instanceType).(*privatev1.BareMetalInstanceTypeReference))
 
 		oldValue := nodeSet.GetSize()
 		newValue := int32(nodeRequest.NumberOfNodes)

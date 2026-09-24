@@ -722,9 +722,6 @@ func (s *PrivateClustersServer) validateNodeSetsUpdate(ctx context.Context,
 	if err := s.validateAtLeastOneNodeSet(newNodeSets); err != nil {
 		return err
 	}
-	if err := s.validateNodeSetHostTypeImmutability(existingNodeSets, newNodeSets); err != nil {
-		return err
-	}
 	if err := s.validateNodeSetBareMetalInstanceTypeImmutability(existingNodeSets, newNodeSets); err != nil {
 		return err
 	}
@@ -840,34 +837,8 @@ func validateClusterNodeSetMap(nodeSets map[string]*privatev1.ClusterNodeSet) er
 		if nodeSet.GetSize() <= 0 {
 			return fmt.Errorf("size for node set '%s' should be greater than zero, but it is %d", name, nodeSet.GetSize())
 		}
-		if nodeSet.GetHostType() == nil || refKey(nodeSet.GetHostType()) == "" {
-			return fmt.Errorf("host type for node set '%s' is required", name)
-		}
-	}
-	return nil
-}
-
-// validateNodeSetHostTypeImmutability ensures that the host_type field of existing node sets
-// cannot be changed. This is an existing documented restriction in the API specification.
-func (s *PrivateClustersServer) validateNodeSetHostTypeImmutability(
-	existingNodeSets map[string]*privatev1.ClusterNodeSet,
-	newNodeSets map[string]*privatev1.ClusterNodeSet) error {
-	for nodeSetName, existingNodeSet := range existingNodeSets {
-		newNodeSet, exists := newNodeSets[nodeSetName]
-		if !exists {
-			// Node set is being removed, which is allowed (if at least one remains)
-			continue
-		}
-		existingHostType := existingNodeSet.GetHostType()
-		newHostType := newNodeSet.GetHostType()
-		if refKey(existingHostType) != refKey(newHostType) {
-			return grpcstatus.Errorf(
-				grpccodes.InvalidArgument,
-				"cannot change host_type for node set '%s' from '%s' to '%s': host_type is immutable",
-				nodeSetName,
-				refKey(existingHostType),
-				refKey(newHostType),
-			)
+		if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
+			return fmt.Errorf("bare metal instance type for node set '%s' is required", name)
 		}
 	}
 	return nil
@@ -1195,17 +1166,9 @@ func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, spe
 			if bmit == nil {
 				continue
 			}
-			fabricInterface := ""
-			for _, port := range bmit.GetSpec().GetHardware().GetNetworkPorts() {
-				if strings.EqualFold(port.GetRole(), "fabric") {
-					fabricInterface = port.GetName()
-					break
-				}
-			}
-			if fabricInterface == "" {
-				return grpcstatus.Errorf(grpccodes.FailedPrecondition,
-					"node_sets[%s]: bare metal instance type '%s' has no network port with role 'fabric'",
-					name, bmitKey)
+			fabricInterface, err := selectClusterFabricInterface(bmit)
+			if err != nil {
+				return grpcstatus.Errorf(grpccodes.FailedPrecondition, "node_sets[%s]: %s", name, err)
 			}
 			nodeSet.SetFabricInterface(fabricInterface)
 		}
@@ -1213,13 +1176,13 @@ func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, spe
 	return nil
 }
 
-func selectClusterFabricInterface(hostType *privatev1.HostType) (string, error) {
-	for _, networkInterface := range hostType.GetInterfaces() {
-		if strings.EqualFold(networkInterface.GetRole(), "fabric") {
-			return networkInterface.GetName(), nil
+func selectClusterFabricInterface(instanceType *privatev1.BareMetalInstanceType) (string, error) {
+	for _, port := range instanceType.GetSpec().GetHardware().GetNetworkPorts() {
+		if strings.EqualFold(port.GetRole(), "fabric") {
+			return port.GetName(), nil
 		}
 	}
-	return "", fmt.Errorf("host type '%s' has no interface with role 'fabric'", hostType.GetId())
+	return "", fmt.Errorf("bare metal instance type '%s' has no network port with role 'fabric'", instanceType.GetId())
 }
 
 // autoProvisionExternalIPs creates two ExternalIPs and two ExternalIPAttachments
@@ -1363,7 +1326,7 @@ func (s *PrivateClustersServer) applyClusterTemplate(ctx context.Context, cluste
 }
 
 // convertTemplateNodeSets copies Template node sets into resource node sets, preserving names and nil entries.
-// HostType references are cloned and sizes gain explicit presence; resolution and compatibility checks run later.
+// BareMetalInstanceType references are cloned and sizes gain explicit presence; resolution runs later.
 func convertTemplateNodeSets(value map[string]*privatev1.ClusterTemplateNodeSet) map[string]*privatev1.ClusterNodeSet {
 	if value == nil {
 		return nil
@@ -1376,7 +1339,6 @@ func convertTemplateNodeSets(value map[string]*privatev1.ClusterTemplateNodeSet)
 		}
 		size := nodeSet.GetSize()
 		result[name] = privatev1.ClusterNodeSet_builder{
-			HostType:              cloneMessage(nodeSet.GetHostType()),
 			BaremetalInstanceType: cloneMessage(nodeSet.GetBaremetalInstanceType()),
 			Size:                  &size,
 		}.Build()

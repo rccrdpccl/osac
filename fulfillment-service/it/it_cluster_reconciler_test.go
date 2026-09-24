@@ -79,18 +79,18 @@ var _ = Describe("Cluster reconciler", func() {
 					Name: bmitName,
 				}.Build(),
 				Spec: privatev1.BareMetalInstanceTypeSpec_builder{
-				Hardware: privatev1.BareMetalHardwareSpec_builder{
-					Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
-					Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
-					NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
-						privatev1.BareMetalNetworkPortSpec_builder{
-							Name:  "eth0",
-							Role:  "fabric",
-							Type:  "Ethernet",
-							Speed: "10Gbps",
-						}.Build(),
-					},
-				}.Build(),
+					Hardware: privatev1.BareMetalHardwareSpec_builder{
+						Cpu:    privatev1.BareMetalCPUSpec_builder{Cores: 32, Architecture: "x86_64", ThreadsPerCore: 2}.Build(),
+						Memory: privatev1.BareMetalMemorySpec_builder{TotalGb: 128}.Build(),
+						NetworkPorts: []*privatev1.BareMetalNetworkPortSpec{
+							privatev1.BareMetalNetworkPortSpec_builder{
+								Name:  "eth0",
+								Role:  "fabric",
+								Type:  "Ethernet",
+								Speed: "10Gbps",
+							}.Build(),
+						},
+					}.Build(),
 					HostLabelSelector: privatev1.BareMetalLabelSelector_builder{
 						MatchLabels: map[string]string{"hardware.profile": "compute"},
 					}.Build(),

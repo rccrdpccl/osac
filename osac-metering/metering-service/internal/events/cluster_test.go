@@ -370,10 +370,9 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 			Expect(cp["component"]).To(Equal("control_plane"))
 		})
 
-		It("uses baremetal_instance_type and ignores legacy host_type", func() {
+		It("uses baremetal_instance_type for worker billing dimensions", func() {
 			cl.Spec.NodeSets = map[string]*privatev1.ClusterNodeSet{
 				"workers": {
-					HostType:              &privatev1.HostTypeReference{Name: "legacy-host"},
 					BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "ci-worker-bm"},
 					Size:                  proto.Int32(1),
 				},
@@ -383,7 +382,6 @@ var _ = Describe("CaaS Cluster Mapper", func() {
 			components := dims["components"].([]any)
 			worker := components[1].(map[string]any)
 			Expect(worker["baremetal_instance_type"]).To(Equal("ci-worker-bm"))
-			Expect(worker).NotTo(HaveKey("host_type"))
 		})
 
 		It("DecomposeClusterComponents works on fresh (non-JSONB) output", func() {
@@ -629,7 +627,6 @@ var _ = Describe("ComponentRecord", func() {
 		Expect(flat["node_set"]).To(Equal("gpu-workers"))
 		Expect(flat["component"]).To(Equal("worker"))
 		Expect(flat["baremetal_instance_type"]).To(Equal("gpu-h100"))
-		Expect(flat).NotTo(HaveKey("host_type"))
 		Expect(flat["node_count"]).To(Equal(int32(2)))
 	})
 

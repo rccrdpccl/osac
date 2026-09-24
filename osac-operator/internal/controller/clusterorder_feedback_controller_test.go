@@ -1295,6 +1295,11 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 				},
 				Spec: osacv1alpha1.ClusterOrderSpec{
 					TemplateID: "test_template",
+					NodeRequests: []osacv1alpha1.NodeRequest{{
+						ResourceClass: "m5.xlarge",
+						NumberOfNodes: 3,
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "m5.xlarge"},
+					}},
 				},
 			}
 			Expect(k8sClient.Create(testCtx, clusterOrder)).To(Succeed())
@@ -1304,7 +1309,6 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 				{
 					ResourceClass: "m5.xlarge",
 					NumberOfNodes: 3,
-					BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "m5.xlarge"},
 				},
 			}
 			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
@@ -1315,7 +1319,7 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 					Spec: &privatev1.ClusterSpec{
 						NodeSets: map[string]*privatev1.ClusterNodeSet{
 							"workers": {
-								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "m5.xlarge"}.Build(),
+								BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "bmit-id", Name: "m5.xlarge"}.Build(),
 							},
 						},
 					},
@@ -1323,6 +1327,13 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 				},
 			}
 			mockClient.updateResponse = &privatev1.ClustersUpdateResponse{}
+		})
+		AfterEach(func() {
+			clusterOrder := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			clusterOrder.Finalizers = nil
+			Expect(k8sClient.Update(testCtx, clusterOrder)).To(Succeed())
+			Expect(k8sClient.Delete(testCtx, clusterOrder)).To(Succeed())
 		})
 
 		It("should propagate node set sizes to fulfillment", func() {
@@ -1335,6 +1346,9 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetBaremetalInstanceType().GetName()).To(
 				Equal("m5.xlarge"),
 			)
+			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetBaremetalInstanceType().GetId()).To(
+				Equal("bmit-id"),
+			)
 
 			hasNodeSetsPath := false
 			for _, path := range mockClient.lastUpdateMask.GetPaths() {
@@ -1343,6 +1357,34 @@ var _ = Describe("ClusterOrder FeedbackReconciler", func() {
 				}
 			}
 			Expect(hasNodeSetsPath).To(BeTrue())
+		})
+
+		It("repairs a status node set missing its BMIT reference", func() {
+			mockClient.getResponse.GetObject().GetStatus().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{Size: ptr.To(int32(3))}.Build(),
+			})
+
+			_, err := reconciler.Reconcile(testCtx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.updateCalled).To(BeTrue())
+			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetSize()).To(Equal(int32(3)))
+			Expect(mockClient.lastUpdate.GetStatus().GetNodeSets()["workers"].GetBaremetalInstanceType().GetId()).To(
+				Equal("bmit-id"),
+			)
+		})
+
+		It("leaves a legacy node set without a BMIT unmatched", func() {
+			clusterOrder := &osacv1alpha1.ClusterOrder{}
+			Expect(k8sClient.Get(testCtx, typeNamespacedName, clusterOrder)).To(Succeed())
+			clusterOrder.Status.NodeRequests = []osacv1alpha1.NodeRequest{{NumberOfNodes: 3}}
+			Expect(k8sClient.Status().Update(testCtx, clusterOrder)).To(Succeed())
+			mockClient.getResponse.GetObject().GetSpec().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
+				"workers": privatev1.ClusterNodeSet_builder{}.Build(),
+			})
+
+			_, err := reconciler.Reconcile(testCtx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mockClient.getResponse.GetObject().GetStatus().GetNodeSets()).To(BeEmpty())
 		})
 	})
 })

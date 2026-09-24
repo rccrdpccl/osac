@@ -522,19 +522,14 @@ func (t *task) prepareNodeRequests() []osacv1alpha1.NodeRequest {
 }
 
 func (t *task) prepareNodeRequest(nodeSet *privatev1.ClusterNodeSet) osacv1alpha1.NodeRequest {
-	rc := controllers.RefKeyStr(nodeSet.GetHostType())
-	if rc == "" {
-		if bmit := nodeSet.GetBaremetalInstanceType(); bmit != nil && bmit.GetName() != "" {
-			rc = bmit.GetName()
-		}
-	}
+	bmitName := nodeSet.GetBaremetalInstanceType().GetName()
 	nr := osacv1alpha1.NodeRequest{
-		ResourceClass: rc,
+		ResourceClass: bmitName,
 		NumberOfNodes: int(nodeSet.GetSize()),
 	}
-	if bmit := nodeSet.GetBaremetalInstanceType(); bmit != nil && bmit.GetName() != "" {
+	if bmitName != "" {
 		nr.BareMetal = &osacv1alpha1.BareMetalNodeSpec{
-			InstanceType: bmit.GetName(),
+			InstanceType: bmitName,
 		}
 	}
 	return nr

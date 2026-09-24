@@ -198,7 +198,7 @@ Use this when you want to review or change multiple fields at once.
 
 ### Constraints
 
-- The `host_type` of an existing node set cannot be changed (immutable after creation)
+- The `baremetal_instance_type` of an existing node set cannot be changed (immutable after creation)
 - At least one node set must remain; node sets can be scaled to zero (the control
   plane continues to run on the hub)
 

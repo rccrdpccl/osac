@@ -90,22 +90,24 @@ var _ = Describe("Private cluster catalog items server", func() {
 		})
 
 		DescribeTable("checks inherited node sets against concrete network policies", func(hasFabric bool) {
-			host := privatev1.HostType_builder{
-				Id:       "inherited-host",
-				Metadata: privatev1.Metadata_builder{Name: "inherited-host", Tenant: testTenant}.Build(),
-			}.Build()
+			hardware := &privatev1.BareMetalHardwareSpec{}
 			if hasFabric {
-				host.SetInterfaces([]*privatev1.NetworkInterface{
-					privatev1.NetworkInterface_builder{Name: "data-0", Role: "fabric"}.Build(),
+				hardware.SetNetworkPorts([]*privatev1.BareMetalNetworkPortSpec{
+					privatev1.BareMetalNetworkPortSpec_builder{Name: "data-0", Role: "fabric"}.Build(),
 				})
 			}
-			_, err := server.hostTypesDao.Create().SetObject(host).Do(ctx)
+			instanceType := privatev1.BareMetalInstanceType_builder{
+				Id:       "inherited-host",
+				Metadata: privatev1.Metadata_builder{Name: "inherited-host", Tenant: testTenant}.Build(),
+				Spec:     privatev1.BareMetalInstanceTypeSpec_builder{Hardware: hardware}.Build(),
+			}.Build()
+			_, err := server.bareMetalInstanceTypesDao.Create().SetObject(instanceType).Do(ctx)
 			Expect(err).ToNot(HaveOccurred())
 			template := privatev1.ClusterTemplate_builder{
 				Metadata: privatev1.Metadata_builder{Tenant: testTenant}.Build(),
 				NodeSets: map[string]*privatev1.ClusterTemplateNodeSet{
 					"workers": privatev1.ClusterTemplateNodeSet_builder{
-						HostType: privatev1.HostTypeReference_builder{Id: host.GetId()}.Build(), Size: 1,
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: instanceType.GetId()}.Build(), Size: 1,
 					}.Build(),
 				},
 			}.Build()
@@ -119,11 +121,11 @@ var _ = Describe("Private cluster catalog items server", func() {
 					}.Build(),
 				}.Build(),
 			}.Build()
-			err = validateClusterCatalogItemNodeSetPolicy(ctx, item, template, server.hostTypesDao)
+			err = validateClusterCatalogItemNodeSetPolicy(ctx, item, template, server.bareMetalInstanceTypesDao)
 			if hasFabric {
 				Expect(err).ToNot(HaveOccurred())
 			} else {
-				Expect(err).To(MatchError(ContainSubstring("has no interface with role 'fabric'")))
+				Expect(err).To(MatchError(ContainSubstring("has no network port with role 'fabric'")))
 			}
 		}, Entry("accepts a fabric interface", true), Entry("rejects a missing fabric interface", false))
 
@@ -883,7 +885,7 @@ var _ = Describe("Cluster Catalog Item policy application", func() {
 		Expect(spec.GetNodeSets()).To(HaveLen(2))
 		Expect(spec.GetNodeSets()["workers"].GetSize()).To(Equal(workerSize))
 		Expect(spec.GetNodeSets()["empty"]).To(BeNil())
-		Expect(spec.GetNodeSets()["workers"].GetHostType()).To(BeNil())
+		Expect(spec.GetNodeSets()["workers"].GetBaremetalInstanceType()).To(BeNil())
 
 		spec.GetVersion().SetName("changed")
 		spec.GetNetworkAttachment().GetSubnet().SetName("changed")

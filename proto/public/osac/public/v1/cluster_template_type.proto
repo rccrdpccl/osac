@@ -20,7 +20,6 @@ import "osac/public/v1/cluster_common_type.proto";
 import "osac/public/v1/cluster_version_type.proto";
 import "osac/public/v1/metadata_type.proto";
 import "osac/public/v1/baremetal_instance_type_type.proto";
-import "osac/public/v1/host_type_type.proto";
 import "osac/public/v1/secret_type.proto";
 
 // A cluster template defines a type of cluster that can be created by the user. Note that the user doesn't create these
@@ -105,13 +104,15 @@ message ClusterTemplateParameterDefinition {
   google.protobuf.Any default = 6;
 }
 
-// Defines a set of nodes that will be part of cluster, all of them of the same type of host.
+// Defines a set of nodes that will be part of a cluster, all sharing the same bare metal instance type.
 message ClusterTemplateNodeSet {
-  // Reference to the type of hosts that are part of the set.
-  HostTypeReference host_type = 1;
+  reserved 1;
+  reserved "host_type";
 
   // Number of nodes of the set.
   int32 size = 2;
+
+  // Bare metal instance type for nodes created from this template node set.
   BareMetalInstanceTypeReference baremetal_instance_type = 3;
 }
 
