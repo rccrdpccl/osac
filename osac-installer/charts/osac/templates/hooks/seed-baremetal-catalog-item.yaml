@@ -1,4 +1,8 @@
-{{- if and .Values.global.services.caas.enabled .Values.global.services.bmaas.enabled }}
+{{- if and
+  .Values.aap.instanceGroups.publishTemplates.enabled
+  .Values.global.services.caas.enabled
+  .Values.global.services.bmaas.enabled
+}}
 apiVersion: batch/v1
 kind: Job
 metadata:

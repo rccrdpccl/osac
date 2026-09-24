@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CHART_DIR="${SCRIPT_DIR}/../charts/osac"
 INSTANCE_VALUES="${SCRIPT_DIR}/../values/caas-ci/instance.yaml"
 BMAAS_VALUES="${SCRIPT_DIR}/../values/bmaas-ci/instance.yaml"
+KIND_VALUES="${SCRIPT_DIR}/../values/dev/kind-instance.yaml"
 TMP_DIR=$(mktemp -d)
 SERVER_PID=""
 FAKE_PORT=""
@@ -33,11 +34,34 @@ assert_not_contains() {
 
 render_profile() {
     local values_file="$1" output_file="$2"
+    shift 2
     helm template osac "${CHART_DIR}" \
         --values "${values_file}" \
         --set service.externalHostname=fulfillment-api.example.com \
         --set service.internalHostname=fulfillment-internal-api.example.com \
+        "$@" \
         >"${output_file}"
+}
+
+assert_hook_presence() {
+    local render_file="$1" hook_name="$2" expected="$3"
+    python3 - "${render_file}" "${hook_name}" "${expected}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+render_file, hook_name, expected = sys.argv[1:]
+documents = yaml.safe_load_all(Path(render_file).read_text())
+present = any(
+    document
+    and document.get("kind") == "Job"
+    and document.get("metadata", {}).get("name") == hook_name
+    for document in documents
+)
+if present != (expected == "present"):
+    raise SystemExit(f"expected hook {hook_name!r} to be {expected}")
+PY
 }
 
 extract_hook_script() {
@@ -142,6 +166,17 @@ run_hook_against_fake_api() {
 
 render_profile "${INSTANCE_VALUES}" "${TMP_DIR}/caas-render.yaml"
 render_profile "${BMAAS_VALUES}" "${TMP_DIR}/bmaas-render.yaml"
+render_profile "${KIND_VALUES}" "${TMP_DIR}/kind-render.yaml" \
+    --set global.osacDeploymentId=osac/osac
+render_profile "${INSTANCE_VALUES}" "${TMP_DIR}/caas-service-disabled-render.yaml" \
+    --set service.enabled=false
+
+assert_hook_presence "${TMP_DIR}/caas-render.yaml" seed-baremetal-catalog-item present
+assert_hook_presence "${TMP_DIR}/bmaas-render.yaml" seed-baremetal-catalog-item absent
+assert_hook_presence "${TMP_DIR}/kind-render.yaml" osac-publish-templates absent
+assert_hook_presence "${TMP_DIR}/kind-render.yaml" seed-baremetal-catalog-item absent
+assert_hook_presence "${TMP_DIR}/caas-service-disabled-render.yaml" osac-publish-templates present
+assert_hook_presence "${TMP_DIR}/caas-service-disabled-render.yaml" seed-baremetal-catalog-item present
 
 CAAS_RENDER=$(cat "${TMP_DIR}/caas-render.yaml")
 BMAAS_RENDER=$(cat "${TMP_DIR}/bmaas-render.yaml")
