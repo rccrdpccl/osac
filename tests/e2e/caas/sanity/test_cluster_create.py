@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from tests.e2e.caas.readiness_diagnostics import log_worker_readiness_snapshot
 from tests.e2e.catalog.conftest import unique_name
 from tests.e2e.core.grpc_client import GRPCClient
 from tests.e2e.core.helpers import (
@@ -151,7 +152,11 @@ def test_cluster_create(
         metering.expect("osac.resource.started.v1", resource_id=uuid)
         metering.verify()
 
-        wait_for_cluster_order_condition(k8s=k8s_hub_client, name=co_name, condition_type="ClusterAvailable")
+        try:
+            wait_for_cluster_order_condition(k8s=k8s_hub_client, name=co_name, condition_type="ClusterAvailable")
+        except TimeoutError:
+            log_worker_readiness_snapshot(k8s=k8s_hub_client, order_name=co_name)
+            raise
 
         # Verify version resolved and propagated end-to-end:
         # fulfillment-service version resolution -> ClusterOrder releaseImage -> HostedCluster image
@@ -430,13 +435,17 @@ def test_cluster_create_with_two_node_sets(
             status = k8s_hub_client.get_json(resource="clusterorder", name=co_name).get("status", {})
             return tuple(int(status.get(key, -1)) for key in ("desiredWorkers", "currentWorkers", "readyWorkers"))
 
-        poll_until(
-            fn=_get_worker_counts,
-            until=lambda value: value == (2, 2, 2),
-            retries=120,
-            delay=10,
-            description=f"{co_name} worker aggregates before NodePool isolation check",
-        )
+        try:
+            poll_until(
+                fn=_get_worker_counts,
+                until=lambda value: value == (2, 2, 2),
+                retries=120,
+                delay=10,
+                description=f"{co_name} worker aggregates before NodePool isolation check",
+            )
+        except TimeoutError:
+            log_worker_readiness_snapshot(k8s=k8s_hub_client, order_name=co_name)
+            raise
 
         def _agent_is_installed(agent: dict[str, Any]) -> bool:
             return any(
