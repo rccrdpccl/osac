@@ -182,8 +182,8 @@ var _ = Describe("update tenant annotation", func() {
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID: "test-template",
 				NodeRequests: []osacv1alpha1.NodeRequest{
-					{
-						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu-gb200"},
+					{NodeSet: "gpu-gb200",
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu.gb200"},
 						NumberOfNodes: 3,
 					},
 				},
@@ -217,7 +217,7 @@ var _ = Describe("update tenant annotation", func() {
 				Template: &privatev1.ClusterTemplateReference{Name: "test-template"},
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu-gb200": privatev1.ClusterNodeSet_builder{
-						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu-gb200"},
+						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu.gb200"},
 						Size:                  proto.Int32(5),
 					}.Build(),
 				},
@@ -248,7 +248,7 @@ var _ = Describe("update tenant annotation", func() {
 
 		updatedCR := list.Items[0]
 		Expect(updatedCR.Spec.NodeRequests).To(HaveLen(1))
-		Expect(updatedCR.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal("gpu-gb200"))
+		Expect(updatedCR.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal("gpu.gb200"))
 		Expect(updatedCR.Spec.NodeRequests[0].NumberOfNodes).To(Equal(5))
 	})
 
@@ -268,8 +268,8 @@ var _ = Describe("update tenant annotation", func() {
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID: "test-template",
 				NodeRequests: []osacv1alpha1.NodeRequest{
-					{
-						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu-gb200"},
+					{NodeSet: "gpu-gb200",
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu.gb200"},
 						NumberOfNodes: 3,
 					},
 				},
@@ -303,7 +303,7 @@ var _ = Describe("update tenant annotation", func() {
 				Template: &privatev1.ClusterTemplateReference{Name: "test-template"},
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu-gb200": privatev1.ClusterNodeSet_builder{
-						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu-gb200"},
+						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu.gb200"},
 						Size:                  proto.Int32(5),
 					}.Build(),
 				},
@@ -334,7 +334,7 @@ var _ = Describe("update tenant annotation", func() {
 
 		updatedCR := list.Items[0]
 		Expect(updatedCR.Spec.NodeRequests).To(HaveLen(1))
-		Expect(updatedCR.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal("gpu-gb200"))
+		Expect(updatedCR.Spec.NodeRequests[0].BareMetal.InstanceType).To(Equal("gpu.gb200"))
 		Expect(updatedCR.Spec.NodeRequests[0].NumberOfNodes).To(Equal(5))
 	})
 
@@ -354,8 +354,8 @@ var _ = Describe("update tenant annotation", func() {
 			Spec: osacv1alpha1.ClusterOrderSpec{
 				TemplateID: "test-template",
 				NodeRequests: []osacv1alpha1.NodeRequest{
-					{
-						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu-gb200"},
+					{NodeSet: "gpu-gb200",
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu.gb200"},
 						NumberOfNodes: 3,
 					},
 				},
@@ -383,7 +383,7 @@ var _ = Describe("update tenant annotation", func() {
 				Template: &privatev1.ClusterTemplateReference{Name: "test-template"},
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu-gb200": privatev1.ClusterNodeSet_builder{
-						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu-gb200"},
+						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu.gb200"},
 						Size:                  proto.Int32(5),
 					}.Build(),
 				},
@@ -589,8 +589,8 @@ var _ = Describe("update tenant annotation", func() {
 				TemplateID:   "test-template",
 				ReleaseImage: resolvedImage,
 				NodeRequests: []osacv1alpha1.NodeRequest{
-					{
-						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu-gb200"},
+					{NodeSet: "gpu-gb200",
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu.gb200"},
 						NumberOfNodes: 3,
 					},
 				},
@@ -640,7 +640,7 @@ var _ = Describe("update tenant annotation", func() {
 				Version:  &privatev1.ClusterVersionReference{Name: versionName},
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu-gb200": privatev1.ClusterNodeSet_builder{
-						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu-gb200"},
+						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu.gb200"},
 						Size:                  proto.Int32(5),
 					}.Build(),
 				},
@@ -696,8 +696,8 @@ var _ = Describe("update tenant annotation", func() {
 				TemplateID:   "test-template",
 				ReleaseImage: oldImage,
 				NodeRequests: []osacv1alpha1.NodeRequest{
-					{
-						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu-gb200"},
+					{NodeSet: "gpu-gb200",
+						BareMetal:     &osacv1alpha1.BareMetalNodeSpec{InstanceType: "gpu.gb200"},
 						NumberOfNodes: 3,
 					},
 				},
@@ -748,7 +748,7 @@ var _ = Describe("update tenant annotation", func() {
 				Version:  &privatev1.ClusterVersionReference{Name: newVersionName},
 				NodeSets: map[string]*privatev1.ClusterNodeSet{
 					"gpu-gb200": privatev1.ClusterNodeSet_builder{
-						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu-gb200"},
+						BaremetalInstanceType: &privatev1.BareMetalInstanceTypeReference{Name: "gpu.gb200"},
 						Size:                  proto.Int32(3),
 					}.Build(),
 				},
@@ -2359,6 +2359,23 @@ var _ = Describe("ensureClusterSecrets", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(cluster.GetStatus().GetKubeconfigSecret().GetId()).To(Equal("existing-kubeconfig-id"))
 		Expect(cluster.GetStatus().GetPasswordSecret().GetId()).To(Equal("password-id"))
+	})
+
+	It("preserves distinct NodeSet keys sharing the same instance type", func() {
+		cluster := makeCluster(privatev1.ClusterState_CLUSTER_STATE_PROGRESSING)
+		cluster.GetSpec().SetNodeSets(map[string]*privatev1.ClusterNodeSet{
+			"compute": privatev1.ClusterNodeSet_builder{Size: proto.Int32(2), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "bm.large"}.Build()}.Build(),
+			"batch":   privatev1.ClusterNodeSet_builder{Size: proto.Int32(3), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Name: "bm.large"}.Build()}.Build(),
+		})
+		t := &task{r: &function{logger: logger}, cluster: cluster}
+		requests := t.prepareNodeRequests()
+		Expect(requests).To(HaveLen(2))
+		Expect(requests[0].NodeSet).To(Equal("batch"))
+		Expect(requests[0].NumberOfNodes).To(Equal(3))
+		Expect(requests[1].NodeSet).To(Equal("compute"))
+		Expect(requests[1].NumberOfNodes).To(Equal(2))
+		Expect(requests[0].BareMetal.InstanceType).To(Equal("bm.large"))
+		Expect(requests[1].BareMetal.InstanceType).To(Equal("bm.large"))
 	})
 
 	It("should set only bareMetal.instanceType from BareMetalInstanceType", func() {
