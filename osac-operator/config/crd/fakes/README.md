@@ -12,7 +12,7 @@ Worker teardown fixtures serve:
   and tests across both served versions; it does not validate upstream schemas.
 - CAP-Agent `AgentMachine`: `capi-provider.agent-install.openshift.io/v1beta1`.
 
-Envtest loads this directory. Dedicated Kind deployments can install these four
-fixtures explicitly for the manager-ServiceAccount read-permission check when
-real CAPI/CAP-Agent APIs are unavailable. There are no provider controllers or
-claim/install semantics in these fixtures.
+Envtest loads this directory to exercise descendant reads and recovery gates.
+The general integration suite does not require these four teardown fixtures.
+They provide no provider controllers, claim/install semantics or evidence of
+deployed manager-ServiceAccount permissions.

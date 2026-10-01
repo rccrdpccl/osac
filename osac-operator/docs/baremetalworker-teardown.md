@@ -73,10 +73,12 @@ only a diagnostic warning and never opens the gate.
   Fulfillment, CAP-Agent and Assisted Service progress are simulated.
 - **Contract / DEV:** `test/contract/manager_worker_teardown_rbac_test.go` checks
   generated and Helm permissions, including get/list-only CAPI/CAP-Agent access.
-- **Component integration / DEV:**
-  `test/integration/baremetalworker_teardown_test.go` issues real GET/LIST requests
-  impersonating the ServiceAccount of the deployed manager pod. This proves API
-  permissions, not a real CAP-Agent claim or hardware teardown.
+- **Component integration / DEV gap:** deployed manager-ServiceAccount GET/LIST
+  authorization is not exercised by the general integration suite. The RBAC
+  contract checks role contents, not live role binding or authorization. A
+  dedicated permission-validation case remains follow-up work under
+  [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843); its child task/owner
+  and environment prerequisites are unresolved.
 
 Run from `osac-operator/`, after configuring envtest assets, plus the normal
 component checks described in `AGENTS.md`:
@@ -89,25 +91,12 @@ go test -race ./internal/controller/baremetalworker/... -count=1
 go test ./test/contract/... -count=1
 ```
 
-For the deployed permission case, use a dedicated Kind cluster with the current
-image/manifests and manager pod labels expected by the integration suite. The
-runner must be allowed to impersonate the manager ServiceAccount and its groups.
-If real CAPI/CAP-Agent APIs are absent, install the four explicit test-only CRDs
-before running `make integration-tests`:
-
-```sh
-kubectl apply -f config/crd/fakes/cluster.x-k8s.io_machinedeployments.yaml \
-  -f config/crd/fakes/cluster.x-k8s.io_machinesets.yaml \
-  -f config/crd/fakes/cluster.x-k8s.io_machines.yaml \
-  -f config/crd/fakes/capi-provider.agent-install.openshift.io_agentmachines.yaml
-```
-
-These fixtures serve CAPI v1beta1/v1beta2 and CAP-Agent v1beta1 but provide no
-provider controller semantics; see `config/crd/fakes/README.md`. Do not install
-them over real provider CRDs. Missing required APIs or permissions fail the case.
-The permission case performs reads only and does not delete cluster resources.
-An object-level GET NotFound is an authorized read; Forbidden is a failure.
-Compilation of the case does not prove deployed RBAC.
+The CAPI/CAP-Agent fixture CRDs remain available for envtest; see
+`config/crd/fakes/README.md`. The general `make integration-tests` suite no
+longer includes the teardown permission case or requires installing these
+fixtures for that case. Do not deploy test fixtures over real provider CRDs.
+Unit/Envtest and RBAC contract results do not prove deployed authorization or
+real CAP-Agent claim/hardware teardown semantics.
 
 ## Real-provider handoff
 
