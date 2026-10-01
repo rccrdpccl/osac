@@ -14,16 +14,19 @@ language governing permissions and limitations under the License.
 package acceptance
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
@@ -2896,6 +2899,174 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 		Expect(co.Status.Workers).To(HaveLen(numWorkers))
 		Expect(controllerutil.ContainsFinalizer(co, bmWorkerFinalizer)).To(BeTrue(),
 			"finalizer should be added during normal reconciliation")
+	}
+
+	// This fixture uses production correlation/prebinding, but simulates AAP job
+	// completion and Assisted Service discovery. CAP-Agent never claims the Agent.
+	prebindWorker := func(name string) (*osacv1alpha1.ClusterOrder, *unstructured.Unstructured) {
+		GinkgoHelper()
+		provisionWorkers(name, 1)
+		r.SetMACResolver(func(_ context.Context, _ string) []string { return []string{"aa:bb:cc:dd:ee:55"} })
+		key := types.NamespacedName{Name: name + "-agent", Namespace: testNamespace}
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{Name: key.Name, Namespace: key.Namespace, MAC: "aa:bb:cc:dd:ee:55"})).To(Succeed())
+		a := &unstructured.Unstructured{}
+		a.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, key, a)).To(Succeed())
+		ie := newInfraEnv(name + "-infraenv")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ie), ie)).To(Succeed())
+		a.SetLabels(map[string]string{"infraenvs.agent-install.openshift.io": ie.GetName()})
+		a.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: ie.GetAPIVersion(), Kind: "InfraEnv", Name: ie.GetName(), UID: ie.GetUID()}})
+		Expect(unstructured.SetNestedField(a.Object, "known", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, a)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, a) })
+		_, err := runReconcile(name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, a)).To(Succeed())
+		ref, found, err := unstructured.NestedMap(a.Object, "spec", "clusterDeploymentName")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(found).To(BeTrue())
+		Expect(ref).To(Equal(map[string]interface{}{"name": name, "namespace": testNamespace}))
+		co := getClusterOrder(name)
+		Expect(co.Status.Workers[0].Phase).To(Equal("Binding"))
+		co.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{
+			{JobID: "create-job", Type: osacv1alpha1.JobTypeProvision, State: osacv1alpha1.JobStateCanceled, Timestamp: metav1.Now()},
+			{JobID: "delete-job", Type: osacv1alpha1.JobTypeDeprovision, State: osacv1alpha1.JobStateRunning, Timestamp: metav1.Now()},
+		}
+		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+		return co, a
+	}
+
+	It("recovers an OSAC-only prebinding separately from observed detachment and BMI deletion", func() {
+		co, a := prebindWorker("bmw-del-osac-only")
+		bmiID := co.Status.Workers[0].ResourceID
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+		res, err := runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+		_, bound, err := unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bound).To(BeFalse(), "first reconcile must clear the production OSAC prebinding")
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		Expect(getClusterOrder(co.Name).Status.Workers[0].Phase).To(Equal("Unbinding"))
+		Expect(controllerutil.ContainsFinalizer(getClusterOrder(co.Name), bmWorkerFinalizer)).To(BeTrue())
+		// Restart and duplicate reconcile are not a detachment acknowledgement.
+		r = baremetalworker.NewReconciler(k8sClient, k8sClient, scheme.Scheme, fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		_, err = runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		Expect(unstructured.SetNestedField(a.Object, "known-unbound", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, a)).To(Succeed())
+		// Model BMI deletion failure so its finalizer must survive until NotFound.
+		fc.SetDeleteError(fmt.Errorf("provider still deleting"))
+		_, err = runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a))).To(BeTrue())
+		Expect(controllerutil.ContainsFinalizer(getClusterOrder(co.Name), bmWorkerFinalizer)).To(BeTrue())
+		fc.SetDeleteError(nil)
+		_, err = runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fc.DeleteCalls()).To(ContainElement(bmiID))
+		Expect(controllerutil.ContainsFinalizer(getClusterOrder(co.Name), bmWorkerFinalizer)).To(BeTrue())
+		_, err = runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), co))).To(BeTrue())
+	})
+
+	for i, tc := range []struct {
+		name string
+		jobs []osacv1alpha1.JobStatus
+	}{
+		{"nonterminal provision", []osacv1alpha1.JobStatus{{JobID: "create", Type: osacv1alpha1.JobTypeProvision, State: osacv1alpha1.JobStateRunning, Timestamp: metav1.Now()}, {JobID: "delete", Type: osacv1alpha1.JobTypeDeprovision, State: osacv1alpha1.JobStateRunning, Timestamp: metav1.Now()}}},
+		{"missing deprovision evidence", nil},
+	} {
+		It("waits for "+tc.name+" before recovery", func() {
+			co, a := prebindWorker(fmt.Sprintf("bmw-del-job-gate-%d", i))
+			valid := co.Status.ProvisioningJobs
+			co.Status.ProvisioningJobs = tc.jobs
+			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+			_, err := runReconcile(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+			_, bound, _ := unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+			Expect(bound).To(BeTrue())
+			Expect(fc.DeleteCalls()).To(BeEmpty())
+			Expect(getClusterOrder(co.Name).Finalizers).To(ContainElement(bmWorkerFinalizer))
+			co = getClusterOrder(co.Name)
+			co.Status.ProvisioningJobs = valid
+			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+			_, err = runReconcile(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+			_, bound, _ = unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+			Expect(bound).To(BeFalse())
+		})
+	}
+
+	It("re-evaluates a CAP-Agent claim inserted between live GET and optimistic patch", func() {
+		co, a := prebindWorker("bmw-del-patch-race")
+		c := &claimDuringRecoveryClient{Client: k8sClient}
+		r = baremetalworker.NewReconciler(c, k8sClient, scheme.Scheme, fc, baremetalworker.NewIgnitionFetcher(nil), rec, testNamespace)
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+		_, err := runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(c.patches).To(Equal(1))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+		_, bound, _ := unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+		Expect(bound).To(BeTrue())
+		Expect(a.GetLabels()["agentMachineRef"]).To(Equal("racing-machine"))
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		_, err = runReconcile(co.Name)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(c.patches).To(Equal(1), "fresh claim must prevent a blind repeat")
+		Expect(getClusterOrder(co.Name).Finalizers).To(ContainElement(bmWorkerFinalizer))
+	})
+
+	for i, gvk := range []schema.GroupVersionKind{
+		{Group: "hypershift.openshift.io", Version: "v1beta1", Kind: "NodePool"},
+		{Group: "cluster.x-k8s.io", Version: "v1beta1", Kind: "MachineDeployment"},
+		{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "MachineSet"},
+		{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Machine"},
+		{Group: "capi-provider.agent-install.openshift.io", Version: "v1beta1", Kind: "AgentMachine"},
+	} {
+		It("waits for even an unlabelled terminating "+gvk.Kind+" before clearing prebinding", func() {
+			co, a := prebindWorker(fmt.Sprintf("bmw-del-descendant-%d", i))
+			hosting := testNamespace + "-" + co.Name
+			for _, name := range []string{hosting, hosting + "-" + co.Name} {
+				ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"osac.openshift.io/clusterorder": co.Name}}}
+				Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, ns) })
+			}
+			u := &unstructured.Unstructured{}
+			u.SetGroupVersionKind(gvk)
+			u.SetName("descendant")
+			u.SetNamespace(hosting + "-" + co.Name)
+			if gvk.Kind == "NodePool" {
+				u.SetNamespace(hosting)
+			}
+			u.SetFinalizers([]string{"test/provider-finalizer"})
+			Expect(k8sClient.Create(ctx, u)).To(Succeed())
+			DeferCleanup(func() { u.SetFinalizers(nil); _ = k8sClient.Update(ctx, u); _ = k8sClient.Delete(ctx, u) })
+			Expect(k8sClient.Delete(ctx, u)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+			_, err := runReconcile(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+			_, bound, _ := unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+			Expect(bound).To(BeTrue())
+			Expect(fc.DeleteCalls()).To(BeEmpty())
+			// Only actual absence opens the gate, not a deletion timestamp.
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(u), u)).To(Succeed())
+			u.SetFinalizers(nil)
+			Expect(k8sClient.Update(ctx, u)).To(Succeed())
+			_, err = runReconcile(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), a)).To(Succeed())
+			_, bound, _ = unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+			Expect(bound).To(BeFalse())
+		})
 	}
 
 	It("adds the finalizer during normal reconciliation", func() {

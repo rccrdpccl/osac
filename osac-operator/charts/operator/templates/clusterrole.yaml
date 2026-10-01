@@ -60,6 +60,31 @@ rules:
   - list
   - patch
   - watch
+# Uncached identity reads for terminal worker prebinding recovery.
+- apiGroups:
+  - agent-install.openshift.io
+  resources:
+  - infraenvs
+  verbs:
+  - get
+  - list
+# Worker descendants are read directly; no informer or mutation permission.
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinedeployments
+  - machinesets
+  - machines
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - capi-provider.agent-install.openshift.io
+  resources:
+  - agentmachines
+  verbs:
+  - get
+  - list
 - apiGroups:
   - hypershift.openshift.io
   resources:

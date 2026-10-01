@@ -14,6 +14,8 @@ language governing permissions and limitations under the License.
 package acceptance
 
 import (
+	"context"
+	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -21,6 +23,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
@@ -218,6 +221,73 @@ var _ = Describe("BareMetalWorker tenant safety", func() {
 		Expect(workers[0].ResourceID).To(BeEmpty(), "stale ID must not block retry indefinitely")
 		Expect(workers[0].AttemptCount).To(Equal(int32(1)))
 	})
+
+	for i, tc := range []struct {
+		name   string
+		mutate func(*unstructured.Unstructured)
+	}{
+		{"foreign tenant", func(a *unstructured.Unstructured) {
+			a.SetAnnotations(map[string]string{"osac.openshift.io/tenant": "tenant2"})
+		}},
+		{"foreign order", func(a *unstructured.Unstructured) {
+			l := a.GetLabels()
+			l["osac.openshift.io/cluster-order"] = "foreign"
+			a.SetLabels(l)
+		}},
+		{"same cluster name in another namespace", func(a *unstructured.Unstructured) {
+			_ = unstructured.SetNestedField(a.Object, "foreign", "spec", "clusterDeploymentName", "namespace")
+		}},
+		{"foreign InfraEnv owner", func(a *unstructured.Unstructured) {
+			o := a.GetOwnerReferences()
+			o[0].UID = "foreign-uid"
+			a.SetOwnerReferences(o)
+		}},
+	} {
+		It("retains prebinding and finalizer for "+tc.name, func() {
+			co := order(fmt.Sprintf("safety-prebinding-%d", i), 1)
+			createOrder(co)
+			ready(co.Name)
+			_, err := run(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			r.SetMACResolver(func(_ context.Context, _ string) []string { return []string{"aa:bb:cc:dd:ee:99"} })
+			Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{Name: co.Name + "-agent", Namespace: testNamespace, MAC: "aa:bb:cc:dd:ee:99"})).To(Succeed())
+			a := &unstructured.Unstructured{}
+			a.SetGroupVersionKind(agentGVK)
+			key := client.ObjectKey{Namespace: testNamespace, Name: co.Name + "-agent"}
+			Expect(k8sClient.Get(ctx, key, a)).To(Succeed())
+			ie := newInfraEnv(co.Name + "-infraenv")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ie), ie)).To(Succeed())
+			a.SetLabels(map[string]string{"infraenvs.agent-install.openshift.io": ie.GetName()})
+			a.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: ie.GetAPIVersion(), Kind: "InfraEnv", Name: ie.GetName(), UID: ie.GetUID()}})
+			Expect(k8sClient.Update(ctx, a)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, a) })
+			_, err = run(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, key, a)).To(Succeed())
+			valid := a.DeepCopy()
+			tc.mutate(a)
+			Expect(k8sClient.Update(ctx, a)).To(Succeed())
+			co = getOrder(co.Name)
+			co.Status.ProvisioningJobs = []osacv1alpha1.JobStatus{{JobID: "delete", Type: osacv1alpha1.JobTypeDeprovision, State: osacv1alpha1.JobStateRunning, Timestamp: metav1.Now()}}
+			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+			_, err = run(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, key, a)).To(Succeed())
+			_, bound, _ := unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+			Expect(bound).To(BeTrue())
+			Expect(fc.DeleteCalls()).To(BeEmpty())
+			Expect(getOrder(co.Name).Finalizers).To(ContainElement(finalizer))
+			// Prove the fixture otherwise qualifies: restore only the test-corrupted identity.
+			valid.SetResourceVersion(a.GetResourceVersion())
+			Expect(k8sClient.Update(ctx, valid)).To(Succeed())
+			_, err = run(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, key, a)).To(Succeed())
+			_, bound, _ = unstructured.NestedFieldNoCopy(a.Object, "spec", "clusterDeploymentName")
+			Expect(bound).To(BeFalse())
+		})
+	}
 
 	for _, phase := range []string{"Failed", "Deleting", "Finalizing"} {
 		It("does not delete another tenant's status ID on "+phase, func() {

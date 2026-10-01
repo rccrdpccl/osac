@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
@@ -147,7 +148,15 @@ func (r *Reconciler) handleUnbindingWorkers(
 	workers []v1alpha1.WorkerStatus,
 ) []v1alpha1.WorkerStatus {
 	log := ctrllog.FromContext(ctx)
-	agents, err := r.listAgents(ctx, co)
+	reader := client.Reader(r.Client)
+	if !co.DeletionTimestamp.IsZero() {
+		reader = r.apiReader
+		if reader == nil {
+			log.Error(fmt.Errorf("missing API reader"), "terminal worker deletion requires live Agent lists")
+			return workers
+		}
+	}
+	agents, err := listAgentsUsing(ctx, co, reader)
 	if err != nil {
 		log.Error(err, "listing agents for unbinding check")
 		return workers
@@ -177,16 +186,45 @@ func (r *Reconciler) processUnbindingWorker(
 		return
 	}
 
+	if !co.DeletionTimestamp.IsZero() {
+		// Do not interpret cached detachment as permission to delete. A claim
+		// or object replacement may have happened since that observation.
+		if r.apiReader == nil {
+			return
+		}
+		live := &unstructured.Unstructured{}
+		live.SetGroupVersionKind(agentGVK)
+		if err := r.apiReader.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+			log.Error(err, "reading live Agent teardown state", "agent", agent.GetName())
+			return
+		}
+		if agent.GetUID() == "" || live.GetUID() != agent.GetUID() {
+			log.Error(fmt.Errorf("agent UID changed"), "retaining worker after Agent identity change", "worker", w.Name)
+			return
+		}
+		agent = live
+	}
+
 	state, _, _ := unstructured.NestedString(agent.Object, "status", "debugInfo", "state")
 	// CAP-Agent may reclaim a worker straight to known-unbound without visiting
 	// unbinding-pending-user-action. Only treat that state as safe once both the
 	// ClusterDeployment and AgentMachine binding references are gone.
 	if state != agentUnbindingState && !isDetachedKnownUnbound(agent, state) {
+		if err := r.recoverOSACPrebinding(ctx, co, w, agent); err != nil {
+			log.Error(err, "checking OSAC-only Agent prebinding recovery", "worker", w.Name, "agent", agent.GetName())
+		}
+		// Even a successful patch is not detachment. A later reconcile must
+		// observe Assisted Service's unbound state before deleting Agent/BMI.
 		r.checkUnbindingTimeout(co, w, agent, now)
 		return
 	}
 
-	if err := r.Delete(ctx, agent); err != nil {
+	var deleteOptions []client.DeleteOption
+	if !co.DeletionTimestamp.IsZero() {
+		uid, resourceVersion := agent.GetUID(), agent.GetResourceVersion()
+		deleteOptions = append(deleteOptions, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion})
+	}
+	if err := r.Delete(ctx, agent, deleteOptions...); err != nil {
 		log.Error(err, "deleting agent CR", "agent", agent.GetName())
 		return
 	}

@@ -25,6 +25,20 @@ custom resources and reconciles them to their desired state:
 - **Volume** (`vol`) — provisions block storage on vendor arrays via the
   VendorProvisioner interface (vendor CSI controllers).
 
+## Bare-metal worker deletion
+
+Terminal ClusterOrder deletion can recover an OSAC-only Agent prebinding after
+live ownership, recorded-job, descendant-absence and claim checks. Recovery
+patches only the prebinding, keeps the worker/finalizer, and waits for separately
+observed detachment before Agent/BMI deletion. Ordinary scale-down and CAP-Agent
+hooks/bootstrap configuration are unchanged.
+
+**Accepted residual risk:** recorded job history does not fence an AAP create job
+whose launch was never durably recorded. No absolute producer-quiescence guarantee
+is claimed. See [recovery safeguards, test tiers and deployment prerequisites](docs/baremetalworker-teardown.md).
+The real interrupted-provisioning E2E needs a per-order claim barrier and assigned
+QE owner under [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+
 ## Configuration
 
 Configuration is supplied via environment variables (e.g. from a Secret mounted

@@ -152,7 +152,7 @@ Touched-area requirements: [component guide](../osac-operator/AGENTS.md#integrat
 | Component integration | `test/integration/`; deploy the current operator into a Kind cluster, then run `make integration-tests` | Installed operator, Kubernetes API, CRDs, controller-manager, console proxy, networking behavior, and startup with the Volume controller enabled but no LVMS endpoint or TopoLVM CRD | AAP/provider provisioning and external infrastructure are not real in the current suite; the LVMS-disabled case does not exercise LogicalVolume provisioning. Some tests remove finalizers to bypass external-provider boundaries. |
 | Component integration (CI) | `make -C osac-installer test PLATFORM=kind PROFILE=dev NS=osac SUITE=operator` (from repository root) | The thin Kind deployment used by the PR workflow | The same external-provider limitations as the local Kind suite. |
 | Component integration / fulfillment-worker contract (opt-in) | `test/integration/caas/`; `make sim-up`, then `make test-integration-caas` | Dedicated marked Kind API, real fulfillment gRPC/Postgres/Keycloak/controller/hub, fulfillment-created ClusterOrder, host-built worker reconciler, real BMI persistence and duplicate-name check | Network readiness/NetworkClass prerequisite and discovery ignition simulated; no running operator/BMF, Agent binding, AAP, hardware, public auth, deployed metrics HTTP or guest install. See [usage](../osac-operator/test/integration/caas/README.md). |
-| Contract | `test/contract/`; included by `make test` | Helm chart RBAC templates against the operator permission contract | No deployed operator or external provider is exercised. |
+| Contract | `test/contract/`; included by `make test` | Generated RBAC and Helm chart templates against the operator permission contract | No deployed operator or external provider is exercised. |
 | E2E | `../tests/e2e/` | Cross-component fulfillment journeys | Depends on the deployed test environment and its configured providers. |
 
 ### Coverage notes
@@ -162,6 +162,30 @@ Touched-area requirements: [component guide](../osac-operator/AGENTS.md#integrat
 - **Controller deployment, watches, RBAC, console proxy, networking, or Helm wiring:** Unit/envtest coverage alone does not prove deployed wiring.
 - **AAP, dispatcher, provisioning-provider, KubeVirt, or fulfillment boundary:** A controllable provider in envtest is not coverage of the real provider boundary.
 - **Generated CRDs or manifests:** Do not hand-edit generated output.
+
+### Bare-metal worker terminal prebinding recovery
+
+[Recovery behavior and prerequisites](../osac-operator/README.md#bare-metal-worker-deletion)
+include an explicitly accepted residual producer risk: recorded job history and
+empty live descendant lists do not fence an external create job launched before
+its ID was durably persisted. Durable producer coordination has no assigned
+follow-up ticket/owner yet; these tests do not prove that missing guarantee.
+
+| Cases / requirements | Tier / owner | Existing test / command | Real boundary; simulated or omitted |
+|---|---|---|---|
+| P1-U1/U2; R2/R3/R6 identity, jobs, API errors and patch scope | Unit / DEV | `internal/controller/baremetalworker/orphan_binding_test.go`; worker `go test` and `go test -race` | Production helpers, fake clients/Cluster/BMI; no external producer fence |
+| P1-E1–E5; R1–R6 patch → detachment → BMI/finalizer, restart, claims and descendants | Envtest / DEV | `internal/controller/baremetalworker/acceptance/`; worker `go test` and `go test -race` | Real API/etcd/public Reconcile and resourceVersion conflict; Fulfillment, AAP job status, CAP-Agent and Assisted Service simulated |
+| P1-C1; R2/R6 read-only descendant permissions | Contract / DEV | `test/contract/manager_worker_teardown_rbac_test.go`; `go test ./test/contract/...` | Real generated/Helm role parsing, no deployed API |
+| P1-I1; R2/R6 actual manager ServiceAccount GET/LIST | Component integration / DEV | `test/integration/baremetalworker_teardown_test.go`; current deployment then `make integration-tests` | Real Kubernetes authorization via deployed manager ServiceAccount impersonation; explicit fake CAPI v1beta1/v1beta2 and CAP-Agent v1beta1 CRDs when upstream APIs are absent; no claim/install/provider semantics |
+| P1-Q1; R1/R2/R4/R5 interrupted-provisioning teardown | E2E / QE | No runnable test/barrier yet; [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843), child task/owner unresolved | Requires real Fulfillment/DB/operators/AAP/HyperShift/CAPI/CAP-Agent/Assisted Service and configured hardware |
+
+Envtest drives the first post-deletion reconcile explicitly and asserts prebinding
+removal then, with no Agent/BMI deletion before separately injected detachment.
+It does not wait for the 30-minute diagnostic timeout or periodic resync. The
+real-provider case must define a test-owned per-order claim barrier, version/image
+prerequisites, polling/deadline bounds and rollback before being called runnable.
+No global CAP-Agent pause or forced hook/finalizer removal may satisfy its
+assertions; BMH/ConsumerRef cleanup is a separate milestone.
 
 ### Coverage gaps
 

@@ -67,6 +67,22 @@ rules:
   - update
   - watch
 - apiGroups:
+  - capi-provider.agent-install.openshift.io
+  resources:
+  - agentmachines
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinedeployments
+  - machines
+  - machinesets
+  verbs:
+  - get
+  - list
+- apiGroups:
   - coordination.k8s.io
   resources:
   - leases

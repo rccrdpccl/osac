@@ -158,19 +158,23 @@ func (r *Reconciler) correlateAgents(
 }
 
 func (r *Reconciler) listAgents(ctx context.Context, co *v1alpha1.ClusterOrder) (*unstructured.UnstructuredList, error) {
+	return listAgentsUsing(ctx, co, r.Client)
+}
+
+func listAgentsUsing(ctx context.Context, co *v1alpha1.ClusterOrder, reader client.Reader) (*unstructured.UnstructuredList, error) {
 	agentList := &unstructured.UnstructuredList{}
 	agentList.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: agentGVK.Group, Version: agentGVK.Version, Kind: agentGVK.Kind + "List",
 	})
 	infraEnvName := co.Name + infraEnvNameSuffix
-	if err := r.List(ctx, agentList,
+	if err := reader.List(ctx, agentList,
 		client.InNamespace(co.Namespace),
 		client.MatchingLabels{infraEnvAgentLabel: infraEnvName},
 	); err != nil {
 		return nil, fmt.Errorf("listing agents for %s by infraenv: %w", co.Name, err)
 	}
 	if len(agentList.Items) == 0 {
-		if err := r.List(ctx, agentList,
+		if err := reader.List(ctx, agentList,
 			client.InNamespace(co.Namespace),
 			client.MatchingLabels{clusterOrderLabel: co.Name},
 		); err != nil {
@@ -418,7 +422,7 @@ func requestedBareMetalWorkersByInstanceType(co *v1alpha1.ClusterOrder) map[stri
 func (r *Reconciler) listNodePools(ctx context.Context, namespace, clusterOrderName string) (*unstructured.UnstructuredList, error) {
 	nodePoolList := &unstructured.UnstructuredList{}
 	nodePoolList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: "hypershift.openshift.io", Version: "v1beta1", Kind: "NodePoolList",
+		Group: hypershiftAPIGroup, Version: hypershiftAPIVersion, Kind: "NodePoolList",
 	})
 	if err := r.List(ctx, nodePoolList,
 		client.InNamespace(namespace),

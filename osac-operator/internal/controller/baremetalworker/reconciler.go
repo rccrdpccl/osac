@@ -157,6 +157,8 @@ func (r *Reconciler) SetMACResolver(resolver MACResolver) {
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups=hypershift.openshift.io,resources=nodepools,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinedeployments;machinesets;machines,verbs=get;list
+// +kubebuilder:rbac:groups=capi-provider.agent-install.openshift.io,resources=agentmachines,verbs=get;list
 
 // Reconcile ensures the InfraEnv for a bare-metal ClusterOrder exists, creates BMIs, correlates
 // registered Agents by MAC, and converges NodePool replicas.
@@ -1140,7 +1142,7 @@ func (r *Reconciler) SetupWithManager(mgr mcmanager.Manager) error {
 		log.Info("Agent CRD not found, skipping Agent watch")
 	}
 
-	npGVK := schema.GroupVersionKind{Group: "hypershift.openshift.io", Version: "v1beta1", Kind: "NodePool"}
+	npGVK := schema.GroupVersionKind{Group: hypershiftAPIGroup, Version: hypershiftAPIVersion, Kind: nodePoolKind}
 	if crdExists(mgr, npGVK) {
 		npObj := &unstructured.Unstructured{}
 		npObj.SetGroupVersionKind(npGVK)

@@ -3,6 +3,10 @@ kind: Kustomization
 resources:
 - agent-install.openshift.io_agents.yaml
 - agent-install.openshift.io_infraenvs.yaml
+- capi-provider.agent-install.openshift.io_agentmachines.yaml
+- cluster.x-k8s.io_machinedeployments.yaml
+- cluster.x-k8s.io_machinesets.yaml
+- cluster.x-k8s.io_machines.yaml
 - hive.openshift.io_clusterdeployments.yaml
 - hypershift.openshift.io_hostedclusters.yaml
 - hypershift.openshift.io_hostedcontrolplanes.yaml

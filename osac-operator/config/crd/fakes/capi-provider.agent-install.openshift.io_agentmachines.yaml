@@ -1,0 +1,27 @@
+# Minimal CAP-Agent v1beta1 test fixture, not the upstream API schema.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: agentmachines.capi-provider.agent-install.openshift.io
+spec:
+  group: capi-provider.agent-install.openshift.io
+  names:
+    kind: AgentMachine
+    listKind: AgentMachineList
+    plural: agentmachines
+    singular: agentmachine
+  scope: Namespaced
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
