@@ -38,12 +38,15 @@ func (r *Reconciler) handleVerifiedClusterDeletion(ctx context.Context, co *v1al
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
-	changes, err := r.observeDeletionWorkers(ctx, co, tenant, observed)
+	workers, err := r.observeDeletionWorkers(ctx, co, tenant, observed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if res, err := r.persistWorkerChangesAndRefresh(ctx, co, changes); err != nil || !res.IsZero() {
-		return res, err
+	if !workerSlicesEqual(co.Status.Workers, workers) {
+		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+			return ctrl.Result{}, err
+		}
+		return workerBoundaryRequeue(), nil
 	}
 	return r.handleClusterDeletion(ctx, co, observed)
 }
@@ -106,24 +109,25 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 
 // reconcileWorkerTeardown refreshes Agents only after an actual Agent mutation.
 // Ordinary stable reconciles reuse their one observation stage without a list.
-func (r *Reconciler) reconcileWorkerTeardown(ctx context.Context, co *v1alpha1.ClusterOrder, o *workerObservation) error {
+func (r *Reconciler) reconcileWorkerTeardown(ctx context.Context, co *v1alpha1.ClusterOrder, o *workerObservation) (bool, error) {
 	if !hasTeardownWorkers(co.Status.Workers) {
-		return nil
+		return false, nil
 	}
 	workers := r.reconcileTeardownWorkers(ctx, co, co.Status.Workers, o)
 	if !workerSlicesEqual(co.Status.Workers, workers) {
 		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
-			return fmt.Errorf("persisting worker teardown: %w", err)
+			return false, fmt.Errorf("persisting worker teardown: %w", err)
 		}
+		return true, nil
 	}
 	if o.agentsInvalidated {
 		agents, err := r.listAgents(ctx, co)
 		if err != nil {
-			return err
+			return false, err
 		}
 		o.agents = agents
 	}
-	return nil
+	return false, nil
 }
 
 // reconcileTeardownWorkers shares the Agent observation and handles each

@@ -53,6 +53,24 @@ func (w *workerStatusFaultWriter) Patch(ctx context.Context, obj client.Object, 
 	return w.SubResourceWriter.Patch(ctx, obj, p, opts...)
 }
 
+// agentPatchFaultClient runs beforeAgentPatch immediately before an Agent patch
+// reaches the real apiserver. It lets a test inject a competing writer after the
+// reconciler's fresh Agent read but before its optimistic Patch, without any
+// production fault-injection hook.
+type agentPatchFaultClient struct {
+	client.Client
+	beforeAgentPatch func(ctx context.Context, agent *unstructured.Unstructured) error
+}
+
+func (c *agentPatchFaultClient) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.PatchOption) error {
+	if agent, ok := obj.(*unstructured.Unstructured); ok && agent.GroupVersionKind() == agentGVK && c.beforeAgentPatch != nil {
+		if err := c.beforeAgentPatch(ctx, agent); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, obj, p, opts...)
+}
+
 var _ = Describe("Unified worker reconciliation", func() {
 	const tenant = "unified-tenant"
 	var co *api.ClusterOrder
@@ -96,6 +114,13 @@ var _ = Describe("Unified worker reconciliation", func() {
 		latest := &api.ClusterOrder{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), latest)).To(Succeed())
 		return latest
+	}
+	getAgent := func(name string) *unstructured.Unstructured {
+		GinkgoHelper()
+		agent := &unstructured.Unstructured{}
+		agent.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: co.Namespace}, agent)).To(Succeed())
+		return agent
 	}
 	run := func() (reconcile.Result, error) {
 		return r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(co)})
@@ -392,7 +417,7 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(fc.CreateCalls()).To(HaveLen(1))
 		Expect(fc.DeleteCalls()).To(BeEmpty())
 	})
-	It("W-E4 merges phase evidence into real latest status after a conflict and derives aggregates from that merged slice", func() {
+	It("R02-E1 restarts after a real status conflict without overwriting another writer", func() {
 		old := provision()
 		fc.SetHostMAC(old.BareMetalInstance.ID, "aa:bb:cc:dd:ee:44")
 		agent := &unstructured.Unstructured{}
@@ -406,37 +431,128 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
 		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
-		appended := api.WorkerStatus{Name: "concurrent-vm", Kind: "VirtualMachine", NodeSet: "concurrent", Phase: "WaitingForAgent", CreationTimestamp: metav1.NewTime(time.Now().Truncate(time.Second))}
 		injected := false
 		r = buildReconciler(&workerStatusFaultClient{Client: k8sClient, fail: func(candidate *api.ClusterOrder) bool {
 			if !injected && candidate.Status.ReadyWorkers != nil && *candidate.Status.ReadyWorkers == 1 {
 				injected = true
 				latest := getOrder()
-				latest.Status.Workers = append(latest.Status.Workers, appended)
 				apimeta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{Type: "ConcurrentOwner", Status: metav1.ConditionTrue, Reason: "Preserved", LastTransitionTime: metav1.Now()})
 				Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
 			}
 			// The underlying optimistic Patch now conflicts with the real apiserver.
 			return false
 		}})
+		// The first call persists the phase repair and ends the invocation.
 		_, err := run()
 		Expect(err).NotTo(HaveOccurred())
-		// The first call persisted the phase repair; aggregation follows fresh observation.
+		// The next call observes the phase and loses its aggregate patch to a real
+		// resource-version conflict injected by another status writer.
+		_, err = run()
+		Expect(err).To(HaveOccurred())
+		Expect(injected).To(BeTrue())
+		// A fresh invocation converges the aggregate fields without rebasing the
+		// stale calculation over the concurrent worker/condition update.
 		_, err = run()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(injected).To(BeTrue())
 		latest := getOrder()
-		Expect(latest.Status.Workers).To(HaveLen(2))
+		Expect(latest.Status.Workers).To(HaveLen(1))
 		Expect(latest.Status.Workers[0].Phase).To(Equal("Ready"))
-		Expect(latest.Status.Workers[1]).To(Equal(appended))
 		Expect(apimeta.IsStatusConditionTrue(latest.Status.Conditions, "ConcurrentOwner")).To(BeTrue())
 		Expect(latest.Status.CurrentWorkers).NotTo(BeNil())
-		Expect(*latest.Status.CurrentWorkers).To(Equal(int32(2)))
+		Expect(*latest.Status.CurrentWorkers).To(Equal(int32(1)))
 		Expect(latest.Status.ReadyWorkers).NotTo(BeNil())
 		Expect(*latest.Status.ReadyWorkers).To(Equal(int32(1)))
 		Expect(latest.Status.DesiredWorkers).NotTo(BeNil())
-		Expect(*latest.Status.DesiredWorkers).To(Equal(int32(2)))
+		Expect(*latest.Status.DesiredWorkers).To(Equal(int32(1)))
 		Expect(fc.CreateCalls()).To(HaveLen(1))
+	})
+
+	It("R02-E2 propagates a real Agent binding conflict without takeover", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:55"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agentName := co.Name + "-agent"
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: agentName, Namespace: co.Namespace, MAC: mac,
+		})).To(Succeed())
+		// The cluster-order label models the controller's watch filter; the Agent is
+		// deliberately left unbound so the next reconcile attempts late binding.
+		agent := getAgent(agentName)
+		agentLabels := agent.GetLabels()
+		if agentLabels == nil {
+			agentLabels = map[string]string{}
+		}
+		agentLabels["osac.openshift.io/cluster-order"] = co.Name
+		agent.SetLabels(agentLabels)
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		createsBefore := len(fc.CreateCalls())
+		patches := 0
+		competingRV := ""
+		r = buildReconciler(&agentPatchFaultClient{Client: k8sClient, beforeAgentPatch: func(ctx context.Context, patched *unstructured.Unstructured) error {
+			patches++
+			// A competing writer rebinds the Agent after the reconciler's fresh read but
+			// before its optimistic Patch, advancing the live resource version. The
+			// worker-name label is left unset so a fresh invocation must refuse adoption
+			// through the binding guard rather than skipping an already-labelled Agent.
+			live := &unstructured.Unstructured{}
+			live.SetGroupVersionKind(agentGVK)
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(patched), live); err != nil {
+				return err
+			}
+			if err := unstructured.SetNestedMap(live.Object, map[string]interface{}{
+				"name": "other-cluster", "namespace": co.Namespace,
+			}, "spec", "clusterDeploymentName"); err != nil {
+				return err
+			}
+			if err := k8sClient.Update(ctx, live); err != nil {
+				return err
+			}
+			competingRV = live.GetResourceVersion()
+			return nil
+		}})
+
+		// The optimistic Patch carries the stale base resource version and is rejected.
+		_, err := run()
+		Expect(err).To(HaveOccurred())
+		Expect(apierrors.IsConflict(err)).To(BeTrue(), "expected a propagated optimistic-lock conflict, got %v", err)
+		Expect(patches).To(Equal(1), "exactly one Agent patch attempt, no in-reconcile retry")
+
+		// No takeover: the competing binding and its resource version survive untouched.
+		live := getAgent(agentName)
+		Expect(live.GetResourceVersion()).To(Equal(competingRV))
+		Expect(live.GetLabels()).NotTo(HaveKey("osac.openshift.io/worker-name"))
+		competingName, _, _ := unstructured.NestedString(live.Object, "spec", "clusterDeploymentName", "name")
+		Expect(competingName).To(Equal("other-cluster"))
+
+		// The interrupted invocation persisted no worker progress and caused no external effect.
+		interrupted := getOrder()
+		Expect(interrupted.Status.Workers).To(HaveLen(1))
+		Expect(interrupted.Status.Workers[0].Name).To(Equal(old.Name))
+		Expect(interrupted.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		Expect(interrupted.Status.Workers[0].BareMetalInstance).To(Equal(old.BareMetalInstance))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+
+		// A fresh invocation respects the competing binding and refuses to adopt it.
+		r = buildReconciler(k8sClient)
+		_, err = run()
+		Expect(err).To(MatchError(ContainSubstring("bound to another cluster deployment")))
+		Expect(getAgent(agentName).GetLabels()).NotTo(HaveKey("osac.openshift.io/worker-name"))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+
+		// Once the test owner releases the competing binding, an explicit invocation
+		// may bind safely to this cluster deployment.
+		released := getAgent(agentName)
+		unstructured.RemoveNestedField(released.Object, "spec", "clusterDeploymentName")
+		Expect(k8sClient.Update(ctx, released)).To(Succeed())
+		_, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		bound := getAgent(agentName)
+		Expect(bound.GetLabels()).To(HaveKeyWithValue("osac.openshift.io/worker-name", old.Name))
+		boundName, _, _ := unstructured.NestedString(bound.Object, "spec", "clusterDeploymentName", "name")
+		Expect(boundName).To(Equal(co.Name))
 	})
 
 	It("W-E5 recovers a Failed ID-less reference during deletion without history reset or allocation", func() {
@@ -455,6 +571,11 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(k8sClient.Delete(ctx, latest)).To(Succeed())
 		createsBefore := len(fc.CreateCalls())
 		result, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Second))
+		// ID recovery is a durable observation boundary. Deletion proceeds only
+		// on the next explicit invocation from the fresh persisted reference.
+		result, err = run()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result.RequeueAfter).To(Equal(30 * time.Second))
 		recovered := getOrder().Status.Workers

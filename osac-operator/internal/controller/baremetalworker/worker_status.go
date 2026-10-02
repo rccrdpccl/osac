@@ -13,7 +13,6 @@ import (
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -42,136 +41,83 @@ const (
 
 var errWorkerObservationChanged = errors.New("worker observation changed; reconcile again")
 
-// workerChange is concrete evidence about one persisted slot, not a slice index.
-// A nil replacement means removal of that exact observed slot.
-type workerChange struct {
-	observed    v1alpha1.WorkerStatus
-	replacement *v1alpha1.WorkerStatus
+// patchStatusFromBase applies a single optimistic status patch. The caller must
+// have obtained base from an authoritative read before making its observation or
+// decision; a conflict deliberately aborts this invocation.
+func (r *Reconciler) patchStatusFromBase(
+	ctx context.Context, base, next *v1alpha1.ClusterOrder,
+) error {
+	if reflect.DeepEqual(base.Status, next.Status) {
+		return nil
+	}
+	return r.Status().Patch(ctx, next, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
+}
+
+// patchStatus reads the authoritative order before applying a status-only
+// mutation. It is used for condition writes that do not depend on an earlier
+// external observation.
+func (r *Reconciler) patchStatus(
+	ctx context.Context, co *v1alpha1.ClusterOrder, mutate func(*v1alpha1.ClusterOrder),
+) error {
+	latest := co.DeepCopy()
+	if err := r.readAuthoritativeOrder(ctx, latest); err != nil {
+		return err
+	}
+	if !sameWorkerOrder(co, latest) {
+		return errWorkerObservationChanged
+	}
+	base := latest.DeepCopy()
+	mutate(latest)
+	return r.patchStatusFromBase(ctx, base, latest)
+}
+
+func (r *Reconciler) readAuthoritativeOrder(ctx context.Context, co *v1alpha1.ClusterOrder) error {
+	reader := r.apiReader
+	if reader == nil {
+		reader = r.Client
+	}
+	latest := &v1alpha1.ClusterOrder{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+		return err
+	}
+	*co = *latest
+	return nil
 }
 
 func (r *Reconciler) updateWorkerStatus(
 	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
 ) error {
-	changes := workerDifferences(co.Status.Workers, workers)
-	stale := false
-	err := r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
-		stale = !mergeWorkerChanges(co, latest, changes, true)
-	})
-	if err != nil {
-		return err
-	}
-	if stale {
-		return errWorkerObservationChanged
-	}
-	return r.apiReader.Get(ctx, client.ObjectKeyFromObject(co), co)
+	next := co.DeepCopy()
+	next.Status.Workers = append([]v1alpha1.WorkerStatus(nil), workers...)
+	return r.patchStatusFromBase(ctx, co, next)
 }
 
 // updateWorkerStatusWithAgent patches status.workers, aggregate counts, and the
-// WorkersFailed condition on the ClusterOrder, re-reading and retrying on conflict.
-// It also resets attemptCount for workers that have been Ready for MinHealthyDuration.
+// WorkersFailed condition on the ClusterOrder. It also resets attemptCount for
+// workers that have been Ready for MinHealthyDuration.
 func (r *Reconciler) updateWorkerStatusWithAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
 ) error {
 	log := ctrllog.FromContext(ctx)
 	workers = append([]v1alpha1.WorkerStatus(nil), workers...)
 	resetHealthyWorkers(log, co, workers)
-	changes := workerDifferences(co.Status.Workers, workers)
-	stale := false
-	err := r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
-		stale = !mergeWorkerChanges(co, latest, changes, false)
-		if stale {
-			return
-		}
-		desired, current, ready := computeWorkerAggregates(latest.Status.Workers)
-		latest.Status.DesiredWorkers = &desired
-		latest.Status.CurrentWorkers = &current
-		latest.Status.ReadyWorkers = &ready
+	next := co.DeepCopy()
+	next.Status.Workers = workers
+	desired, current, ready := computeWorkerAggregates(workers)
+	next.Status.DesiredWorkers = &desired
+	next.Status.CurrentWorkers = &current
+	next.Status.ReadyWorkers = &ready
 
-		failedMsg := FormatWorkersFailed(latest.Status.Workers)
-		switch {
-		case failedMsg != "":
-			latest.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
-				metav1.ConditionTrue, failedMsg, reasonWorkersFailed)
-		case apimeta.IsStatusConditionTrue(latest.Status.Conditions, v1alpha1.ConditionWorkersFailed):
-			latest.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
-				metav1.ConditionFalse, "all workers healthy", reasonWorkersFailedCleared)
-		}
-	})
-	if err != nil {
-		return err
+	failedMsg := FormatWorkersFailed(workers)
+	switch {
+	case failedMsg != "":
+		next.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+			metav1.ConditionTrue, failedMsg, reasonWorkersFailed)
+	case apimeta.IsStatusConditionTrue(next.Status.Conditions, v1alpha1.ConditionWorkersFailed):
+		next.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+			metav1.ConditionFalse, "all workers healthy", reasonWorkersFailedCleared)
 	}
-	if stale {
-		return errWorkerObservationChanged
-	}
-	return r.apiReader.Get(ctx, client.ObjectKeyFromObject(co), co)
-}
-
-func (r *Reconciler) persistWorkerChangesAndRefresh(ctx context.Context, co *v1alpha1.ClusterOrder, changes []workerChange) (ctrl.Result, error) {
-	if len(changes) == 0 {
-		return ctrl.Result{}, nil
-	}
-	stale := false
-	err := r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
-		stale = false
-		if !sameWorkerOrder(co, latest) {
-			stale = true
-			return
-		}
-		// Validate the entire set first: do not partly apply stale evidence.
-		candidate := latest.DeepCopy()
-		for _, change := range changes {
-			if !applyWorkerChange(candidate, change) {
-				stale = true
-				return
-			}
-		}
-		latest.Status.Workers = candidate.Status.Workers
-	})
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("persisting observed workers: %w", err)
-	}
-	if err := r.refreshWorkerOrder(ctx, co); err != nil {
-		return ctrl.Result{}, err
-	}
-	if stale {
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	}
-	return ctrl.Result{}, nil
-}
-
-func (r *Reconciler) refreshWorkerOrder(ctx context.Context, co *v1alpha1.ClusterOrder) error {
-	latest := &v1alpha1.ClusterOrder{}
-	if err := r.apiReader.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
-		return err
-	}
-	if !sameWorkerOrder(co, latest) {
-		return errWorkerObservationChanged
-	}
-	*co = *latest
-	return nil
-}
-
-// patchStatusWithRetry re-reads the ClusterOrder and applies the mutate function to its status,
-// retrying on conflict with optimistic locking.
-func (r *Reconciler) patchStatusWithRetry(
-	ctx context.Context, co *v1alpha1.ClusterOrder, mutate func(*v1alpha1.ClusterOrder),
-) error {
-	key := client.ObjectKeyFromObject(co)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &v1alpha1.ClusterOrder{}
-		if err := r.apiReader.Get(ctx, key, latest); err != nil {
-			return err
-		}
-		if !sameWorkerOrder(co, latest) {
-			return errWorkerObservationChanged
-		}
-		base := latest.DeepCopy()
-		mutate(latest)
-		if reflect.DeepEqual(base.Status, latest.Status) {
-			return nil
-		}
-		return r.Status().Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
-	})
+	return r.patchStatusFromBase(ctx, co, next)
 }
 
 func sameWorkerOrder(observed, latest *v1alpha1.ClusterOrder) bool {
@@ -179,82 +125,25 @@ func sameWorkerOrder(observed, latest *v1alpha1.ClusterOrder) bool {
 		latest.Labels[clusterOrderIDLabel] == observed.Labels[clusterOrderIDLabel] && latest.DeletionTimestamp.Equal(observed.DeletionTimestamp)
 }
 
+func sameCapacityPlan(expected, latest *v1alpha1.ClusterOrder) bool {
+	return sameWorkerOrder(expected, latest) && expected.Generation == latest.Generation &&
+		reflect.DeepEqual(expected.Spec, latest.Spec) && reflect.DeepEqual(expected.Status.Workers, latest.Status.Workers)
+}
+
 // checkCurrentCapacityPlan is an authoritative interruption boundary before an
 // external action. Conditions may change, but spec, tenancy, deletion and all
-// planned slots must still describe the plan. No provider call occurs in a
-// conflict-retry callback. The expectation never advances after an external action.
+// planned slots must still describe the plan. A stale plan returns before the
+// action; a persistence conflict aborts the invocation rather than retrying
+// inside it. The expectation never advances after an external action.
 func (r *Reconciler) checkCurrentCapacityPlan(ctx context.Context, expected *v1alpha1.ClusterOrder) error {
 	latest := &v1alpha1.ClusterOrder{}
 	if err := r.apiReader.Get(ctx, client.ObjectKeyFromObject(expected), latest); err != nil {
 		return err
 	}
-	if !sameWorkerOrder(expected, latest) || expected.Generation != latest.Generation || !reflect.DeepEqual(expected.Spec, latest.Spec) || !reflect.DeepEqual(expected.Status.Workers, latest.Status.Workers) {
+	if !sameCapacityPlan(expected, latest) {
 		return errWorkerObservationChanged
 	}
 	return nil
-}
-
-// workerDifferences includes only previously observed slots. Capacity additions
-// belong to the authoritative reservation callback, never to this merge.
-func workerDifferences(before, after []v1alpha1.WorkerStatus) []workerChange {
-	next := make(map[string]v1alpha1.WorkerStatus, len(after))
-	for _, w := range after {
-		next[w.Name] = w
-	}
-	var changes []workerChange
-	for _, w := range before {
-		if replacement, ok := next[w.Name]; ok {
-			changes = appendWorkerDifference(changes, w, replacement)
-		} else {
-			changes = append(changes, workerChange{observed: w})
-		}
-	}
-	return changes
-}
-
-func appendWorkerDifference(changes []workerChange, before, after v1alpha1.WorkerStatus) []workerChange {
-	if reflect.DeepEqual(before, after) {
-		return changes
-	}
-	return append(changes, workerChange{observed: before, replacement: &after})
-}
-
-func mergeWorkerChanges(co, latest *v1alpha1.ClusterOrder, changes []workerChange, capacity bool) bool {
-	if !sameWorkerOrder(co, latest) {
-		return false
-	}
-	if capacity && (co.Generation != latest.Generation || !reflect.DeepEqual(co.Spec, latest.Spec)) {
-		return false
-	}
-	candidate := latest.DeepCopy()
-	for _, change := range changes {
-		if !applyWorkerChange(candidate, change) {
-			return false
-		}
-	}
-	latest.Status.Workers = candidate.Status.Workers
-	return true
-}
-
-func applyWorkerChange(latest *v1alpha1.ClusterOrder, change workerChange) bool {
-	for i := range latest.Status.Workers {
-		w := &latest.Status.Workers[i]
-		if w.Name != change.observed.Name {
-			continue
-		}
-		// Identity, lifecycle, clocks and failure history must still describe the
-		// observation. Unrelated appended workers and order status fields survive.
-		if !reflect.DeepEqual(*w, change.observed) {
-			return false
-		}
-		if change.replacement == nil {
-			latest.Status.Workers = append(latest.Status.Workers[:i], latest.Status.Workers[i+1:]...)
-		} else {
-			*w = *change.replacement
-		}
-		return true
-	}
-	return false
 }
 
 // handleFulfillmentError converts service unavailability into a backoff only
@@ -274,7 +163,7 @@ func (r *Reconciler) handleFulfillmentError(ctx context.Context, co *v1alpha1.Cl
 func (r *Reconciler) setFulfillmentServiceUnavailable(
 	ctx context.Context, co *v1alpha1.ClusterOrder, condStatus metav1.ConditionStatus, reason, message string,
 ) error {
-	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
+	return r.patchStatus(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionFulfillmentServiceUnavailable, condStatus, message, reason)
 	})
 }
@@ -344,6 +233,23 @@ func initializeReadySince(workers []v1alpha1.WorkerStatus) {
 
 func workerSlicesEqual(a, b []v1alpha1.WorkerStatus) bool {
 	return reflect.DeepEqual(a, b)
+}
+
+func workerStatusesEqual(a, b []v1alpha1.WorkerStatus) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := make(map[string]v1alpha1.WorkerStatus, len(a))
+	for _, worker := range a {
+		left[worker.Name] = worker
+	}
+	for _, worker := range b {
+		other, ok := left[worker.Name]
+		if !ok || !reflect.DeepEqual(other, worker) {
+			return false
+		}
+	}
+	return true
 }
 
 func countWorkersInPhase(workers []v1alpha1.WorkerStatus, phase string) int {

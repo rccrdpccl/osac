@@ -40,15 +40,22 @@
 //   - scaling.go selects retained/excess slots and initiates scale-down.
 //   - retry.go handles failed workers, backoff and healthy-history reset.
 //   - worker_teardown.go unbinds Agents, confirms BMI absence and finalizes.
-//   - worker_status.go owns guarded status merges, conditions and aggregates.
+//   - worker_status.go owns one-shot optimistic status patches, conditions and
+//     aggregates; a conflict abandons the invocation instead of merging stale
+//     evidence into newer worker state.
 //   - metrics.go owns metric registration and observations.
 //
 // The fulfillment.go, ignition.go and resolver.go adapters retain their existing
 // boundaries. Tests are grouped by the behavior they exercise, with real API
 // server/etcd persistence coverage in acceptance and shared doubles in fake.
+// R02-E1/E2 drive public reconciles through real status and Agent binding
+// conflicts: one rejected optimistic patch, no takeover, and a fresh invocation
+// that respects the competing writer.
 //
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs
-// a fresh ownership/existence check. Keep status persistence and optimistic-lock
-// guards explicit when adding helpers to any of these files.
+// a fresh ownership/existence check. Worker and Agent writes use one authoritative
+// snapshot plus one optimistic patch; conflicts return to controller-runtime for
+// a fresh invocation. Keep those boundaries explicit when adding helpers to any
+// of these files.
 package baremetalworker

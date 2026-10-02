@@ -16,6 +16,7 @@ package baremetalworker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -306,7 +307,10 @@ func TestPendingBMIRecoveryUsesRecordedNameNotWorkerName(t *testing.T) {
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	if err := runDeletionBMIStage(context.Background(), r, co); err != nil {
+	if err := runDeletionBMIStage(context.Background(), r, co); !errors.Is(err, errWorkerObservationChanged) {
+		t.Fatalf("first deletion observation error=%v, want boundary", err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
 	w := co.Status.Workers[0]
@@ -315,23 +319,21 @@ func TestPendingBMIRecoveryUsesRecordedNameNotWorkerName(t *testing.T) {
 	}
 }
 
-func TestNodeSetStaleSnapshotReusesReservedNames(t *testing.T) {
+func TestNodeSetStaleSnapshotConflictsInsteadOfRebasing(t *testing.T) {
 	r, _, co := nodeSetHarness(t, "stale-order", nodeRequest("standard", 2))
 	stale := co.DeepCopy()
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	first := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
-	if _, err := r.reserveWorkerSlots(context.Background(), stale); err != nil {
+	latest := &v1alpha1.ClusterOrder{}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), latest); err != nil {
 		t.Fatal(err)
 	}
-	if len(stale.Status.Workers) != 2 {
-		t.Fatalf("stale snapshot allocated duplicate slots: %+v", stale.Status.Workers)
+	if _, err := r.reserveWorkerSlots(context.Background(), stale); !errors.Is(err, errWorkerObservationChanged) {
+		t.Fatalf("error=%v, want stale-observation interruption", err)
 	}
-	for i := range first {
-		if first[i].Name != stale.Status.Workers[i].Name {
-			t.Fatal("stale snapshot replaced a persisted name")
-		}
+	if len(latest.Status.Workers) != 2 || len(stale.Status.Workers) != 0 {
+		t.Fatalf("unexpected reservations after stale conflict: latest=%+v stale=%+v", latest.Status.Workers, stale.Status.Workers)
 	}
 }
 

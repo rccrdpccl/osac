@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -97,6 +98,9 @@ func TestR01StaleCachedOrderUsesPersistedSlots(t *testing.T) {
 	r, fc, co := nodeSetHarness(t, "r01-stale", nodeRequest("standard", 2))
 	stale := co.DeepCopy()
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
 	names := []string{co.Status.Workers[0].Name, co.Status.Workers[1].Name}
@@ -198,7 +202,7 @@ func TestR01FailedCapacityReturnsAfterOneRetryDelete(t *testing.T) {
 }
 
 func TestCapacityActionRejectsChangedSpecOrSlot(t *testing.T) {
-	for _, mutation := range []string{"spec", "deletion", "reference", "failed", "appended"} {
+	for _, mutation := range []string{"spec", "deletion", "reference", "failed", "appended", "tenant", "replacement"} {
 		t.Run(mutation, func(t *testing.T) {
 			r, fc, co := nodeSetHarness(t, "guard-capacity", nodeRequest("standard", 1))
 			if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
@@ -219,6 +223,13 @@ func TestCapacityActionRejectsChangedSpecOrSlot(t *testing.T) {
 						latest.Status.Workers[0].Phase = workerPhaseFailed
 					case "appended":
 						latest.Status.Workers = append(latest.Status.Workers, newWorkerStatus("standard", "standard", "appended", "appended-id", workerPhaseReady))
+					case "tenant":
+						if latest.Annotations == nil {
+							latest.Annotations = map[string]string{}
+						}
+						latest.Annotations["osac.openshift.io/tenant"] = "other-tenant"
+					case "replacement":
+						latest.UID = "replacement-order"
 					}
 				})
 				if mutation == "deletion" {
@@ -254,8 +265,8 @@ func TestCreatePersistencePreservesAppendedSlotAndStopsNextAction(t *testing.T) 
 		})
 	}
 	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
-	if err == nil && res.IsZero() {
-		t.Fatal("did not stop after new capacity evidence")
+	if !apierrors.IsConflict(err) || !res.IsZero() {
+		t.Fatalf("result=%+v err=%v, want one-shot conflict", res, err)
 	}
 	if len(fc.names) != 1 {
 		t.Fatalf("creates=%v, want only first action", fc.names)
@@ -267,8 +278,8 @@ func TestCreatePersistencePreservesAppendedSlotAndStopsNextAction(t *testing.T) 
 		t.Fatalf("lost appended slot: %+v", co.Status.Workers)
 	}
 	w := workerByName(co.Status.Workers, fc.names[0])
-	if w == nil || w.BareMetalInstance.ID == "" {
-		t.Fatal("lost successful create identity")
+	if w == nil || w.BareMetalInstance.Name != fc.names[0] || w.BareMetalInstance.ID != "" {
+		t.Fatalf("lost reserved create identity: %+v", w)
 	}
 }
 func TestReservationRejectsReplacementOrder(t *testing.T) {

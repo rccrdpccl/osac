@@ -152,13 +152,16 @@ func (r *Reconciler) workerMACResolver(o *workerObservation) MACResolver {
 
 // observeExistingWorkers verifies all recorded IDs, including protected lifecycle
 // states, then combines identity repair and quiet early Agent projection in one pass.
-func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, o *workerObservation) ([]workerChange, error) {
+// The returned slice is a complete replacement calculated from co's authoritative
+// invocation snapshot; it is never merged into a newer status object.
+func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, o *workerObservation) ([]v1alpha1.WorkerStatus, error) {
 	if err := validateWorkerBMIReferences(co); err != nil {
 		return nil, err
 	}
 	macs := r.workerMACResolver(o)
-	var changes []workerChange
-	for _, w := range co.Status.Workers {
+	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
+	for i := 0; i < len(workers); i++ {
+		w := workers[i]
 		if w.Kind != workerKindBMI {
 			continue
 		}
@@ -172,7 +175,8 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 		}
 		candidate := reconcileBMI(w, state)
 		if candidate == nil {
-			changes = append(changes, workerChange{observed: w})
+			workers = append(workers[:i], workers[i+1:]...)
+			i--
 			continue
 		}
 		next := *candidate
@@ -185,32 +189,30 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 			}
 		}
 		o.projected[w.Name] = next
-		changes = appendWorkerDifference(changes, w, next)
+		workers[i] = next
 	}
-	return changes, nil
+	return workers, nil
 }
 
 // observeDeletionWorkers recovers names in every lifecycle state, verifies all
 // recorded IDs, and changes only identity. It never resets history, projects
 // Agent phases, reserves capacity or provisions resources.
-func (r *Reconciler) observeDeletionWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, o *workerObservation) ([]workerChange, error) {
+func (r *Reconciler) observeDeletionWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, o *workerObservation) ([]v1alpha1.WorkerStatus, error) {
 	if err := validateWorkerBMIReferences(co); err != nil {
 		return nil, err
 	}
-	var changes []workerChange
-	for _, w := range co.Status.Workers {
-		if w.Kind != workerKindBMI {
+	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
+	for i := range workers {
+		if workers[i].Kind != workerKindBMI {
 			continue
 		}
-		state, err := r.verifyRecordedBMI(ctx, co, tenant, w, o)
+		state, err := r.verifyRecordedBMI(ctx, co, tenant, workers[i], o)
 		if err != nil {
 			return nil, err
 		}
-		next := w
-		if next.BareMetalInstance.ID == "" && state.bmi != nil {
-			next.BareMetalInstance.ID = state.bmi.GetId()
+		if workers[i].BareMetalInstance.ID == "" && state.bmi != nil {
+			workers[i].BareMetalInstance.ID = state.bmi.GetId()
 		}
-		changes = appendWorkerDifference(changes, w, next)
 	}
-	return changes, nil
+	return workers, nil
 }

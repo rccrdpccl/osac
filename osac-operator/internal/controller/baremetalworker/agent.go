@@ -12,7 +12,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -67,7 +66,9 @@ func (r *Reconciler) reconcileAgentWithProjection(ctx context.Context, co *v1alp
 	r.observeAgentReadiness(ctx, co, workers, observed)
 	workers = observed
 	initializeReadySince(workers)
-	r.matchAndBindAgents(ctx, co, agents, workers, macs)
+	if _, err := r.matchAndBindAgents(ctx, co, agents, workers, macs); err != nil {
+		return nil, ctrl.Result{}, err
+	}
 	workers = r.checkAgentRegistrationTimeout(ctx, co, workers)
 
 	if countWorkersInPhase(workers, workerPhaseWaitingForAgent) > 0 {
@@ -97,18 +98,22 @@ func (r *Reconciler) observeAgentReadiness(
 func (r *Reconciler) matchAndBindAgents(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	agents *unstructured.UnstructuredList, workers []v1alpha1.WorkerStatus, resolvers ...MACResolver,
-) int {
+) (int, error) {
 	bound := 0
 	for idx := range agents.Items {
 		agent := &agents.Items[idx]
 		if agent.GetLabels()[workerNameLabel] != "" {
 			continue
 		}
-		if r.matchAndBindAgent(ctx, co, agent, workers, resolvers...) {
+		matched, err := r.matchAndBindAgent(ctx, co, agent, workers, resolvers...)
+		if err != nil {
+			return bound, err
+		}
+		if matched {
 			bound++
 		}
 	}
-	return bound
+	return bound, nil
 }
 
 // matchAndBindAgent matches a single Agent to a BMI by MAC, then binds it.
@@ -116,7 +121,7 @@ func (r *Reconciler) matchAndBindAgents(
 func (r *Reconciler) matchAndBindAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	agent *unstructured.Unstructured, workers []v1alpha1.WorkerStatus, resolvers ...MACResolver,
-) bool {
+) (bool, error) {
 	log := ctrllog.FromContext(ctx)
 
 	macs := r.workerMACResolver(nil)
@@ -126,16 +131,15 @@ func (r *Reconciler) matchAndBindAgent(
 	workerName, isAmbiguous := matchAgentToBMI(ctx, agent, workers, macs)
 	if isAmbiguous {
 		log.Error(nil, "multiple BMIs match agent MAC, skipping bind", "agent", agent.GetName())
-		return false
+		return false, nil
 	}
 	if workerName == "" {
-		return false
+		return false, nil
 	}
 
 	worker := workerByName(workers, workerName)
 	if err := r.bindAgent(ctx, co, agent, worker); err != nil {
-		log.Error(err, "binding agent failed", "agent", agent.GetName(), "worker", workerName)
-		return false
+		return false, err
 	}
 
 	setWorkerPhase(workers, workerName, workerPhaseBinding)
@@ -145,7 +149,7 @@ func (r *Reconciler) matchAndBindAgent(
 	log.Info("agent correlated", "agent", agent.GetName(), "worker", workerName)
 	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
 		"agent %s correlated to worker %s", agent.GetName(), workerName)
-	return true
+	return true, nil
 }
 
 // bindAgent sets the Agent's clusterDeploymentName (late binding), marks it approved,
@@ -158,48 +162,49 @@ func (r *Reconciler) bindAgent(
 	if reader == nil {
 		reader = r.Client
 	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &unstructured.Unstructured{}
-		latest.SetGroupVersionKind(agentGVK)
-		if err := reader.Get(ctx, client.ObjectKeyFromObject(agent), latest); err != nil {
-			return err
-		}
-		if err := verifyAgentBinding(latest, co, worker); err != nil {
-			return err
-		}
-		base := latest.DeepCopy()
+	latest := &unstructured.Unstructured{}
+	latest.SetGroupVersionKind(agentGVK)
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(agent), latest); err != nil {
+		return err
+	}
+	if latest.GetUID() != agent.GetUID() {
+		return fmt.Errorf("agent %s identity changed before binding", agent.GetName())
+	}
+	if err := verifyAgentBinding(latest, co, worker); err != nil {
+		return err
+	}
+	base := latest.DeepCopy()
 
-		if err := unstructured.SetNestedMap(latest.Object, map[string]interface{}{
-			"name":      co.Name,
-			"namespace": co.Namespace,
-		}, "spec", "clusterDeploymentName"); err != nil {
-			return fmt.Errorf("setting agent clusterDeploymentName: %w", err)
-		}
+	if err := unstructured.SetNestedMap(latest.Object, map[string]interface{}{
+		"name":      co.Name,
+		"namespace": co.Namespace,
+	}, "spec", "clusterDeploymentName"); err != nil {
+		return fmt.Errorf("setting agent clusterDeploymentName: %w", err)
+	}
 
-		if err := unstructured.SetNestedField(latest.Object, true, "spec", "approved"); err != nil {
-			return fmt.Errorf("setting agent approved: %w", err)
-		}
+	if err := unstructured.SetNestedField(latest.Object, true, "spec", "approved"); err != nil {
+		return fmt.Errorf("setting agent approved: %w", err)
+	}
 
-		labels := latest.GetLabels()
-		if labels == nil {
-			labels = make(map[string]string)
+	labels := latest.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	workerName := ""
+	if worker != nil {
+		workerName = worker.Name
+		labels[agentNodeSetLabel] = worker.NodeSet
+		if worker.InstanceType != "" {
+			labels[agentInstanceTypeLabel] = worker.InstanceType
 		}
-		workerName := ""
-		if worker != nil {
-			workerName = worker.Name
-			labels[agentNodeSetLabel] = worker.NodeSet
-			if worker.InstanceType != "" {
-				labels[agentInstanceTypeLabel] = worker.InstanceType
-			}
-		}
-		labels[workerNameLabel] = workerName
-		labels[agentBareMetalRoleLabel] = "true"
-		labels[clusterOrderLabel] = co.Name
-		labels["osac.openshift.io/clusterorder"] = co.Name
-		latest.SetLabels(labels)
+	}
+	labels[workerNameLabel] = workerName
+	labels[agentBareMetalRoleLabel] = "true"
+	labels[clusterOrderLabel] = co.Name
+	labels["osac.openshift.io/clusterorder"] = co.Name
+	latest.SetLabels(labels)
 
-		return r.Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
-	})
+	return r.Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
 // verifyAgentBinding prevents reassigning an Agent, including when its binding
