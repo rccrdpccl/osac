@@ -1590,11 +1590,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileAgent", func() {
 			// Keep provider deletion pending. Installed Agents likewise hold Unbinding.
 			fc.SetDeleteError(fmt.Errorf("provider deletion pending"))
 			_, err := runReconcile(name)
-			if phase == "Failed" {
-				Expect(err).To(MatchError(ContainSubstring("provider deletion pending")), "retry deletion failure must stop capacity actions")
-			} else {
-				Expect(err).ToNot(HaveOccurred())
-			}
+			Expect(err).ToNot(HaveOccurred(), "bound Agent must block cleanup before backend deletion")
+			Expect(fc.DeleteCalls()).To(BeEmpty())
 			co = getClusterOrder(name)
 			Expect(co.Status.Workers).To(ContainElement(before))
 			Expect(*co.Status.ReadyWorkers).To(Equal(int32(0)))
@@ -1934,7 +1931,11 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		// Simulate failure.
 		setWorkerFailed("bmw-retry-del", co.Status.Workers[0].Name, "InfrastructureError", "host allocation failed")
 
-		// Reconcile → handleFailedWorkers deletes the BMI and sets backoff.
+		// Accepted Delete retains identity; only the next Get confirms absence.
+		oldID := co.Status.Workers[0].BareMetalInstance.ID
+		_, err = runReconcile("bmw-retry-del")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getClusterOrder("bmw-retry-del").Status.Workers[0].BareMetalInstance.ID).To(Equal(oldID))
 		_, err = runReconcile("bmw-retry-del")
 		Expect(err).ToNot(HaveOccurred())
 
@@ -1966,6 +1967,10 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		_, err = runReconcile("bmw-retry-repl")
 		Expect(err).ToNot(HaveOccurred())
 
+		// Confirm old-incarnation absence and persist the retry checkpoint.
+		_, err = runReconcile("bmw-retry-repl")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getClusterOrder("bmw-retry-repl").Status.Workers[0].BareMetalInstance.ID).To(BeEmpty())
 		// Move NextRetryTime to the past so retry is due.
 		co = getClusterOrder("bmw-retry-repl")
 		pastTime := metav1.NewTime(time.Now().Add(-1 * time.Minute))
@@ -2003,6 +2008,9 @@ var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {
 		_, err = runReconcile("bmw-retry-clear")
 		Expect(err).ToNot(HaveOccurred())
 
+		_, err = runReconcile("bmw-retry-clear") // Confirm absence before scheduling.
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getClusterOrder("bmw-retry-clear").Status.Workers[0].BareMetalInstance.ID).To(BeEmpty())
 		// Set NextRetryTime to past.
 		co = getClusterOrder("bmw-retry-clear")
 		pastTime := metav1.NewTime(time.Now().Add(-1 * time.Minute))
@@ -2292,6 +2300,11 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 		Expect(k8sClient.Update(ctx, co)).To(Succeed())
 
 		_, err := runReconcile("bmw-scalefail")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getClusterOrder("bmw-scalefail").Status.Workers[1].BareMetalInstance.ID).To(Equal(failed.BareMetalInstance.ID))
+		_, err = runReconcile("bmw-scalefail") // Confirm cleanup and schedule retry.
+		Expect(err).ToNot(HaveOccurred())
+		_, err = runReconcile("bmw-scalefail") // Provision the independent reservation.
 		Expect(err).ToNot(HaveOccurred())
 
 		co = getClusterOrder("bmw-scalefail")
@@ -2800,7 +2813,7 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		co.Spec.NodeRequests[0].NumberOfNodes = 1
 		Expect(k8sClient.Update(ctx, co)).To(Succeed())
 
-		_, err = runReconcile("bmw-sd-failed")
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "bmw-sd-failed", Namespace: testNamespace}})
 		Expect(err).ToNot(HaveOccurred())
 
 		co = getClusterOrder("bmw-sd-failed")
@@ -2809,11 +2822,11 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		for _, w := range co.Status.Workers {
 			workerNames[w.Name] = true
 		}
-		Expect(workerNames).ToNot(HaveKey(failedName), "Failed worker-1 should be removed")
-
-		deletesAfterScaleDown := fc.DeleteCalls()
-		Expect(len(deletesAfterScaleDown)).To(BeNumerically(">", deletesBeforeScaleDown),
-			"BMI for failed worker should have been deleted")
+		Expect(workerNames).To(HaveKey(failedName), "Failed worker must retain its slot until confirmed cleanup")
+		Expect(fc.DeleteCalls()).To(HaveLen(deletesBeforeScaleDown), "persist retirement before deleting")
+		_, err = runReconcile("bmw-sd-failed") // Request cleanup.
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fc.DeleteCalls()).To(HaveLen(deletesBeforeScaleDown + 2))
 
 		// Worker-2 (WaitingForAgent, no bound agent) transitions Unbinding → Deleting in one
 		// reconcile since there is no agent to wait for unbinding.
@@ -2824,6 +2837,11 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 			}
 		}
 		Expect(hasTeardown).To(BeTrue(), "non-failed excess worker-2 should be in teardown")
+		_, err = runReconcile("bmw-sd-failed") // Confirm both absences.
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-sd-failed")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Name).NotTo(Equal(failedName))
 	})
 
 	It("handles Agent unbinding lifecycle and removes worker after BMI deletion confirmed", func() {
@@ -2870,6 +2888,10 @@ var _ = Describe("BareMetalWorkerReconciler scale-down", func() {
 		_, err = runReconcile("bmw-sd-unbind")
 		Expect(err).ToNot(HaveOccurred())
 
+		Expect(fc.DeleteCalls()).To(HaveLen(deletesBeforeUnbind), "Agent deletion must finish before BMI deletion")
+		Expect(getClusterOrder("bmw-sd-unbind").Status.Workers).To(ContainElement(HaveField("Phase", "Unbinding")))
+		_, err = runReconcile("bmw-sd-unbind") // Re-observe Agent absence, then request BMI deletion.
+		Expect(err).ToNot(HaveOccurred())
 		co = getClusterOrder("bmw-sd-unbind")
 		var deletingWorker *osacv1alpha1.WorkerStatus
 		for i := range co.Status.Workers {
@@ -3236,8 +3258,11 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 		Expect(sim.UnbindAgent(ctx, agent.GetName(), testNamespace)).To(Succeed())
 		_, err = runReconcile(co.Name)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(fc.DeleteCalls()).To(ContainElement(worker.BareMetalInstance.ID))
+		Expect(fc.DeleteCalls()).To(BeEmpty(), "Agent Delete is not permission to delete BMI in the same invocation")
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, agent))).To(BeTrue())
+		_, err = runReconcile(co.Name) // Authoritative old Agent absence.
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fc.DeleteCalls()).To(ContainElement(worker.BareMetalInstance.ID))
 	})
 
 	It("releases a known-unbound worker only after reclaim and detachment", func() {
@@ -3294,6 +3319,9 @@ var _ = Describe("BareMetalWorkerReconciler cluster deletion", func() {
 		_, err = runReconcile(co.Name)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, agent))).To(BeTrue())
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		_, err = runReconcile(co.Name) // Confirm Agent absence before BMI deletion.
+		Expect(err).ToNot(HaveOccurred())
 		Expect(fc.DeleteCalls()).To(ContainElement(worker.BareMetalInstance.ID))
 		_, err = runReconcile(co.Name)
 		Expect(err).ToNot(HaveOccurred())

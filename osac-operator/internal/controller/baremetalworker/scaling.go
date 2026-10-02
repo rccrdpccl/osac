@@ -79,8 +79,8 @@ func sortByDeletionPriority(workers []v1alpha1.WorkerStatus) {
 }
 
 // handleScaleDown processes excess workers by deletion priority (CAPI-aligned):
-// Failed first, then not-yet-bound, then newest Ready. Failed workers have their
-// BMIs deleted immediately; others are marked Unbinding.
+// Failed first, then not-yet-bound, then newest Ready. All slots persist their
+// retirement intent as Unbinding before shared cleanup may touch infrastructure.
 func (r *Reconciler) handleScaleDown(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	workers []v1alpha1.WorkerStatus, excess []v1alpha1.WorkerStatus, observations ...*workerObservation,
@@ -97,10 +97,6 @@ func (r *Reconciler) handleScaleDown(
 
 	now := metav1.Now()
 	for _, w := range excess {
-		if w.Phase == workerPhaseFailed {
-			workers = r.removeFailedExcess(ctx, co, workers, w, observations...)
-			continue
-		}
 		if w.Phase == workerPhaseUnbinding || w.Phase == workerPhaseDeleting {
 			workers = append(workers, w)
 			continue
@@ -113,27 +109,6 @@ func (r *Reconciler) handleScaleDown(
 		workers = append(workers, w)
 	}
 
-	return workers
-}
-
-func (r *Reconciler) removeFailedExcess(
-	ctx context.Context, co *v1alpha1.ClusterOrder,
-	workers []v1alpha1.WorkerStatus, w v1alpha1.WorkerStatus, observations ...*workerObservation,
-) []v1alpha1.WorkerStatus {
-	log := ctrllog.FromContext(ctx)
-
-	if w.BareMetalInstance.ID != "" {
-		if err := r.checkedDeleteBMI(ctx, co, w); err != nil {
-			log.Error(err, "deleting excess failed BMI", "worker", w.Name)
-			return append(workers, w)
-		}
-		for _, o := range observations {
-			o.invalidateBMI(w.BareMetalInstance.ID)
-		}
-		log.Info("deleted excess failed BMI", "worker", w.Name, "bmiID", w.BareMetalInstance.ID)
-	}
-	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ScaleDown",
-		"removed failed worker %s during scale-down", w.Name)
 	return workers
 }
 

@@ -71,12 +71,19 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 		changed = true
 	}
 
+	if changed {
+		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+			return ctrl.Result{}, err
+		}
+		return workerBoundaryRequeue(), nil
+	}
+
 	// CAP-Agent must unbind the Agent and release its Machine pre-terminate hook
 	// before BMaaS tears down the host. Agents that never registered proceed to
 	// Deleting immediately; bound Agents are deleted only after unbinding.
 	workers = r.reconcileTeardownWorkers(ctx, co, workers, observed)
 
-	if changed || !workerSlicesEqual(co.Status.Workers, workers) {
+	if !workerSlicesEqual(co.Status.Workers, workers) {
 		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating worker status during cluster deletion: %w", err)
 		}
@@ -107,102 +114,44 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 	return ctrl.Result{}, nil
 }
 
-// reconcileWorkerTeardown refreshes Agents only after an actual Agent mutation.
-// Ordinary stable reconciles reuse their one observation stage without a list.
+// reconcileWorkerTeardown persists shared cleanup progress and summaries. Its
+// boolean marks a return boundary (including pending cleanup), not a status
+// change. Never continue Agent convergence from a possibly mutated snapshot.
 func (r *Reconciler) reconcileWorkerTeardown(ctx context.Context, co *v1alpha1.ClusterOrder, o *workerObservation) (bool, error) {
 	if !hasTeardownWorkers(co.Status.Workers) {
 		return false, nil
 	}
 	workers := r.reconcileTeardownWorkers(ctx, co, co.Status.Workers, o)
-	if !workerSlicesEqual(co.Status.Workers, workers) {
-		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
-			return false, fmt.Errorf("persisting worker teardown: %w", err)
-		}
-		return true, nil
+	if err := r.updateWorkerStatusWithAgent(ctx, co, workers); err != nil {
+		return false, fmt.Errorf("persisting worker teardown: %w", err)
 	}
-	if o.agentsInvalidated {
-		agents, err := r.listAgents(ctx, co)
-		if err != nil {
-			return false, err
-		}
-		o.agents = agents
-	}
-	return false, nil
+	return true, nil
 }
 
-// reconcileTeardownWorkers shares the Agent observation and handles each
+// reconcileTeardownWorkers obtains fresh cleanup evidence and handles each
 // worker's Unbinding -> Deleting transition in order. A Delete request never
 // counts as confirmed BMI absence. Persistence is the caller's named boundary.
 func (r *Reconciler) reconcileTeardownWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, o *workerObservation) []v1alpha1.WorkerStatus {
 	var kept []v1alpha1.WorkerStatus
-	now := time.Now()
 	for _, w := range workers {
 		switch w.Phase {
-		case workerPhaseUnbinding:
-			if r.processUnbindingWorker(ctx, co, &w, o.agents, now) {
-				o.agentsInvalidated = true
-			}
-		case workerPhaseDeleting:
-			// Already eligible for the fresh ownership/existence read below.
+		case workerPhaseUnbinding, workerPhaseDeleting:
+			// Cleanup always rechecks Agent detach/removal, even after Deleting.
 		default:
 			kept = append(kept, w)
 			continue
 		}
-		if w.Phase != workerPhaseDeleting || r.processDeletingWorker(ctx, co, w, o) {
-			kept = append(kept, w)
+		gone, err := r.cleanupWorker(ctx, co, &w)
+		if err != nil {
+			ctrllog.FromContext(ctx).Error(err, "cleaning up worker", "worker", w.Name)
 		}
+		if !gone {
+			kept = append(kept, w)
+			continue
+		}
+		r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ConfirmDeletion", "worker %s removed after Agent and BMI %s deletion confirmed", w.Name, w.BareMetalInstance.ID)
 	}
 	return kept
-}
-
-func (r *Reconciler) processUnbindingWorker(
-	ctx context.Context, co *v1alpha1.ClusterOrder,
-	w *v1alpha1.WorkerStatus, agents *unstructured.UnstructuredList, now time.Time,
-) bool {
-	log := ctrllog.FromContext(ctx)
-
-	agent := findAgentByWorkerName(agents, w.Name)
-	if agent == nil {
-		log.Info("no agent found for unbinding worker, transitioning to Deleting", "worker", w.Name)
-		w.Phase = workerPhaseDeleting
-		return false
-	}
-
-	state, _, _ := unstructured.NestedString(agent.Object, "status", "debugInfo", "state")
-	// CAP-Agent may reclaim a worker straight to known-unbound without visiting
-	// unbinding-pending-user-action. Only treat that state as safe once both the
-	// ClusterDeployment and AgentMachine binding references are gone.
-	if state != agentUnbindingState && !isDetachedKnownUnbound(agent, state) {
-		r.checkUnbindingTimeout(co, w, agent, now)
-		return false
-	}
-
-	if err := r.Delete(ctx, agent); err != nil {
-		log.Error(err, "deleting agent CR", "agent", agent.GetName())
-		return false
-	}
-	log.Info("deleted agent CR", "worker", w.Name, "agent", agent.GetName())
-	w.Phase = workerPhaseDeleting
-	return true
-}
-
-// processDeletingWorker returns whether the recorded slot must remain.
-func (r *Reconciler) processDeletingWorker(ctx context.Context, co *v1alpha1.ClusterOrder, w v1alpha1.WorkerStatus, o *workerObservation) bool {
-	if w.BareMetalInstance.ID == "" {
-		r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ConfirmDeletion", "worker %s removed after BMI deletion confirmed", w.Name)
-		return false
-	}
-	absent, err := r.checkedDeleteBMIState(ctx, co, w)
-	if err != nil {
-		ctrllog.FromContext(ctx).Error(err, "checking BMI existence for deleting worker", "worker", w.Name)
-		return true
-	}
-	o.invalidateBMI(w.BareMetalInstance.ID)
-	if !absent {
-		return true
-	}
-	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ConfirmDeletion", "worker %s removed after BMI %s deletion confirmed", w.Name, w.BareMetalInstance.ID)
-	return false
 }
 
 func hasTeardownWorkers(workers []v1alpha1.WorkerStatus) bool {

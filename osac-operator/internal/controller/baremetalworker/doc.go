@@ -24,6 +24,15 @@
 // Name-based creation recovery rejects ambiguous, foreign and deleting candidates.
 // Recorded deleting IDs and finalization recovery still remain observable.
 // Finalization takes the identity-only recovery path in worker_teardown.go.
+// Retry, scale-down and parent deletion share cleanup.go. Retirement intent is
+// persisted before external cleanup. Cleanup reads the complete Agent namespace
+// authoritatively, waits for owner-driven detach, deletes with UID/resourceVersion
+// preconditions, and waits for Agent removal before requesting BMI deletion.
+// Deleting metadata means wait; only BMI Get NotFound releases a recorded ID.
+// Failed callers then initialize one retry checkpoint; retiring callers remove
+// the exact slot. Unknown ID-less reservations recover by owned name or remain
+// blocked, including during finalization. Bound-worker remediation is not owned
+// here; archived-Cluster ownership lookup remains a production-deletion blocker.
 //
 // Resource operations are grouped by target:
 //   - infraenv.go and image.go prepare discovery ignition and the disk image.
@@ -39,7 +48,8 @@
 //   - worker_capacity.go reserves durable slots and fulfills their capacity.
 //   - scaling.go selects retained/excess slots and initiates scale-down.
 //   - retry.go handles failed workers, backoff and healthy-history reset.
-//   - worker_teardown.go unbinds Agents, confirms BMI absence and finalizes.
+//   - cleanup.go shares ownership-safe Agent/BMI cleanup evidence and actions.
+//   - worker_teardown.go persists retirement, confirms cleanup and finalizes.
 //   - worker_status.go owns one-shot optimistic status patches, conditions and
 //     aggregates; a conflict abandons the invocation instead of merging stale
 //     evidence into newer worker state.
@@ -48,9 +58,14 @@
 // The fulfillment.go, ignition.go and resolver.go adapters retain their existing
 // boundaries. Tests are grouped by the behavior they exercise, with real API
 // server/etcd persistence coverage in acceptance and shared doubles in fake.
+// R03-E1–E5 drive public cleanup/retry/retirement with explicit completion and
+// real Agent Delete preconditions; fulfillment and owner detach remain simulated.
 // R02-E1/E2 drive public reconciles through real status and Agent binding
 // conflicts: one rejected optimistic patch, no takeover, and a fresh invocation
 // that respects the competing writer.
+// Sim-backed R03-C1 is explicitly skipped and its fixture removed; it is not a
+// local completion gate. Unit/Envtest do not prove real fulfillment/provider
+// cleanup or resolve the archived-Cluster and targeted-remediation gaps.
 //
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs

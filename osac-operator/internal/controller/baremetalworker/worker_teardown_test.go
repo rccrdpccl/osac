@@ -124,6 +124,52 @@ func TestFinalizationRetainsFinalizerForConcurrentAppendedWorker(t *testing.T) {
 	}
 }
 
+func TestR03FailedScaleDownKeepsSlot(t *testing.T) {
+	r, base, co := workerReadHarness(t)
+	fc := &teardownReadClient{workerReadClient: base}
+	r.fulfillment = fc
+	w := co.Status.Workers[0]
+	w.Phase = workerPhaseFailed
+	fc.returned = ownedBMIFixture(co, w.BareMetalInstance.Name, w.BareMetalInstance.ID)
+	kept := r.handleScaleDown(context.Background(), co, nil, []v1alpha1.WorkerStatus{w})
+	if len(kept) != 1 || kept[0].BareMetalInstance != w.BareMetalInstance || kept[0].Phase != workerPhaseUnbinding || fc.deletes != 0 {
+		t.Fatalf("retirement must precede external cleanup: workers=%+v deletes=%d", kept, fc.deletes)
+	}
+}
+
+func TestR03UnknownCleanupDoesNotRelease(t *testing.T) {
+	for _, scenario := range []string{"outage", "denied", "foreign-tenant", "foreign-owner", "idless"} {
+		t.Run(scenario, func(t *testing.T) {
+			r, base, co := workerReadHarness(t)
+			fc := &teardownReadClient{workerReadClient: base}
+			r.fulfillment = fc
+			w := co.Status.Workers[0]
+			w.Phase = workerPhaseDeleting
+			switch scenario {
+			case "outage":
+				base.getErr = status.Error(codes.Unavailable, "outage")
+			case "denied":
+				base.getErr = status.Error(codes.PermissionDenied, "denied")
+			case "foreign-tenant", "foreign-owner":
+				fc.returned = ownedBMIFixture(co, w.BareMetalInstance.Name, w.BareMetalInstance.ID)
+				if scenario == "foreign-tenant" {
+					fc.returned.GetMetadata().SetTenant("foreign")
+				} else {
+					fc.returned.GetMetadata().SetAnnotations(map[string]string{ownerReferenceAnnotation: "ClusterOrder/foreign"})
+				}
+			case "idless":
+				w.BareMetalInstance.ID = ""
+			}
+			o := indexWorkerBMIs(nil)
+			o.agents = &unstructured.UnstructuredList{}
+			kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w}, o)
+			if len(kept) != 1 || kept[0].BareMetalInstance != w.BareMetalInstance || fc.deletes != 0 {
+				t.Fatalf("unknown released: workers=%+v deletes=%d", kept, fc.deletes)
+			}
+		})
+	}
+}
+
 func TestStableConvergenceDoesNotRelistAgentsForTeardown(t *testing.T) {
 	r, _, co := workerReadHarness(t)
 	observed := indexWorkerBMIs(nil)

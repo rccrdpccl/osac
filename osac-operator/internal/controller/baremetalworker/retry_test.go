@@ -14,14 +14,77 @@ language governing permissions and limitations under the License.
 package baremetalworker
 
 import (
+	"context"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
+	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+func TestR03FailedReservationRecoversBeforeRetry(t *testing.T) {
+	r, base, co := workerReadHarness(t)
+	fc := &teardownReadClient{workerReadClient: base}
+	r.fulfillment = fc
+	w := &co.Status.Workers[0]
+	fc.returned = ownedBMIFixture(co, w.BareMetalInstance.Name, w.BareMetalInstance.ID)
+	base.listed = []*privatev1.BareMetalInstance{fc.returned}
+	w.Phase = workerPhaseFailed
+	w.BareMetalInstance.ID = ""
+	if err := r.Status().Update(context.Background(), co); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.handleFailedWorkers(context.Background(), co); err != nil {
+		t.Fatal(err)
+	}
+	got := co.Status.Workers[0] // Status().Update can replace the slice; do not assert through its old pointer.
+	if got.BareMetalInstance.ID != fc.returned.GetId() || got.NextRetryTime != nil || got.AttemptCount != 0 || fc.deletes != 0 {
+		t.Fatalf("failed reservation bypassed recovery: %+v deletes=%d", got, fc.deletes)
+	}
+}
+
+func TestR03RetryKeepsIDUntilAbsent(t *testing.T) {
+	r, base, co := workerReadHarness(t)
+	fc := &teardownReadClient{workerReadClient: base}
+	r.fulfillment = fc
+	co.Status.Workers[0].Phase = workerPhaseFailed
+	if err := r.Status().Update(context.Background(), co); err != nil {
+		t.Fatal(err)
+	}
+	w := co.Status.Workers[0]
+	fc.returned = ownedBMIFixture(co, w.BareMetalInstance.Name, w.BareMetalInstance.ID)
+	for range 2 {
+		if err := r.handleFailedWorkers(context.Background(), co); err != nil {
+			t.Fatal(err)
+		}
+		got := co.Status.Workers[0]
+		if got.BareMetalInstance.ID != w.BareMetalInstance.ID || got.AttemptCount != 0 || got.NextRetryTime != nil {
+			t.Fatalf("released retry identity before absence: %+v", got)
+		}
+	}
+	fc.returned = nil
+	base.getErr = status.Error(codes.NotFound, "confirmed archived")
+	if err := r.handleFailedWorkers(context.Background(), co); err != nil {
+		t.Fatal(err)
+	}
+	got := co.Status.Workers[0]
+	if got.BareMetalInstance.ID != "" || got.AttemptCount != 1 || got.NextRetryTime == nil || got.ReadySince != nil {
+		t.Fatalf("retry checkpoint: %+v", got)
+	}
+	deadline := got.NextRetryTime.DeepCopy()
+	if err := r.handleFailedWorkers(context.Background(), co); err != nil {
+		t.Fatal(err)
+	}
+	if co.Status.Workers[0].AttemptCount != 1 || !co.Status.Workers[0].NextRetryTime.Equal(deadline) {
+		t.Fatal("retry checkpoint scheduled twice")
+	}
+}
 
 var _ = Describe("ClassifyFailure", func() {
 	DescribeTable("maps failure reasons to categories",

@@ -116,13 +116,3 @@ func findAgentForWorker(ctx context.Context, agents *unstructured.UnstructuredLi
 	}
 	return nil
 }
-
-func findAgentByWorkerName(agents *unstructured.UnstructuredList, workerName string) *unstructured.Unstructured {
-	for idx := range agents.Items {
-		agent := &agents.Items[idx]
-		if agent.GetLabels()[workerNameLabel] == workerName {
-			return agent
-		}
-	}
-	return nil
-}

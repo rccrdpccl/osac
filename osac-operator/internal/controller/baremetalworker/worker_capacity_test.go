@@ -143,6 +143,8 @@ func TestR01WaitingRetryDoesNotBlockAnotherReservation(t *testing.T) {
 		newWorkerStatus("standard", "standard", "actionable", "", workerPhaseFailed),
 	}
 	co.Status.Workers[0].NextRetryTime = &future
+	past := metav1.NewTime(time.Now().Add(-time.Minute))
+	co.Status.Workers[1].NextRetryTime = &past // Persisted cleanup-complete retry checkpoint.
 	if err := r.Status().Update(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
@@ -190,10 +192,9 @@ func TestR01FailedCapacityReturnsAfterOneRetryDelete(t *testing.T) {
 			if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 				t.Fatal(err)
 			}
-			wantID := ""
-			if deleteErr != nil {
-				wantID = "recorded-id"
-			}
+			// Accepted deletion is not completed deletion, including the default
+			// immediate-delete fixture. Completion requires another fresh Get.
+			wantID := "recorded-id"
 			if co.Status.Workers[0].BareMetalInstance.ID != wantID || co.Status.Workers[1].BareMetalInstance.ID != "second-id" {
 				t.Fatalf("retry changed wrong slots: %+v", co.Status.Workers)
 			}

@@ -113,6 +113,33 @@ The Unit/Envtest cases above are [DEV] work, not fulfillment wire,
 manager-watch, or deployed-provider coverage; those
 remaining boundaries belong to
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+R03 cleanup Unit tests in `cleanup_test.go`, `retry_test.go` and
+`worker_teardown_test.go` cover delayed/lost Delete acknowledgements, retention
+until fresh Get NotFound, once-only retry scheduling, retirement before cleanup,
+ID-less name recovery, unknown/foreign references, authoritative Agent reads
+instead of cached omission, ambiguous/malformed/bound Agents, and UID-conditioned
+Agent deletion. The Kubernetes fake does not enforce Delete UID preconditions;
+the unit race fixture checks the supplied options and simulates API rejection.
+The shared fulfillment fake supports explicit pending-deletion completion and
+uses distinct generated incarnation IDs. Existing acceptance lifecycle specs
+use separate retirement, Agent removal, BMI deletion and absence checkpoints.
+Dedicated R03-E1–E5 public Envtest traces in `acceptance/worker_reconcile_test.go`
+execute seven specs covering delayed retry/retirement, API outages, interrupted
+provisioning recovery without Create, authoritative Agent reads despite cached
+omission, real-apiserver UID-precondition rejection and bound-worker blocking
+with replacement-readiness isolation. Explicit calls stay within `16 + 8*N`;
+retry deadlines and test-owned Agent finalizers advance only in the fixture.
+Sim-backed R03-C1 is explicitly skipped at the user's request because the sim
+is slated for removal; its added fixture/entry has been removed. It is not a
+local R03 completion gate, and no real fulfillment/Postgres/provider cleanup
+pass is claimed. The pre-existing connected suite and R01-C1 remain unchanged.
+No replacement deployed integration harness is required for this cleanup-policy
+refactor; Unit/Envtest cover its local invariants, not the real-service boundary.
+Bound-worker remediation deliberately waits for its owner; no Machine/CAP-Agent
+hooks or NodePool replicas are manipulated to force cleanup. Production deletion
+still requires an approved archived-Cluster ownership fix (dedicated owner/ticket
+unresolved); provider/drain/hardware journeys remain [QE] work under
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 The Kind suite's LVMS-disabled case verifies the Volume controller remains
 ready without the TopoLVM `LogicalVolume` CRD; it does not exercise LVMS
 provisioning or the CSI data path.

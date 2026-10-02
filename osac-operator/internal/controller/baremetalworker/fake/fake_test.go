@@ -35,8 +35,62 @@ func TestFake(t *testing.T) {
 
 func bmiNamed(name string) *privatev1.BareMetalInstance {
 	return privatev1.BareMetalInstance_builder{
-		Metadata: privatev1.Metadata_builder{Name: name}.Build(),
+		Id: name, Metadata: privatev1.Metadata_builder{Name: name}.Build(),
 	}.Build()
+}
+
+func TestR03PendingDeletion(t *testing.T) {
+	fc := NewFulfillmentClient()
+	fc.SetPendingDeletion(true)
+	ctx := context.Background()
+	obj := bmiNamed("reserved")
+	bmi, err := fc.CreateBareMetalInstance(ctx, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := fc.DeleteBareMetalInstance(ctx, bmi.GetId()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := fc.GetBareMetalInstance(ctx, bmi.GetId())
+	if err != nil || got.GetMetadata().GetDeletionTimestamp() == nil {
+		t.Fatalf("pending deletion: bmi=%v err=%v", got, err)
+	}
+	obj.SetId("successor")
+	if _, err := fc.CreateBareMetalInstance(ctx, obj); status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("name reused before archival: %v", err)
+	}
+	fc.CompleteDeletion(bmi.GetId())
+	if _, err := fc.GetBareMetalInstance(ctx, bmi.GetId()); status.Code(err) != codes.NotFound {
+		t.Fatalf("completed deletion: %v", err)
+	}
+	if _, err := fc.CreateBareMetalInstance(ctx, obj); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestR03DistinctIncarnations(t *testing.T) {
+	fc := NewFulfillmentClient()
+	ctx := context.Background()
+	obj := privatev1.BareMetalInstance_builder{Metadata: privatev1.Metadata_builder{Name: "reserved"}.Build()}.Build()
+	first, err := fc.CreateBareMetalInstance(ctx, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.GetId() == "reserved" {
+		t.Fatal("generated ID must not be the reserved name")
+	}
+	if err := fc.DeleteBareMetalInstance(ctx, first.GetId()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := fc.CreateBareMetalInstance(ctx, obj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.GetId() == second.GetId() {
+		t.Fatal("replacement reused the old incarnation ID")
+	}
 }
 
 var _ = Describe("Fake FulfillmentClient", func() {

@@ -416,9 +416,9 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 			_ = k8sClient.Delete(ctx, ie)
 		})
 
-		// Create BMIs in the fake for two workers. The fake defaults resource ID to name.
+		// Legacy fixture identities are explicit; generated incarnation IDs no longer equal names.
 		_, err := fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
-			Metadata: privatev1.Metadata_builder{
+			Id: "bmw-rebuild-worker-0", Metadata: privatev1.Metadata_builder{
 				Tenant:      "tenant1",
 				Name:        "bmw-rebuild-worker-0",
 				Labels:      map[string]string{"osac.openshift.io/cluster-order": "bmw-rebuild"},
@@ -427,7 +427,7 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 		}.Build())
 		Expect(err).ToNot(HaveOccurred())
 		_, err = fc.CreateBareMetalInstance(ctx, privatev1.BareMetalInstance_builder{
-			Metadata: privatev1.Metadata_builder{
+			Id: "bmw-rebuild-worker-1", Metadata: privatev1.Metadata_builder{
 				Tenant:      "tenant1",
 				Name:        "bmw-rebuild-worker-1",
 				Labels:      map[string]string{"osac.openshift.io/cluster-order": "bmw-rebuild"},
