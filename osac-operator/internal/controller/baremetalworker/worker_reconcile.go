@@ -50,11 +50,11 @@ func workerBoundaryRequeue() ctrl.Result {
 }
 
 func (r *Reconciler) finishWorkerConvergence(ctx context.Context, co *v1alpha1.ClusterOrder, observed *workerObservation) (ctrl.Result, error) {
-	changed, err := r.reconcileWorkerTeardown(ctx, co, observed)
+	stop, err := r.reconcileWorkerTeardown(ctx, co, observed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if changed {
+	if stop {
 		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 	workers, res, err := r.reconcileObservedAgents(ctx, co, observed)

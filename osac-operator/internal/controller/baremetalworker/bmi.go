@@ -65,6 +65,17 @@ func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrde
 		return nil, r.rejectWorkerIdentity(co, err.Error())
 	}
 	if bmi != nil {
+		// AlreadyExists is a recovery hint, not permission to adopt a stale
+		// List snapshot. Verify this incarnation's current ownership/liveness.
+		id := bmi.GetId()
+		bmi, err = r.fulfillment.GetBareMetalInstance(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("verifying recovered BMI %s: %w", name, err)
+		}
+		ref := v1alpha1.WorkerStatus{BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: name, ID: id}}
+		if err := checkRecordedWorkerBMI(co, tenant, ref, bmi); err != nil {
+			return nil, r.rejectWorkerIdentity(co, err.Error())
+		}
 		if err := checkBMIRecoveryCandidate(bmi); err != nil {
 			return nil, err
 		}
@@ -164,7 +175,7 @@ func resolveFabricInterface(it *privatev1.BareMetalInstanceType) (string, error)
 // checkBMIRecoveryCandidate applies only to creation/name recovery. Existing
 // recorded IDs and finalization still need to observe deleting resources.
 func checkBMIRecoveryCandidate(bmi *privatev1.BareMetalInstance) error {
-	if bmi.GetMetadata().GetDeletionTimestamp() != nil || bmi.GetStatus().GetState() == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING {
+	if bmiDeleting(bmi) {
 		return fmt.Errorf("BMI %s is deleting; cannot recover a created worker", bmi.GetId())
 	}
 	return nil
@@ -223,28 +234,22 @@ func eligibleForBMIAbsence(w v1alpha1.WorkerStatus) bool {
 	return w.Kind == workerKindBMI && w.BareMetalInstance.ID != "" && w.Phase != workerPhaseFailed && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting
 }
 
-func (r *Reconciler) checkedDeleteBMI(ctx context.Context, co *v1alpha1.ClusterOrder, w v1alpha1.WorkerStatus) error {
-	_, err := r.checkedDeleteBMIState(ctx, co, w)
-	return err
+func bmiDeleting(bmi *privatev1.BareMetalInstance) bool {
+	return bmi.GetMetadata().GetDeletionTimestamp() != nil || bmi.GetStatus().GetState() == privatev1.BareMetalInstanceState_BARE_METAL_INSTANCE_STATE_DELETING
 }
 
-// checkedDeleteBMIState combines a fresh ownership/existence read with deletion.
-// Successful Delete is only a request; only this authoritative Get NotFound
-// confirms absence. The initial reconcile observation never authorizes deletion.
-func (r *Reconciler) checkedDeleteBMIState(ctx context.Context, co *v1alpha1.ClusterOrder, w v1alpha1.WorkerStatus) (bool, error) {
-	tenant, err := r.authoritativeWorkerTenant(ctx, co)
-	if err != nil {
-		return false, err
-	}
+// Only a fresh Get NotFound proves recorded-incarnation absence. List omission,
+// deleting state, Delete success and lookup failures never release the identity.
+func (r *Reconciler) readCleanupBMI(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, w v1alpha1.WorkerStatus) (bmiState, error) {
 	bmi, err := r.fulfillment.GetBareMetalInstance(ctx, w.BareMetalInstance.ID)
 	if status.Code(err) == codes.NotFound {
-		return true, nil
+		return bmiState{absent: true}, nil
 	}
 	if err != nil {
-		return false, err
+		return bmiState{}, err
 	}
 	if err := checkRecordedWorkerBMI(co, tenant, w, bmi); err != nil {
-		return false, r.rejectWorkerIdentity(co, err.Error())
+		return bmiState{}, r.rejectWorkerIdentity(co, err.Error())
 	}
-	return false, r.fulfillment.DeleteBareMetalInstance(ctx, w.BareMetalInstance.ID)
+	return bmiState{bmi: bmi}, nil
 }

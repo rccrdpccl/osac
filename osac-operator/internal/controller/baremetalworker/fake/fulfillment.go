@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -50,6 +51,7 @@ type FulfillmentClient struct {
 	instanceTypes   map[string]*privatev1.BareMetalInstanceType
 	createErr       error
 	deleteErr       error
+	pendingDeletion bool
 	listEmptyCalls  int
 	listErr         error
 	getErrors       map[string]error
@@ -98,7 +100,7 @@ func cloneDiskImage(d *privatev1.DiskImage) *privatev1.DiskImage {
 	return proto.Clone(d).(*privatev1.DiskImage)
 }
 
-// CreateBareMetalInstance records the call, assigns an id (defaulting to metadata.name) and stores
+// CreateBareMetalInstance records the call, assigns a distinct incarnation UUID and stores
 // the object. It returns the injected create error when one is set (still recording the call).
 func (f *FulfillmentClient) CreateBareMetalInstance(
 	_ context.Context, obj *privatev1.BareMetalInstance,
@@ -126,10 +128,7 @@ func (f *FulfillmentClient) CreateBareMetalInstance(
 	stored := cloneBMI(obj)
 	id := stored.GetId()
 	if id == "" {
-		id = name
-		if _, exists := f.bmis[id]; exists {
-			id = uuid.NewString()
-		}
+		id = uuid.NewString()
 		stored.SetId(id)
 	}
 	if _, exists := f.bmis[id]; exists {
@@ -139,8 +138,9 @@ func (f *FulfillmentClient) CreateBareMetalInstance(
 	return cloneBMI(stored), nil
 }
 
-// DeleteBareMetalInstance records the call and removes the object. It returns the injected delete
-// error when one is set (still recording the call).
+// DeleteBareMetalInstance records the request. By default it removes the object;
+// pending-deletion fixtures retain it with deletion metadata until completion.
+// Injected errors precede mutation (lost acknowledgements use a test wrapper).
 func (f *FulfillmentClient) DeleteBareMetalInstance(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -148,6 +148,12 @@ func (f *FulfillmentClient) DeleteBareMetalInstance(_ context.Context, id string
 	f.deleteCalls = append(f.deleteCalls, id)
 	if f.deleteErr != nil {
 		return f.deleteErr
+	}
+	if f.pendingDeletion {
+		if bmi := f.bmis[id]; bmi != nil && bmi.GetMetadata().GetDeletionTimestamp() == nil {
+			bmi.GetMetadata().SetDeletionTimestamp(timestamppb.Now())
+		}
+		return nil
 	}
 	delete(f.bmis, id)
 	delete(f.hostMACs, id)
@@ -443,6 +449,22 @@ func (f *FulfillmentClient) SetDeleteError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteErr = err
+}
+
+// SetPendingDeletion retains deleting objects until explicit fixture completion.
+// This models API persistence, not provider or hardware release.
+func (f *FulfillmentClient) SetPendingDeletion(pending bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pendingDeletion = pending
+}
+
+// CompleteDeletion explicitly archives a test-owned pending object.
+func (f *FulfillmentClient) CompleteDeletion(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.bmis, id)
+	delete(f.hostMACs, id)
 }
 
 // --- Recorded-call accessors (return copies under lock) ---

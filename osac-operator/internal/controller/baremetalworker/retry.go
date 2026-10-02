@@ -92,23 +92,26 @@ func ComputeBackoff(category FailureCategory, attemptCount int32) time.Duration 
 	return sched.cap
 }
 
-// handleFailedWorkers processes at most one Failed worker: deletes its BMI via the
-// fulfillment API, increments attemptCount, computes failure-appropriate backoff, and
-// sets NextRetryTime. The failed BMI's ID is cleared so reconcileNodeSets
-// creates a replacement when the retry is due.
+// handleFailedWorkers cleans at most one recorded Failed incarnation. Retain
+// the old ID until Agent removal and BMI Get NotFound; initialize retry exactly
+// once at that transition. An ID-less retry checkpoint is not another failure.
 func (r *Reconciler) handleFailedWorkers(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 ) error {
 	log := ctrllog.FromContext(ctx)
 	for i := range co.Status.Workers {
 		w := &co.Status.Workers[i]
-		if w.Phase != workerPhaseFailed || w.BareMetalInstance.ID == "" {
+		if w.Phase != workerPhaseFailed || (w.BareMetalInstance.ID == "" && w.NextRetryTime != nil) {
 			continue
 		}
-		if err := r.checkedDeleteBMI(ctx, co, *w); err != nil {
-			return fmt.Errorf("deleting failed worker %s: %w", w.Name, err)
+		gone, err := r.cleanupWorker(ctx, co, w)
+		if err != nil {
+			return fmt.Errorf("cleaning failed worker %s: %w", w.Name, err)
 		}
-		log.Info("deleted failed BMI", "worker", w.Name, "bmiID", w.BareMetalInstance.ID)
+		if !gone {
+			return nil
+		}
+		log.Info("confirmed failed incarnation cleanup", "worker", w.Name, "bmiID", w.BareMetalInstance.ID)
 		w.AttemptCount++
 		category := ClassifyFailure(w.LastFailureReason)
 		backoff := ComputeBackoff(category, w.AttemptCount)
@@ -125,6 +128,15 @@ func (r *Reconciler) handleFailedWorkers(
 	return nil
 }
 
+func hasFailedIncarnations(workers []v1alpha1.WorkerStatus) bool {
+	for _, w := range workers {
+		if w.Phase == workerPhaseFailed && w.BareMetalInstance.ID != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // retryFailedWorker creates a replacement BMI for a failed worker whose retry is due.
 // Returns a non-zero result if the fulfillment service is unavailable. If the worker is not
 // eligible for retry, this is a no-op.
@@ -133,7 +145,7 @@ func (r *Reconciler) retryFailedWorker(
 	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
 	image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string, observations ...*workerObservation,
 ) (ctrl.Result, error) {
-	if prev.Phase != workerPhaseFailed || prev.BareMetalInstance.ID != "" || !isRetryDue(*prev) {
+	if prev.Phase != workerPhaseFailed || prev.BareMetalInstance.ID != "" || prev.NextRetryTime == nil || !isRetryDue(*prev) {
 		return ctrl.Result{}, nil
 	}
 	log := ctrllog.FromContext(ctx)

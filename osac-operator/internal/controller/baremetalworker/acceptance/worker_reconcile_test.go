@@ -6,6 +6,7 @@ package acceptance
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -79,13 +81,15 @@ var _ = Describe("Unified worker reconciliation", func() {
 	var ignition *fake.IgnitionServer
 	var r *baremetalworker.Reconciler
 	var sim *envsim.Simulator
+	var recorder *events.FakeRecorder
 	buildReconciler := func(c client.Client) *baremetalworker.Reconciler {
-		return baremetalworker.NewReconciler(c, k8sClient, scheme.Scheme, provider, baremetalworker.NewIgnitionFetcher(nil), events.NewFakeRecorder(100), testNamespace)
+		return baremetalworker.NewReconciler(c, k8sClient, scheme.Scheme, provider, baremetalworker.NewIgnitionFetcher(nil), recorder, testNamespace)
 	}
 	BeforeEach(func() {
 		name := "unified-" + uuid.NewString()
 		co = &api.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: map[string]string{"osac.openshift.io/clusterorder-uuid": "cluster"}, Annotations: map[string]string{"osac.openshift.io/tenant": tenant}}, Spec: api.ClusterOrderSpec{TemplateID: "test", PullSecret: `{"auths":{}}`, NodeRequests: []api.NodeRequest{{NodeSet: "standard", NumberOfNodes: 1, BareMetal: &api.BareMetalNodeSpec{InstanceType: "standard"}}}}}
 		fc = fake.NewFulfillmentClient()
+		recorder = events.NewFakeRecorder(100)
 		provider = fc
 		ignition = fake.NewIgnitionServer()
 		sim = envsim.New(k8sClient)
@@ -146,6 +150,283 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(latest.Status.Workers).To(HaveLen(1))
 		return latest.Status.Workers[0]
 	}
+
+	markFailed := func() api.WorkerStatus {
+		GinkgoHelper()
+		latest := getOrder()
+		w := &latest.Status.Workers[0]
+		w.Phase = "Failed"
+		w.LastFailureReason = "AgentRegistrationTimeout"
+		past := metav1.NewTime(time.Now().Add(-time.Hour))
+		now := metav1.Now()
+		w.LastFailureTime = &now
+		w.ReadySince = &past
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		return getOrder().Status.Workers[0]
+	}
+	step := func() reconcile.Result {
+		GinkgoHelper()
+		result, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		return result
+	}
+	makeRetryDue := func() {
+		GinkgoHelper()
+		latest := getOrder()
+		Expect(latest.Status.Workers[0].NextRetryTime).NotTo(BeNil())
+		// Explicit fixture clock transition; do not sleep through production backoff.
+		past := metav1.NewTime(time.Now().Add(-time.Minute))
+		latest.Status.Workers[0].NextRetryTime = &past
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+	}
+	cleanupAgent := func(w api.WorkerStatus, state string) *unstructured.Unstructured {
+		GinkgoHelper()
+		agent := &unstructured.Unstructured{Object: map[string]interface{}{
+			"spec": map[string]interface{}{}, "status": map[string]interface{}{
+				"debugInfo": map[string]interface{}{"state": state},
+			},
+		}}
+		agent.SetGroupVersionKind(agentGVK)
+		agent.SetName(co.Name + "-cleanup-agent")
+		agent.SetNamespace(co.Namespace)
+		agent.SetLabels(map[string]string{"osac.openshift.io/worker-name": w.Name})
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() {
+			latest := agent.DeepCopy()
+			if k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), latest) == nil {
+				latest.SetFinalizers(nil)
+				Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+		return agent
+	}
+
+	It("R03-E1 retains a failed incarnation until absence and schedules one distinct replacement", func() {
+		old := provision()
+		fc.SetPendingDeletion(true)
+		markFailed()
+		step() // Request Delete, not completion.
+		for range 3 {
+			Expect(step().RequeueAfter).To(BeNumerically(">", 0))
+			w := getOrder().Status.Workers[0]
+			Expect(w.BareMetalInstance).To(Equal(old.BareMetalInstance))
+			Expect(w.Phase).To(Equal("Failed"))
+			Expect(w.AttemptCount).To(BeZero())
+			Expect(w.NextRetryTime).To(BeNil())
+		}
+		Expect(fc.DeleteCalls()).To(Equal([]string{old.BareMetalInstance.ID}))
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+		fc.CompleteDeletion(old.BareMetalInstance.ID)
+		step()
+		checkpoint := getOrder().Status.Workers[0]
+		Expect(checkpoint.BareMetalInstance.ID).To(BeEmpty())
+		Expect(checkpoint.AttemptCount).To(Equal(int32(1)))
+		Expect(checkpoint.NextRetryTime).NotTo(BeNil())
+		Expect(checkpoint.ReadySince).To(BeNil())
+		step()
+		Expect(getOrder().Status.Workers[0]).To(Equal(checkpoint))
+		makeRetryDue()
+		step()
+		replacement := getOrder().Status.Workers[0]
+		Expect(replacement.BareMetalInstance.Name).To(Equal(old.BareMetalInstance.Name))
+		Expect(replacement.BareMetalInstance.ID).NotTo(BeEmpty())
+		Expect(replacement.BareMetalInstance.ID).NotTo(Equal(old.BareMetalInstance.ID))
+		Expect(replacement.AttemptCount).To(Equal(int32(1)))
+		Expect(replacement.ReadySince).To(BeNil())
+		Expect(fc.CreateCalls()).To(HaveLen(2))
+	})
+
+	DescribeTable("R03-E2 retains retirement references and the finalizer through delay and outages", func(parentDeleting bool) {
+		latest := getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		ready()
+		step() // Reserve both slots.
+		step()
+		step() // One Create per invocation.
+		step() // Persist normal phase repair before exercising retirement.
+		old := getOrder().Status.Workers[0]
+		retiring := func() api.WorkerStatus {
+			GinkgoHelper()
+			for _, w := range getOrder().Status.Workers {
+				if w.Name == old.Name {
+					return w
+				}
+			}
+			Fail("retiring worker disappeared before completion")
+			return api.WorkerStatus{}
+		}
+		fc.SetPendingDeletion(true)
+		markFailed()
+		latest = getOrder()
+		if parentDeleting {
+			Expect(k8sClient.Delete(ctx, latest)).To(Succeed())
+		} else {
+			latest.Spec.NodeRequests[0].NumberOfNodes = 1
+			Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		}
+		step() // Durable retirement before external cleanup.
+		Expect(retiring().Phase).To(Equal("Unbinding"))
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		step()
+		for range 2 {
+			step()
+			Expect(retiring().BareMetalInstance).To(Equal(old.BareMetalInstance))
+			Expect(getOrder().Finalizers).To(ContainElement("osac.openshift.io/baremetalworker-finalizer"))
+		}
+		fc.SetListEmptyOnce()
+		fc.SetGetError(old.BareMetalInstance.ID, status.Error(codes.PermissionDenied, "cleanup Get denied"))
+		_, err := run()
+		Expect(err).To(HaveOccurred())
+		Expect(getOrder().Status.Workers).To(HaveLen(2))
+		Expect(getOrder().Finalizers).NotTo(BeEmpty())
+		fc.SetGetError(old.BareMetalInstance.ID, nil)
+		fc.SetListError(status.Error(codes.Unavailable, "cleanup List outage"))
+		_, err = run()
+		Expect(err).To(MatchError(ContainSubstring("cleanup List outage")))
+		Expect(retiring().BareMetalInstance).To(Equal(old.BareMetalInstance))
+		fc.SetListError(nil)
+		fc.CompleteDeletion(old.BareMetalInstance.ID)
+		if parentDeleting {
+			for _, w := range getOrder().Status.Workers[1:] {
+				fc.CompleteDeletion(w.BareMetalInstance.ID)
+			}
+		}
+		step()
+		if parentDeleting {
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), &api.ClusterOrder{}))).To(BeTrue())
+		} else {
+			Expect(getOrder().Status.Workers).To(HaveLen(1))
+			Expect(getOrder().Status.Workers[0].BareMetalInstance.ID).NotTo(Equal(old.BareMetalInstance.ID))
+		}
+		Expect(fc.CreateCalls()).To(HaveLen(2))
+	}, Entry("failed scale-down", false), Entry("parent deletion", true))
+
+	It("R03-E3 recovers an interrupted provisioning ID during deletion without creating", func() {
+		ready()
+		step() // Reserve.
+		interrupted := errors.New("lost ID persistence")
+		r = buildReconciler(&workerStatusFaultClient{Client: k8sClient, err: interrupted, fail: func(order *api.ClusterOrder) bool {
+			return order.Status.Workers[0].BareMetalInstance.ID != ""
+		}})
+		_, err := run()
+		Expect(err).To(MatchError(interrupted))
+		reserved := getOrder().Status.Workers[0]
+		Expect(reserved.BareMetalInstance.ID).To(BeEmpty())
+		stored, err := fc.ListBareMetalInstances(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stored).To(HaveLen(1))
+		fc.SetPendingDeletion(true)
+		Expect(k8sClient.Delete(ctx, getOrder())).To(Succeed())
+		// Finalization must not need ignition or image/instance-type prerequisites.
+		Expect(k8sClient.Delete(ctx, newInfraEnv(co.Name+"-infraenv"))).To(Succeed())
+		r = buildReconciler(k8sClient)
+		step()
+		Expect(getOrder().Status.Workers[0].BareMetalInstance.ID).To(Equal(stored[0].GetId()))
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		step() // Retirement intent.
+		step() // Delete request.
+		Expect(getOrder().Finalizers).NotTo(BeEmpty())
+		Expect(fc.DeleteCalls()).To(Equal([]string{stored[0].GetId()}))
+		fc.CompleteDeletion(stored[0].GetId())
+		step()
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), &api.ClusterOrder{}))).To(BeTrue())
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+	})
+
+	It("R03-E4 waits for authoritative old Agent removal despite cached omission", func() {
+		old := provision()
+		markFailed()
+		agent := cleanupAgent(old, "known-unbound")
+		agent.SetFinalizers([]string{"test.osac.openshift.io/agent-cleanup"})
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		cache := &cleanupAgentFaultClient{Client: k8sClient, omitAgents: true}
+		r = buildReconciler(cache)
+		for range 3 {
+			step()
+			Expect(getOrder().Status.Workers[0].BareMetalInstance.ID).To(Equal(old.BareMetalInstance.ID))
+			Expect(fc.DeleteCalls()).To(BeEmpty())
+			Expect(fc.CreateCalls()).To(HaveLen(1))
+		}
+		Expect(cache.omittedLists).To(BeNumerically(">", 0))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), agent)).To(Succeed())
+		Expect(agent.GetDeletionTimestamp().IsZero()).To(BeFalse())
+		// Only the simulated test-owned Agent lifecycle finalizer is advanced.
+		agent.SetFinalizers(nil)
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		step()
+		Expect(fc.DeleteCalls()).To(Equal([]string{old.BareMetalInstance.ID}))
+		step()
+		Expect(getOrder().Status.Workers[0].NextRetryTime).NotTo(BeNil())
+	})
+
+	It("R03-E4 real API UID preconditions reject deletion of a recreated Agent", func() {
+		old := provision()
+		markFailed()
+		agent := cleanupAgent(old, "known-unbound")
+		oldUID := agent.GetUID()
+		fault := &cleanupAgentFaultClient{Client: k8sClient, beforeDelete: func() {
+			Expect(k8sClient.Delete(ctx, agent)).To(Succeed())
+			replacement := agent.DeepCopy()
+			replacement.SetUID("")
+			replacement.SetResourceVersion("")
+			Expect(k8sClient.Create(ctx, replacement)).To(Succeed())
+			Expect(replacement.GetUID()).NotTo(Equal(oldUID))
+		}}
+		r = buildReconciler(fault)
+		_, err := run()
+		Expect(apierrors.IsConflict(err)).To(BeTrue())
+		Expect(apierrors.IsConflict(fault.deleteErr)).To(BeTrue(), "real apiserver must reject stale preconditions")
+		Expect(fault.deleteErr).To(MatchError(ContainSubstring("UID")))
+		Expect(fault.deleteOptions.Preconditions.UID).To(HaveValue(Equal(oldUID)))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), agent)).To(Succeed())
+		Expect(agent.GetUID()).NotTo(Equal(oldUID))
+		Expect(agent.GetDeletionTimestamp().IsZero()).To(BeTrue())
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+		Expect(getOrder().Status.Workers[0].BareMetalInstance.ID).To(Equal(old.BareMetalInstance.ID))
+	})
+
+	It("R03-E5 blocks bound Failed cleanup and excludes old readiness from its replacement", func() {
+		old := provision()
+		failed := markFailed()
+		agent := cleanupAgent(old, "installed")
+		Expect(unstructured.SetNestedMap(agent.Object, map[string]interface{}{"name": co.Name, "namespace": co.Namespace}, "spec", "clusterDeploymentName")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		for range 3 {
+			step()
+			Expect(getOrder().Status.Workers[0]).To(Equal(failed))
+			Expect(getOrder().Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+		}
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+		Expect(fc.CreateCalls()).To(HaveLen(1))
+		found := false
+		for len(recorder.Events) > 0 {
+			if strings.Contains(<-recorder.Events, "WorkerCleanupBlocked") {
+				found = true
+			}
+		}
+		Expect(found).To(BeTrue(), "bound remediation must have an observable blocker")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(agent), agent)).To(Succeed())
+		Expect(agent.GetDeletionTimestamp().IsZero()).To(BeTrue())
+		// Simulate the owner completing detach; never clear a production hook.
+		unstructured.RemoveNestedField(agent.Object, "spec", "clusterDeploymentName")
+		Expect(unstructured.SetNestedField(agent.Object, "known-unbound", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		step() // Agent removal.
+		step() // BMI request.
+		step() // Confirm absence and schedule.
+		makeRetryDue()
+		step()
+		step() // Fresh replacement observation, not old installed evidence.
+		w := getOrder().Status.Workers[0]
+		Expect(w.BareMetalInstance.ID).NotTo(Equal(old.BareMetalInstance.ID))
+		Expect(w.Phase).To(Equal("WaitingForAgent"))
+		Expect(w.ReadySince).To(BeNil())
+		Expect(getOrder().Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+		Expect(fc.CreateCalls()).To(HaveLen(2))
+	})
 
 	It("R01-E1 persists reserve -> one create -> observe checkpoints for NodeSets sharing a type", func() {
 		latest := getOrder()
@@ -309,9 +590,13 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(err).NotTo(HaveOccurred())
 		recovered := getOrder().Status.Workers[0]
 		Expect(recovered.Name).To(Equal(reserved.Name))
-		Expect(recovered.BareMetalInstance.ID).To(Equal("reserved"))
+		stored, err := fc.ListBareMetalInstances(ctx, "")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(stored).To(HaveLen(1))
+		Expect(recovered.BareMetalInstance.ID).To(Equal(stored[0].GetId()))
+		Expect(recovered.BareMetalInstance.ID).NotTo(Equal("reserved"))
 		Expect(fc.CreateCalls()).To(HaveLen(1))
-		Expect(fc.ListCalls()).To(HaveLen(beforeLists + 1))
+		Expect(fc.ListCalls()).To(HaveLen(beforeLists + 2)) // Includes the assertion's List.
 		Expect(fc.GetCalls()).To(HaveLen(beforeGets))
 	})
 	It("W-E2 replaces an authoritative NotFound slot across prune, reserve and create checkpoints", func() {
@@ -577,7 +862,12 @@ var _ = Describe("Unified worker reconciliation", func() {
 		// on the next explicit invocation from the fresh persisted reference.
 		result, err = run()
 		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Second)) // Persist retirement before mutation.
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Unbinding"))
+		result, err = run()
+		Expect(err).NotTo(HaveOccurred())
 		Expect(result.RequeueAfter).To(Equal(30 * time.Second))
+		Expect(fc.DeleteCalls()).To(BeEmpty(), "deletion metadata proves the request is already persisted")
 		recovered := getOrder().Status.Workers
 		Expect(recovered).To(HaveLen(1))
 		Expect(recovered[0].BareMetalInstance.ID).To(Equal("old-bmi"))

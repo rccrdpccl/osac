@@ -56,6 +56,16 @@ func (r *Reconciler) reconcileWorkerCapacity(
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Persist retirement before retry cleanup, so failed excess slots cannot
+	// schedule replacements and every destructive action has durable intent.
+	plan := planWorkerSlots(co)
+	retiring := r.handleScaleDown(ctx, co, plan.selected, plan.excess, observed)
+	if !workerStatusesEqual(co.Status.Workers, retiring) {
+		if err := r.updateWorkerStatus(ctx, co, retiring); err != nil {
+			return ctrl.Result{}, err
+		}
+		return workerBoundaryRequeue(), nil
+	}
 	prepared := co.DeepCopy()
 	added, err := r.reserveWorkerSlots(ctx, co)
 	if err != nil {
@@ -83,6 +93,15 @@ func (r *Reconciler) reconcileWorkerCapacity(
 			return ctrl.Result{}, err
 		}
 		return workerBoundaryRequeue(), nil
+	}
+
+	if hasFailedIncarnations(failed.Status.Workers) {
+		// A pending cleanup action ends this invocation; re-observe before
+		// creating or guessing at completion. Publish protected summaries.
+		if err := r.updateWorkerStatusWithAgent(ctx, co, co.Status.Workers); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 
 	workers, res, err := r.reconcileNodeSets(ctx, co, tenant, existingByName, image, string(ignition), filter, observed)

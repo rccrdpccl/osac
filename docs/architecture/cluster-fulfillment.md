@@ -358,6 +358,49 @@ When a cluster deletion is requested:
    - Removes the cluster namespace
 4. **OSAC Controller**: Finalizes ClusterOrder deletion after all resources are cleaned up
 
+### Bare-metal worker cleanup boundaries
+
+The independent bare-metal worker reconciler uses one ownership-safe cleanup
+path for failed-worker retry, failed/ordinary scale-down and parent deletion.
+Scale-down persists `Unbinding` retirement intent first. Cleanup observes the
+complete Agent namespace through an authoritative reader, rejects ambiguous or
+malformed associations, waits for owner-driven detachment, then deletes a safe
+Agent with UID/resourceVersion preconditions. It waits for actual old Agent
+removal before requesting infrastructure deletion; it never clears Machine or
+CAP-Agent hooks or decrements NodePool replicas to force a particular worker out.
+
+A BMI Delete response is only a request. Deletion metadata causes a wait, and
+only fresh Get NotFound confirms the recorded incarnation is absent. Until then,
+retry retains the Failed phase and old ID; retirement retains the slot and ID.
+Confirmed retry cleanup increments the attempt and sets a deadline once, clears
+the old ID and ReadySince, and keeps the reserved name for a distinct successor
+incarnation. Interrupted Create recovery checks current ownership and liveness;
+foreign, ambiguous or deleting name-recovery candidates cannot become replacements.
+
+Finalization never provisions. It recovers exact ID-less reservations in every
+phase and retains the worker/finalizer if name ownership or absence is uncertain.
+The finalizer is removed only after a fresh optimistic parent read confirms no
+authoritative worker references remain. Full worker-status loss is not a supported
+allocation-recovery contract.
+
+Local Unit and R03-E1–E5 public Envtest traces verify these retention and
+incarnation boundaries, including authoritative Agent observation and real API
+UID-precondition rejection. They are not proof of deployed hardware release.
+Sim-backed R03-C1 is explicitly skipped because the sim is slated for removal;
+its added fixture has been removed and is not a local completion gate. The
+pre-existing connected/R01 suites are preserved. Real fulfillment/Postgres
+retention and name reuse have not been established by this refactor's local
+checks, and no replacement deployed integration harness is required here.
+Production deletion still has an archived-Cluster ownership lookup blocker;
+a dedicated fix owner/ticket remains unresolved. Bound-worker remediation also
+requires a supported owner mechanism, so the current implementation waits closed
+and emits `WorkerCleanupBlocked`. Remaining deployed provider/drain/hardware
+journeys are tracked under
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843); see
+[testing boundaries](../INTEGRATION-TESTING.md#r03-unified-worker-cleanup-implementation-checkpoint).
+CaaS remains a BMaaS consumer; this change does not alter DHCP, fabric port moves
+or networking-attachment contracts.
+
 ## Scalability and Performance
 
 The cluster fulfillment system is designed for scale:

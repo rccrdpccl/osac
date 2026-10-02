@@ -268,6 +268,49 @@ further capacity actions; protected lifecycle fixtures assert no resurrection
 from installed Agents. No controller watch, RBAC, or deployment wiring changes
 are involved.
 
+### R03 unified worker cleanup implementation checkpoint
+
+The local implementation shares Agent-before-BMI cleanup across retry,
+scale-down and finalization. `cleanup_test.go`, `retry_test.go`,
+`worker_teardown_test.go` and `fake/fake_test.go` cover asynchronous deletion,
+lost acknowledgement, ID retention, one retry checkpoint, retirement intent,
+ID-less recovery, unknown/foreign references, ambiguous/malformed/bound Agents,
+authoritative reads despite cached omission, and UID-conditioned Agent Delete.
+These are **Unit / osac-operator [DEV]** cases with simulated APIs. The unit UID
+race checks Delete options and simulates rejection because the Kubernetes fake
+ignores UID preconditions. Existing acceptance Envtest specs are migrated to
+explicit retirement/Agent/BMI/absence checkpoints; they run real Kubernetes/etcd
+but simulated fulfillment and Agent lifecycle progression.
+
+Dedicated **R03-E1–E5 Envtest / osac-operator [DEV]** fault traces in
+`acceptance/worker_reconcile_test.go` are implemented and executed/passed (seven
+specs). They drive public Reconcile with real persistence and explicit delayed
+BMI/Agent completion, once-only retry scheduling and distinct replacement IDs,
+failed scale-down/parent finalizer retention through outages, interrupted Create
+ID recovery during deletion without provisioning prerequisites, authoritative
+Agent reads despite cached List omission, real API UID-precondition rejection,
+and bound Failed blocking/readiness isolation. Every trace uses finite calls
+within `16 + 8*N`; the fixture moves retry deadlines rather than sleeping.
+A temporary premature-completion mutation made R03-E1 fail on the lost old ID;
+the mutation was restored before final validation.
+
+**R03-C1 component integration / osac-operator [DEV]** is explicitly **skipped**
+at the user's request because the sim environment is slated for removal. Its
+added fixture-finalizer helpers and table entry have been removed from
+`test/integration/caas/worker_test.go`; the pre-existing connected suite and
+R01-C1 are preserved. R03-C1 is no longer a local completion gate. No live
+fulfillment/Postgres retention/name-reuse or provider cleanup pass is claimed.
+Unit/Envtest establish the cleanup policy/persistence invariants, not that real
+service boundary or hardware release. No replacement deployed integration
+harness is required for this refactor; optional same-UID Agent binding-change
+Delete resourceVersion coverage (R03-E6, Envtest / [DEV]) remains proposed,
+not implemented or a completion gate.
+Production archived-Cluster ownership lookup needs an approved fix and a dedicated
+owner/ticket (unresolved). Automated bound-worker remediation is not implemented:
+cleanup waits for owner-driven detach and preserves identity/finalizers. Deployed
+CAP-Agent/drain/hardware coverage remains **[QE] E2E** under
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+
 ### Coverage gaps
 
 The current component integration suite does not exercise real AAP,

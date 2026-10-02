@@ -125,6 +125,25 @@ Do not infer real uniqueness or provider cleanup from fake/Envtest results.
 The archived-Cluster deletion and deployed provider boundaries above remain
 unchanged, tracked under [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
+### R03 pending-deletion contract (explicitly skipped)
+
+Sim-backed `R03-C1` is explicitly skipped at the user's request because the sim
+environment is slated for removal. Its added pending-finalizer fixture helpers,
+imports and table entry have been removed; it is no longer a local R03 completion
+gate. The pre-existing connected suite, ordinary worker fixture and R01-C1 are
+preserved. No sim teardown, deployment or replacement integration harness is
+part of this finish-up. Do not run a focused R03-C1 filter: the spec no longer
+exists, so a zero-match run would not verify anything.
+
+R03-E1–E5 in the separate acceptance Envtest suite executed/passed seven specs
+covering local public cleanup traces, including real Agent UID preconditions.
+Their fake fulfillment completion is not evidence of real fulfillment/Postgres
+retention, name reuse or provider release. The archived-Cluster ownership blocker
+and deployed provider/drain/hardware gaps remain unchanged under
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843); a dedicated ownership
+fix owner/ticket is unresolved. Optional same-UID binding-change Delete
+resourceVersion coverage (R03-E6, Envtest / [DEV]) remains proposed, not required.
+
 The separate envtest acceptance suite remains necessary for controller
 lifecycle, fault injection and tenant-safety cases that this real-DB contract
 suite does not exercise.

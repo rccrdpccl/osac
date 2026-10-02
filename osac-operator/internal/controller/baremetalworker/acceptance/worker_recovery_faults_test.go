@@ -10,10 +10,47 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/osac-project/osac/osac-operator/internal/controller/baremetalworker"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
+
+// cleanupAgentFaultClient omits Agents only from cached observation. Deletes
+// still delegate to the real apiserver, including all caller preconditions.
+// beforeDelete models a same-name recreation between authoritative List and Delete.
+type cleanupAgentFaultClient struct {
+	client.Client
+	omitAgents    bool
+	omittedLists  int
+	beforeDelete  func()
+	deleteErr     error
+	deleteOptions *client.DeleteOptions
+}
+
+func (c *cleanupAgentFaultClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if agents, ok := list.(*unstructured.UnstructuredList); ok && agents.GetKind() == "AgentList" && c.omitAgents {
+		c.omittedLists++
+		agents.Items = nil
+		return nil
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+func (c *cleanupAgentFaultClient) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if obj.GetObjectKind().GroupVersionKind() == agentGVK {
+		c.deleteOptions = (&client.DeleteOptions{}).ApplyOptions(opts)
+		if c.beforeDelete != nil {
+			before := c.beforeDelete
+			c.beforeDelete = nil
+			before()
+		}
+		c.deleteErr = c.Client.Delete(ctx, obj, opts...)
+		return c.deleteErr
+	}
+	return c.Client.Delete(ctx, obj, opts...)
+}
 
 // Faults belong to the test, not the production transport. Different IDs on
 // repeated requests also ensure fake name uniqueness is not just ID equality.

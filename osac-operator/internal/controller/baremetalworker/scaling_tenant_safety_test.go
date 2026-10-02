@@ -25,8 +25,8 @@ import (
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
 
-// Exercise removeFailedExcess directly: the ordinary reconcile calls handleFailedWorkers
-// first, so an end-to-end failed scale-down case alone cannot reach this deletion branch.
+// Failed scale-down persists retirement intent without deleting even a foreign
+// reference. Shared cleanup separately validates ownership before mutation.
 type foreignExcessClient struct {
 	FulfillmentClient
 	bmi     *privatev1.BareMetalInstance
@@ -59,8 +59,10 @@ var _ = Describe("BareMetalWorker failed excess tenant safety", func() {
 			}.Build(),
 		}.Build()}
 		r := &Reconciler{fulfillment: foreign, recorder: events.NewFakeRecorder(10)}
-		kept := r.removeFailedExcess(context.Background(), co, nil, w)
+		kept := r.handleScaleDown(context.Background(), co, nil, []v1alpha1.WorkerStatus{w})
 		Expect(foreign.deletes).To(BeEmpty())
-		Expect(kept).To(ConsistOf(w), "foreign status must be retained for safe recovery")
+		Expect(kept).To(HaveLen(1))
+		Expect(kept[0].BareMetalInstance).To(Equal(w.BareMetalInstance), "foreign reference must remain available for safe recovery")
+		Expect(kept[0].Phase).To(Equal(workerPhaseUnbinding))
 	})
 })
