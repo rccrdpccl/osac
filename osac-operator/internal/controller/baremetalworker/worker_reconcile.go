@@ -21,14 +21,14 @@ func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterO
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
-	changes, err := r.observeExistingWorkers(ctx, co, tenant, observed)
+	workers, err := r.observeExistingWorkers(ctx, co, tenant, observed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if res, err := r.persistWorkerChangesAndRefresh(ctx, co, changes); err != nil || !res.IsZero() {
-		return res, err
-	}
-	if len(changes) > 0 {
+	if !workerSlicesEqual(co.Status.Workers, workers) {
+		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+			return ctrl.Result{}, err
+		}
 		return workerBoundaryRequeue(), nil
 	}
 	image, ignition, res, err := r.prepareWorkerProvisioning(ctx, co)
@@ -50,11 +50,12 @@ func workerBoundaryRequeue() ctrl.Result {
 }
 
 func (r *Reconciler) finishWorkerConvergence(ctx context.Context, co *v1alpha1.ClusterOrder, observed *workerObservation) (ctrl.Result, error) {
-	if err := r.refreshWorkerOrder(ctx, co); err != nil {
+	changed, err := r.reconcileWorkerTeardown(ctx, co, observed)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileWorkerTeardown(ctx, co, observed); err != nil {
-		return ctrl.Result{}, err
+	if changed {
+		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 	workers, res, err := r.reconcileObservedAgents(ctx, co, observed)
 	if err != nil {

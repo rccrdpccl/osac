@@ -15,10 +15,12 @@ package baremetalworker
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -84,6 +86,12 @@ func TestBMIDeletionRecoveryPreservesPhaseAndHistory(t *testing.T) {
 			want := co.Status.Workers[0]
 			want.BareMetalInstance.ID = "owned-id"
 			fc.bmis = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "owned-id")}
+			if err := runDeletionBMIStage(context.Background(), r, co); !errors.Is(err, errWorkerObservationChanged) {
+				t.Fatalf("first deletion observation error=%v, want boundary", err)
+			}
+			if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+				t.Fatal(err)
+			}
 			if err := runDeletionBMIStage(context.Background(), r, co); err != nil {
 				t.Fatal(err)
 			}
@@ -126,13 +134,13 @@ func TestBMIRecoveryDoesNotOverwriteNewerReservation(t *testing.T) {
 					}
 				}}
 				if deletion {
-					if err := runDeletionBMIStage(context.Background(), r, co); err == nil {
-						t.Fatal("expected fresh-observation retry")
+					if err := runDeletionBMIStage(context.Background(), r, co); !apierrors.IsConflict(err) {
+						t.Fatalf("error=%v, want one-shot conflict", err)
 					}
 				} else {
 					_, res, err := runBMIStage(context.Background(), r, co)
-					if err != nil || res.IsZero() {
-						t.Fatalf("result=%+v err=%v", res, err)
+					if !apierrors.IsConflict(err) || !res.IsZero() {
+						t.Fatalf("result=%+v err=%v, want one-shot conflict", res, err)
 					}
 				}
 				if err := kube.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
@@ -184,6 +192,9 @@ func TestBMIMissingSlotIsReplacedWithANewReservation(t *testing.T) {
 		t.Fatal("reservation did not return before create")
 	}
 	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
 	w := co.Status.Workers[0]

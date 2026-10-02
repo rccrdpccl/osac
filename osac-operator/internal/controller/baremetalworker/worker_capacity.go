@@ -6,7 +6,6 @@ package baremetalworker
 import (
 	"context"
 	"fmt"
-	"reflect"
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
@@ -29,12 +28,21 @@ func (r *Reconciler) reconcileWorkerCapacity(
 ) (ctrl.Result, error) {
 	// Standalone callers also plan from authoritative status. A supplied resource
 	// observation belongs to the original snapshot and must not absorb new slots.
+	// First reject changes to the worker plan, then refresh the object itself so
+	// status-only patches made earlier in this invocation (for example, the
+	// InfraEnv UID annotation) do not leave the next optimistic patch stale.
+	var expected *v1alpha1.ClusterOrder
 	if len(observations) > 0 && observations[0] != nil {
-		if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
+		expected = co.DeepCopy()
+		if err := r.checkCurrentCapacityPlan(ctx, expected); err != nil {
 			return ctrl.Result{}, err
 		}
-	} else if err := r.refreshWorkerOrder(ctx, co); err != nil {
+	}
+	if err := r.readAuthoritativeOrder(ctx, co); err != nil {
 		return ctrl.Result{}, err
+	}
+	if expected != nil && !sameCapacityPlan(expected, co) {
+		return ctrl.Result{}, errWorkerObservationChanged
 	}
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	observed, res, err := r.workerCapacityObservation(ctx, co, filter, observations...)
@@ -45,6 +53,9 @@ func (r *Reconciler) reconcileWorkerCapacity(
 	if err != nil {
 		return ctrl.Result{}, r.rejectWorkerIdentity(co, err.Error())
 	}
+	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
+		return ctrl.Result{}, err
+	}
 	prepared := co.DeepCopy()
 	added, err := r.reserveWorkerSlots(ctx, co)
 	if err != nil {
@@ -53,7 +64,7 @@ func (r *Reconciler) reconcileWorkerCapacity(
 	if added {
 		return workerBoundaryRequeue(), nil
 	}
-	if !sameWorkerOrder(prepared, co) || prepared.Generation != co.Generation || !reflect.DeepEqual(prepared.Spec, co.Spec) || !reflect.DeepEqual(prepared.Status.Workers, co.Status.Workers) {
+	if !sameCapacityPlan(prepared, co) {
 		return ctrl.Result{}, errWorkerObservationChanged
 	}
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
@@ -78,7 +89,7 @@ func (r *Reconciler) reconcileWorkerCapacity(
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
-	if len(workerDifferences(co.Status.Workers, workers)) > 0 {
+	if !workerStatusesEqual(co.Status.Workers, workers) {
 		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -137,8 +148,15 @@ func (r *Reconciler) reconcileNodeSets(
 			if err != nil || !res.IsZero() {
 				return nil, res, err
 			}
-			if res, err := r.persistWorkerChangesAndRefresh(ctx, co, appendWorkerDifference(nil, before, prev)); err != nil || !res.IsZero() {
-				return nil, res, err
+			next := co.DeepCopy()
+			for i := range next.Status.Workers {
+				if next.Status.Workers[i].Name == before.Name {
+					next.Status.Workers[i] = prev
+					break
+				}
+			}
+			if err := r.patchStatusFromBase(ctx, co, next); err != nil {
+				return nil, ctrl.Result{}, err
 			}
 			// Observe the external action next time, even if its response was a no-op.
 			return nil, workerBoundaryRequeue(), nil
@@ -158,25 +176,24 @@ func (r *Reconciler) reconcileNodeSets(
 // external create. added reports actual additions in the successful patch, not
 // whether a no-op helper was called or another invocation's slots were refreshed.
 func (r *Reconciler) reserveWorkerSlots(ctx context.Context, co *v1alpha1.ClusterOrder) (bool, error) {
-	var referenceErr error
-	added := false
-	if err := r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
-		referenceErr = nil
-		added = false
-		if err := validateBareMetalNodeSets(latest); err != nil {
-			referenceErr = err
-			return
-		}
-		before := len(latest.Status.Workers)
-		referenceErr = allocateMissingWorkerSlots(latest)
-		added = len(latest.Status.Workers) > before
-	}); err != nil {
+	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 		return false, err
 	}
-	if referenceErr != nil {
-		return false, referenceErr
+	if err := validateBareMetalNodeSets(co); err != nil {
+		return false, err
 	}
-	return added, r.refreshWorkerOrder(ctx, co)
+	next := co.DeepCopy()
+	before := len(next.Status.Workers)
+	if err := allocateMissingWorkerSlots(next); err != nil {
+		return false, err
+	}
+	if len(next.Status.Workers) == before {
+		return false, nil
+	}
+	if err := r.patchStatusFromBase(ctx, co, next); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // allocateMissingWorkerSlots fills gaps in each NodeSet's desired capacity in status.

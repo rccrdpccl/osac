@@ -77,17 +77,18 @@ refusal. These cases do not test manager watch delivery or deployed Assisted Ser
 Unified worker convergence is covered by `worker_reconcile_test.go`,
 `worker_capacity_test.go`, `worker_teardown_test.go`, `worker_projection_test.go`,
 and the BMI identity suites. Unit fault injection covers shared read budgets,
-unknown versus absent references, latest-status conflict guards, concurrent
-reference interruption, capacity interruption, and one fresh ownership/existence Get per BMI
+unknown versus absent references, one-shot optimistic status conflicts, concurrent
+reference/spec/tenant/UID interruption, capacity interruption, and one fresh ownership/existence Get per BMI
 delete attempt, and finalizer retention for concurrently appended workers.
 `acceptance/worker_reconcile_test.go` drives public `Reconcile`
 through real status persistence and optimistic-lock conflicts: successful-create
 ID write interruption, List omission/NotFound/outages, repair before prerequisite
-gates, stale-failure write rejection before InfraEnv UID recording, merged
-aggregate counts, and identity-only finalization recovery. Assertions follow
+gates, stale-failure write rejection before InfraEnv UID recording, conflict
+interruption followed by fresh aggregate convergence, and identity-only finalization recovery. Assertions follow
 explicit reconciliation calls, not fallback polling. R01 Unit cases and the
-R01-E1/E2 acceptance specs additionally assert separate finalizer/repair/reservation
-and single-Create checkpoints, stable names across stale parent snapshots,
+R01-E1/E2 acceptance specs and R02-E1/E2 conflict-restart coverage additionally assert separate finalizer/repair/reservation
+and single-Create checkpoints, a single rejected optimistic Agent binding patch with no takeover,
+stable names across stale parent snapshots,
 independent NodeSets sharing one instance type, waiting-retry selection, a
 single failed-worker retry Delete (including errors), and no requeue from a
 no-op retention ordering. Stale-ignition repair persists without advancing the

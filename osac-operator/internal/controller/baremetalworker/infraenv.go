@@ -15,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -53,6 +52,12 @@ func (r *Reconciler) prepareWorkerProvisioning(ctx context.Context, co *v1alpha1
 	ignition, uid, res, err := r.ensureInfraEnv(ctx, co)
 	if err != nil || !res.IsZero() {
 		return nil, nil, res, err
+	}
+	// ensureInfraEnv may have persisted InfraEnvReady. Refresh before stale
+	// worker classification so its next optimistic worker patch uses that
+	// successful write's resource version and status snapshot.
+	if err := r.readAuthoritativeOrder(ctx, co); err != nil {
+		return nil, nil, ctrl.Result{}, err
 	}
 	changed, res, err := r.detectStaleIgnitionWorkers(ctx, co, uid)
 	if err != nil || !res.IsZero() {
@@ -255,7 +260,7 @@ func (r *Reconciler) buildInfraEnv(co *v1alpha1.ClusterOrder, name string) (*uns
 func (r *Reconciler) setInfraEnvReady(
 	ctx context.Context, co *v1alpha1.ClusterOrder, status metav1.ConditionStatus, reason, message string,
 ) error {
-	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
+	return r.patchStatus(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, status, message, reason)
 	})
 }
@@ -268,25 +273,26 @@ func (r *Reconciler) trackInfraEnvUID(
 	if uid == "" || co.Annotations[infraEnvUIDAnnotation] == uid {
 		return nil
 	}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &v1alpha1.ClusterOrder{}
-		if err := r.apiReader.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
-			return err
-		}
-		if !sameWorkerOrder(co, latest) || latest.Annotations[infraEnvUIDAnnotation] != co.Annotations[infraEnvUIDAnnotation] {
-			return fmt.Errorf("ClusterOrder changed before InfraEnv UID recording")
-		}
-		base := latest.DeepCopy()
-		if latest.Annotations == nil {
-			latest.Annotations = make(map[string]string)
-		}
-		latest.Annotations[infraEnvUIDAnnotation] = uid
-		return r.Patch(ctx, latest, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
-	})
-	if err != nil {
+	base := co.DeepCopy()
+	reader := r.apiReader
+	if reader == nil {
+		reader = r.Client
+	}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(co), base); err != nil {
+		return fmt.Errorf("reading ClusterOrder for InfraEnv UID recording: %w", err)
+	}
+	if !sameWorkerOrder(co, base) || base.Annotations[infraEnvUIDAnnotation] != co.Annotations[infraEnvUIDAnnotation] {
+		return fmt.Errorf("ClusterOrder changed before InfraEnv UID recording")
+	}
+	next := base.DeepCopy()
+	if next.Annotations == nil {
+		next.Annotations = make(map[string]string)
+	}
+	next.Annotations[infraEnvUIDAnnotation] = uid
+	if err := r.Patch(ctx, next, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("recording InfraEnv UID: %w", err)
 	}
-	return r.apiReader.Get(ctx, client.ObjectKeyFromObject(co), co)
+	return nil
 }
 
 // detectStaleIgnitionWorkers checks whether the InfraEnv was recreated since the last
@@ -295,37 +301,46 @@ func (r *Reconciler) trackInfraEnvUID(
 func (r *Reconciler) detectStaleIgnitionWorkers(
 	ctx context.Context, co *v1alpha1.ClusterOrder, infraEnvUID string,
 ) (bool, ctrl.Result, error) {
-	changes := classifyStaleIgnition(co, infraEnvUID)
-	res, err := r.persistWorkerChangesAndRefresh(ctx, co, changes)
-	if err != nil || !res.IsZero() {
-		return false, res, err
+	workers := classifyStaleIgnition(co, infraEnvUID)
+	if workerSlicesEqual(co.Status.Workers, workers) {
+		return false, ctrl.Result{}, nil
 	}
-	for _, change := range changes {
-		w := *change.replacement
-		observeProvisioningFailure(tenantOf(co), w)
+	changed := make(map[string]v1alpha1.WorkerStatus)
+	for i, worker := range co.Status.Workers {
+		if workers[i].Phase == workerPhaseFailed && worker.Phase == workerPhaseWaitingForAgent {
+			changed[workers[i].Name] = workers[i]
+		}
+	}
+	if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+		return false, ctrl.Result{}, err
+	}
+	for name := range changed {
+		w := workerByName(workers, name)
+		if w == nil {
+			continue
+		}
+		observeProvisioningFailure(tenantOf(co), *w)
 		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonStaleIgnition, "DetectStaleIgnition",
 			"worker %s: marked failed due to stale ignition after InfraEnv recreation", w.Name)
 	}
-	return len(changes) > 0, ctrl.Result{}, nil
+	return true, ctrl.Result{}, nil
 }
 
-func classifyStaleIgnition(co *v1alpha1.ClusterOrder, infraEnvUID string) []workerChange {
+func classifyStaleIgnition(co *v1alpha1.ClusterOrder, infraEnvUID string) []v1alpha1.WorkerStatus {
+	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	storedUID := co.Annotations[infraEnvUIDAnnotation]
 	if storedUID == "" || storedUID == infraEnvUID {
-		return nil
+		return workers
 	}
-	var changes []workerChange
 	now := metav1.Now()
-	for _, w := range co.Status.Workers {
-		if w.Phase != workerPhaseWaitingForAgent {
+	for i := range workers {
+		if workers[i].Phase != workerPhaseWaitingForAgent {
 			continue
 		}
-		next := w
-		next.Phase = workerPhaseFailed
-		next.LastFailureReason = eventReasonAgentRegistrationTimeout
-		next.LastFailureMessage = "stale ignition: InfraEnv was recreated"
-		next.LastFailureTime = &now
-		changes = appendWorkerDifference(changes, w, next)
+		workers[i].Phase = workerPhaseFailed
+		workers[i].LastFailureReason = eventReasonAgentRegistrationTimeout
+		workers[i].LastFailureMessage = "stale ignition: InfraEnv was recreated"
+		workers[i].LastFailureTime = &now
 	}
-	return changes
+	return workers
 }

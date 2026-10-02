@@ -149,10 +149,14 @@ type failingAgentPatchClient struct {
 	client.Client
 	patches  int
 	conflict bool
+	succeed  bool
 }
 
 func (c *failingAgentPatchClient) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.PatchOption) error {
 	c.patches++
+	if c.succeed {
+		return c.Client.Patch(ctx, obj, p, opts...)
+	}
 	if c.conflict {
 		return apierrors.NewConflict(schema.GroupResource{Group: agentGVK.Group, Resource: "agents"}, obj.GetName(), errors.New("test conflict"))
 	}
@@ -197,19 +201,58 @@ func TestAgentReconcileBindingFailure(t *testing.T) {
 			co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac", CreationTimestamp: metav1.Now()}}
 			w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
 			got, res, err := r.reconcileAgent(context.Background(), co, []v1alpha1.WorkerStatus{w}, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}})
-			if err != nil {
-				t.Fatal(err)
+			if err == nil {
+				t.Fatal("binding failure was hidden")
 			}
-			if got[0].Phase != workerPhaseWaitingForAgent || res.RequeueAfter != agentRequeueInterval {
-				t.Fatalf("failed bind advanced worker: %+v, %+v", got, res)
+			if len(got) != 0 || !res.IsZero() {
+				t.Fatalf("failed bind returned stale worker state: %+v, %+v", got, res)
 			}
-			if c.patches == 0 {
-				t.Fatal("did not attempt bind")
+			if c.patches != 1 {
+				t.Fatalf("bind patches=%d, want one", c.patches)
 			}
 			if len(recorder.Events) != 0 {
 				t.Fatalf("failed bind emitted %d events", len(recorder.Events))
 			}
 		})
+	}
+}
+
+func TestR02AgentConflictRestarts(t *testing.T) {
+	ctx := context.Background()
+	a := agentPhaseFixture("", false)
+	a.SetUID("agent-v1")
+	_ = unstructured.SetNestedSlice(a.Object, []interface{}{map[string]interface{}{"macAddress": "aa"}}, "status", "inventory", "interfaces")
+	base := clientfake.NewClientBuilder().WithObjects(a).Build()
+	patchClient := &failingAgentPatchClient{Client: base, conflict: true}
+	r := &Reconciler{Client: patchClient, apiReader: base, recorder: events.NewFakeRecorder(10), macResolver: func(context.Context, string) []string { return []string{"aa"} }}
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
+	observed := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}}
+
+	workers, result, err := r.reconcileAgent(ctx, co, []v1alpha1.WorkerStatus{w}, observed)
+	if !apierrors.IsConflict(err) || !result.IsZero() || workers != nil {
+		t.Fatalf("first invocation: workers=%+v result=%+v err=%v", workers, result, err)
+	}
+	if patchClient.patches != 1 {
+		t.Fatalf("agent patches=%d, want 1", patchClient.patches)
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(agentGVK)
+	if err := base.Get(ctx, client.ObjectKeyFromObject(a), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.GetLabels()[workerNameLabel] != "" {
+		t.Fatal("conflicted invocation took over the Agent")
+	}
+
+	patchClient.conflict = false
+	patchClient.succeed = true
+	workers, result, err = r.reconcileAgent(ctx, co, []v1alpha1.WorkerStatus{w}, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*current}})
+	if err != nil || !result.IsZero() || len(workers) != 1 || workers[0].Phase != workerPhaseBinding {
+		t.Fatalf("fresh invocation: workers=%+v result=%+v err=%v", workers, result, err)
+	}
+	if patchClient.patches != 2 {
+		t.Fatalf("agent patches=%d after restart, want 2", patchClient.patches)
 	}
 }
 
@@ -356,11 +399,7 @@ func TestAgentObservationBeforeSlotSelectionAndStaleIgnition(t *testing.T) {
 	if len(plan.selected) != 1 || plan.selected[0].Name != "installed" {
 		t.Fatalf("incorrect early retention: %+v", plan)
 	}
-	for _, change := range classifyStaleIgnition(co, "new") {
-		if !applyWorkerChange(co, change) {
-			t.Fatal("stale ignition classifier produced incompatible evidence")
-		}
-	}
+	co.Status.Workers = classifyStaleIgnition(co, "new")
 	if co.Status.Workers[0].Phase != workerPhaseReady || co.Status.Workers[1].Phase != workerPhaseFailed {
 		t.Fatalf("incorrect stale ignition classification: %+v", co.Status.Workers)
 	}

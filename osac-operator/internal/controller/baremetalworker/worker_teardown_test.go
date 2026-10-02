@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -108,17 +109,17 @@ func TestFinalizationRetainsFinalizerForConcurrentAppendedWorker(t *testing.T) {
 	o := indexWorkerBMIs(nil)
 	o.agents = &unstructured.UnstructuredList{}
 	res, err := r.handleClusterDeletion(context.Background(), co, o)
-	if err != nil {
-		t.Fatal(err)
+	if !apierrors.IsConflict(err) || !res.IsZero() {
+		t.Fatalf("result=%+v err=%v, want one-shot conflict", res, err)
 	}
 	latest := co.DeepCopy()
 	if err := kube.Get(context.Background(), client.ObjectKeyFromObject(co), latest); err != nil {
 		t.Fatal(err)
 	}
-	if len(latest.Finalizers) != 1 || latest.Finalizers[0] != bmWorkerFinalizer || res.RequeueAfter != teardownRequeueInterval {
+	if len(latest.Finalizers) != 1 || latest.Finalizers[0] != bmWorkerFinalizer || !res.IsZero() {
 		t.Fatalf("removed finalizer with appended worker: finalizers=%v result=%v", latest.Finalizers, res)
 	}
-	if len(latest.Status.Workers) != 1 || latest.Status.Workers[0].Name != appended.Name {
+	if len(latest.Status.Workers) != 2 || latest.Status.Workers[1].Name != appended.Name {
 		t.Fatalf("workers=%v", latest.Status.Workers)
 	}
 }
@@ -129,7 +130,7 @@ func TestStableConvergenceDoesNotRelistAgentsForTeardown(t *testing.T) {
 	observed.agents = &unstructured.UnstructuredList{}
 	c := &agentListCountingClient{Client: r.Client}
 	r.Client = c
-	err := r.reconcileWorkerTeardown(context.Background(), co, observed)
+	_, err := r.reconcileWorkerTeardown(context.Background(), co, observed)
 	if err != nil {
 		t.Fatal(err)
 	}

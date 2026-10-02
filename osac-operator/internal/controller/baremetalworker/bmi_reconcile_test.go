@@ -90,12 +90,15 @@ func runBMIStage(ctx context.Context, r *Reconciler, co *v1alpha1.ClusterOrder) 
 	if err != nil || !res.IsZero() {
 		return false, res, err
 	}
-	changes, err := r.observeExistingWorkers(ctx, co, "tenant", observed)
+	workers, err := r.observeExistingWorkers(ctx, co, "tenant", observed)
 	if err != nil {
 		return false, ctrl.Result{}, err
 	}
-	res, err = r.persistWorkerChangesAndRefresh(ctx, co, changes)
-	return len(changes) > 0, res, err
+	changed := !workerSlicesEqual(co.Status.Workers, workers)
+	if changed {
+		err = r.updateWorkerStatus(ctx, co, workers)
+	}
+	return changed, ctrl.Result{}, err
 }
 
 // Identity-only deletion-stage harness uses the public finalization stages.
@@ -110,15 +113,14 @@ func runDeletionBMIStage(ctx context.Context, r *Reconciler, co *v1alpha1.Cluste
 	if !res.IsZero() {
 		return errWorkerObservationChanged
 	}
-	changes, err := r.observeDeletionWorkers(ctx, co, "tenant", o)
+	workers, err := r.observeDeletionWorkers(ctx, co, "tenant", o)
 	if err != nil {
 		return err
 	}
-	res, err = r.persistWorkerChangesAndRefresh(ctx, co, changes)
-	if err != nil {
-		return err
-	}
-	if !res.IsZero() {
+	if !workerSlicesEqual(co.Status.Workers, workers) {
+		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
+			return err
+		}
 		return errWorkerObservationChanged
 	}
 	return nil
@@ -311,17 +313,17 @@ func TestBMIStageDoesNotRemoveNewerReference(t *testing.T) {
 					fc.onGet = mutate
 				}
 				_, res, err := runBMIStage(context.Background(), r, co)
-				if err != nil {
-					t.Fatal(err)
+				if !apierrors.IsConflict(err) {
+					t.Fatalf("error=%v, want one-shot conflict", err)
+				}
+				if !res.IsZero() {
+					t.Fatalf("conflict returned result=%+v", res)
 				}
 				if err := kube.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 					t.Fatal(err)
 				}
 				if !reflect.DeepEqual(co.Status.Workers, latest.Status.Workers) {
 					t.Fatalf("old NotFound removed newer identity: %+v", co.Status.Workers)
-				}
-				if res.IsZero() {
-					t.Fatal("changed evidence must stop provisioning and requeue")
 				}
 			})
 		}

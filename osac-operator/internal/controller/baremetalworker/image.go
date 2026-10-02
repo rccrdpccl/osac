@@ -100,7 +100,7 @@ func refKeyStr(ref *privatev1.DiskImageReference) string {
 func (r *Reconciler) setRHCOSImageNotFound(
 	ctx context.Context, co *v1alpha1.ClusterOrder, status metav1.ConditionStatus, reason, message string,
 ) error {
-	return r.patchStatusWithRetry(ctx, co, func(latest *v1alpha1.ClusterOrder) {
+	return r.patchStatus(ctx, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.SetStatusCondition(v1alpha1.ConditionRHCOSImageNotFound, status, message, reason)
 	})
 }

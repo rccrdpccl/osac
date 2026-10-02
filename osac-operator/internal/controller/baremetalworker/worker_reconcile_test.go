@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -165,13 +166,13 @@ func TestBMIRecoveryRejectsAmbiguousNames(t *testing.T) {
 		t.Fatal("persisted ambiguous identity")
 	}
 }
-func TestEarlyAgentObservationPreservesConcurrentWorkerState(t *testing.T) {
+func TestEarlyAgentObservationStopsOnConcurrentWorkerState(t *testing.T) {
 	for _, mutation := range []string{"appended", "failed", "history"} {
 		t.Run(mutation, func(t *testing.T) {
 			r, _, co := bmiStageHarness(t, workerPhaseWaitingForAgent, "id")
 			kube := r.Client
 			var concurrent v1alpha1.WorkerStatus
-			r.Client = &bmiConflictClient{Client: kube, beforePatch: func() {
+			conflict := &bmiConflictClient{Client: kube, beforePatch: func() {
 				latest := &v1alpha1.ClusterOrder{}
 				if err := kube.Get(context.Background(), client.ObjectKeyFromObject(co), latest); err != nil {
 					t.Fatal(err)
@@ -193,15 +194,20 @@ func TestEarlyAgentObservationPreservesConcurrentWorkerState(t *testing.T) {
 				}
 				concurrent = latest.Status.Workers[len(latest.Status.Workers)-1]
 			}}
+			r.Client = conflict
 			agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture("slot", true)}}
 			observed := indexWorkerBMIs([]*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "id")})
 			observed.agents = agents
-			changes, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
+			workers, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := r.persistWorkerChangesAndRefresh(context.Background(), co, changes); err != nil {
-				t.Fatal(err)
+			err = r.updateWorkerStatus(context.Background(), co, workers)
+			if !apierrors.IsConflict(err) {
+				t.Fatalf("error=%v, want one-shot conflict", err)
+			}
+			if conflict.patches != 1 {
+				t.Fatalf("status patches=%d, want 1", conflict.patches)
 			}
 			if err := kube.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 				t.Fatal(err)
@@ -214,11 +220,49 @@ func TestEarlyAgentObservationPreservesConcurrentWorkerState(t *testing.T) {
 	}
 }
 
-func TestFinalWorkerStatusPreservesAppendedWorkersAndAggregates(t *testing.T) {
+func TestR02ConflictDoesNotRetry(t *testing.T) {
 	ctx := context.Background()
 	r, _, co := bmiStageHarness(t, workerPhaseBinding, "id")
 	kube := r.Client
-	r.Client = &bmiConflictClient{Client: kube, beforePatch: func() {
+	conflict := &bmiConflictClient{Client: kube, beforePatch: func() {
+		latest := &v1alpha1.ClusterOrder{}
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+			t.Fatal(err)
+		}
+		latest.Status.Workers = append(latest.Status.Workers,
+			newWorkerStatus("standard", "standard", "concurrent", "concurrent-id", workerPhaseReady))
+		if err := kube.Status().Update(ctx, latest); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	r.Client = conflict
+	next := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
+	next[0].Phase = workerPhaseReady
+
+	err := r.updateWorkerStatus(ctx, co, next)
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("error=%v, want one-shot conflict", err)
+	}
+	if conflict.patches != 1 {
+		t.Fatalf("status patches=%d, want 1", conflict.patches)
+	}
+	latest := &v1alpha1.ClusterOrder{}
+	if err := kube.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
+		t.Fatal(err)
+	}
+	if len(latest.Status.Workers) != 2 || latest.Status.Workers[1].Name != "concurrent" {
+		t.Fatalf("concurrent worker was not preserved: %+v", latest.Status.Workers)
+	}
+	if latest.Status.Workers[0].Phase != workerPhaseBinding {
+		t.Fatalf("stale worker update was applied after conflict: %+v", latest.Status.Workers)
+	}
+}
+
+func TestFinalWorkerStatusStopsOnConflict(t *testing.T) {
+	ctx := context.Background()
+	r, _, co := bmiStageHarness(t, workerPhaseBinding, "id")
+	kube := r.Client
+	conflict := &bmiConflictClient{Client: kube, beforePatch: func() {
 		latest := &v1alpha1.ClusterOrder{}
 		if err := kube.Get(ctx, client.ObjectKeyFromObject(co), latest); err != nil {
 			t.Fatal(err)
@@ -228,16 +272,23 @@ func TestFinalWorkerStatusPreservesAppendedWorkersAndAggregates(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
+	r.Client = conflict
 	next := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	next[0].Phase = workerPhaseReady
-	if err := r.updateWorkerStatusWithAgent(ctx, co, next); err != nil {
-		t.Fatal(err)
+	if err := r.updateWorkerStatusWithAgent(ctx, co, next); !apierrors.IsConflict(err) {
+		t.Fatalf("error=%v, want one-shot conflict", err)
+	}
+	if conflict.patches != 1 {
+		t.Fatalf("status patches=%d, want 1", conflict.patches)
 	}
 	if err := kube.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
-	if len(co.Status.Workers) != 2 || co.Status.ReadyWorkers == nil || *co.Status.ReadyWorkers != 2 {
-		t.Fatalf("lost appended worker or stale aggregate: %+v", co.Status)
+	if len(co.Status.Workers) != 2 || co.Status.Workers[1].Name != "appended" {
+		t.Fatalf("lost appended worker: %+v", co.Status)
+	}
+	if co.Status.ReadyWorkers != nil {
+		t.Fatalf("aggregates changed after conflict: %+v", co.Status)
 	}
 }
 
@@ -250,12 +301,17 @@ func TestFinalAgentStageReusesEarlyPhaseProjection(t *testing.T) {
 	if err != nil || !res.IsZero() {
 		t.Fatalf("observation: %+v %v", res, err)
 	}
-	changes, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
+	workers, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res, err := r.persistWorkerChangesAndRefresh(context.Background(), co, changes); err != nil || !res.IsZero() {
-		t.Fatalf("status: %+v %v", res, err)
+	if !workerSlicesEqual(co.Status.Workers, workers) {
+		if err := r.updateWorkerStatus(context.Background(), co, workers); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+			t.Fatal(err)
+		}
 	}
 	_, _, err = r.reconcileObservedAgents(context.Background(), co, observed)
 	if err != nil {

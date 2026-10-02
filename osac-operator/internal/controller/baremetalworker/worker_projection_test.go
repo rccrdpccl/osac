@@ -38,20 +38,17 @@ func observeWorkerFixture(t *testing.T, workers []v1alpha1.WorkerStatus, agents 
 	observed := indexWorkerBMIs(bmis)
 	observed.agents = agents
 	r := &Reconciler{fulfillment: absentProjectionClient{}, macResolver: macs, recorder: events.NewFakeRecorder(10)}
-	changes, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
+	workers, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var removed []string
-	for _, change := range changes {
-		if change.replacement == nil {
-			removed = append(removed, change.observed.Name)
-		}
-		if !applyWorkerChange(co, change) {
-			t.Fatal("fixture changes did not match original slot")
+	for _, before := range co.Status.Workers {
+		if workerByName(workers, before.Name) == nil {
+			removed = append(removed, before.Name)
 		}
 	}
-	return co.Status.Workers, removed
+	return workers, removed
 }
 func TestFindAgentForWorkerNameAndNICFallback(t *testing.T) {
 	for _, tt := range []struct {
