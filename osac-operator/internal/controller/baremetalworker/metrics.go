@@ -50,9 +50,11 @@ var metricLabels = []string{metricTenantLabel, metricWorkerTypeLabel, metricInst
 // would be unbounded. Per-cluster detail lives in Kubernetes events and status fields instead.
 //
 //   - desired/ready are gauges (levels that move both directions): dashboards, the fulfillment
-//     ratio (ready/desired), and the silent-stall alert (desired-ready > 0 sustained). They are
-//     recomputed from the full ClusterOrder set on each reconcile via updateWorkerGauges
-//     (Reset + Set), mirroring bare-metal-fulfillment-operator's bcmHostsAvailable.
+//     ratio (ready/desired), and the silent-stall alert (desired-ready > 0 sustained). Desired is
+//     derived from the requested NodeSets (spec), while ready is derived from the retained,
+//     identity-backed worker summary. They are recomputed from the full ClusterOrder set on each
+//     reconcile via updateWorkerGauges (Reset + Set), mirroring bare-metal-fulfillment-operator's
+//     bcmHostsAvailable.
 //   - provisioningFailures is a counter (a failure is a cumulative event, not a level): the
 //     rate-alertable failure signal, robust to workers being retried or deleted afterward.
 //   - the duration histograms anchor on WorkerStatus.CreationTimestamp, which survives retries.
@@ -125,9 +127,12 @@ func (r *Reconciler) syncWorkerGauges(ctx context.Context) {
 }
 
 // updateWorkerGauges recomputes the desired/ready gauges from the full set of ClusterOrders.
-// Reset clears stale (tenant, worker_type, instance_type) series — e.g. for deleted clusters —
-// before the current counts are set, mirroring bcmHostsAvailable. Failures are tracked
-// separately as a counter (see observeProvisioningFailure), not recomputed here.
+// Desired comes from the requested bare-metal NodeSets, so a series exists before any worker
+// reservation. Ready comes from the same retained, identity-backed eligibility the status
+// summary uses. Reset clears stale (tenant, worker_type, instance_type) series — e.g. for
+// deleted clusters or removed type requests — before the current counts are set, mirroring
+// bcmHostsAvailable. Failures are tracked separately as a counter (see
+// observeProvisioningFailure), not recomputed here.
 func updateWorkerGauges(orders []v1alpha1.ClusterOrder) {
 	workerDesired.Reset()
 	workerReady.Reset()
@@ -135,19 +140,34 @@ func updateWorkerGauges(orders []v1alpha1.ClusterOrder) {
 	type key struct{ tenant, instanceType string }
 	type counts struct{ desired, ready float64 }
 	agg := map[key]*counts{}
+	at := func(k key) *counts {
+		c := agg[k]
+		if c == nil {
+			c = &counts{}
+			agg[k] = c
+		}
+		return c
+	}
 	for i := range orders {
-		tenant := tenantOf(&orders[i])
-		for _, w := range orders[i].Status.Workers {
-			k := key{tenant: tenant, instanceType: w.InstanceType}
-			c := agg[k]
-			if c == nil {
-				c = &counts{}
-				agg[k] = c
+		co := &orders[i]
+		tenant := tenantOf(co)
+		// Desired is the requested intent, independent of the worker journal.
+		for j := range co.Spec.NodeRequests {
+			nr := &co.Spec.NodeRequests[j]
+			if !nr.IsBareMetal() || nr.NumberOfNodes <= 0 {
+				continue
 			}
-			c.desired++
-			if w.Phase == workerPhaseReady {
-				c.ready++
+			at(key{tenant: tenant, instanceType: nr.BareMetal.InstanceType}).desired += float64(nr.NumberOfNodes)
+		}
+		// Ready keeps the provisioned instance type of the retained worker, so a
+		// hardware change does not relabel existing capacity as the new profile.
+		plan := planWorkerSlots(co)
+		for j := range plan.selected {
+			w := &plan.selected[j]
+			if w.Phase != workerPhaseReady || w.BareMetalInstance.ID == "" {
+				continue
 			}
+			at(key{tenant: tenant, instanceType: w.InstanceType}).ready++
 		}
 	}
 

@@ -40,13 +40,20 @@ type workerSlotPlan struct {
 // independently of request order and hardware profiles. Teardown entries never
 // satisfy capacity. Prefer retaining healthy, older workers.
 func planWorkerSlots(co *v1alpha1.ClusterOrder) workerSlotPlan {
+	return planWorkerSlotsFor(co, co.Status.Workers)
+}
+
+// planWorkerSlotsFor is planWorkerSlots against an explicit worker list, so the
+// summary and metric consumers can classify a projected or persisted journal
+// with the same NodeSet-safe retention rules before it is written.
+func planWorkerSlotsFor(co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus) workerSlotPlan {
 	plan := workerSlotPlan{missingByNodeSet: make(map[string]int)}
 	for _, nr := range co.Spec.NodeRequests {
 		if nr.IsBareMetal() {
 			plan.missingByNodeSet[nr.NodeSet] = nr.NumberOfNodes
 		}
 	}
-	candidates := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
+	candidates := append([]v1alpha1.WorkerStatus(nil), workers...)
 	sortByDeletionPriority(candidates)
 	for _, w := range candidates {
 		if isExcessWorkerSlot(w, plan.missingByNodeSet[w.NodeSet]) {

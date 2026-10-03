@@ -887,19 +887,23 @@ var _ = Describe("Unified worker reconciliation", func() {
 			// The underlying optimistic Patch now conflicts with the real apiserver.
 			return false
 		}})
-		// The first call persists the phase repair and ends the invocation.
+		// The first invocation persists the phase repair, aggregates and conditions
+		// in one write. Another status writer wins the optimistic race first, so the
+		// write is rejected and the invocation restarts.
 		_, err := run()
-		Expect(err).NotTo(HaveOccurred())
-		// The next call observes the phase and loses its aggregate patch to a real
-		// resource-version conflict injected by another status writer.
-		_, err = run()
 		Expect(err).To(HaveOccurred())
 		Expect(injected).To(BeTrue())
-		// A fresh invocation converges the aggregate fields without rebasing the
-		// stale calculation over the concurrent worker/condition update.
+		latest := getOrder()
+		Expect(latest.Status.Workers).To(HaveLen(1))
+		Expect(latest.Status.Workers[0].Phase).To(Equal("WaitingForAgent"),
+			"the rejected write must not overwrite the concurrent writer")
+		Expect(apimeta.IsStatusConditionTrue(latest.Status.Conditions, "ConcurrentOwner")).To(BeTrue())
+		// A fresh invocation observes the persisted phase and converges the aggregate
+		// fields without rebasing the stale calculation over the concurrent
+		// worker/condition update.
 		_, err = run()
 		Expect(err).NotTo(HaveOccurred())
-		latest := getOrder()
+		latest = getOrder()
 		Expect(latest.Status.Workers).To(HaveLen(1))
 		Expect(latest.Status.Workers[0].Phase).To(Equal("Ready"))
 		Expect(apimeta.IsStatusConditionTrue(latest.Status.Conditions, "ConcurrentOwner")).To(BeTrue())
@@ -1485,11 +1489,172 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(err).To(HaveOccurred())
 		latest := getOrder()
 		Expect(latest.Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
-		Expect(latest.Status.DesiredWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(latest.Status.DesiredWorkers).To(HaveValue(Equal(int32(2))))
 		Expect(latest.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))))
 		Expect(latest.Status.Workers[0].BareMetalInstance.ID).To(Equal(old.BareMetalInstance.ID))
 		Expect(fc.CreateCalls()).To(HaveLen(creates))
 		Expect(fc.DeleteCalls()).To(HaveLen(deletes))
+	})
+
+	It("R10-E1 reports intent before reservation and advances current/ready with evidence", func() {
+		latest := getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		// Finalizer and InfraEnv creation are separate boundaries; while the
+		// ignition artifact is unpublished the summary already reports intent and
+		// no allocation.
+		for range 3 {
+			step()
+		}
+		before := getOrder()
+		Expect(before.Status.Workers).To(BeEmpty())
+		Expect(before.Status.DesiredWorkers).To(HaveValue(Equal(int32(2))))
+		Expect(before.Status.CurrentWorkers).To(HaveValue(Equal(int32(0))))
+		Expect(before.Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+		Expect(sim.MarkInfraEnvReady(ctx, co.Name+"-infraenv", co.Namespace, ignition.URL())).To(Succeed())
+
+		// Reservations hold names but no verified identity, so they stay out of current.
+		_, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		reserved := getOrder()
+		Expect(reserved.Status.Workers).To(HaveLen(2))
+		Expect(reserved.Status.CurrentWorkers).To(HaveValue(Equal(int32(0))))
+		for _, w := range reserved.Status.Workers {
+			Expect(w.BareMetalInstance.Name).NotTo(BeEmpty())
+			Expect(w.BareMetalInstance.ID).To(BeEmpty())
+		}
+
+		// Each successful create persists an identity; the next observation counts it.
+		for count := 1; count <= 2; count++ {
+			_, err = run()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(getOrder().Status.Workers[count-1].BareMetalInstance.ID).NotTo(BeEmpty())
+		}
+		_, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		observed := getOrder()
+		Expect(observed.Status.CurrentWorkers).To(HaveValue(Equal(int32(2))))
+		Expect(observed.Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+
+		// A unique compatible, installed Agent advances exactly one worker to Ready.
+		first := observed.Status.Workers[0]
+		const mac = "aa:bb:cc:dd:ee:91"
+		fc.SetHostMAC(first.BareMetalInstance.ID, mac)
+		agent := &unstructured.Unstructured{}
+		agent.SetGroupVersionKind(agentGVK)
+		agent.SetName(co.Name + "-r10-e1-agent")
+		agent.SetNamespace(co.Namespace)
+		agent.SetLabels(map[string]string{
+			"infraenvs.agent-install.openshift.io": co.Name + "-infraenv",
+			"osac.openshift.io/worker-name":        first.Name,
+		})
+		Expect(unstructured.SetNestedField(agent.Object, true, "spec", "approved")).To(Succeed())
+		Expect(unstructured.SetNestedMap(agent.Object, map[string]interface{}{"name": co.Name, "namespace": co.Namespace}, "spec", "clusterDeploymentName")).To(Succeed())
+		Expect(unstructured.SetNestedSlice(agent.Object, []interface{}{map[string]interface{}{"macAddress": mac}}, "status", "inventory", "interfaces")).To(Succeed())
+		Expect(unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+		for range 2 {
+			_, err = run()
+			Expect(err).NotTo(HaveOccurred())
+		}
+		converged := getOrder()
+		Expect(converged.Status.CurrentWorkers).To(HaveValue(Equal(int32(2))))
+		Expect(converged.Status.ReadyWorkers).To(HaveValue(Equal(int32(1))))
+	})
+
+	It("R10-E2 drops desired immediately on scale-down and keeps retiring references until cleanup", func() {
+		latest := getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		ready()
+		for range 4 {
+			step()
+		}
+		scaled := getOrder()
+		Expect(scaled.Status.Workers).To(HaveLen(2))
+		Expect(scaled.Status.DesiredWorkers).To(HaveValue(Equal(int32(2))))
+		Expect(scaled.Status.CurrentWorkers).To(HaveValue(Equal(int32(2))))
+
+		// The intent drops in the same write that records the retirement intent.
+		latest = getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		_, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		retiring := getOrder()
+		Expect(retiring.Status.DesiredWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(retiring.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(retiring.Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+		Expect(retiring.Status.Workers).To(HaveLen(2), "the journal reference stays until cleanup confirms absence")
+		unbinding := 0
+		for _, w := range retiring.Status.Workers {
+			if w.Phase == "Unbinding" {
+				unbinding++
+				Expect(w.BareMetalInstance.ID).NotTo(BeEmpty())
+			}
+		}
+		Expect(unbinding).To(Equal(1))
+	})
+
+	It("R10-E3 partitions capacity per NodeSet so surplus cannot mask a missing set", func() {
+		latest := getOrder()
+		latest.Spec.NodeRequests = []api.NodeRequest{
+			{NodeSet: "compute", NumberOfNodes: 1, BareMetal: &api.BareMetalNodeSpec{InstanceType: "standard"}},
+			{NodeSet: "batch", NumberOfNodes: 1, BareMetal: &api.BareMetalNodeSpec{InstanceType: "standard"}},
+		}
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		ready()
+		for range 4 {
+			step()
+		}
+		Expect(getOrder().Status.Workers).To(HaveLen(2))
+
+		// Relabel the batch reservation as a second compute worker: compute now has
+		// surplus while batch is missing, both sharing one instance type.
+		latest = getOrder()
+		for i := range latest.Status.Workers {
+			if latest.Status.Workers[i].NodeSet == "batch" {
+				latest.Status.Workers[i].NodeSet = "compute"
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		_, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		got := getOrder()
+		Expect(got.Status.DesiredWorkers).To(HaveValue(Equal(int32(2))), "intent still covers both NodeSets")
+		Expect(got.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))), "surplus compute cannot satisfy the missing batch set")
+		Expect(got.Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+	})
+
+	It("R10-E4 retains the last summary across a provider outage and recovers explicitly", func() {
+		provision()
+		step()
+		before := getOrder()
+		Expect(before.Status.DesiredWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(before.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(before.Status.Workers).To(HaveLen(1))
+
+		// A List outage is unknown, not absence: no fabricated zero summary.
+		fc.SetListError(fmt.Errorf("%w: %w", baremetalworker.ErrFulfillmentServiceUnavailable,
+			status.Error(codes.Unavailable, "R10 provider outage")))
+		result, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+		blocked := getOrder()
+		Expect(apimeta.IsStatusConditionTrue(blocked.Status.Conditions, api.ConditionFulfillmentServiceUnavailable)).To(BeTrue())
+		Expect(blocked.Status.DesiredWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(blocked.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(blocked.Status.Workers).To(ConsistOf(before.Status.Workers))
+
+		// Recovery is explicit on the next successful observation.
+		fc.SetListError(nil)
+		_, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		recovered := getOrder()
+		Expect(apimeta.IsStatusConditionTrue(recovered.Status.Conditions, api.ConditionFulfillmentServiceUnavailable)).To(BeFalse())
+		Expect(recovered.Status.DesiredWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(recovered.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))))
 	})
 })
 

@@ -20,6 +20,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -602,12 +603,21 @@ func bareMetalWorkersReady(instance *v1alpha1.ClusterOrder) bool {
 	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, v1alpha1.ConditionWorkersFailed) {
 		return false
 	}
+	// An unknown observation must not promote readiness from a stale ready
+	// summary: the worker controller leaves the last-known counts in place while
+	// the fulfillment service is unavailable.
+	if apimeta.IsStatusConditionTrue(instance.Status.Conditions, v1alpha1.ConditionFulfillmentServiceUnavailable) {
+		return false
+	}
 	requestedWorkers := int32(0)
 	for _, nodeRequest := range instance.Spec.NodeRequests {
 		if !nodeRequest.IsBareMetal() {
 			continue
 		}
 		if nodeRequest.NumberOfNodes <= 0 {
+			return false
+		}
+		if int(requestedWorkers) > math.MaxInt32-nodeRequest.NumberOfNodes {
 			return false
 		}
 		requestedWorkers += int32(nodeRequest.NumberOfNodes)

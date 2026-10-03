@@ -424,6 +424,34 @@ journeys are tracked under
 CaaS remains a BMaaS consumer; this change does not alter DHCP, fabric port moves
 or networking-attachment contracts.
 
+### Bare-metal worker count semantics
+
+`status.desiredWorkers`, `status.currentWorkers` and `status.readyWorkers`
+describe one intent-and-evidence summary rather than the length of the worker
+journal:
+
+- `desiredWorkers` is the sum of the positive `numberOfNodes` values of the
+  requested bare-metal node sets. It is the user's requested capacity, so it is
+  visible before reservations, images or Agents exist, and it ignores retiring
+  workers and surplus journal entries.
+- `currentWorkers` counts retained requested slots that hold a verified
+  BareMetalInstance identity in an active phase (Provisioning, WaitingForAgent,
+  Binding or Ready). Identity-less reservations, `Failed`, retiring, surplus and
+  non-bare-metal entries never count.
+- `readyWorkers` is the `Ready` subset of `currentWorkers`, limited to the
+  requested node-set membership.
+
+Retention is partitioned per node set, so ready surplus in one node set cannot
+compensate for a missing node set even when both share one instance type. An
+observation that cannot be completed (for example a fulfillment-service outage)
+retains the last-known summary and its `FulfillmentServiceUnavailable` condition
+instead of publishing a fabricated zero. Parent readiness additionally requires
+that `desiredWorkers` matches the current spec, so a summary that lags a spec
+change cannot promote the order. The `osac_caas_worker_desired` gauge is derived
+from spec requests; `osac_caas_worker_ready` uses the same retained eligibility
+and keeps the provisioned instance type, so a hardware change does not relabel
+existing capacity.
+
 ## Scalability and Performance
 
 The cluster fulfillment system is designed for scale:

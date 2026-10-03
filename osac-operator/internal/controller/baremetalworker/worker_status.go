@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"time"
@@ -89,6 +90,14 @@ func (r *Reconciler) updateWorkerStatus(
 ) error {
 	next := co.DeepCopy()
 	next.Status.Workers = append([]v1alpha1.WorkerStatus(nil), workers...)
+	// Counts are derived from the intent and the journal, so they are persisted
+	// with every worker write instead of lagging one reconcile behind it. The
+	// failure summary follows the same rule: a retired failed record stops
+	// reporting as soon as its retirement intent is durable.
+	if err := setWorkerSummary(next); err != nil {
+		return err
+	}
+	setWorkersFailedCondition(next)
 	return r.patchStatusFromBase(ctx, co, next)
 }
 
@@ -105,21 +114,26 @@ func (r *Reconciler) updateWorkerStatusWithAgent(
 	resetHealthyWorkers(log, co, workers, now)
 	next := co.DeepCopy()
 	next.Status.Workers = workers
-	desired, current, ready := computeWorkerAggregates(workers)
-	next.Status.DesiredWorkers = &desired
-	next.Status.CurrentWorkers = &current
-	next.Status.ReadyWorkers = &ready
+	if err := setWorkerSummary(next); err != nil {
+		return err
+	}
+	setWorkersFailedCondition(next)
+	return r.patchStatusFromBase(ctx, co, next)
+}
 
-	failedMsg := FormatWorkersFailed(workers)
+// setWorkersFailedCondition reports actionable failures from the worker journal.
+// A retired (Unbinding/Deleting) or otherwise non-selected failed record is no
+// longer actionable, so it does not keep an otherwise converged order retrying.
+func setWorkersFailedCondition(co *v1alpha1.ClusterOrder) {
+	failedMsg := FormatWorkersFailed(co.Status.Workers)
 	switch {
 	case failedMsg != "":
-		next.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+		co.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
 			metav1.ConditionTrue, failedMsg, reasonWorkersFailed)
-	case apimeta.IsStatusConditionTrue(next.Status.Conditions, v1alpha1.ConditionWorkersFailed):
-		next.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+	case apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionWorkersFailed):
+		co.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
 			metav1.ConditionFalse, "all workers healthy", reasonWorkersFailedCleared)
 	}
-	return r.patchStatusFromBase(ctx, co, next)
 }
 
 func sameWorkerOrder(observed, latest *v1alpha1.ClusterOrder) bool {
@@ -174,19 +188,80 @@ func (r *Reconciler) setFulfillmentServiceUnavailable(
 	})
 }
 
-func computeWorkerAggregates(workers []v1alpha1.WorkerStatus) (desired, current, ready int32) {
-	for _, w := range workers {
-		desired++
+// errWorkerCountOverflow reports a requested capacity that cannot be represented
+// in the status int32 count fields. Current schema limits keep this unreachable,
+// but the conversion is checked instead of silently wrapping.
+var errWorkerCountOverflow = errors.New("requested worker capacity overflows int32")
+
+// workerCountSummary is the single desired/current/ready derivation shared by
+// status persistence, metrics and readiness consumers.
+type workerCountSummary struct {
+	desired int32
+	current int32
+	ready   int32
+}
+
+// setWorkerSummary stores the summary derived from the order's intent and its
+// own worker journal. It is the only place the three count fields are written.
+func setWorkerSummary(co *v1alpha1.ClusterOrder) error {
+	summary, err := summarizeWorkerCounts(co, co.Status.Workers)
+	if err != nil {
+		return err
+	}
+	co.Status.DesiredWorkers = &summary.desired
+	co.Status.CurrentWorkers = &summary.current
+	co.Status.ReadyWorkers = &summary.ready
+	return nil
+}
+
+// summarizeWorkerCounts derives desired capacity from the requested bare-metal
+// NodeSets and current/ready availability from the retained worker slots.
+//
+// Desired is the user's intent, independent of the status journal, so it is
+// visible before any reservation exists. Current counts retained slots that hold
+// a verified BMI identity in an active provisioning/binding/ready phase; ready
+// is the Ready subset. Identity-less reservations, Failed records, retiring
+// entries and capacity surplus never count, and readiness is partitioned per
+// NodeSet so surplus in one set cannot compensate for another.
+func summarizeWorkerCounts(co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus) (workerCountSummary, error) {
+	desired, err := sumBareMetalNodeRequests(co)
+	if err != nil {
+		return workerCountSummary{}, err
+	}
+	summary := workerCountSummary{desired: desired}
+	plan := planWorkerSlotsFor(co, workers)
+	for i := range plan.selected {
+		w := &plan.selected[i]
+		if w.BareMetalInstance.ID == "" {
+			continue
+		}
 		switch w.Phase {
-		case workerPhaseProvisioning, workerPhaseWaitingForAgent, workerPhaseBinding, workerPhaseReady,
-			workerPhaseUnbinding, workerPhaseDeleting:
-			current++
+		case workerPhaseProvisioning, workerPhaseWaitingForAgent, workerPhaseBinding, workerPhaseReady:
+			summary.current++
 		}
 		if w.Phase == workerPhaseReady {
-			ready++
+			summary.ready++
 		}
 	}
-	return
+	return summary, nil
+}
+
+// sumBareMetalNodeRequests sums the positive requested capacity for bare-metal
+// NodeSets with a checked int32 conversion. Non-bare-metal and non-positive
+// requests are ignored; request validation owns rejecting them elsewhere.
+func sumBareMetalNodeRequests(co *v1alpha1.ClusterOrder) (int32, error) {
+	total := 0
+	for i := range co.Spec.NodeRequests {
+		nr := &co.Spec.NodeRequests[i]
+		if !nr.IsBareMetal() || nr.NumberOfNodes <= 0 {
+			continue
+		}
+		if total > math.MaxInt32-nr.NumberOfNodes {
+			return 0, errWorkerCountOverflow
+		}
+		total += nr.NumberOfNodes
+	}
+	return int32(total), nil
 }
 
 // FormatWorkersFailed builds tenant-safe retry details from failed workers.
