@@ -228,7 +228,10 @@ var _ = Describe("Private clusters server", func() {
 			func(name string) {
 				size := int32(2)
 				Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
-					name: privatev1.ClusterNodeSet_builder{Size: &size}.Build(),
+					name: privatev1.ClusterNodeSet_builder{
+						Size:                  &size,
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "worker"}.Build(),
+					}.Build(),
 				})).To(Succeed())
 			},
 			Entry("simple name", "workers"),
@@ -241,7 +244,10 @@ var _ = Describe("Private clusters server", func() {
 			func(name string) {
 				size := int32(2)
 				Expect(validateClusterNodeSetMap(map[string]*privatev1.ClusterNodeSet{
-					name: privatev1.ClusterNodeSet_builder{Size: &size}.Build(),
+					name: privatev1.ClusterNodeSet_builder{
+						Size:                  &size,
+						BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "worker"}.Build(),
+					}.Build(),
 				})).To(MatchError(ContainSubstring("node set name '" + name + "' is not a valid DNS label")))
 			},
 			Entry("uppercase", "WORKERS"),
