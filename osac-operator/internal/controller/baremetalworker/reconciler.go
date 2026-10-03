@@ -102,7 +102,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !co.DeletionTimestamp.IsZero() {
-		return r.handleVerifiedClusterDeletion(ctx, co)
+		res, err := r.handleVerifiedClusterDeletion(ctx, co)
+		if err != nil {
+			return r.handleFulfillmentError(ctx, co, err)
+		}
+		return res, nil
 	}
 	if v, ok := co.Annotations[managementStateAnnotation]; ok && v == managementStateUnmanaged {
 		return ctrl.Result{}, nil
@@ -115,7 +119,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	tenant, err := r.authoritativeWorkerTenant(ctx, co)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.handleFulfillmentError(ctx, co, err)
 	}
 
 	// Refresh the worker gauges from the full ClusterOrder set at the end of every
@@ -133,7 +137,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if errors.Is(err, errWorkerObservationChanged) {
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
-	return res, err
+	if err != nil {
+		return r.handleFulfillmentError(ctx, co, err)
+	}
+	return res, nil
 }
 
 func namespacePredicate(namespace string) predicate.Predicate {

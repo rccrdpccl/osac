@@ -47,8 +47,7 @@ func (r *Reconciler) ensureBMI(
 		return bmi, ctrl.Result{}, nil
 	}
 
-	res, err := r.handleFulfillmentError(ctx, co, fmt.Errorf("creating BMI %s: %w", workerName, err))
-	return nil, res, err
+	return nil, ctrl.Result{}, fmt.Errorf("creating BMI %s: %w", workerName, err)
 }
 
 // findBMIByName re-lists BMIs and returns the one matching the given name.
@@ -147,8 +146,7 @@ func (r *Reconciler) resolveNodeSetInstanceType(
 			ctrllog.FromContext(ctx).Info("BareMetalInstanceType not found, requeuing", "instanceType", instanceTypeName)
 			return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
 		}
-		res, err := r.handleFulfillmentError(ctx, co, fmt.Errorf("getting BareMetalInstanceType %s: %w", instanceTypeName, err))
-		return nil, res, err
+		return nil, ctrl.Result{}, fmt.Errorf("getting BareMetalInstanceType %s: %w", instanceTypeName, err)
 	}
 	if it == nil {
 		ctrllog.FromContext(ctx).Info("BareMetalInstanceType is empty, requeuing", "instanceType", instanceTypeName)
