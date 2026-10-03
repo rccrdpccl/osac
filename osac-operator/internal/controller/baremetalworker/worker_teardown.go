@@ -48,10 +48,10 @@ func (r *Reconciler) handleVerifiedClusterDeletion(ctx context.Context, co *v1al
 		}
 		return workerBoundaryRequeue(), nil
 	}
-	return r.handleClusterDeletion(ctx, co, observed)
+	return r.handleClusterDeletion(ctx, co)
 }
 
-func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.ClusterOrder, observed *workerObservation) (ctrl.Result, error) {
+func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(co, bmWorkerFinalizer) {
 		return ctrl.Result{}, nil
 	}
@@ -81,7 +81,7 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 	// CAP-Agent must unbind the Agent and release its Machine pre-terminate hook
 	// before BMaaS tears down the host. Agents that never registered proceed to
 	// Deleting immediately; bound Agents are deleted only after unbinding.
-	workers = r.reconcileTeardownWorkers(ctx, co, workers, observed)
+	workers = r.reconcileTeardownWorkers(ctx, co, workers)
 
 	if !workerSlicesEqual(co.Status.Workers, workers) {
 		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
@@ -117,11 +117,11 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 // reconcileWorkerTeardown persists shared cleanup progress and summaries. Its
 // boolean marks a return boundary (including pending cleanup), not a status
 // change. Never continue Agent convergence from a possibly mutated snapshot.
-func (r *Reconciler) reconcileWorkerTeardown(ctx context.Context, co *v1alpha1.ClusterOrder, o *workerObservation) (bool, error) {
+func (r *Reconciler) reconcileWorkerTeardown(ctx context.Context, co *v1alpha1.ClusterOrder) (bool, error) {
 	if !hasTeardownWorkers(co.Status.Workers) {
 		return false, nil
 	}
-	workers := r.reconcileTeardownWorkers(ctx, co, co.Status.Workers, o)
+	workers := r.reconcileTeardownWorkers(ctx, co, co.Status.Workers)
 	if err := r.updateWorkerStatusWithAgent(ctx, co, workers); err != nil {
 		return false, fmt.Errorf("persisting worker teardown: %w", err)
 	}
@@ -131,7 +131,7 @@ func (r *Reconciler) reconcileWorkerTeardown(ctx context.Context, co *v1alpha1.C
 // reconcileTeardownWorkers obtains fresh cleanup evidence and handles each
 // worker's Unbinding -> Deleting transition in order. A Delete request never
 // counts as confirmed BMI absence. Persistence is the caller's named boundary.
-func (r *Reconciler) reconcileTeardownWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, o *workerObservation) []v1alpha1.WorkerStatus {
+func (r *Reconciler) reconcileTeardownWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus) []v1alpha1.WorkerStatus {
 	var kept []v1alpha1.WorkerStatus
 	for _, w := range workers {
 		switch w.Phase {

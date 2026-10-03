@@ -197,7 +197,7 @@ func TestR03TeardownEndsInvocation(t *testing.T) {
 	}
 	o := indexWorkerBMIs(nil)
 	o.agents = &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agent}}
-	stop, err := r.reconcileWorkerTeardown(context.Background(), co, o)
+	stop, err := r.reconcileWorkerTeardown(context.Background(), co)
 	if err != nil || !stop || fc.deletes != 0 {
 		t.Fatalf("Agent mutation must end the invocation: stop=%v err=%v deletes=%d", stop, err, fc.deletes)
 	}
@@ -258,7 +258,7 @@ func TestR03AgentCleanupBeforeBMI(t *testing.T) {
 			o := indexWorkerBMIs(nil)
 			o.agents = &unstructured.UnstructuredList{} // Deliberate cached omission.
 			for range 2 {
-				kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w}, o)
+				kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w})
 				if len(kept) != 1 || fc.deletes != 0 {
 					t.Fatalf("old Agent bypassed: workers=%+v deletes=%d", kept, fc.deletes)
 				}

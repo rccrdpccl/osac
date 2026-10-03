@@ -24,42 +24,30 @@ const eventReasonWorkerCreated = "WorkerCreated"
 // Each invocation ends at its first durable allocation/lifecycle boundary.
 func (r *Reconciler) reconcileWorkerCapacity(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, image *privatev1.DiskImageReference, ignition []byte,
-	observations ...*workerObservation,
+	observed *workerObservation,
 ) (ctrl.Result, error) {
-	// Standalone callers also plan from authoritative status. A supplied resource
-	// observation belongs to the original snapshot and must not absorb new slots.
-	// First reject changes to the worker plan, then refresh the object itself so
-	// status-only patches made earlier in this invocation (for example, the
-	// InfraEnv UID annotation) do not leave the next optimistic patch stale.
-	var expected *v1alpha1.ClusterOrder
-	if len(observations) > 0 && observations[0] != nil {
-		expected = co.DeepCopy()
-		if err := r.checkCurrentCapacityPlan(ctx, expected); err != nil {
-			return ctrl.Result{}, err
-		}
+	// The observation belongs to the original snapshot and must not absorb new
+	// slots. First reject changes to the worker plan, then refresh the object
+	// itself so status-only patches made earlier in this invocation (for example,
+	// the InfraEnv UID annotation) do not leave the next optimistic patch stale.
+	expected := co.DeepCopy()
+	if err := r.checkCurrentCapacityPlan(ctx, expected); err != nil {
+		return ctrl.Result{}, err
 	}
 	if err := r.readAuthoritativeOrder(ctx, co); err != nil {
 		return ctrl.Result{}, err
 	}
-	if expected != nil && !sameCapacityPlan(expected, co) {
+	if !sameCapacityPlan(expected, co) {
 		return ctrl.Result{}, errWorkerObservationChanged
 	}
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
-	observed, res, err := r.workerCapacityObservation(ctx, co, filter, observations...)
-	if err != nil || !res.IsZero() {
-		return res, err
-	}
-	existingByName, err := observed.uniqueBMIsByName()
-	if err != nil {
-		return ctrl.Result{}, r.rejectWorkerIdentity(co, err.Error())
-	}
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Persist retirement before retry cleanup, so failed excess slots cannot
 	// schedule replacements and every destructive action has durable intent.
 	plan := planWorkerSlots(co)
-	retiring := r.handleScaleDown(ctx, co, plan.selected, plan.excess, observed)
+	retiring := r.handleScaleDown(ctx, co, plan.selected, plan.excess)
 	if !workerStatusesEqual(co.Status.Workers, retiring) {
 		if err := r.updateWorkerStatus(ctx, co, retiring); err != nil {
 			return ctrl.Result{}, err
@@ -104,7 +92,7 @@ func (r *Reconciler) reconcileWorkerCapacity(
 		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
 
-	workers, res, err := r.reconcileNodeSets(ctx, co, tenant, existingByName, image, string(ignition), filter, observed)
+	workers, res, err := r.reconcileNodeSets(ctx, co, tenant, observed, image, string(ignition), filter)
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
@@ -127,8 +115,8 @@ func (r *Reconciler) reconcileWorkerCapacity(
 // Slots waiting for retry do not monopolize creation of other reserved workers.
 func (r *Reconciler) reconcileNodeSets(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
-	existingByName map[string]*privatev1.BareMetalInstance,
-	image *privatev1.DiskImageReference, ignitionRaw, filter string, observations ...*workerObservation,
+	observed *workerObservation,
+	image *privatev1.DiskImageReference, ignitionRaw, filter string,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
 	plan := planWorkerSlots(co)
 	for i := range co.Spec.NodeRequests {
@@ -156,10 +144,10 @@ func (r *Reconciler) reconcileNodeSets(
 			}
 			before := prev
 			if prev.Phase == workerPhaseFailed {
-				res, err = r.retryFailedWorker(ctx, co, tenant, nr, &prev, image, ignitionRaw, filter, fabricInterface, observations...)
+				res, err = r.retryFailedWorker(ctx, co, tenant, nr, &prev, image, ignitionRaw, filter, fabricInterface)
 			} else {
 				var ws v1alpha1.WorkerStatus
-				ws, res, err = r.ensureWorkerBMI(ctx, co, tenant, nr, prev.BareMetalInstance.Name, existingByName, image, ignitionRaw, filter, fabricInterface, observations...)
+				ws, res, err = r.ensureWorkerBMI(ctx, co, tenant, nr, prev.BareMetalInstance.Name, observed, image, ignitionRaw, filter, fabricInterface)
 				if err == nil && res.IsZero() {
 					workerCreated(&prev, ws.BareMetalInstance.Name, ws.BareMetalInstance.ID)
 				}
@@ -186,7 +174,7 @@ func (r *Reconciler) reconcileNodeSets(
 	}
 	workers := plan.selected
 	if len(plan.excess) > 0 {
-		workers = r.handleScaleDown(ctx, co, workers, plan.excess, observations...)
+		workers = r.handleScaleDown(ctx, co, workers, plan.excess)
 	}
 	return workers, ctrl.Result{}, nil
 }
@@ -236,25 +224,27 @@ func allocateMissingWorkerSlots(co *v1alpha1.ClusterOrder) error {
 }
 
 // ensureWorkerBMI resumes the persisted name, including after a lost Create
-// acknowledgement. Ownership and ambiguity checks apply before adoption.
+// acknowledgement. Ownership and ambiguity checks use the canonical observation
+// index instead of duplicating a second name view.
 func (r *Reconciler) ensureWorkerBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
 	nr *v1alpha1.NodeRequest, workerName string,
-	existingByName map[string]*privatev1.BareMetalInstance,
-	image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string, observations ...*workerObservation,
+	observed *workerObservation,
+	image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string,
 ) (v1alpha1.WorkerStatus, ctrl.Result, error) {
 	log := ctrllog.FromContext(ctx)
-	if bmi, ok := existingByName[workerName]; ok {
-		if err := checkWorkerBMI(co, tenant, workerName, bmi); err != nil {
-			return v1alpha1.WorkerStatus{}, ctrl.Result{}, r.rejectWorkerIdentity(co, err.Error())
-		}
+	bmi, nameErr := observed.exactOwnedName(co, tenant, workerName)
+	if nameErr != nil {
+		return v1alpha1.WorkerStatus{}, ctrl.Result{}, r.rejectWorkerIdentity(co, nameErr.Error())
+	}
+	if bmi != nil {
 		if err := checkBMIRecoveryCandidate(bmi); err != nil {
 			return v1alpha1.WorkerStatus{}, ctrl.Result{}, err
 		}
 		log.Info("worker BMI already exists, skipping create", "name", workerName)
 		return newWorkerStatus(nr.NodeSet, nr.BareMetal.InstanceType, workerName, bmi.GetId(), workerPhaseWaitingForAgent), ctrl.Result{}, nil
 	}
-	bmi, res, err := r.ensureBMI(ctx, co, tenant, *nr, workerName, image, ignitionRaw, filter, fabricInterface, observations...)
+	bmi, res, err := r.ensureBMI(ctx, co, tenant, *nr, workerName, image, ignitionRaw, filter, fabricInterface)
 	if err != nil || !res.IsZero() {
 		return v1alpha1.WorkerStatus{}, res, err
 	}

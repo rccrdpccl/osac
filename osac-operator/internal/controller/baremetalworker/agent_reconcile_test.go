@@ -31,10 +31,26 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
+
+// reconcileAgentStage exercises the production observation projection and Agent
+// action stages against a supplied worker slice and Agent snapshot. Standalone
+// Agent tests arrange an observation instead of requiring a second production
+// entry point.
+func reconcileAgentStage(
+	r *Reconciler, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, agents *unstructured.UnstructuredList,
+) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
+	o := indexWorkerBMIs(nil)
+	o.agents = agents
+	projected := projectAgentWorkerPhases(context.Background(), workers, agents, r.workerMACResolver(o))
+	initializeReadySince(projected)
+	r.observeAgentReadiness(context.Background(), co, workers, projected)
+	return r.reconcileObservedAgents(context.Background(), co, projected, o)
+}
 
 func agentPhaseFixture(worker string, installed bool) *unstructured.Unstructured {
 	a := &unstructured.Unstructured{Object: map[string]interface{}{}}
@@ -84,7 +100,7 @@ func TestAgentConvergence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, result, err := r.reconcileAgent(context.Background(), co, workers, agents)
+			got, result, err := reconcileAgentStage(r, co, workers, agents)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -200,7 +216,7 @@ func TestAgentReconcileBindingFailure(t *testing.T) {
 			r := &Reconciler{Client: c, recorder: recorder, macResolver: func(context.Context, string) []string { return []string{"aa:bb:cc:dd:ee:ff"} }}
 			co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac", CreationTimestamp: metav1.Now()}}
 			w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
-			got, res, err := r.reconcileAgent(context.Background(), co, []v1alpha1.WorkerStatus{w}, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}})
+			got, res, err := reconcileAgentStage(r, co, []v1alpha1.WorkerStatus{w}, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}})
 			if err == nil {
 				t.Fatal("binding failure was hidden")
 			}
@@ -229,7 +245,7 @@ func TestR02AgentConflictRestarts(t *testing.T) {
 	w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
 	observed := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}}
 
-	workers, result, err := r.reconcileAgent(ctx, co, []v1alpha1.WorkerStatus{w}, observed)
+	workers, result, err := reconcileAgentStage(r, co, []v1alpha1.WorkerStatus{w}, observed)
 	if !apierrors.IsConflict(err) || !result.IsZero() || workers != nil {
 		t.Fatalf("first invocation: workers=%+v result=%+v err=%v", workers, result, err)
 	}
@@ -247,7 +263,7 @@ func TestR02AgentConflictRestarts(t *testing.T) {
 
 	patchClient.conflict = false
 	patchClient.succeed = true
-	workers, result, err = r.reconcileAgent(ctx, co, []v1alpha1.WorkerStatus{w}, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*current}})
+	workers, result, err = reconcileAgentStage(r, co, []v1alpha1.WorkerStatus{w}, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*current}})
 	if err != nil || !result.IsZero() || len(workers) != 1 || workers[0].Phase != workerPhaseBinding {
 		t.Fatalf("fresh invocation: workers=%+v result=%+v err=%v", workers, result, err)
 	}
@@ -271,7 +287,7 @@ func TestAgentBindingCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}}
-	bound, res, err := r.reconcileAgent(ctx, co, co.Status.Workers, agents)
+	bound, res, err := reconcileAgentStage(r, co, co.Status.Workers, agents)
 	if err != nil || bound[0].Phase != workerPhaseBinding || !res.IsZero() {
 		t.Fatalf("binding: %+v %+v %v", bound, res, err)
 	}
@@ -280,7 +296,7 @@ func TestAgentBindingCrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	agents.Items = []unstructured.Unstructured{*a}
-	recovered, res, err := r.reconcileAgent(ctx, co, co.Status.Workers, agents)
+	recovered, res, err := reconcileAgentStage(r, co, co.Status.Workers, agents)
 	if err != nil || recovered[0].Phase != workerPhaseBinding || !res.IsZero() {
 		t.Fatalf("status repair: %+v %+v %v", recovered, res, err)
 	}
@@ -323,7 +339,6 @@ func TestWorkerPhaseStartTimeBoundaries(t *testing.T) {
 }
 
 func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
-	ctx := context.Background()
 	recorder := events.NewFakeRecorder(10)
 	r := &Reconciler{recorder: recorder, macResolver: func(context.Context, string) []string { return nil }}
 	fixed := metav1.NewTime(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
@@ -331,7 +346,7 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", CreationTimestamp: fixed}, Status: v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{w}}}
 	failures := workerProvisioningFailures.WithLabelValues(tenantOf(co), workerTypeBareMetal, w.InstanceType)
 	beforeFailures := testutil.ToFloat64(failures)
-	got, res, err := r.reconcileAgent(ctx, co, co.Status.Workers, &unstructured.UnstructuredList{})
+	got, res, err := reconcileAgentStage(r, co, co.Status.Workers, &unstructured.UnstructuredList{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +354,7 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 		t.Fatalf("incorrect timeout: %+v, %+v", got, res)
 	}
 	co.Status.Workers = got
-	got, _, err = r.reconcileAgent(ctx, co, got, &unstructured.UnstructuredList{})
+	got, _, err = reconcileAgentStage(r, co, got, &unstructured.UnstructuredList{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -356,7 +371,7 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 	w.LastFailureTime = new(metav1.Time)
 	*w.LastFailureTime = metav1.Now()
 	co.Status.Workers = []v1alpha1.WorkerStatus{w}
-	got, res, err = r.reconcileAgent(ctx, co, co.Status.Workers, &unstructured.UnstructuredList{})
+	got, res, err = reconcileAgentStage(r, co, co.Status.Workers, &unstructured.UnstructuredList{})
 	if err != nil || got[0].Phase != workerPhaseWaitingForAgent || res.RequeueAfter != agentRequeueInterval {
 		t.Fatalf("recent retry timed out: %+v, %+v, %v", got, res, err)
 	}
@@ -368,12 +383,12 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture(w.Name, true)}}
-	got, _, err = r.reconcileAgent(ctx, co, []v1alpha1.WorkerStatus{w}, agents)
+	got, _, err = reconcileAgentStage(r, co, []v1alpha1.WorkerStatus{w}, agents)
 	if err != nil || got[0].ReadySince == nil {
 		t.Fatalf("missing readiness: %+v, %v", got, err)
 	}
 	since := got[0].ReadySince.DeepCopy()
-	got, _, err = r.reconcileAgent(ctx, co, got, agents)
+	got, _, err = reconcileAgentStage(r, co, got, agents)
 	if err != nil || !got[0].ReadySince.Equal(since) || len(recorder.Events) != 2 {
 		t.Fatalf("duplicate readiness or timestamp reset: %+v, %v, events=%d", got, err, len(recorder.Events))
 	}

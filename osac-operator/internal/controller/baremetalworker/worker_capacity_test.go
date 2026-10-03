@@ -57,7 +57,7 @@ func mutateCapacityOrder(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder,
 }
 func TestR01ReservationReturnsBeforeCreate(t *testing.T) {
 	r, fc, co := nodeSetHarness(t, "r01-reserve", nodeRequest("standard", 2))
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,11 @@ func TestR01SingleCreateBoundary(t *testing.T) {
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+	// Capacity consumes the same durable snapshot the observation was built from.
+	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +98,7 @@ func TestR01SingleCreateBoundary(t *testing.T) {
 	}
 }
 
-func TestR01StaleCachedOrderUsesPersistedSlots(t *testing.T) {
+func TestR01StaleCachedOrderIsRejectedInsteadOfDuplicating(t *testing.T) {
 	r, fc, co := nodeSetHarness(t, "r01-stale", nodeRequest("standard", 2))
 	stale := co.DeepCopy()
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
@@ -104,18 +108,18 @@ func TestR01StaleCachedOrderUsesPersistedSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	names := []string{co.Status.Workers[0].Name, co.Status.Workers[1].Name}
-	for i := range 2 {
-		if _, err := r.reconcileWorkerCapacity(context.Background(), stale.DeepCopy(), "tenant", nil, nil); err != nil {
-			t.Fatal(err)
-		}
-		if len(fc.names) != i+1 {
-			t.Fatalf("invocation %d creates=%v", i, fc.names)
-		}
+	// A caller whose snapshot predates the reservation must return to a fresh
+	// invocation rather than refreshing and duplicating allocation.
+	if _, err := r.reconcileWorkerCapacity(context.Background(), stale, "tenant", nil, nil, capacityObservation(t, r.fulfillment)); !errors.Is(err, errWorkerObservationChanged) {
+		t.Fatalf("error=%v, want stale-observation rejection", err)
+	}
+	if len(fc.names) != 0 {
+		t.Fatalf("stale snapshot created BMIs: %v", fc.names)
 	}
 	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
-	if len(co.Status.Workers) != 2 || co.Status.Workers[0].Name != names[0] || co.Status.Workers[1].Name != names[1] || len(fc.bmis) != 2 {
+	if len(co.Status.Workers) != 2 || co.Status.Workers[0].Name != names[0] || co.Status.Workers[1].Name != names[1] || len(fc.bmis) != 0 {
 		t.Fatalf("stale snapshot changed reservations or duplicated allocation: %+v", co.Status.Workers)
 	}
 }
@@ -129,7 +133,7 @@ func TestR01NoOpCapacityDoesNotRequeueForRetentionOrdering(t *testing.T) {
 	if err := r.Status().Update(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 	if err != nil || !res.IsZero() {
 		t.Fatalf("unchanged capacity requeued solely for sorted plan: result=%+v err=%v", res, err)
 	}
@@ -148,7 +152,7 @@ func TestR01WaitingRetryDoesNotBlockAnotherReservation(t *testing.T) {
 	if err := r.Status().Update(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 	if err != nil || res.IsZero() || len(fc.names) != 1 || fc.names[0] != "actionable" {
 		t.Fatalf("waiting slot blocked progress: result=%+v err=%v creates=%v", res, err, fc.names)
 	}
@@ -185,7 +189,7 @@ func TestR01FailedCapacityReturnsAfterOneRetryDelete(t *testing.T) {
 				t.Fatal(err)
 			}
 			fc.bmis = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "recorded-id"), ownedBMIFixture(co, "second", "second-id")}
-			res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+			res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 			if !errors.Is(err, deleteErr) || res.IsZero() != (deleteErr != nil) || len(fc.deletes) != 1 || len(fc.names) != 0 {
 				t.Fatalf("retry-delete boundary: result=%+v err=%v deletes=%v creates=%v", res, err, fc.deletes, fc.names)
 			}
@@ -243,7 +247,7 @@ func TestCapacityActionRejectsChangedSpecOrSlot(t *testing.T) {
 					}
 				}
 			}
-			res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+			res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 			if err == nil && res.IsZero() {
 				t.Fatal("capacity action accepted stale plan")
 			}
@@ -258,6 +262,9 @@ func TestCreatePersistencePreservesAppendedSlotAndStopsNextAction(t *testing.T) 
 	if _, err := r.reserveWorkerSlots(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
+	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
 	provider := &capacityMutationClient{nodeSetClient: fc}
 	r.fulfillment = provider
 	provider.afterCreate = func() {
@@ -265,7 +272,7 @@ func TestCreatePersistencePreservesAppendedSlotAndStopsNextAction(t *testing.T) 
 			latest.Status.Workers = append(latest.Status.Workers, newWorkerStatus("standard", "standard", "appended", "appended-id", workerPhaseReady))
 		})
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil)
+	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
 	if !apierrors.IsConflict(err) || !res.IsZero() {
 		t.Fatalf("result=%+v err=%v, want one-shot conflict", res, err)
 	}

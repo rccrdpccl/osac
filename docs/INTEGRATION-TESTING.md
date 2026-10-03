@@ -167,9 +167,9 @@ Touched-area requirements: [component guide](../osac-operator/AGENTS.md#integrat
 - **Generated CRDs or manifests:** Do not hand-edit generated output.
 - **Bare-metal worker identity ([DEV], Unit/Envtest):** Unit tests in `internal/controller/baremetalworker/nodesets_test.go` verify bounded opaque names, reservation before external creation, stale-snapshot resumes, retry backoff, and logical NodeSet-based scale-down, including multiple NodeSets sharing a hardware profile. NodePool capacity/readiness and feedback unit tests verify independent counts and exact map-key attribution without instance-type fallback. The acceptance envtest suite verifies persisted BMI name/ID references, interrupted-create recovery, existing-worker reuse, independent request scaling/reordering, and recovery before cluster finalization. Missing-name references are rejected without guessing from worker names; finalization retains the worker and finalizer for reference repair. Kubernetes/etcd and generated CRDs are real; fulfillment and Agent state are simulated. This does not replace deployed fulfillment/BMaaS, provider, or hardware coverage; those boundary gaps remain owned by [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
-- **Bare-metal worker Agent convergence ([DEV], Unit/Envtest):** `internal/controller/baremetalworker/agent_reconcile_test.go` and `correlation_test.go` cover all eligible worker phases and protected states, early capacity/stale-ignition observation, unique MAC matching, authoritative binding isolation/conflicts, registration timeout, interrupted status recovery, ReadySince retention, and transition event/metric counts. The `reconcileAgent` scenarios in `acceptance/reconciler_test.go` invoke public `Reconcile` manually and read back real persisted phases/counts after Installed-condition changes or Agent removal. They also verify bound-Agent/stale-Waiting recovery without another BMI or Agent patch, lifecycle-state preservation while provider deletion is pending, and ambiguous binding refusal. Kubernetes/etcd and CRDs are real; fulfillment and Agent state are simulated. These tests do not run a manager or establish watch delivery/restart latency, deployed Assisted Service, or hardware behavior; provider gaps remain under [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+- **Bare-metal worker Agent convergence ([DEV], Unit/Envtest):** `internal/controller/baremetalworker/agent_reconcile_test.go` and `correlation_test.go` cover all eligible worker phases and protected states, early capacity/stale-ignition observation, unique MAC matching, authoritative binding isolation/conflicts, registration timeout, interrupted status recovery, ReadySince retention, and transition event/metric counts. The Agent convergence scenarios in `acceptance/reconciler_test.go` invoke public `Reconcile` manually and read back real persisted phases/counts after Installed-condition changes or Agent removal. They also verify bound-Agent/stale-Waiting recovery without another BMI or Agent patch, lifecycle-state preservation while provider deletion is pending, and ambiguous binding refusal. Kubernetes/etcd and CRDs are real; fulfillment and Agent state are simulated. These tests do not run a manager or establish watch delivery/restart latency, deployed Assisted Service, or hardware behavior; provider gaps remain under [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
-- **Unified bare-metal worker convergence ([DEV], Unit/Envtest):** The `worker_*_test.go` and BMI identity suites under `internal/controller/baremetalworker/` cover invocation-local BMI/Agent read reuse, pure per-worker identity/phase projection, one-shot optimistic status patches, authoritative reservation/capacity checks, interruption after a successful create, concurrent foreign-reference/spec/tenant/UID interruption, one fresh ownership/existence Get per destructive attempt, and finalizer retention for concurrently appended workers. `acceptance/worker_reconcile_test.go` drives public `Reconcile` through real CRD status persistence and optimistic-lock conflicts. It checks successful-create ID-write recovery without another create, authoritative NotFound replacement, list-omission fallback, unknown List/Get errors and service-unavailable requeues, repair before InfraEnv gates, rejection of stale-failure persistence before recording a recreated UID, conflict interruption followed by fresh aggregate convergence while preserving concurrent status, and finalization recovery without resetting history or allocating capacity. The older rebuild pipeline is removed; its mixed/protected worker, MAC fallback, and clock/history cases are covered by the combined observation tests. Explicit successful reconciliations establish the convergence assertions, not fallback polling. Kubernetes/etcd and generated CRDs are real; fulfillment, ignition and Agent status are simulated. These cases do not establish watch delivery, real fulfillment/BMaaS wire behavior, deployed Assisted Service, or hardware provisioning; missing boundary coverage remains owned by [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+- **Unified bare-metal worker convergence ([DEV], Unit/Envtest):** The `worker_*_test.go` and BMI identity suites under `internal/controller/baremetalworker/` cover the single invocation-local BMI/Agent observation (one List, one Agent stage, memoized recorded-ID fallback Gets), one pure identity/phase projection, one-shot optimistic status patches, authoritative reservation/capacity checks, interruption after a successful create, concurrent foreign-reference/spec/tenant/UID interruption, one fresh ownership/existence Get per destructive attempt, and finalizer retention for concurrently appended workers. The former `projected`/`agentsInvalidated` continuation caches, post-mutation `recordBMI`/`invalidateBMI` index repair, and variadic optional observation/resolver parameters are removed; capacity consumes the explicit observation and uses its canonical name/ambiguity index instead of a second name view. `acceptance/worker_reconcile_test.go` drives public `Reconcile` through real CRD status persistence and optimistic-lock conflicts. It checks successful-create ID-write recovery without another create, authoritative NotFound replacement, list-omission fallback, unknown List/Get errors and service-unavailable requeues, repair before InfraEnv gates, rejection of stale-failure persistence before recording a recreated UID, conflict interruption followed by fresh aggregate convergence while preserving concurrent status, and finalization recovery without resetting history or allocating capacity. The older rebuild pipeline is removed; its mixed/protected worker, MAC fallback, and clock/history cases are covered by the combined observation tests. Explicit successful reconciliations establish the convergence assertions, not fallback polling. Kubernetes/etcd and generated CRDs are real; fulfillment, ignition and Agent status are simulated. These cases do not establish watch delivery, real fulfillment/BMaaS wire behavior, deployed Assisted Service, or hardware provisioning; missing boundary coverage remains owned by [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
 Focused commands from `osac-operator/` (also included by `make test`):
 
@@ -178,6 +178,8 @@ go test ./internal/controller/baremetalworker -count=1
 go test -race ./internal/controller/baremetalworker -count=1
 KUBEBUILDER_ASSETS="$PWD/bin/k8s/1.31.0-linux-amd64" \
   go test ./internal/controller/baremetalworker/acceptance -count=1
+KUBEBUILDER_ASSETS="$PWD/bin/k8s/1.31.0-linux-amd64" \
+  go test ./internal/controller/baremetalworker/acceptance -count=1 -ginkgo.focus='R05-'
 ```
 
 The focused Envtest command requires the existing Kubernetes 1.31.0 binaries at
@@ -263,6 +265,49 @@ owner/ticket (unresolved). Automated bound-worker remediation is not implemented
 cleanup waits for owner-driven detach and preserves identity/finalizers. Deployed
 CAP-Agent/drain/hardware coverage remains **[QE] E2E** under
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+
+### R05 single observation snapshot implementation checkpoint
+
+The local implementation (`worker_observation.go`, `agent_observation.go`,
+`agent.go`, `worker_capacity.go`, `bmi.go`, `retry.go`, `worker_teardown.go`)
+derives worker identity and eligible Agent phases once per invocation from one
+explicit `*workerObservation`, memoizes recorded-ID fallback Gets including
+unknown results, and returns at every resource mutation without repairing
+indexes, re-listing Agents after teardown, or re-projecting phases. The variadic
+optional `observations ...*workerObservation`/`resolvers ...MACResolver`
+parameters and the duplicated capacity `existingByName` view are removed. No
+mutation is followed by post-mutation index repair or another projection in the
+same invocation. Read budgets are structural assertions, not a reason to skip a
+fresh destructive authorization.
+
+**R05-U1–U5 Unit / osac-operator [DEV]** in `worker_observation_test.go`,
+`worker_reconcile_test.go` and the migrated stage fixtures assert one logical BMI
+List and one Agent observation stage per invocation, no Get for listed recorded
+IDs, at most one fallback Get per invocation for success/NotFound/error, no
+post-mutation index repair after a Create, independent per-order observation
+state with a configured MAC override, and exactly one Agent-phase projection.
+Existing `cleanup_test.go`/`worker_teardown_test.go` cases keep the fresh
+ownership/existence Get per destructive attempt as an explicit exception.
+
+**R05-E1–E3 Envtest / osac-operator [DEV]** in
+`acceptance/worker_reconcile_test.go` drive public `Reconcile` through real
+status persistence: a lost worker-status write after a successful Agent patch
+recovers Binding/Ready from the Agent without a second patch or Create; Ready
+demotion and protected Unbinding retain identity/history while provisioning
+prerequisites are blocked; and a pre-bind Agent snapshot never yields a Ready
+decision before a fresh invocation observes completion. Existing Envtest cases
+continue to cover Ready demotion after Agent disappearance or Installed False,
+status repair without a rebind, protected lifecycle preservation, ambiguous and
+tenant/owner rejection, NIC-source and restart behavior, and stale-ignition
+repair. Explicit reconciliations establish the checkpoints, not fallback polling.
+
+These cases require real Kubernetes/etcd and generated CRDs; fulfillment,
+ignition and Agent progression are simulated. They do not establish watch
+delivery, deployed Assisted Service, real fulfillment/BMaaS wire behavior, or
+hardware provisioning; those gaps remain owned by
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843). No new provider
+protocol, production fault-injection API, managed cache framework, worker CRD, or
+status reconstruction is introduced.
 
 ### Coverage gaps
 

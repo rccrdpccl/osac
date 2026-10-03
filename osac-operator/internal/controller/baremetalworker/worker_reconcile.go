@@ -50,14 +50,16 @@ func workerBoundaryRequeue() ctrl.Result {
 }
 
 func (r *Reconciler) finishWorkerConvergence(ctx context.Context, co *v1alpha1.ClusterOrder, observed *workerObservation) (ctrl.Result, error) {
-	stop, err := r.reconcileWorkerTeardown(ctx, co, observed)
+	// Teardown mutates Agent/BMI state, so it ends the invocation and the next
+	// observation supplies fresh evidence; never project from a mutated snapshot.
+	stop, err := r.reconcileWorkerTeardown(ctx, co)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if stop {
 		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
-	workers, res, err := r.reconcileObservedAgents(ctx, co, observed)
+	workers, res, err := r.reconcileObservedAgents(ctx, co, co.Status.Workers, observed)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

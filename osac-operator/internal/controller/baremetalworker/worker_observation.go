@@ -21,49 +21,28 @@ type bmiGetResult struct {
 
 // workerObservation lives for one invocation only. List omission is not evidence
 // of deletion, and unknown fallback Get results are remembered just like success.
+// The indexes are built during observation and are never repaired after a
+// mutation: a create/delete/bind ends the invocation and a fresh observation
+// supplies the next one.
 type workerObservation struct {
-	byID              map[string]*privatev1.BareMetalInstance
-	byName            map[string][]*privatev1.BareMetalInstance
-	gets              map[string]bmiGetResult
-	agents            *unstructured.UnstructuredList
-	agentsInvalidated bool
-	projected         map[string]v1alpha1.WorkerStatus
+	byID   map[string]*privatev1.BareMetalInstance
+	byName map[string][]*privatev1.BareMetalInstance
+	gets   map[string]bmiGetResult
+	agents *unstructured.UnstructuredList
 }
 
 func indexWorkerBMIs(bmis []*privatev1.BareMetalInstance) *workerObservation {
-	o := &workerObservation{byID: make(map[string]*privatev1.BareMetalInstance), byName: make(map[string][]*privatev1.BareMetalInstance), gets: make(map[string]bmiGetResult), projected: make(map[string]v1alpha1.WorkerStatus)}
+	o := &workerObservation{
+		byID:   make(map[string]*privatev1.BareMetalInstance),
+		byName: make(map[string][]*privatev1.BareMetalInstance),
+		gets:   make(map[string]bmiGetResult),
+	}
 	for _, bmi := range bmis {
-		o.recordBMI(bmi)
+		id, name := bmi.GetId(), bmi.GetMetadata().GetName()
+		o.byID[id] = bmi
+		o.byName[name] = append(o.byName[name], bmi)
 	}
 	return o
-}
-
-func (o *workerObservation) recordBMI(bmi *privatev1.BareMetalInstance) {
-	id, name := bmi.GetId(), bmi.GetMetadata().GetName()
-	// Replacing the same ID updates its indexes rather than inventing ambiguity.
-	if old := o.byID[id]; old != nil {
-		o.invalidateBMI(id)
-	}
-	o.byID[id] = bmi
-	o.byName[name] = append(o.byName[name], bmi)
-	delete(o.gets, id)
-}
-
-func (o *workerObservation) invalidateBMI(id string) {
-	old := o.byID[id]
-	if old != nil {
-		name := old.GetMetadata().GetName()
-		kept := o.byName[name][:0]
-		for _, bmi := range o.byName[name] {
-			if bmi.GetId() != id {
-				kept = append(kept, bmi)
-			}
-		}
-		o.byName[name] = kept
-	}
-	delete(o.byID, id)
-	// A Delete request is not a completed deletion; never cache synthetic NotFound.
-	delete(o.gets, id)
 }
 
 func (o *workerObservation) getBMI(ctx context.Context, f FulfillmentClient, id string) (*privatev1.BareMetalInstance, error) {
@@ -93,19 +72,6 @@ func (o *workerObservation) exactOwnedName(co *v1alpha1.ClusterOrder, tenant, na
 	return bmi, nil
 }
 
-func (o *workerObservation) uniqueBMIsByName() (map[string]*privatev1.BareMetalInstance, error) {
-	result := make(map[string]*privatev1.BareMetalInstance)
-	for name, candidates := range o.byName {
-		if len(candidates) > 1 {
-			return nil, fmt.Errorf("ambiguous BMI name %q", name)
-		}
-		if len(candidates) == 1 {
-			result[name] = candidates[0]
-		}
-	}
-	return result, nil
-}
-
 func (r *Reconciler) observeWorkerResources(ctx context.Context, co *v1alpha1.ClusterOrder) (*workerObservation, ctrl.Result, error) {
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	bmis, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
@@ -116,22 +82,6 @@ func (r *Reconciler) observeWorkerResources(ctx context.Context, co *v1alpha1.Cl
 	o := indexWorkerBMIs(bmis)
 	o.agents, err = r.listAgents(ctx, co)
 	return o, ctrl.Result{}, err
-}
-
-// workerCapacityObservation reuses the reconcile-local observation when supplied;
-// standalone capacity reconciliation only needs to list and index BMIs.
-func (r *Reconciler) workerCapacityObservation(
-	ctx context.Context, co *v1alpha1.ClusterOrder, filter string, observations ...*workerObservation,
-) (*workerObservation, ctrl.Result, error) {
-	if len(observations) > 0 && observations[0] != nil {
-		return observations[0], ctrl.Result{}, nil
-	}
-	existing, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
-	if err != nil {
-		res, err := r.handleFulfillmentError(ctx, co, fmt.Errorf("listing BMIs for %s: %w", co.Name, err))
-		return nil, res, err
-	}
-	return indexWorkerBMIs(existing), ctrl.Result{}, nil
 }
 
 func (r *Reconciler) workerMACResolver(o *workerObservation) MACResolver {
@@ -179,18 +129,19 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 			i--
 			continue
 		}
-		next := *candidate
-		if o.agents != nil && eligibleForAgentObservation(next) {
-			next.Phase = deriveWorkerPhase(findAgentForWorker(ctx, o.agents, next.BareMetalInstance.ID, next.Name, macs), next.Name)
-			if next.Phase == workerPhaseReady && next.ReadySince == nil {
-				projected := []v1alpha1.WorkerStatus{next}
-				initializeReadySince(projected)
-				next = projected[0]
-			}
-		}
-		o.projected[w.Name] = next
-		workers[i] = next
+		workers[i] = *candidate
 	}
+	// The pure helper is the single Agent-phase projection owner; this stage only
+	// supplies the snapshot and never re-derives phases elsewhere.
+	if o.agents != nil {
+		workers = projectAgentWorkerPhases(ctx, workers, o.agents, macs)
+	}
+	initializeReadySince(workers)
+	// Readiness telemetry belongs to this single projection boundary. It is
+	// emitted only for an actual Binding -> Ready observation; the caller
+	// persists the projection afterwards or returns a conflict without
+	// pretending the transition happened.
+	r.observeAgentReadiness(ctx, co, co.Status.Workers, workers)
 	return workers, nil
 }
 

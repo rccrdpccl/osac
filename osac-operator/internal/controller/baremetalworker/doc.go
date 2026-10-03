@@ -43,8 +43,12 @@
 //   - nodepool.go converges requested NodeSet replica counts.
 //
 // Worker policy and persistence are grouped by lifecycle responsibility:
-//   - worker_observation.go caches invocation-local resource reads and projects
-//     identity/phase changes; agent_observation.go interprets Agent snapshots.
+//   - worker_observation.go owns the single invocation-local resource snapshot:
+//     it indexes scoped BMIs, memoizes recorded-ID fallback Gets (including
+//     unknown results), and projects identity/phase once; agent_observation.go
+//     interprets Agent snapshots. The snapshot is passed explicitly and is never
+//     repaired after a mutation: a create, delete or bind ends the invocation and
+//     the next one re-observes. No phase-projection or invalidation cache exists.
 //   - worker_capacity.go reserves durable slots and fulfills their capacity.
 //   - scaling.go selects retained/excess slots and initiates scale-down.
 //   - retry.go handles failed workers, backoff and healthy-history reset.
@@ -63,6 +67,10 @@
 // R02-E1/E2 drive public reconciles through real status and Agent binding
 // conflicts: one rejected optimistic patch, no takeover, and a fresh invocation
 // that respects the competing writer.
+// R05-U1–U5 characterize the read budget, memoized fallback outcomes and
+// independent per-order observation state; R05-E1–E3 drive public reconciles
+// through real status persistence for interrupted binding recovery, demotion and
+// protected history with blocked prerequisites, and no pre-bind Ready decision.
 // Sim-backed R03-C1 is explicitly skipped and its fixture removed; it is not a
 // local completion gate. Unit/Envtest do not prove real fulfillment/provider
 // cleanup or resolve the archived-Cluster and targeted-remediation gaps.
