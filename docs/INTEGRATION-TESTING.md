@@ -169,7 +169,7 @@ Touched-area requirements: [component guide](../osac-operator/AGENTS.md#integrat
 
 - **Bare-metal worker Agent convergence ([DEV], Unit/Envtest):** `internal/controller/baremetalworker/agent_reconcile_test.go` and `correlation_test.go` cover all eligible worker phases and protected states, early capacity/stale-ignition observation, unique MAC matching, authoritative binding isolation/conflicts, registration timeout, interrupted status recovery, ReadySince retention, and transition event/metric counts. The Agent convergence scenarios in `acceptance/reconciler_test.go` invoke public `Reconcile` manually and read back real persisted phases/counts after Installed-condition changes or Agent removal. They also verify bound-Agent/stale-Waiting recovery without another BMI or Agent patch, lifecycle-state preservation while provider deletion is pending, and ambiguous binding refusal. Kubernetes/etcd and CRDs are real; fulfillment and Agent state are simulated. These tests do not run a manager or establish watch delivery/restart latency, deployed Assisted Service, or hardware behavior; provider gaps remain under [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
-- **Unified bare-metal worker convergence ([DEV], Unit/Envtest):** The `worker_*_test.go` and BMI identity suites under `internal/controller/baremetalworker/` cover the single invocation-local BMI/Agent observation (one List, one Agent stage, memoized recorded-ID fallback Gets), one pure identity/phase projection, one-shot optimistic status patches, authoritative reservation/capacity checks, interruption after a successful create, concurrent foreign-reference/spec/tenant/UID interruption, one fresh ownership/existence Get per destructive attempt, and finalizer retention for concurrently appended workers. The former `projected`/`agentsInvalidated` continuation caches, post-mutation `recordBMI`/`invalidateBMI` index repair, and variadic optional observation/resolver parameters are removed; capacity consumes the explicit observation and uses its canonical name/ambiguity index instead of a second name view. `acceptance/worker_reconcile_test.go` drives public `Reconcile` through real CRD status persistence and optimistic-lock conflicts. It checks successful-create ID-write recovery without another create, authoritative NotFound replacement, list-omission fallback, unknown List/Get errors and service-unavailable requeues, repair before InfraEnv gates, rejection of stale-failure persistence before recording a recreated UID, conflict interruption followed by fresh aggregate convergence while preserving concurrent status, and finalization recovery without resetting history or allocating capacity. The older rebuild pipeline is removed; its mixed/protected worker, MAC fallback, and clock/history cases are covered by the combined observation tests. Explicit successful reconciliations establish the convergence assertions, not fallback polling. R04 adds prerequisite-free progress coverage: retirement and BMI cleanup with an absent pull secret, a deleted InfraEnv and an unresolvable disk image (no discovery-ignition fetch and no Create), Agent binding while another worker's retry/cleanup is pending, an aggregate worker summary written before the blocked create gate, shortest-positive recheck selection with no timer for a stable Ready order, and stale-ignition failure persistence while the image input is blocked. Kubernetes/etcd and generated CRDs are real; fulfillment, ignition and Agent status are simulated. These cases do not establish watch delivery, real fulfillment/BMaaS wire behavior, deployed Assisted Service, or hardware provisioning; missing boundary coverage remains owned by [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+- **Unified bare-metal worker convergence ([DEV], Unit/Envtest):** The `worker_*_test.go` and BMI identity suites under `internal/controller/baremetalworker/` cover the single invocation-local BMI/Agent observation (one List, one Agent stage, memoized recorded-ID fallback Gets), one pure identity/phase projection, one-shot optimistic status patches, authoritative reservation/capacity checks, interruption after a successful create, concurrent foreign-reference/spec/tenant/UID interruption, one fresh ownership/existence Get per destructive attempt, and finalizer retention for concurrently appended workers. The former `projected`/`agentsInvalidated` continuation caches, post-mutation `recordBMI`/`invalidateBMI` index repair, and variadic optional observation/resolver parameters are removed; capacity consumes the explicit observation and uses its canonical name/ambiguity index instead of a second name view. `acceptance/worker_reconcile_test.go` drives public `Reconcile` through real CRD status persistence and optimistic-lock conflicts. It checks successful-create ID-write recovery without another create, authoritative NotFound replacement, list-omission fallback, unknown List/Get errors and service-unavailable requeues, repair before InfraEnv gates, rejection of stale-failure persistence before recording a recreated UID, conflict interruption followed by fresh aggregate convergence while preserving concurrent status, and finalization recovery without resetting history or allocating capacity. The older rebuild pipeline is removed; its mixed/protected worker, MAC fallback, and clock/history cases are covered by the combined observation tests. Explicit successful reconciliations establish the convergence assertions, not fallback polling. R04 adds prerequisite-free progress coverage: retirement and BMI cleanup with an absent pull secret, a deleted InfraEnv and an unresolvable disk image (no discovery-ignition fetch and no Create), Agent binding while another worker's retry/cleanup is pending, an aggregate worker summary written before the blocked create gate, shortest-positive recheck selection with no timer for a stable Ready order, and stale-ignition failure persistence while the image input is blocked. R07 replaces the condition-gated InfraEnv lookup with one resource-driven observation: present/absent lookup against every Ready state, owner validation before any UID or boot artifact is consumed, scripted ignition outcomes that cannot authorize a Create, and a recreated InfraEnv whose replacement UID is recorded only after the stale waiting worker's failure is durable. Kubernetes/etcd and generated CRDs are real; fulfillment, ignition and Agent status are simulated. These cases do not establish watch delivery, real fulfillment/BMaaS wire behavior, deployed Assisted Service, or hardware provisioning; missing boundary coverage remains owned by [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
 Focused commands from `osac-operator/` (also included by `make test`):
 
@@ -182,6 +182,8 @@ KUBEBUILDER_ASSETS="$PWD/bin/k8s/1.31.0-linux-amd64" \
   go test ./internal/controller/baremetalworker/acceptance -count=1 -ginkgo.focus='R05-'
 KUBEBUILDER_ASSETS="$PWD/bin/k8s/1.31.0-linux-amd64" \
   go test ./internal/controller/baremetalworker/acceptance -count=1 -ginkgo.focus='R04-'
+KUBEBUILDER_ASSETS="$PWD/bin/k8s/1.31.0-linux-amd64" \
+  go test ./internal/controller/baremetalworker/acceptance -count=1 -ginkgo.focus='R07-'
 ```
 
 The focused Envtest command requires the existing Kubernetes 1.31.0 binaries at
@@ -408,6 +410,48 @@ connected suite has no Agent controller) and **R06-Q1** (the existing deployed
 CaaS create/scale/delete journey) remain owned by
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843)/[QE]; no identity or API
 contract was expanded.
+
+### R07 resource-driven InfraEnv evidence implementation checkpoint
+
+`observeInfraEnvEvidence` performs the invocation's single InfraEnv observation:
+one cached Get, confirmed by an uncached read when the cache omits the object,
+creation only on authoritative absence, and ownership validation (namespace,
+controller kind and name, plus the recorded order UID when set) before any UID or
+boot artifact is consumed. `InfraEnvReady` is output evidence, not a control
+gate: a missing or replaced artifact URL clears a stale Ready claim, and only a
+fetched, JSON-valid discovery ignition reports Ready. The recorded InfraEnv UID
+remains a durable checkpoint until stale-worker failures are persisted, so the
+classification write and the UID recording stay separate invocations.
+
+**R07-U1–U7 Unit / osac-operator [DEV]** in `worker_reconcile_test.go`
+characterize condition-independent lookup (present and absent InfraEnv against
+Ready True, Ready False and a missing condition, including a stale Ready claim
+with no artifact URL), owner validation by namespace, controller kind, name and
+incarnation UID, scripted ignition outcomes that cannot authorize a BMI Create
+(missing URL, invalid JSON, fetch failure, foreign owner), interruption safety
+for the stale-UID checkpoint, and a stable Ready order that writes no status and
+fetches no ignition. Fault injection covers an interrupted stale-classification
+status write, which must leave the recorded UID and the waiting worker untouched
+until a later invocation persists the same classification, and a lost UID patch,
+after which the next invocation records the UID without re-emitting failure
+accounting.
+
+**R07-E1–E2 Envtest / osac-operator [DEV]** in `acceptance/reconciler_test.go`
+and `acceptance/worker_reconcile_test.go` drive public `Reconcile` through real
+owner UIDs, metadata and status: a removed boot-artifact URL clears Ready and a
+recreated InfraEnv's new UID advances without requiring a condition transition to
+authorize the Get; and, with creation inputs blocked, replacing the InfraEnv
+fails only the stale waiting worker while a bound, installed Agent stays Ready,
+records the replacement UID only in a following invocation, and creates no BMI.
+These traces call `Reconcile` directly, so they do not establish manager watch
+delivery.
+
+**R07-C1** reuses the existing connected worker suite (real fulfillment and
+Kubernetes; simulated InfraEnv/ignition; no real Assisted Service artifact
+behavior). That command still requires the approved marked sim environment, which
+is not available in this workspace, so it is recorded as not executed here rather
+than passed; the real Assisted Service boundary remains owned by
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
 ### Coverage gaps
 

@@ -195,6 +195,25 @@ hooks or NodePool replicas are manipulated to force cleanup. Production deletion
 still requires an approved archived-Cluster ownership fix (dedicated owner/ticket
 unresolved); provider/drain/hardware journeys remain [QE] work under
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+R07 collapses the InfraEnvReady-gated lookup into one resource-driven
+observation. `observeInfraEnvEvidence` performs the invocation's single InfraEnv
+Get through the cache, confirms a cached omission with an uncached read before
+treating it as absence, creates the object only on authoritative absence, and
+validates ownership (namespace, controller kind and name, plus the recorded order
+UID when set) before consuming any UID or boot artifact. `InfraEnvReady` is
+output evidence rather than a control gate: a missing or replaced artifact URL
+clears a stale Ready claim, and only a fetched, JSON-valid discovery ignition
+reports Ready. The recorded UID stays a durable checkpoint until stale-worker
+failures are persisted; the classification write and the UID recording are
+separate invocations, and a failed classification write or lost UID patch
+re-emits no failure accounting on retry. Foreign same-name objects are errors,
+not recreate permission. `R07-U1–U7` Unit cases in `worker_reconcile_test.go`
+characterize this with fake InfraEnv/HTTP outcomes and fault-injected status and
+metadata patches; `R07-E1–E2` Envtest traces in `acceptance/reconciler_test.go`
+and `acceptance/worker_reconcile_test.go` drive public `Reconcile` through real
+owner UIDs, metadata and status. These cases do not prove real Assisted Service
+artifact behavior (`R07-C1`, owned by
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843)).
 The Kind suite's LVMS-disabled case verifies the Volume controller remains
 ready without the TopoLVM `LogicalVolume` CRD; it does not exercise LVMS
 provisioning or the CSI data path.

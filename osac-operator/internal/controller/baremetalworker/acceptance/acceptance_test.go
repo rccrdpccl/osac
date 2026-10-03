@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	osacv1alpha1 "github.com/osac-project/osac/osac-operator/api/v1alpha1"
@@ -52,6 +53,17 @@ func newInfraEnv(name string) *unstructured.Unstructured {
 	u.SetGroupVersionKind(infraEnvGVK)
 	u.SetName(name)
 	u.SetNamespace(testNamespace)
+	return u
+}
+
+// newOwnedInfraEnv builds the object the reconciler itself creates: the
+// deterministic name, controlled by the ClusterOrder. Fixtures that stand in for a
+// reconciled InfraEnv must carry that owner reference, because a same-name object
+// this ClusterOrder does not control is rejected as foreign evidence.
+func newOwnedInfraEnv(co *osacv1alpha1.ClusterOrder) *unstructured.Unstructured {
+	GinkgoHelper()
+	u := newInfraEnv(co.Name + "-infraenv")
+	Expect(controllerutil.SetControllerReference(co, u, scheme.Scheme)).To(Succeed())
 	return u
 }
 
@@ -487,9 +499,10 @@ var _ = Describe("Bare-metal worker provisioning", func() {
 
 		// No agent for worker-1 — should rebuild to WaitingForAgent.
 
-		// Set up InfraEnv so the rest of the reconcile doesn't error.
+		// Set up InfraEnv so the rest of the reconcile doesn't error. It carries the
+		// same controller owner reference as a reconciled InfraEnv.
 		Expect(sim.EnsureClusterDeployment(ctx, "bmw-rebuild-cd", testNamespace)).To(Succeed())
-		ie := newInfraEnv("bmw-rebuild-infraenv")
+		ie := newOwnedInfraEnv(co)
 		Expect(k8sClient.Create(ctx, ie)).To(Succeed())
 		Expect(sim.MarkInfraEnvReady(ctx, "bmw-rebuild-infraenv", testNamespace, ign.URL())).To(Succeed())
 

@@ -10,7 +10,9 @@
 //
 // Entry points and controller/watch setup live in reconciler.go. Normal stage
 // ordering lives in worker_reconcile.go: observe resources and persist repairs,
-// observe InfraEnv UID evidence, run the input-free existing-worker lifecycle
+// take one InfraEnv evidence observation (the owned object or an authoritative
+// absence, its UID and current artifact evidence), run the input-free
+// existing-worker lifecycle
 // (retirement intent and failed-incarnation cleanup), resolve creation inputs for
 // a due reservation or create, then converge teardown, Agents, NodePools and the
 // worker summary. A missing pull secret, discovery ignition, disk image or
@@ -43,7 +45,12 @@
 // here; archived-Cluster ownership lookup remains a production-deletion blocker.
 //
 // Resource operations are grouped by target:
-//   - infraenv.go and image.go prepare discovery ignition and the disk image.
+//   - infraenv.go owns the invocation's single InfraEnv observation: a
+//     deterministic Get whose cached omission is confirmed by an uncached read,
+//     creation only on authoritative absence, ownership validation before any UID
+//     or boot artifact is consumed, stale-UID classification, and the create
+//     stage's discovery-ignition input. InfraEnvReady reports verified ignition
+//     evidence and is never a control gate; image.go resolves the disk image.
 //   - bmi.go handles BMI lookup, creation, request construction and deletion.
 //   - ownership.go validates authoritative tenant and resource identities.
 //   - agent.go handles Agent convergence, binding and registration timeouts.
@@ -113,6 +120,19 @@
 // restart. R06-C1 (real Assisted Service selector/UID/binding behavior) and
 // R06-Q1 (deployed CaaS create/scale/delete) remain owned by OSAC-4843/[QE]; no
 // identity or API contract was expanded.
+// R07-U1–U7 Unit cases in worker_reconcile_test.go characterize
+// condition-independent lookup (present/absent against every Ready state), owner
+// validation by namespace, controller kind, name and recorded incarnation UID,
+// scripted ignition outcomes (missing URL, invalid JSON, fetch failure, foreign
+// owner) that cannot authorize a BMI Create, and interruption safety for the
+// stale-UID checkpoint: an interrupted classification write or a lost UID patch
+// preserves the recorded UID and re-emits no failure accounting on retry, while a
+// stable Ready order writes no status and fetches no ignition. R07-E1–E2 Envtest
+// traces in the acceptance suites drive public Reconcile through real owner UIDs,
+// metadata and status for an absent or recreated InfraEnv that must converge
+// without a condition transition, and for a replacement that fails only the stale
+// waiting worker before the new UID is recorded, with blocked creation inputs.
+// R07-C1 (real Assisted Service artifact behavior) remains OSAC-4843.
 //
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs

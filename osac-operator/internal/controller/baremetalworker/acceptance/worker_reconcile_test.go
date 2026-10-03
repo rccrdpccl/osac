@@ -687,7 +687,9 @@ var _ = Describe("Unified worker reconciliation", func() {
 		infra := newInfraEnv(co.Name + "-infraenv")
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(infra), infra)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, infra)).To(Succeed())
-		replacement := newInfraEnv(infra.GetName())
+		// The replacement models the object the reconciler recreates for an
+		// authoritatively absent InfraEnv: same name, same owner, new UID.
+		replacement := newOwnedInfraEnv(co)
 		Expect(k8sClient.Create(ctx, replacement)).To(Succeed())
 		Expect(sim.MarkInfraEnvReady(ctx, replacement.GetName(), co.Namespace, ignition.URL())).To(Succeed())
 		interrupted := errors.New("stale failure persistence failed")
@@ -990,6 +992,88 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
 	})
 
+	It("R07-E2 fails only the stale waiting worker and records the replacement UID afterwards", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:81"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r07-e2-agent", mac)
+		// Bind, then report installed so the first worker reaches Ready.
+		step()
+		installed := getAgent(agent.GetName())
+		Expect(unstructured.SetNestedField(installed.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, installed)).To(Succeed())
+		step()
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Ready"))
+		storedUID := getOrder().Annotations["osac.openshift.io/infraenv-uid"]
+		Expect(storedUID).NotTo(BeEmpty())
+
+		// A second worker is still waiting for its Agent when the InfraEnv is replaced.
+		latest := getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		for i := 0; i < 6; i++ {
+			workers := getOrder().Status.Workers
+			if len(workers) == 2 && workers[1].BareMetalInstance.ID != "" {
+				break
+			}
+			step()
+		}
+		workers := getOrder().Status.Workers
+		Expect(workers).To(HaveLen(2))
+		Expect(workers[1].Phase).To(Equal("WaitingForAgent"))
+		Expect(workers[1].BareMetalInstance.ID).NotTo(BeEmpty())
+
+		// Block a creation prerequisite: stale classification is InfraEnv evidence,
+		// not a creation input, so it must not be gated on the disk image.
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: "version", Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: "missing-image"}.Build(),
+			}.Build(),
+		}.Build())
+		creates := len(fc.CreateCalls())
+
+		// An authoritatively absent InfraEnv is recreated with a new UID; the deleted
+		// object's Ready claim must not be reused as evidence.
+		infra := newInfraEnv(co.Name + "-infraenv")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(infra), infra)).To(Succeed())
+		oldInfraUID := infra.GetUID()
+		Expect(k8sClient.Delete(ctx, infra)).To(Succeed())
+		recreated := false
+		for i := 0; i < 10 && !recreated; i++ {
+			step()
+			got := newInfraEnv(co.Name + "-infraenv")
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(got), got); err == nil && got.GetUID() != oldInfraUID {
+				recreated = true
+			}
+		}
+		Expect(recreated).To(BeTrue(), "the reconciler must recreate an authoritatively absent InfraEnv")
+		Expect(sim.MarkInfraEnvReady(ctx, co.Name+"-infraenv", co.Namespace, ignition.URL())).To(Succeed())
+
+		// The replacement is a durable boundary: only the waiting worker fails, and the
+		// replacement UID is not acknowledged in the same invocation as the repair.
+		result, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(time.Second), "stale-worker classification is a durable boundary")
+		workers = getOrder().Status.Workers
+		Expect(workers[0].Phase).To(Equal("Ready"), "bound and installed Agent evidence is not stale")
+		Expect(workers[0].BareMetalInstance).To(Equal(old.BareMetalInstance))
+		Expect(workers[1].Phase).To(Equal("Failed"))
+		Expect(workers[1].LastFailureReason).To(Equal("AgentRegistrationTimeout"))
+		Expect(getOrder().Annotations["osac.openshift.io/infraenv-uid"]).To(Equal(storedUID),
+			"the replacement UID must not be recorded before the stale worker keeps its evidence")
+		Expect(fc.CreateCalls()).To(HaveLen(creates))
+
+		// The next invocation records the replacement UID. The healthy worker keeps its
+		// incarnation and the failed worker waits for its own retry.
+		step()
+		latest = getOrder()
+		Expect(latest.Annotations["osac.openshift.io/infraenv-uid"]).NotTo(Equal(storedUID))
+		Expect(latest.Status.Workers).To(HaveLen(2))
+		Expect(latest.Status.Workers[0].Phase).To(Equal("Ready"))
+		Expect(latest.Status.Workers[0].BareMetalInstance).To(Equal(old.BareMetalInstance))
+		Expect(latest.Status.Workers[1].Phase).To(Equal("Failed"))
+		Expect(fc.CreateCalls()).To(HaveLen(creates))
+	})
 	It("R05-E3 makes no Ready decision from the pre-bind snapshot", func() {
 		old := provision()
 		const mac = "aa:bb:cc:dd:ee:73"

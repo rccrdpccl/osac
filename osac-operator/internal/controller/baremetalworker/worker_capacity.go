@@ -88,23 +88,23 @@ type workerCreationInputs struct {
 	ignition []byte
 }
 
-// resolveIgnitionReadiness ensures the InfraEnv exists and its discovery
-// ignition is current. It projects InfraEnvReady, which is observable status for
-// an existing worker set even when no create is due.
-func (r *Reconciler) resolveIgnitionReadiness(
-	ctx context.Context, co *v1alpha1.ClusterOrder,
-) ([]byte, ctrl.Result, error) {
-	ignition, _, res, err := r.ensureInfraEnv(ctx, co)
-	return ignition, res, err
-}
-
-// resolveWorkerCreationInputs resolves the cluster-level inputs for a create. A
-// non-zero result is a bounded prerequisite wait, for example an InfraEnv whose
-// discovery ignition URL is not published yet.
+// resolveWorkerCreationInputs resolves the cluster-level inputs for a create from
+// the invocation's single InfraEnv observation. A non-zero result is a bounded
+// prerequisite wait, for example an InfraEnv whose discovery ignition URL is not
+// published yet. Held observation evidence is reported as-is so the caller keeps
+// converging prerequisite-free work.
 func (r *Reconciler) resolveWorkerCreationInputs(
-	ctx context.Context, co *v1alpha1.ClusterOrder,
+	ctx context.Context, co *v1alpha1.ClusterOrder, infra infraEnvEvidence,
 ) (workerCreationInputs, ctrl.Result, error) {
-	ignition, res, err := r.resolveIgnitionReadiness(ctx, co)
+	if infra.err != nil {
+		return workerCreationInputs{}, ctrl.Result{}, infra.err
+	}
+	if infra.object == nil {
+		// Authoritative absence was observed and its creation is a separate
+		// boundary; this invocation must not resolve inputs against nothing.
+		return workerCreationInputs{}, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+	}
+	ignition, res, err := r.fetchDiscoveryIgnition(ctx, co, infra.object)
 	if err != nil || !res.IsZero() {
 		return workerCreationInputs{}, res, err
 	}
@@ -123,10 +123,10 @@ func (r *Reconciler) resolveWorkerCreationInputs(
 // unrelated event. A prerequisite wait/error is reported without created so the
 // caller can still converge teardown, Agents and NodePool replicas.
 func (r *Reconciler) reconcileWorkerCreation(
-	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, observed *workerObservation,
+	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, observed *workerObservation, infra infraEnvEvidence,
 ) (bool, ctrl.Result, error) {
 	if _, prev := selectDueSlot(co); prev == nil && !workerCreationDue(co) {
-		res, err := r.refreshWorkerReadiness(ctx, co)
+		res, err := r.refreshWorkerReadiness(ctx, co, infra)
 		if err != nil || !res.IsZero() {
 			return false, res, err
 		}
@@ -134,7 +134,7 @@ func (r *Reconciler) reconcileWorkerCreation(
 		return false, res, err
 	}
 	expected := co.DeepCopy()
-	inputs, res, err := r.resolveWorkerCreationInputs(ctx, co)
+	inputs, res, err := r.resolveWorkerCreationInputs(ctx, co, infra)
 	// Input resolution can persist prerequisite conditions; refresh before any
 	// later optimistic patch, including on the deferred path.
 	if refreshErr := r.readAuthoritativeOrder(ctx, co); refreshErr != nil {
@@ -149,19 +149,24 @@ func (r *Reconciler) reconcileWorkerCreation(
 	return r.reconcileDueWorkerCapacity(ctx, co, tenant, inputs, observed)
 }
 
-// refreshWorkerReadiness projects InfraEnv readiness for an existing worker set
-// when no create or reservation is due. It resolves no image or instance type,
-// and an order whose readiness is already current re-fetches nothing. The write
-// is a status projection, not a create boundary, so it does not end the
-// invocation; the caller revalidates the plan before any later action.
-func (r *Reconciler) refreshWorkerReadiness(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
-	if len(co.Status.Workers) == 0 || apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
+// refreshWorkerReadiness reports current discovery-ignition evidence for an
+// existing worker set when no create needs the bytes, so a published artifact is
+// still observed as Ready. It reads the object the invocation already observed
+// (never a second lookup) and does not re-fetch a claim that is already True: a
+// stable order performs no ignition request for status alone.
+func (r *Reconciler) refreshWorkerReadiness(
+	ctx context.Context, co *v1alpha1.ClusterOrder, infra infraEnvEvidence,
+) (ctrl.Result, error) {
+	if infra.err != nil || infra.object == nil {
 		return ctrl.Result{}, nil
 	}
-	if _, res, err := r.resolveIgnitionReadiness(ctx, co); err != nil || !res.IsZero() {
+	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
+		return ctrl.Result{}, nil
+	}
+	if _, res, err := r.fetchDiscoveryIgnition(ctx, co, infra.object); err != nil || !res.IsZero() {
 		return res, err
 	}
-	return ctrl.Result{}, r.readAuthoritativeOrder(ctx, co)
+	return ctrl.Result{}, nil
 }
 
 // workerCreationDue reports whether the current worker plan still needs a
