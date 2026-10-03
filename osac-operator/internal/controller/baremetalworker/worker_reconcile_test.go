@@ -495,7 +495,7 @@ func TestR04PendingRetryDoesNotBlockBinding(t *testing.T) {
 	if !reflect.DeepEqual(fc.deletes, []string{"failed-id"}) {
 		t.Fatalf("pending cleanup deletes=%v, want the failed incarnation only", fc.deletes)
 	}
-	if deadline := r.workerRecheckDeadline(co.Status.Workers); deadline.RequeueAfter <= 0 {
+	if deadline := r.workerRecheckDeadline(co.Status.Workers, time.Now()); deadline.RequeueAfter <= 0 {
 		t.Fatalf("pending cleanup did not contribute a bounded recheck: %+v", deadline)
 	}
 }
@@ -568,7 +568,7 @@ func TestR04FairnessTraceAcrossWorkerStates(t *testing.T) {
 	if len(fc.deletes) == 0 {
 		t.Fatal("pending cleanup was starved by unrelated progress")
 	}
-	if deadline := r.workerRecheckDeadline(co.Status.Workers); deadline.RequeueAfter <= 0 {
+	if deadline := r.workerRecheckDeadline(co.Status.Workers, time.Now()); deadline.RequeueAfter <= 0 {
 		t.Fatalf("no bounded recheck for the delayed worker: %+v", deadline)
 	}
 }

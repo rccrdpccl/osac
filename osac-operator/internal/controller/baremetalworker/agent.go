@@ -55,7 +55,7 @@ func (r *Reconciler) reconcileObservedAgents(
 			return nil, ctrl.Result{}, err
 		}
 	}
-	workers = r.checkAgentRegistrationTimeout(ctx, co, workers)
+	workers = r.checkAgentRegistrationTimeout(ctx, co, workers, time.Now())
 
 	if countWorkersInPhase(workers, workerPhaseWaitingForAgent) > 0 {
 		return workers, ctrl.Result{RequeueAfter: agentRequeueInterval}, nil
@@ -211,23 +211,21 @@ func agentBindingConflict(agent *unstructured.Unstructured, co *v1alpha1.Cluster
 }
 
 // checkAgentRegistrationTimeout transitions workers stuck in WaitingForAgent past the timeout
-// to Failed with reason AgentRegistrationTimeout.
+// to Failed with reason AgentRegistrationTimeout. The clock is the durable per-attempt origin,
+// never the parent ClusterOrder age or an unrelated failure timestamp. Emitting a VM worker or
+// an ID-less reservation is not eligible, so it is never timed out. now is captured at the
+// orchestration boundary and passed in for deterministic policy evaluation.
 func (r *Reconciler) checkAgentRegistrationTimeout(
-	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
+	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, now time.Time,
 ) []v1alpha1.WorkerStatus {
 	log := ctrllog.FromContext(ctx)
-	now := time.Now()
 
 	for i := range workers {
 		w := &workers[i]
-		if !eligibleForAgentObservation(*w) || w.Phase != workerPhaseWaitingForAgent {
+		if !eligibleForAgentObservation(*w) || w.Phase != workerPhaseWaitingForAgent || w.AttemptStartedAt == nil {
 			continue
 		}
-		phaseStart := r.workerPhaseStartTime(co, w.Name)
-		if phaseStart.IsZero() {
-			continue
-		}
-		if now.Sub(phaseStart) < agentRegistrationTimeout {
+		if now.Sub(w.AttemptStartedAt.Time) < agentRegistrationTimeout {
 			continue
 		}
 		w.Phase = workerPhaseFailed
@@ -241,19 +239,4 @@ func (r *Reconciler) checkAgentRegistrationTimeout(
 			"worker %s: no agent registered within %s", w.Name, agentRegistrationTimeout)
 	}
 	return workers
-}
-
-// workerPhaseStartTime returns when a worker entered its current phase by checking the
-// ClusterOrder's existing status.workers. For WaitingForAgent workers that were just
-// transitioned, uses the resource version change time approximation.
-func (r *Reconciler) workerPhaseStartTime(co *v1alpha1.ClusterOrder, workerName string) time.Time {
-	for _, w := range co.Status.Workers {
-		if w.Name == workerName && w.Phase == workerPhaseWaitingForAgent {
-			if w.LastFailureTime != nil {
-				return w.LastFailureTime.Time
-			}
-			return co.CreationTimestamp.Time
-		}
-	}
-	return time.Time{}
 }

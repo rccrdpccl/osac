@@ -55,6 +55,37 @@ func mutateCapacityOrder(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder,
 		t.Fatal(err)
 	}
 }
+func TestR09ClockSurvivesLostAcknowledgement(t *testing.T) {
+	r, fc, co := nodeSetHarness(t, "r09-lost-ack", nodeRequest("standard", 1))
+	fc.failCreate = true
+	if _, err := runWorkerCapacityStage(t, r, co); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if len(co.Status.Workers) != 1 {
+		t.Fatalf("workers=%+v", co.Status.Workers)
+	}
+	origin := co.Status.Workers[0].AttemptStartedAt
+	if origin == nil {
+		t.Fatal("attempt origin was not persisted before the first Create")
+	}
+	// A lost Create acknowledgement retries the same reservation and must not
+	// move the durable attempt origin.
+	for range 2 {
+		if _, err := runWorkerCapacityStage(t, r, co); err == nil {
+			t.Fatal("expected interrupted create")
+		}
+		if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+			t.Fatal(err)
+		}
+		if got := co.Status.Workers[0].AttemptStartedAt; got == nil || !got.Equal(origin) {
+			t.Fatalf("lost acknowledgement moved the attempt origin: %+v want %+v", got, origin)
+		}
+	}
+}
+
 func TestR01ReservationReturnsBeforeCreate(t *testing.T) {
 	r, fc, co := nodeSetHarness(t, "r01-reserve", nodeRequest("standard", 2))
 	res, err := runWorkerCapacityStage(t, r, co)
@@ -195,7 +226,7 @@ func TestR01FailedCapacityReturnsAfterOneRetryDelete(t *testing.T) {
 			}
 			if deleteErr == nil {
 				// A pending provider cleanup is a bounded recheck, not a global gate.
-				if deadline := r.workerRecheckDeadline(co.Status.Workers); deadline.RequeueAfter <= 0 {
+				if deadline := r.workerRecheckDeadline(co.Status.Workers, time.Now()); deadline.RequeueAfter <= 0 {
 					t.Fatalf("pending cleanup did not schedule a recheck: %+v", deadline)
 				}
 			}

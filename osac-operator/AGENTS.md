@@ -238,6 +238,33 @@ outage with independent conditions and explicit recovery. These cases inject
 simulated gRPC outcomes; real backend outages and authorization visibility
 (`R08-C1`) remain with
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+R09 adds one durable attempt clock per worker. `WorkerStatus.AttemptStartedAt` is
+persisted with the reservation, and for a legacy ID-less attempt or a due retry
+immediately before `Create`, then never refreshed by an error, Get or
+re-observation. `checkAgentRegistrationTimeout` measures
+`AttemptStartedAt + agentRegistrationTimeout` against a caller-captured `now`, so
+a worker added to an old order and a retry attempt are no longer aged by the
+parent ClusterOrder or a stale `LastFailureTime`. Confirmed old-attempt cleanup
+clears the origin with the old ID and `ReadySince`; the retry checkpoint keeps its
+own `NextRetryTime`; and the replacement attempt persists a fresh origin before
+its Create. A pre-existing worker is migrated once: the backing BMI's creation
+timestamp when usable, otherwise a single observation-time origin with a
+compatibility diagnostic. `ReadySince` is now a continuous interval: entering
+Ready starts it, every demotion, failure or cleanup transition clears it, and the
+healthy-history reset only fires after `MinHealthyDuration` of uninterrupted
+readiness, with `workerRecheckDeadline` scheduling that deadline for a quiet
+Ready worker. `R09-U1–U6` Unit cases in `agent_reconcile_test.go`,
+`retry_test.go`, `worker_projection_test.go` and `worker_capacity_test.go` use
+fixed clocks for the origin, lost-acknowledgement recovery, one-time backfill,
+continuous interval and exact/just-before/just-after boundaries; `R09-E1–E4`
+Envtest traces in the acceptance suites drive public `Reconcile` through real CRD
+status persistence for the timeout origin, a lost Create acknowledgement plus
+restart, one-time legacy backfill and Ready demotion/re-entry. Real provider
+timeout/health behavior (`R09-C1`) and the deployed scale/retry journey remain
+with
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) and [QE]. An older
+independently deployed controller that ignores the optional status field keeps
+the old parent-age timeout behavior; this is not a guaranteed safe downgrade.
 The Kind suite's LVMS-disabled case verifies the Volume controller remains
 ready without the TopoLVM `LogicalVolume` CRD; it does not exercise LVMS
 provisioning or the CSI data path.

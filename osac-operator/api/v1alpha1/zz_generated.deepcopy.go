@@ -1829,6 +1829,10 @@ func (in *WorkerStatus) DeepCopyInto(out *WorkerStatus) {
 	*out = *in
 	out.BareMetalInstance = in.BareMetalInstance
 	in.CreationTimestamp.DeepCopyInto(&out.CreationTimestamp)
+	if in.AttemptStartedAt != nil {
+		in, out := &in.AttemptStartedAt, &out.AttemptStartedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.LastFailureTime != nil {
 		in, out := &in.LastFailureTime, &out.LastFailureTime
 		*out = (*in).DeepCopy()

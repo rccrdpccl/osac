@@ -29,10 +29,12 @@ func reserveExistingWorker(order *osacv1alpha1.ClusterOrder, name string) {
 	latest := &osacv1alpha1.ClusterOrder{}
 	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(order), latest)).To(Succeed())
 	instanceType := latest.Spec.NodeRequests[0].BareMetal.InstanceType
+	now := metav1.Now()
 	latest.Status.Workers = []osacv1alpha1.WorkerStatus{{
 		Name: name, Kind: "BareMetalInstance", NodeSet: latest.Spec.NodeRequests[0].NodeSet,
-		InstanceType: instanceType, Phase: "Provisioning", CreationTimestamp: metav1.Now(),
+		InstanceType: instanceType, Phase: "Provisioning", CreationTimestamp: now,
 		BareMetalInstance: osacv1alpha1.BareMetalInstanceReference{Name: name},
+		AttemptStartedAt:  &now,
 	}}
 	Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
 }

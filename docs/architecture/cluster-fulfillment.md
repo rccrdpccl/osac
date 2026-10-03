@@ -383,9 +383,22 @@ A BMI Delete response is only a request. Deletion metadata causes a wait, and
 only fresh Get NotFound confirms the recorded incarnation is absent. Until then,
 retry retains the Failed phase and old ID; retirement retains the slot and ID.
 Confirmed retry cleanup increments the attempt and sets a deadline once, clears
-the old ID and ReadySince, and keeps the reserved name for a distinct successor
-incarnation. Interrupted Create recovery checks current ownership and liveness;
-foreign, ambiguous or deleting name-recovery candidates cannot become replacements.
+the old ID, attempt origin and ReadySince, and keeps the reserved name for a
+distinct successor incarnation. Interrupted Create recovery checks current
+ownership and liveness; foreign, ambiguous or deleting name-recovery candidates
+cannot become replacements.
+
+Each provisioning attempt has one durable registration clock.
+`status.workers[].attemptStartedAt` is persisted with the reservation, and before
+the `Create` of a legacy ID-less attempt or a due retry, then never refreshed by
+an error, Get or re-observation. The agent registration timeout is measured from
+that origin, not from the parent ClusterOrder's age or a failure timestamp, so a
+worker added to an old order and a retry attempt each get their full interval.
+A pre-existing worker is migrated once from the backing BareMetalInstance's
+creation timestamp when usable, otherwise from one observation-time origin.
+`readySince` is a continuous interval: entering Ready starts it, and every
+demotion, failure or cleanup transition clears it, so the healthy-history reset
+requires uninterrupted readiness.
 
 Finalization never provisions. It recovers exact ID-less reservations in every
 phase and retains the worker/finalizer if name ownership or absence is uncertain.

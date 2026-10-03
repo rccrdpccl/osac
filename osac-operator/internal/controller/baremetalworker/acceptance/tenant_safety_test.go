@@ -137,9 +137,11 @@ var _ = Describe("BareMetalWorker tenant safety", func() {
 	setStatus := func(name, workerName, bmiID, phase string) {
 		GinkgoHelper()
 		co := getOrder(name)
+		now := metav1.Now()
 		co.Status.Workers = []osacv1alpha1.WorkerStatus{{
 			Kind: "BareMetalInstance", Name: workerName, NodeSet: "bm-standard", Phase: phase,
-			BareMetalInstance: osacv1alpha1.BareMetalInstanceReference{Name: workerName, ID: bmiID}, CreationTimestamp: metav1.Now(),
+			BareMetalInstance: osacv1alpha1.BareMetalInstanceReference{Name: workerName, ID: bmiID}, CreationTimestamp: now,
+			AttemptStartedAt: &now,
 		}}
 		Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
 	}

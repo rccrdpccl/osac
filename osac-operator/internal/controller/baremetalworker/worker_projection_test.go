@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/tools/events"
@@ -154,7 +155,19 @@ func TestCombinedObservationMigratedPhaseAndHistoryCases(t *testing.T) {
 				t.Fatalf("result=%v removed=%v", got, removed)
 			}
 			got[0].Phase = w.Phase
-			if w.ReadySince == nil {
+			// AttemptStartedAt is a separate attempt clock owned by R09 and covered by
+			// TestR09LegacyAttemptBackfill; normalize it so the identity/history and
+			// ReadySince assertions below stay focused.
+			w.AttemptStartedAt = nil
+			got[0].AttemptStartedAt = nil
+			// ReadySince describes a continuous interval: it is cleared on any demotion
+			// and only compared when the observed phase is still Ready.
+			if tt.want != workerPhaseReady {
+				if got[0].ReadySince != nil {
+					t.Fatalf("demoted worker retained the healthy interval: %+v", got[0].ReadySince)
+				}
+				w.ReadySince = nil
+			} else if w.ReadySince == nil {
 				got[0].ReadySince = nil
 			}
 			if !reflect.DeepEqual(got[0], w) {
@@ -163,6 +176,83 @@ func TestCombinedObservationMigratedPhaseAndHistoryCases(t *testing.T) {
 		})
 	}
 }
+
+// TestR09ContinuousHealthyInterval proves a Ready demotion clears ReadySince, so
+// disjoint healthy intervals cannot accumulate into the healthy-reset threshold.
+func TestR09ContinuousHealthyInterval(t *testing.T) {
+	stale := metav1.NewTime(time.Now().Add(-2 * time.Hour).Truncate(time.Second))
+	ready := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseReady)
+	ready.ReadySince = &stale
+	got, _ := observeWorkerFixture(t, []v1alpha1.WorkerStatus{ready}, &unstructured.UnstructuredList{}, func(string) bool { return true })
+	if len(got) != 1 || got[0].Phase != workerPhaseWaitingForAgent {
+		t.Fatalf("expected a Ready demotion: %+v", got)
+	}
+	if got[0].ReadySince != nil {
+		t.Fatalf("demotion retained the previous healthy interval: %+v", got[0].ReadySince)
+	}
+	// Re-entering Ready starts a new interval instead of inheriting the stale one.
+	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture("worker", true)}}
+	got, _ = observeWorkerFixture(t, []v1alpha1.WorkerStatus{got[0]}, agents, func(string) bool { return true })
+	if len(got) != 1 || got[0].Phase != workerPhaseReady || got[0].ReadySince == nil {
+		t.Fatalf("re-entry did not start a fresh healthy interval: %+v", got)
+	}
+	if !got[0].ReadySince.Time.After(stale.Time) {
+		t.Fatalf("re-entry reused a disconnected interval: %+v", got[0].ReadySince)
+	}
+}
+
+// TestR09LegacyAttemptBackfill proves the one-time legacy migration: a pre-existing
+// attempt inherits the backing BMI's creation time when usable, otherwise a single
+// observation-time origin. Neither is refreshed by later reconciles.
+func TestR09LegacyAttemptBackfill(t *testing.T) {
+	ctx := context.Background()
+	r := &Reconciler{recorder: events.NewFakeRecorder(10)}
+	created := time.Date(2024, 5, 1, 10, 0, 0, 0, time.UTC)
+
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	bmi := ownedBMIFixture(co, "worker", "id")
+	bmi.GetMetadata().SetCreationTimestamp(timestamppb.New(created))
+	legacy := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
+	legacy.AttemptStartedAt = nil
+	co.Status.Workers = []v1alpha1.WorkerStatus{legacy}
+	observed := indexWorkerBMIs([]*privatev1.BareMetalInstance{bmi})
+	observed.agents = &unstructured.UnstructuredList{}
+	got, err := r.observeExistingWorkers(ctx, co, "tenant", observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].AttemptStartedAt == nil || !got[0].AttemptStartedAt.Time.Equal(created) {
+		t.Fatalf("legacy worker did not inherit the BMI creation time: %+v", got[0].AttemptStartedAt)
+	}
+
+	// Persisted once: another observation with the field already set must keep it.
+	co.Status.Workers = got
+	observed = indexWorkerBMIs([]*privatev1.BareMetalInstance{bmi})
+	observed.agents = &unstructured.UnstructuredList{}
+	again, err := r.observeExistingWorkers(ctx, co, "tenant", observed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again[0].AttemptStartedAt == nil || !again[0].AttemptStartedAt.Equal(got[0].AttemptStartedAt) {
+		t.Fatal("backfill refreshed an already persisted attempt origin")
+	}
+
+	// No usable BMI clock: one observation-time origin is still durable.
+	noclock := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	noclockWorker := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
+	noclockWorker.AttemptStartedAt = nil
+	noclock.Status.Workers = []v1alpha1.WorkerStatus{noclockWorker}
+	fallbackObs := indexWorkerBMIs([]*privatev1.BareMetalInstance{ownedBMIFixture(noclock, "worker", "id")})
+	fallbackObs.agents = &unstructured.UnstructuredList{}
+	fallback, err := r.observeExistingWorkers(ctx, noclock, "tenant", fallbackObs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback[0].AttemptStartedAt == nil {
+		t.Fatal("missing-clock legacy worker was not given a one-time origin")
+	}
+}
+
 func TestCombinedObservationMixedAndEmptyWorkers(t *testing.T) {
 	workers := []v1alpha1.WorkerStatus{newWorkerStatus("standard", "standard", "waiting", "id-0", workerPhaseProvisioning), newWorkerStatus("standard", "standard", "installed", "id-1", workerPhaseProvisioning), newWorkerStatus("standard", "standard", "missing", "id-2", workerPhaseReady), {Name: "vm", Kind: "VirtualMachine", Phase: "Running"}}
 	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture("installed", true)}}

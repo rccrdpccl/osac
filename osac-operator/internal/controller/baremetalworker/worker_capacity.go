@@ -6,6 +6,7 @@ package baremetalworker
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
@@ -125,7 +126,7 @@ func (r *Reconciler) resolveWorkerCreationInputs(
 func (r *Reconciler) reconcileWorkerCreation(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, observed *workerObservation, infra infraEnvEvidence,
 ) (bool, ctrl.Result, error) {
-	if _, prev := selectDueSlot(co); prev == nil && !workerCreationDue(co) {
+	if _, prev := selectDueSlot(co, time.Now()); prev == nil && !workerCreationDue(co) {
 		res, err := r.refreshWorkerReadiness(ctx, co, infra)
 		if err != nil || !res.IsZero() {
 			return false, res, err
@@ -196,7 +197,7 @@ func (r *Reconciler) reconcileDueWorkerCapacity(
 	if added {
 		return true, workerBoundaryRequeue(), nil
 	}
-	nr, prev := selectDueSlot(co)
+	nr, prev := selectDueSlot(co, time.Now())
 	if prev == nil {
 		res, err := r.reconcileDueWorkerCreation(ctx, co, tenant, inputs, observed)
 		return false, res, err
@@ -212,7 +213,7 @@ func (r *Reconciler) reconcileDueWorkerCreation(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
 	inputs workerCreationInputs, observed *workerObservation,
 ) (ctrl.Result, error) {
-	nr, prev := selectDueSlot(co)
+	nr, prev := selectDueSlot(co, time.Now())
 	if prev == nil {
 		if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 			return ctrl.Result{}, err
@@ -231,7 +232,7 @@ func (r *Reconciler) reconcileDueWorkerCreation(
 // selectDueSlot returns the first slot that may create or retry a BMI in
 // spec/retention order. Slots waiting for retry and slots that already hold an
 // identity are not due. It returns a nil worker when no create is due.
-func selectDueSlot(co *v1alpha1.ClusterOrder) (*v1alpha1.NodeRequest, *v1alpha1.WorkerStatus) {
+func selectDueSlot(co *v1alpha1.ClusterOrder, now time.Time) (*v1alpha1.NodeRequest, *v1alpha1.WorkerStatus) {
 	plan := planWorkerSlots(co)
 	for i := range co.Spec.NodeRequests {
 		nr := &co.Spec.NodeRequests[i]
@@ -240,7 +241,7 @@ func selectDueSlot(co *v1alpha1.ClusterOrder) (*v1alpha1.NodeRequest, *v1alpha1.
 		}
 		for _, prev := range plan.selected {
 			if prev.NodeSet != nr.NodeSet || prev.BareMetalInstance.ID != "" ||
-				(prev.Phase == workerPhaseFailed && !isRetryDue(prev)) {
+				(prev.Phase == workerPhaseFailed && !isRetryDue(prev, now)) {
 				continue
 			}
 			candidate := prev
@@ -273,7 +274,18 @@ func (r *Reconciler) createSelectedWorker(
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 		return ctrl.Result{}, err
 	}
-	before := *prev
+	// Persist the durable attempt origin before the first external Create for this
+	// attempt. A lost acknowledgement or lost identity write then recovers the same
+	// clock instead of restarting it, and no provider call happens inside this
+	// status write.
+	if prev.AttemptStartedAt == nil {
+		origin := metav1.NewTime(time.Now())
+		prev.AttemptStartedAt = &origin
+		if err := r.writeSelectedWorker(ctx, co, prev); err != nil {
+			return ctrl.Result{}, err
+		}
+		return workerBoundaryRequeue(), nil
+	}
 	if prev.Phase == workerPhaseFailed {
 		res, err = r.retryFailedWorker(ctx, co, tenant, nr, prev, inputs.image, string(inputs.ignition), filter, fabricInterface)
 	} else {
@@ -287,18 +299,25 @@ func (r *Reconciler) createSelectedWorker(
 	if err != nil || !res.IsZero() {
 		return res, err
 	}
-	next := co.DeepCopy()
-	for i := range next.Status.Workers {
-		if next.Status.Workers[i].Name == before.Name {
-			next.Status.Workers[i] = *prev
-			break
-		}
-	}
-	if err := r.patchStatusFromBase(ctx, co, next); err != nil {
+	if err := r.writeSelectedWorker(ctx, co, prev); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Observe the external action next time, even if its response was a no-op.
 	return workerBoundaryRequeue(), nil
+}
+
+// writeSelectedWorker persists one selected slot's status from the invocation's
+// authoritative order. It is used for durable identity and attempt-boundary
+// writes and keeps optimistic-lock protection.
+func (r *Reconciler) writeSelectedWorker(ctx context.Context, co *v1alpha1.ClusterOrder, worker *v1alpha1.WorkerStatus) error {
+	next := co.DeepCopy()
+	for i := range next.Status.Workers {
+		if next.Status.Workers[i].Name == worker.Name {
+			next.Status.Workers[i] = *worker
+			break
+		}
+	}
+	return r.patchStatusFromBase(ctx, co, next)
 }
 
 // reserveWorkerSlots allocates opaque names in authoritative status before any
@@ -338,8 +357,9 @@ func allocateMissingWorkerSlots(co *v1alpha1.ClusterOrder) error {
 		}
 		for range plan.missingByNodeSet[nr.NodeSet] {
 			name := uuid.NewString()
-			w := newWorkerStatus(nr.NodeSet, nr.BareMetal.InstanceType, name, "", workerPhaseProvisioning)
-			co.Status.Workers = append(co.Status.Workers, w)
+			// newWorkerStatus seeds the attempt origin, so the reservation write
+			// records the registration clock before any external Create.
+			co.Status.Workers = append(co.Status.Workers, newWorkerStatus(nr.NodeSet, nr.BareMetal.InstanceType, name, "", workerPhaseProvisioning))
 		}
 	}
 	return nil

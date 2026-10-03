@@ -6,9 +6,12 @@ package baremetalworker
 import (
 	"context"
 	"fmt"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -107,6 +110,7 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 	if err := validateWorkerBMIReferences(co); err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	for i := 0; i < len(workers); i++ {
 		w := workers[i]
@@ -127,6 +131,18 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 			i--
 			continue
 		}
+		// Legacy optional-field migration: a pre-existing attempt gets one durable
+		// origin, preferably from the backing BMI's own creation timestamp. It is
+		// persisted before any side effect and never refreshed, so grace is granted
+		// exactly once and parent age is never used as the registration clock.
+		if candidate.AttemptStartedAt == nil && eligibleForAgentObservation(*candidate) {
+			origin, fromBMI := attemptOrigin(state.bmi, now)
+			candidate.AttemptStartedAt = &origin
+			if !fromBMI {
+				ctrllog.FromContext(ctx).Info("backfilled attempt start for legacy worker",
+					"worker", candidate.Name, "reason", "no usable BMI creation timestamp")
+			}
+		}
 		workers[i] = *candidate
 	}
 	// The pure helper is the single Agent-phase projection owner; this stage only
@@ -138,13 +154,24 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 			return nil, err
 		}
 	}
-	initializeReadySince(workers)
+	projectReadySince(workers, now)
 	// Readiness telemetry belongs to this single projection boundary. It is
 	// emitted only for an actual Binding -> Ready observation; the caller
 	// persists the projection afterwards or returns a conflict without
 	// pretending the transition happened.
 	r.observeAgentReadiness(ctx, co, co.Status.Workers, workers)
 	return workers, nil
+}
+
+// attemptOrigin returns the durable registration origin to backfill for a
+// pre-existing worker. The backing BMI's creation timestamp is used when it is
+// plausible; otherwise the supplied observation time is used and the boolean
+// reports that a compatibility fallback happened.
+func attemptOrigin(bmi *privatev1.BareMetalInstance, now time.Time) (metav1.Time, bool) {
+	if ts := bmi.GetMetadata().GetCreationTimestamp(); ts != nil && ts.GetSeconds() > 0 && ts.CheckValid() == nil {
+		return metav1.NewTime(ts.AsTime()), true
+	}
+	return metav1.NewTime(now), false
 }
 
 // observeDeletionWorkers recovers names in every lifecycle state, verifies all

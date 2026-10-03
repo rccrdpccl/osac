@@ -228,6 +228,11 @@ var _ = Describe("Unified worker reconciliation", func() {
 		step()
 		Expect(getOrder().Status.Workers[0]).To(Equal(checkpoint))
 		makeRetryDue()
+		// R09: the replacement attempt persists a fresh origin before its Create.
+		step()
+		awaiting := getOrder().Status.Workers[0]
+		Expect(awaiting.AttemptStartedAt).NotTo(BeNil())
+		Expect(awaiting.BareMetalInstance.ID).To(BeEmpty())
 		step()
 		replacement := getOrder().Status.Workers[0]
 		Expect(replacement.BareMetalInstance.Name).To(Equal(old.BareMetalInstance.Name))
@@ -260,6 +265,7 @@ var _ = Describe("Unified worker reconciliation", func() {
 		}
 		fc.SetPendingDeletion(true)
 		markFailed()
+		step() // R09: persist the failed demotion before retirement.
 		latest = getOrder()
 		if parentDeleting {
 			Expect(k8sClient.Delete(ctx, latest)).To(Succeed())
@@ -365,6 +371,7 @@ var _ = Describe("Unified worker reconciliation", func() {
 	It("R03-E4 real API UID preconditions reject deletion of a recreated Agent", func() {
 		old := provision()
 		markFailed()
+		step() // R09: persist the failed demotion before Agent deletion preconditions.
 		agent := cleanupAgent(old, "known-unbound")
 		oldUID := agent.GetUID()
 		fault := &cleanupAgentFaultClient{Client: k8sClient, beforeDelete: func() {
@@ -391,7 +398,10 @@ var _ = Describe("Unified worker reconciliation", func() {
 
 	It("R03-E5 blocks bound Failed cleanup and excludes old readiness from its replacement", func() {
 		old := provision()
-		failed := markFailed()
+		markFailed()
+		step() // R09: persist the failed demotion, clearing the old healthy interval.
+		failed := getOrder().Status.Workers[0]
+		Expect(failed.ReadySince).To(BeNil())
 		agent := cleanupAgent(old, "installed")
 		Expect(unstructured.SetNestedMap(agent.Object, map[string]interface{}{"name": co.Name, "namespace": co.Namespace}, "spec", "clusterDeploymentName")).To(Succeed())
 		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
@@ -419,7 +429,7 @@ var _ = Describe("Unified worker reconciliation", func() {
 		step() // BMI request.
 		step() // Confirm absence and schedule.
 		makeRetryDue()
-		step()
+		step() // R09: persist the fresh attempt origin.
 		step() // Fresh replacement observation, not old installed evidence.
 		w := getOrder().Status.Workers[0]
 		Expect(w.BareMetalInstance.ID).NotTo(Equal(old.BareMetalInstance.ID))
@@ -427,6 +437,75 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(w.ReadySince).To(BeNil())
 		Expect(getOrder().Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
 		Expect(fc.CreateCalls()).To(HaveLen(2))
+	})
+
+	It("R09-E1 measures the registration timeout from the persisted attempt origin", func() {
+		provision()
+		// The order is fresh; only the persisted attempt origin may drive the clock.
+		latest := getOrder()
+		recent := metav1.NewTime(time.Now().Add(-time.Minute))
+		latest.Status.Workers[0].AttemptStartedAt = &recent
+		latest.Status.Workers[0].CreationTimestamp = metav1.NewTime(time.Now().Add(-24 * time.Hour))
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		step()
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+
+		// An expired origin fails without waiting for a real 30-minute timeout.
+		latest = getOrder()
+		stale := metav1.NewTime(time.Now().Add(-time.Hour))
+		latest.Status.Workers[0].AttemptStartedAt = &stale
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		step()
+		failed := getOrder().Status.Workers[0]
+		Expect(failed.Phase).To(Equal("Failed"))
+		Expect(failed.LastFailureReason).To(Equal("AgentRegistrationTimeout"))
+	})
+
+	It("R09-E2 keeps one attempt origin across a lost Create acknowledgement and restart", func() {
+		ready()
+		step() // Reserve only; the origin is part of the reservation write.
+		reserved := getOrder().Status.Workers[0]
+		Expect(reserved.AttemptStartedAt).NotTo(BeNil())
+		Expect(reserved.BareMetalInstance.ID).To(BeEmpty())
+
+		// The Create succeeds but its ID status write is lost.
+		interrupted := errors.New("interrupted ID persistence")
+		r = buildReconciler(&workerStatusFaultClient{Client: k8sClient, err: interrupted, fail: func(latest *api.ClusterOrder) bool {
+			return len(latest.Status.Workers) > 0 && latest.Status.Workers[0].BareMetalInstance.ID != ""
+		}})
+		_, err := run()
+		Expect(errors.Is(err, interrupted)).To(BeTrue())
+		lost := getOrder().Status.Workers[0]
+		Expect(lost.BareMetalInstance.ID).To(BeEmpty())
+		Expect(lost.AttemptStartedAt).To(Equal(reserved.AttemptStartedAt))
+
+		// A restarted reconciler recovers the same identity and origin.
+		r = buildReconciler(k8sClient)
+		_, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		recovered := getOrder().Status.Workers[0]
+		Expect(recovered.BareMetalInstance.ID).NotTo(BeEmpty())
+		Expect(recovered.AttemptStartedAt).To(Equal(reserved.AttemptStartedAt))
+	})
+
+	It("R09-E3 backfills a legacy attempt once without extending its deadline", func() {
+		provision()
+		latest := getOrder()
+		latest.Status.Workers[0].AttemptStartedAt = nil
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		step()
+		backfilled := getOrder().Status.Workers[0].AttemptStartedAt
+		Expect(backfilled).NotTo(BeNil())
+		step()
+		Expect(getOrder().Status.Workers[0].AttemptStartedAt).To(Equal(backfilled), "backfill must be one-time")
+
+		// The persisted origin, not the parent order age, schedules the timeout.
+		latest = getOrder()
+		stale := metav1.NewTime(time.Now().Add(-time.Hour))
+		latest.Status.Workers[0].AttemptStartedAt = &stale
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		step()
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Failed"))
 	})
 
 	It("R01-E1 persists reserve -> one create -> observe checkpoints for NodeSets sharing a type", func() {
@@ -1050,7 +1129,8 @@ var _ = Describe("Unified worker reconciliation", func() {
 		demoted := getOrder().Status.Workers[0]
 		Expect(demoted.Phase).To(Equal("Binding"))
 		Expect(demoted.BareMetalInstance).To(Equal(old.BareMetalInstance))
-		Expect(demoted.ReadySince).To(Equal(ready.ReadySince))
+		// R09: demotion ends the continuous healthy interval.
+		Expect(demoted.ReadySince).To(BeNil())
 		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
 
 		// A protected phase is not resurrected from an installed Agent while provider
