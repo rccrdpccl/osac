@@ -96,7 +96,7 @@ func TestR05MutationDiscardsSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	observed := indexWorkerBMIs(nil)
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, observed)
+	res, err := r.reconcileDueWorkerCreation(context.Background(), co, "tenant", workerCreationInputs{}, observed)
 	if err != nil {
 		t.Fatal(err)
 	}

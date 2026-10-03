@@ -20,11 +20,14 @@ import (
 
 const eventReasonWorkerCreated = "WorkerCreated"
 
-// reconcileWorkerCapacity persists reservations before creating infrastructure.
-// Each invocation ends at its first durable allocation/lifecycle boundary.
-func (r *Reconciler) reconcileWorkerCapacity(
-	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, image *privatev1.DiskImageReference, ignition []byte,
-	observed *workerObservation,
+// reconcileWorkerLifecycle performs the existing-worker lifecycle work that
+// needs no creation inputs: retirement intent and failed incarnation cleanup. A
+// durable status write ends the invocation at its own boundary. Pending
+// provider cleanup is not a global gate: it is reported through the final
+// scheduling decision so teardown, Agent binding and NodePool replicas still
+// converge.
+func (r *Reconciler) reconcileWorkerLifecycle(
+	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
 ) (ctrl.Result, error) {
 	// The observation belongs to the original snapshot and must not absorb new
 	// slots. First reject changes to the worker plan, then refresh the object
@@ -40,7 +43,6 @@ func (r *Reconciler) reconcileWorkerCapacity(
 	if !sameCapacityPlan(expected, co) {
 		return ctrl.Result{}, errWorkerObservationChanged
 	}
-	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -53,20 +55,6 @@ func (r *Reconciler) reconcileWorkerCapacity(
 			return ctrl.Result{}, err
 		}
 		return workerBoundaryRequeue(), nil
-	}
-	prepared := co.DeepCopy()
-	added, err := r.reserveWorkerSlots(ctx, co)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if added {
-		return workerBoundaryRequeue(), nil
-	}
-	if !sameCapacityPlan(prepared, co) {
-		return ctrl.Result{}, errWorkerObservationChanged
-	}
-	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
-		return ctrl.Result{}, err
 	}
 	failed := co.DeepCopy()
 	if err := r.handleFailedWorkers(ctx, failed); err != nil {
@@ -82,42 +70,163 @@ func (r *Reconciler) reconcileWorkerCapacity(
 		}
 		return workerBoundaryRequeue(), nil
 	}
-
 	if hasFailedIncarnations(failed.Status.Workers) {
-		// A pending cleanup action ends this invocation; re-observe before
-		// creating or guessing at completion. Publish protected summaries.
+		// A pending cleanup action is a wait, not a global gate. Publish protected
+		// summaries; the caller schedules the bounded cleanup recheck.
 		if err := r.updateWorkerStatusWithAgent(ctx, co, co.Status.Workers); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: teardownRequeueInterval}, nil
 	}
-
-	workers, res, err := r.reconcileNodeSets(ctx, co, tenant, observed, image, string(ignition), filter)
-	if err != nil || !res.IsZero() {
-		return res, err
-	}
-	if !workerStatusesEqual(co.Status.Workers, workers) {
-		if err := r.updateWorkerStatus(ctx, co, workers); err != nil {
-			return ctrl.Result{}, err
-		}
-		return workerBoundaryRequeue(), nil
-	}
-	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionFulfillmentServiceUnavailable) {
-		if err := r.setFulfillmentServiceUnavailable(ctx, co, metav1.ConditionFalse,
-			reasonFulfillmentAvailable, "fulfillment service recovered"); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-	return r.earliestRetryRequeue(workers), nil
+	return ctrl.Result{}, nil
 }
 
-// reconcileNodeSets selects at most one actionable slot in spec/retention order.
-// Slots waiting for retry do not monopolize creation of other reserved workers.
-func (r *Reconciler) reconcileNodeSets(
+// workerCreationInputs holds the external inputs a BMI create needs. They are
+// resolved only after a due slot is selected, so a stable order never fetches
+// discovery ignition or resolves disk images on an unrelated event.
+type workerCreationInputs struct {
+	image    *privatev1.DiskImageReference
+	ignition []byte
+}
+
+// resolveIgnitionReadiness ensures the InfraEnv exists and its discovery
+// ignition is current. It projects InfraEnvReady, which is observable status for
+// an existing worker set even when no create is due.
+func (r *Reconciler) resolveIgnitionReadiness(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+) ([]byte, ctrl.Result, error) {
+	ignition, _, res, err := r.ensureInfraEnv(ctx, co)
+	return ignition, res, err
+}
+
+// resolveWorkerCreationInputs resolves the cluster-level inputs for a create. A
+// non-zero result is a bounded prerequisite wait, for example an InfraEnv whose
+// discovery ignition URL is not published yet.
+func (r *Reconciler) resolveWorkerCreationInputs(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+) (workerCreationInputs, ctrl.Result, error) {
+	ignition, res, err := r.resolveIgnitionReadiness(ctx, co)
+	if err != nil || !res.IsZero() {
+		return workerCreationInputs{}, res, err
+	}
+	image, res, err := r.resolveDiskImage(ctx, co)
+	if err != nil || !res.IsZero() {
+		return workerCreationInputs{}, res, err
+	}
+	return workerCreationInputs{image: image, ignition: ignition}, ctrl.Result{}, nil
+}
+
+// reconcileWorkerCreation performs the durable reservation and the single
+// create/retry for the selected due slot. created reports that a durable
+// identity write was persisted, which always ends the invocation. Creation
+// inputs are resolved only when a reservation or create is actually due, so a
+// stable order never fetches discovery ignition or resolves disk images on an
+// unrelated event. A prerequisite wait/error is reported without created so the
+// caller can still converge teardown, Agents and NodePool replicas.
+func (r *Reconciler) reconcileWorkerCreation(
+	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, observed *workerObservation,
+) (bool, ctrl.Result, error) {
+	if _, prev := selectDueSlot(co); prev == nil && !workerCreationDue(co) {
+		res, err := r.refreshWorkerReadiness(ctx, co)
+		if err != nil || !res.IsZero() {
+			return false, res, err
+		}
+		res, err = r.reconcileDueWorkerCreation(ctx, co, tenant, workerCreationInputs{}, observed)
+		return false, res, err
+	}
+	expected := co.DeepCopy()
+	inputs, res, err := r.resolveWorkerCreationInputs(ctx, co)
+	// Input resolution can persist prerequisite conditions; refresh before any
+	// later optimistic patch, including on the deferred path.
+	if refreshErr := r.readAuthoritativeOrder(ctx, co); refreshErr != nil {
+		return false, ctrl.Result{}, refreshErr
+	}
+	if err != nil || !res.IsZero() {
+		return false, res, err
+	}
+	if !sameCapacityPlan(expected, co) {
+		return false, ctrl.Result{}, errWorkerObservationChanged
+	}
+	return r.reconcileDueWorkerCapacity(ctx, co, tenant, inputs, observed)
+}
+
+// refreshWorkerReadiness projects InfraEnv readiness for an existing worker set
+// when no create or reservation is due. It resolves no image or instance type,
+// and an order whose readiness is already current re-fetches nothing. The write
+// is a status projection, not a create boundary, so it does not end the
+// invocation; the caller revalidates the plan before any later action.
+func (r *Reconciler) refreshWorkerReadiness(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
+	if len(co.Status.Workers) == 0 || apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
+		return ctrl.Result{}, nil
+	}
+	if _, res, err := r.resolveIgnitionReadiness(ctx, co); err != nil || !res.IsZero() {
+		return res, err
+	}
+	return ctrl.Result{}, r.readAuthoritativeOrder(ctx, co)
+}
+
+// workerCreationDue reports whether the current worker plan still needs a
+// durable reservation. It is the reservation counterpart of selectDueSlot: a
+// missing slot has no worker yet, so the reservation itself is the due action.
+func workerCreationDue(co *v1alpha1.ClusterOrder) bool {
+	plan := planWorkerSlots(co)
+	for _, missing := range plan.missingByNodeSet {
+		if missing > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// reconcileDueWorkerCapacity reserves missing slots and then creates at most one
+// selected slot using already resolved inputs. A durable reservation is itself a
+// status mutation, so it ends the invocation before any external create.
+func (r *Reconciler) reconcileDueWorkerCapacity(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
-	observed *workerObservation,
-	image *privatev1.DiskImageReference, ignitionRaw, filter string,
-) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
+	inputs workerCreationInputs, observed *workerObservation,
+) (bool, ctrl.Result, error) {
+	added, err := r.reserveWorkerSlots(ctx, co)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if added {
+		return true, workerBoundaryRequeue(), nil
+	}
+	nr, prev := selectDueSlot(co)
+	if prev == nil {
+		res, err := r.reconcileDueWorkerCreation(ctx, co, tenant, inputs, observed)
+		return false, res, err
+	}
+	res, err := r.createSelectedWorker(ctx, co, tenant, nr, prev, inputs, observed)
+	return true, res, err
+}
+
+// reconcileDueWorkerCreation selects the due slot and creates it with already
+// resolved inputs. Without a due slot it only revalidates the capacity plan and
+// clears a recovered fulfillment-service condition.
+func (r *Reconciler) reconcileDueWorkerCreation(
+	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
+	inputs workerCreationInputs, observed *workerObservation,
+) (ctrl.Result, error) {
+	nr, prev := selectDueSlot(co)
+	if prev == nil {
+		if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
+			return ctrl.Result{}, err
+		}
+		if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionFulfillmentServiceUnavailable) {
+			if err := r.setFulfillmentServiceUnavailable(ctx, co, metav1.ConditionFalse,
+				reasonFulfillmentAvailable, "fulfillment service recovered"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+	return r.createSelectedWorker(ctx, co, tenant, nr, prev, inputs, observed)
+}
+
+// selectDueSlot returns the first slot that may create or retry a BMI in
+// spec/retention order. Slots waiting for retry and slots that already hold an
+// identity are not due. It returns a nil worker when no create is due.
+func selectDueSlot(co *v1alpha1.ClusterOrder) (*v1alpha1.NodeRequest, *v1alpha1.WorkerStatus) {
 	plan := planWorkerSlots(co)
 	for i := range co.Spec.NodeRequests {
 		nr := &co.Spec.NodeRequests[i]
@@ -125,58 +234,66 @@ func (r *Reconciler) reconcileNodeSets(
 			continue
 		}
 		for _, prev := range plan.selected {
-			if prev.NodeSet != nr.NodeSet || prev.BareMetalInstance.ID != "" || (prev.Phase == workerPhaseFailed && !isRetryDue(prev)) {
+			if prev.NodeSet != nr.NodeSet || prev.BareMetalInstance.ID != "" ||
+				(prev.Phase == workerPhaseFailed && !isRetryDue(prev)) {
 				continue
 			}
-			instanceType, res, err := r.resolveNodeSetInstanceType(ctx, co, nr.BareMetal.InstanceType)
-			if err != nil || !res.IsZero() {
-				return nil, res, err
-			}
-			var fabricInterface string
-			if co.Spec.NetworkAttachment != nil && co.Spec.NetworkAttachment.SubnetRef != "" {
-				fabricInterface, err = resolveFabricInterface(instanceType)
-				if err != nil {
-					return nil, ctrl.Result{}, err
-				}
-			}
-			if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
-				return nil, ctrl.Result{}, err
-			}
-			before := prev
-			if prev.Phase == workerPhaseFailed {
-				res, err = r.retryFailedWorker(ctx, co, tenant, nr, &prev, image, ignitionRaw, filter, fabricInterface)
-			} else {
-				var ws v1alpha1.WorkerStatus
-				ws, res, err = r.ensureWorkerBMI(ctx, co, tenant, nr, prev.BareMetalInstance.Name, observed, image, ignitionRaw, filter, fabricInterface)
-				if err == nil && res.IsZero() {
-					workerCreated(&prev, ws.BareMetalInstance.Name, ws.BareMetalInstance.ID)
-				}
-			}
-			if err != nil || !res.IsZero() {
-				return nil, res, err
-			}
-			next := co.DeepCopy()
-			for i := range next.Status.Workers {
-				if next.Status.Workers[i].Name == before.Name {
-					next.Status.Workers[i] = prev
-					break
-				}
-			}
-			if err := r.patchStatusFromBase(ctx, co, next); err != nil {
-				return nil, ctrl.Result{}, err
-			}
-			// Observe the external action next time, even if its response was a no-op.
-			return nil, workerBoundaryRequeue(), nil
+			candidate := prev
+			return nr, &candidate
 		}
 	}
+	return nil, nil
+}
+
+// createSelectedWorker performs the single durable create/retry for an already
+// selected slot and persists its identity before returning. It is the only stage
+// that consumes image and ignition bytes.
+func (r *Reconciler) createSelectedWorker(
+	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string,
+	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
+	inputs workerCreationInputs, observed *workerObservation,
+) (ctrl.Result, error) {
+	instanceType, res, err := r.resolveNodeSetInstanceType(ctx, co, nr.BareMetal.InstanceType)
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+	var fabricInterface string
+	if co.Spec.NetworkAttachment != nil && co.Spec.NetworkAttachment.SubnetRef != "" {
+		fabricInterface, err = resolveFabricInterface(instanceType)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	if err := r.checkCurrentCapacityPlan(ctx, co); err != nil {
-		return nil, ctrl.Result{}, err
+		return ctrl.Result{}, err
 	}
-	workers := plan.selected
-	if len(plan.excess) > 0 {
-		workers = r.handleScaleDown(ctx, co, workers, plan.excess)
+	before := *prev
+	if prev.Phase == workerPhaseFailed {
+		res, err = r.retryFailedWorker(ctx, co, tenant, nr, prev, inputs.image, string(inputs.ignition), filter, fabricInterface)
+	} else {
+		var ws v1alpha1.WorkerStatus
+		ws, res, err = r.ensureWorkerBMI(ctx, co, tenant, nr, prev.BareMetalInstance.Name, observed,
+			inputs.image, string(inputs.ignition), filter, fabricInterface)
+		if err == nil && res.IsZero() {
+			workerCreated(prev, ws.BareMetalInstance.Name, ws.BareMetalInstance.ID)
+		}
 	}
-	return workers, ctrl.Result{}, nil
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+	next := co.DeepCopy()
+	for i := range next.Status.Workers {
+		if next.Status.Workers[i].Name == before.Name {
+			next.Status.Workers[i] = *prev
+			break
+		}
+	}
+	if err := r.patchStatusFromBase(ctx, co, next); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Observe the external action next time, even if its response was a no-op.
+	return workerBoundaryRequeue(), nil
 }
 
 // reserveWorkerSlots allocates opaque names in authoritative status before any

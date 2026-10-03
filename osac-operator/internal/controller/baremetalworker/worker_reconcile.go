@@ -13,8 +13,12 @@ import (
 )
 
 // reconcileWorkers owns normal worker convergence. Finalization never enters
-// this flow: observation repairs precede gates, then durable capacity actions,
-// teardown, Agent convergence and the final merged status summary.
+// this flow. Stages run in dependency order and each ends at its own durable
+// boundary: observation and repair, InfraEnv UID evidence, existing-worker
+// lifecycle (retirement, reservation, failed cleanup), creation with lazily
+// resolved inputs, then teardown, Agent binding, NodePool replicas and summary.
+// Creation prerequisites never gate existing-worker work: a wait or error from
+// the create stage is merged into the final scheduling decision instead.
 func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string) (ctrl.Result, error) {
 	// One local observation supplies identity, ownership and early Agent phases.
 	observed, res, err := r.observeWorkerResources(ctx, co)
@@ -31,17 +35,70 @@ func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterO
 		}
 		return workerBoundaryRequeue(), nil
 	}
-	image, ignition, res, err := r.prepareWorkerProvisioning(ctx, co)
-	if err != nil || !res.IsZero() {
-		return res, err
+
+	// InfraEnv object and UID evidence. Creating the object or persisting a
+	// stale-worker classification is a durable boundary; a missing creation
+	// prerequisite is held so existing-worker work still runs.
+	prereqWait, prereqMutated, prereqErr := r.reconcileInfraEnvEvidence(ctx, co)
+	if prereqMutated {
+		return prereqWait, prereqErr
 	}
 
-	res, err = r.reconcileWorkerCapacity(ctx, co, tenant, image, ignition, observed)
-	if err != nil || !res.IsZero() {
-		return res, err
+	// Retirement, durable reservations and failed-incarnation cleanup need no
+	// creation inputs, so a missing pull secret, ignition or disk image cannot
+	// starve them.
+	lifecycleRes, err := r.reconcileWorkerLifecycle(ctx, co, tenant)
+	if err != nil || !lifecycleRes.IsZero() {
+		return lifecycleRes, err
 	}
 
-	return r.finishWorkerConvergence(ctx, co, observed)
+	// At most one Create for the selected due slot, with image, ignition and
+	// instance type resolved only now.
+	created, creationRes, creationErr := r.reconcileWorkerCreation(ctx, co, tenant, observed)
+	if created {
+		return creationRes, creationErr
+	}
+
+	// Teardown, Agent binding, NodePool replicas and the summary are independent
+	// of creation prerequisites, so they converge even when a create cannot.
+	finishRes, err := r.finishWorkerConvergence(ctx, co, observed)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Surface a creation-prerequisite failure only after independent lifecycle
+	// work has been persisted, instead of pretending the invocation completed.
+	if prereqErr != nil {
+		return ctrl.Result{}, prereqErr
+	}
+	if creationErr != nil {
+		return ctrl.Result{}, creationErr
+	}
+	if !finishRes.IsZero() {
+		return finishRes, nil
+	}
+	return mergeWorkerWaits(creationRes, r.workerRecheckDeadline(co.Status.Workers)), nil
+}
+
+// mergeWorkerWaits keeps the earliest positive recheck delay, clamped so a
+// stalled dependency cannot spin. A zero result means no explicit timer and the
+// invocation relies on watches.
+func mergeWorkerWaits(results ...ctrl.Result) ctrl.Result {
+	wait := time.Duration(0)
+	for _, res := range results {
+		if res.RequeueAfter <= 0 {
+			continue
+		}
+		if wait == 0 || res.RequeueAfter < wait {
+			wait = res.RequeueAfter
+		}
+	}
+	if wait == 0 {
+		return ctrl.Result{}
+	}
+	if wait < time.Second {
+		wait = time.Second
+	}
+	return ctrl.Result{RequeueAfter: wait}
 }
 
 // A bounded wakeup does not depend on status-only events or cache freshness.
@@ -50,6 +107,11 @@ func workerBoundaryRequeue() ctrl.Result {
 }
 
 func (r *Reconciler) finishWorkerConvergence(ctx context.Context, co *v1alpha1.ClusterOrder, observed *workerObservation) (ctrl.Result, error) {
+	// Earlier stages may have persisted status or annotations; patch from the
+	// successful writes' resource version instead of a stale snapshot.
+	if err := r.readAuthoritativeOrder(ctx, co); err != nil {
+		return ctrl.Result{}, err
+	}
 	// Teardown mutates Agent/BMI state, so it ends the invocation and the next
 	// observation supplies fresh evidence; never project from a mutated snapshot.
 	stop, err := r.reconcileWorkerTeardown(ctx, co)

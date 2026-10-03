@@ -57,7 +57,7 @@ func mutateCapacityOrder(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder,
 }
 func TestR01ReservationReturnsBeforeCreate(t *testing.T) {
 	r, fc, co := nodeSetHarness(t, "r01-reserve", nodeRequest("standard", 2))
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+	res, err := runWorkerCapacityStage(t, r, co)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestR01SingleCreateBoundary(t *testing.T) {
 	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+	res, err := runWorkerCapacityStage(t, r, co)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestR01StaleCachedOrderIsRejectedInsteadOfDuplicating(t *testing.T) {
 	names := []string{co.Status.Workers[0].Name, co.Status.Workers[1].Name}
 	// A caller whose snapshot predates the reservation must return to a fresh
 	// invocation rather than refreshing and duplicating allocation.
-	if _, err := r.reconcileWorkerCapacity(context.Background(), stale, "tenant", nil, nil, capacityObservation(t, r.fulfillment)); !errors.Is(err, errWorkerObservationChanged) {
+	if _, err := runWorkerCapacityStage(t, r, stale); !errors.Is(err, errWorkerObservationChanged) {
 		t.Fatalf("error=%v, want stale-observation rejection", err)
 	}
 	if len(fc.names) != 0 {
@@ -133,7 +133,7 @@ func TestR01NoOpCapacityDoesNotRequeueForRetentionOrdering(t *testing.T) {
 	if err := r.Status().Update(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+	res, err := runWorkerCapacityStage(t, r, co)
 	if err != nil || !res.IsZero() {
 		t.Fatalf("unchanged capacity requeued solely for sorted plan: result=%+v err=%v", res, err)
 	}
@@ -152,7 +152,7 @@ func TestR01WaitingRetryDoesNotBlockAnotherReservation(t *testing.T) {
 	if err := r.Status().Update(context.Background(), co); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+	res, err := runWorkerCapacityStage(t, r, co)
 	if err != nil || res.IsZero() || len(fc.names) != 1 || fc.names[0] != "actionable" {
 		t.Fatalf("waiting slot blocked progress: result=%+v err=%v creates=%v", res, err, fc.names)
 	}
@@ -189,9 +189,15 @@ func TestR01FailedCapacityReturnsAfterOneRetryDelete(t *testing.T) {
 				t.Fatal(err)
 			}
 			fc.bmis = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "recorded-id"), ownedBMIFixture(co, "second", "second-id")}
-			res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
-			if !errors.Is(err, deleteErr) || res.IsZero() != (deleteErr != nil) || len(fc.deletes) != 1 || len(fc.names) != 0 {
+			res, err := runWorkerCapacityStage(t, r, co)
+			if !errors.Is(err, deleteErr) || !res.IsZero() || len(fc.deletes) != 1 || len(fc.names) != 0 {
 				t.Fatalf("retry-delete boundary: result=%+v err=%v deletes=%v creates=%v", res, err, fc.deletes, fc.names)
+			}
+			if deleteErr == nil {
+				// A pending provider cleanup is a bounded recheck, not a global gate.
+				if deadline := r.workerRecheckDeadline(co.Status.Workers); deadline.RequeueAfter <= 0 {
+					t.Fatalf("pending cleanup did not schedule a recheck: %+v", deadline)
+				}
 			}
 			if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 				t.Fatal(err)
@@ -247,7 +253,7 @@ func TestCapacityActionRejectsChangedSpecOrSlot(t *testing.T) {
 					}
 				}
 			}
-			res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+			res, err := runWorkerCapacityStage(t, r, co)
 			if err == nil && res.IsZero() {
 				t.Fatal("capacity action accepted stale plan")
 			}
@@ -272,7 +278,7 @@ func TestCreatePersistencePreservesAppendedSlotAndStopsNextAction(t *testing.T) 
 			latest.Status.Workers = append(latest.Status.Workers, newWorkerStatus("standard", "standard", "appended", "appended-id", workerPhaseReady))
 		})
 	}
-	res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+	res, err := runWorkerCapacityStage(t, r, co)
 	if !apierrors.IsConflict(err) || !res.IsZero() {
 		t.Fatalf("result=%+v err=%v, want one-shot conflict", res, err)
 	}
@@ -321,7 +327,7 @@ func TestConcurrentForeignReferenceStopsCapacity(t *testing.T) {
 	mutateCapacityOrder(t, r, co, func(latest *v1alpha1.ClusterOrder) {
 		latest.Status.Workers = append(latest.Status.Workers, v1alpha1.WorkerStatus{Name: "foreign", Kind: workerKindBMI, NodeSet: "standard", Phase: workerPhaseReady, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "foreign-bmi", ID: "foreign-id"}, CreationTimestamp: metav1.Now()})
 	})
-	if _, err := r.reconcileWorkerCapacity(context.Background(), initial, "tenant", nil, nil, observed); err == nil {
+	if _, err := r.reconcileDueWorkerCreation(context.Background(), initial, "tenant", workerCreationInputs{}, observed); err == nil {
 		t.Fatal("unverified refreshed reference permitted capacity actions")
 	}
 	if len(fc.names) != 0 {

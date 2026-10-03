@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -379,6 +380,277 @@ func TestWorkerFallbackGetMemoizesUnknownEvidence(t *testing.T) {
 
 func (f *workerReadClient) GetClusterVersion(context.Context, string) (*privatev1.ClusterVersion, error) {
 	return privatev1.ClusterVersion_builder{Id: "cv"}.Build(), nil
+}
+
+func TestR04CleanupWithoutImageOrIgnition(t *testing.T) {
+	ctx := context.Background()
+	r, base, co := workerReadHarness(t)
+	blocked := &r04PrereqClient{workerReadClient: base}
+	r.fulfillment = blocked
+	ignition := &countingIgnition{}
+	r.ignition = ignition
+	base.listed = []*privatev1.BareMetalInstance{
+		ownedBMIFixture(co, "recorded-bmi", "recorded-id"),
+		ownedBMIFixture(co, "excess", "excess-id"),
+	}
+	base.bmis = base.listed
+	// One extra slot retires while every creation prerequisite is unavailable:
+	// the pull secret is absent, the InfraEnv is gone and the image chain fails.
+	co.Spec.NodeRequests[0].NumberOfNodes = 1
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.Status.Workers = append(co.Status.Workers, newWorkerStatus("standard", "standard", "excess", "excess-id", workerPhaseWaitingForAgent))
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+	if err != nil || res.IsZero() {
+		t.Fatalf("retirement boundary: result=%+v err=%v", res, err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if got := workerByName(co.Status.Workers, "excess"); got == nil || got.Phase != workerPhaseUnbinding {
+		t.Fatalf("retirement intent was not persisted without prerequisites: %+v", co.Status.Workers)
+	}
+	if len(blocked.names) != 0 || len(blocked.deletes) != 0 || ignition.calls != 0 {
+		t.Fatalf("prerequisite-free retirement acted externally: creates=%v deletes=%v ignition=%d", blocked.names, blocked.deletes, ignition.calls)
+	}
+
+	// Cleanup proceeds on the next invocation even though the missing pull secret
+	// is still reported, and it never fetches discovery ignition.
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err == nil {
+		t.Fatal("missing pull secret was not reported")
+	}
+	if len(blocked.deletes) != 1 || blocked.deletes[0] != "excess-id" {
+		t.Fatalf("cleanup did not request BMI deletion: %v", blocked.deletes)
+	}
+	if ignition.calls != 0 || len(blocked.names) != 0 {
+		t.Fatalf("cleanup fetched ignition or created a BMI: ignition=%d creates=%v", ignition.calls, blocked.names)
+	}
+}
+
+func TestR04PendingRetryDoesNotBlockBinding(t *testing.T) {
+	ctx := context.Background()
+	r, base, co := workerReadHarness(t)
+	fc := &r04PrereqClient{workerReadClient: base}
+	r.fulfillment = fc
+	future := metav1.NewTime(time.Now().Add(time.Hour))
+	failed := newWorkerStatus("standard", "standard", "failed-bmi", "failed-id", workerPhaseFailed)
+	failed.NextRetryTime = &future
+	binding := newWorkerStatus("standard", "standard", "binding-bmi", "binding-id", workerPhaseBinding)
+	co.Spec.NodeRequests[0].NumberOfNodes = 2
+	co.Spec.PullSecret = `{"auths":{}}`
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.Status.Workers = []v1alpha1.WorkerStatus{failed, binding}
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	fc.bmis = []*privatev1.BareMetalInstance{
+		ownedBMIFixture(co, "failed-bmi", "failed-id"),
+		ownedBMIFixture(co, "binding-bmi", "binding-id"),
+	}
+	fc.listed = fc.bmis
+	agent := agentPhaseFixture("binding-bmi", true)
+	agent.SetNamespace(co.Namespace)
+	agent.SetLabels(map[string]string{workerNameLabel: "binding-bmi", clusterOrderLabel: co.Name})
+	if err := unstructured.SetNestedSlice(agent.Object, []interface{}{map[string]interface{}{"macAddress": "aa:bb:cc:dd:ee:01"}}, "status", "inventory", "interfaces"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	// The first invocation projects the labeled Agent to Ready while the other
+	// worker still waits for its retry; the second performs its pending cleanup.
+	// A finite trace: binding converges on the first invocation, while the other
+	// worker's cleanup proceeds on the next one that is not preempted by the
+	// InfraEnv creation boundary.
+	for i := 0; i < 4 && len(fc.deletes) == 0; i++ {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if got := workerByName(co.Status.Workers, "binding-bmi"); got == nil || got.Phase != workerPhaseReady {
+		t.Fatalf("binding did not converge past the pending retry: %+v", co.Status.Workers)
+	}
+	if got := workerByName(co.Status.Workers, "failed-bmi"); got == nil || got.Phase != workerPhaseFailed || got.BareMetalInstance.ID != "failed-id" {
+		t.Fatalf("pending retry lost its recorded incarnation: %+v", co.Status.Workers)
+	}
+	if !reflect.DeepEqual(fc.deletes, []string{"failed-id"}) {
+		t.Fatalf("pending cleanup deletes=%v, want the failed incarnation only", fc.deletes)
+	}
+	if deadline := r.workerRecheckDeadline(co.Status.Workers); deadline.RequeueAfter <= 0 {
+		t.Fatalf("pending cleanup did not contribute a bounded recheck: %+v", deadline)
+	}
+}
+
+func TestR04FairnessTraceAcrossWorkerStates(t *testing.T) {
+	ctx := context.Background()
+	r, base, co := workerReadHarness(t)
+	fc := &r04PrereqClient{workerReadClient: base}
+	r.fulfillment = fc
+	// A ready worker with recent retry history must not be reset merely because
+	// another worker is delayed.
+	healthy := newWorkerStatus("standard", "standard", "healthy-bmi", "healthy-id", workerPhaseReady)
+	healthy.AttemptCount = 2
+	healthy.LastFailureReason = "previous"
+	// metav1.Time persists at second precision, so compare at that precision.
+	recent := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
+	healthy.ReadySince = &recent
+	future := metav1.NewTime(time.Now().Add(time.Hour))
+	pending := newWorkerStatus("standard", "standard", "pending-bmi", "pending-id", workerPhaseFailed)
+	pending.NextRetryTime = &future
+	waiting := newWorkerStatus("standard", "standard", "waiting-bmi", "waiting-id", workerPhaseWaitingForAgent)
+	co.Spec.NodeRequests[0].NumberOfNodes = 3
+	co.Spec.PullSecret = `{"auths":{}}`
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.Status.Workers = []v1alpha1.WorkerStatus{healthy, pending, waiting}
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	fc.bmis = []*privatev1.BareMetalInstance{
+		ownedBMIFixture(co, "healthy-bmi", "healthy-id"),
+		ownedBMIFixture(co, "pending-bmi", "pending-id"),
+		ownedBMIFixture(co, "waiting-bmi", "waiting-id"),
+	}
+	fc.listed = fc.bmis
+	for i, name := range []string{"healthy-bmi", "waiting-bmi"} {
+		agent := agentPhaseFixture(name, true)
+		agent.SetName(name + "-agent")
+		agent.SetNamespace(co.Namespace)
+		agent.SetLabels(map[string]string{workerNameLabel: name, clusterOrderLabel: co.Name})
+		mac := "aa:bb:cc:dd:ee:0" + string(rune('2'+i))
+		if err := unstructured.SetNestedSlice(agent.Object, []interface{}{map[string]interface{}{"macAddress": mac}}, "status", "inventory", "interfaces"); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Create(ctx, agent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 4 {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	bound := workerByName(co.Status.Workers, "waiting-bmi")
+	if bound == nil || bound.Phase != workerPhaseReady {
+		t.Fatalf("actionable worker did not converge: %+v", co.Status.Workers)
+	}
+	kept := workerByName(co.Status.Workers, "healthy-bmi")
+	if kept == nil || kept.AttemptCount != 2 || kept.LastFailureReason != "previous" || kept.ReadySince == nil || !kept.ReadySince.Equal(&recent) {
+		t.Fatalf("healthy worker history was reset by an unrelated delay: %+v", kept)
+	}
+	delayed := workerByName(co.Status.Workers, "pending-bmi")
+	if delayed == nil || delayed.Phase != workerPhaseFailed || delayed.BareMetalInstance.ID != "pending-id" {
+		t.Fatalf("delayed worker lost its recorded incarnation: %+v", delayed)
+	}
+	if len(fc.deletes) == 0 {
+		t.Fatal("pending cleanup was starved by unrelated progress")
+	}
+	if deadline := r.workerRecheckDeadline(co.Status.Workers); deadline.RequeueAfter <= 0 {
+		t.Fatalf("no bounded recheck for the delayed worker: %+v", deadline)
+	}
+}
+
+func TestR04SummaryBeforeCreateGate(t *testing.T) {
+	ctx := context.Background()
+	r, base, co := workerReadHarness(t)
+	imageErr := status.Error(codes.NotFound, "disk image unavailable")
+	blocked := &r04PrereqClient{workerReadClient: base, imageErr: imageErr}
+	r.fulfillment = blocked
+	r.ignition = &countingIgnition{}
+	blocked.listed = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "recorded-id")}
+	blocked.bmis = blocked.listed
+	// The worker was already demoted, but its aggregate summary is stale. A
+	// scale-up makes the create gate due even though no slot needs a create yet.
+	stale := int32(1)
+	co.Spec.PullSecret = `{"auths":{}}`
+	co.Spec.NodeRequests[0].NumberOfNodes = 2
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.Status.ReadyWorkers = &stale
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	infra := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	infra.SetGroupVersionKind(infraEnvGVK)
+	infra.SetName(co.Name + infraEnvNameSuffix)
+	infra.SetNamespace(co.Namespace)
+	infra.SetUID("infra-uid")
+	if err := unstructured.SetNestedField(infra.Object, "http://ignition.test", "status", "bootArtifacts", "discoveryIgnitionURL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Create(ctx, infra); err != nil {
+		t.Fatal(err)
+	}
+	co.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, metav1.ConditionTrue, "ready", reasonInfraEnvReady)
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+	if !errors.Is(err, imageErr) {
+		t.Fatalf("error=%v, want the blocked image lookup", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if co.Status.ReadyWorkers == nil || *co.Status.ReadyWorkers != 0 {
+		t.Fatalf("stale ready summary was not demoted before the create gate: %+v", co.Status)
+	}
+	if co.Status.DesiredWorkers == nil || *co.Status.DesiredWorkers != 1 || co.Status.CurrentWorkers == nil || *co.Status.CurrentWorkers != 1 {
+		t.Fatalf("aggregate counts were not persisted: %+v", co.Status)
+	}
+	if len(blocked.names) != 0 {
+		t.Fatalf("created a BMI under a blocked image lookup: %v", blocked.names)
+	}
+}
+
+// r04PrereqClient records destructive actions and blocks the creation input
+// chain, so prerequisite-free work can be asserted without resolving an image.
+type r04PrereqClient struct {
+	*workerReadClient
+	deletes  []string
+	imageErr error
+}
+
+func (f *r04PrereqClient) DeleteBareMetalInstance(_ context.Context, id string) error {
+	f.deletes = append(f.deletes, id)
+	return nil
+}
+
+// GetClusterVersion resolves a reference to an unusable disk image so image
+// resolution fails after the tenant/version lookups succeed.
+func (f *r04PrereqClient) GetClusterVersion(_ context.Context, id string) (*privatev1.ClusterVersion, error) {
+	return privatev1.ClusterVersion_builder{
+		Id:   id,
+		Spec: privatev1.ClusterVersionSpec_builder{DiskImage: privatev1.DiskImageReference_builder{Id: "blocked"}.Build()}.Build(),
+	}.Build(), nil
+}
+
+func (f *r04PrereqClient) GetDiskImage(context.Context, string) (*privatev1.DiskImage, error) {
+	if f.imageErr != nil {
+		return nil, f.imageErr
+	}
+	return nil, status.Error(codes.NotFound, "disk image unavailable")
+}
+
+type countingIgnition struct{ calls int }
+
+func (c *countingIgnition) FetchIgnition(context.Context, string) ([]byte, error) {
+	c.calls++
+	return []byte(`{}`), nil
 }
 
 type workerIgnition struct{}
