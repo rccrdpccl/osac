@@ -610,7 +610,7 @@ func TestR04SummaryBeforeCreateGate(t *testing.T) {
 	if co.Status.ReadyWorkers == nil || *co.Status.ReadyWorkers != 0 {
 		t.Fatalf("stale ready summary was not demoted before the create gate: %+v", co.Status)
 	}
-	if co.Status.DesiredWorkers == nil || *co.Status.DesiredWorkers != 1 || co.Status.CurrentWorkers == nil || *co.Status.CurrentWorkers != 1 {
+	if co.Status.DesiredWorkers == nil || *co.Status.DesiredWorkers != 2 || co.Status.CurrentWorkers == nil || *co.Status.CurrentWorkers != 1 {
 		t.Fatalf("aggregate counts were not persisted: %+v", co.Status)
 	}
 	if len(blocked.names) != 0 {
@@ -1229,4 +1229,103 @@ func TestR07LostUIDEvidenceDoesNotDuplicateFailureAccounting(t *testing.T) {
 		!co.Status.Workers[0].LastFailureTime.Equal(failed.LastFailureTime) {
 		t.Fatalf("UID recording re-emitted failure accounting: before=%+v after=%+v", failed, co.Status.Workers[0])
 	}
+}
+
+// --- R10: intent-based worker counts ---
+
+// workerCountsHarness builds an order with a bare-metal intent and (optionally)
+// a pre-existing worker journal, then reloads the persisted object so the
+// summary write starts from an authoritative snapshot.
+func workerCountsHarness(
+	t *testing.T, name string, requests []v1alpha1.NodeRequest, workers []v1alpha1.WorkerStatus,
+) (*Reconciler, *v1alpha1.ClusterOrder) {
+	t.Helper()
+	r, _, co := nodeSetHarness(t, name, requests...)
+	if len(workers) > 0 {
+		mutateCapacityOrder(t, r, co, func(o *v1alpha1.ClusterOrder) {
+			o.Status.Workers = workers
+		})
+	}
+	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	return r, co
+}
+
+// persistWorkerSummary runs the production summary write and reloads it.
+func persistWorkerSummary(
+	t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
+) *v1alpha1.ClusterOrder {
+	t.Helper()
+	if err := r.updateWorkerStatusWithAgent(context.Background(), co, workers); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	return co
+}
+
+func assertWorkerCounts(t *testing.T, co *v1alpha1.ClusterOrder, desired, current, ready int32) {
+	t.Helper()
+	if co.Status.DesiredWorkers == nil || co.Status.CurrentWorkers == nil || co.Status.ReadyWorkers == nil {
+		t.Fatalf("summary not persisted: %+v", co.Status)
+	}
+	if *co.Status.DesiredWorkers != desired || *co.Status.CurrentWorkers != current || *co.Status.ReadyWorkers != ready {
+		t.Fatalf("counts=(%d,%d,%d), want (%d,%d,%d)",
+			*co.Status.DesiredWorkers, *co.Status.CurrentWorkers, *co.Status.ReadyWorkers,
+			desired, current, ready)
+	}
+}
+
+// R10-U1: requested capacity is visible before any reservation exists and is not
+// derived from the length of the worker journal.
+func TestR10DesiredBeforeReservation(t *testing.T) {
+	r, co := workerCountsHarness(t, "r10-desired", []v1alpha1.NodeRequest{nodeRequest("standard", 2)}, nil)
+	persistWorkerSummary(t, r, co, nil)
+	assertWorkerCounts(t, co, 2, 0, 0)
+}
+
+// R10-U2: retiring and failed records do not inflate desired or active
+// availability, and a durably retired failed record does not keep the order
+// retrying while an actionable failure still reports.
+func TestR10CleanupNotDesiredOrCurrent(t *testing.T) {
+	r, co := workerCountsHarness(t, "r10-cleanup", []v1alpha1.NodeRequest{nodeRequest("standard", 1)}, nil)
+	co.SetStatusCondition(v1alpha1.ConditionWorkersFailed, metav1.ConditionTrue, "retry 1", reasonWorkersFailed)
+	workers := []v1alpha1.WorkerStatus{
+		newWorkerStatus("standard", "standard", "ready-0", "id-ready", workerPhaseReady),
+		newWorkerStatus("standard", "standard", "retiring-0", "id-retiring", workerPhaseUnbinding),
+		newWorkerStatus("standard", "standard", "failed-0", "id-failed", workerPhaseUnbinding),
+	}
+	persistWorkerSummary(t, r, co, workers)
+	assertWorkerCounts(t, co, 1, 1, 1)
+	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionWorkersFailed) {
+		t.Fatalf("a retired failed record kept the order retrying: %+v", co.Status.Conditions)
+	}
+
+	// An actionable failure within the requested capacity still reports.
+	actionable := []v1alpha1.WorkerStatus{
+		newWorkerStatus("standard", "standard", "failed-1", "id-failed1", workerPhaseFailed),
+	}
+	persistWorkerSummary(t, r, co, actionable)
+	assertWorkerCounts(t, co, 1, 0, 0)
+	if !apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionWorkersFailed) {
+		t.Fatalf("an actionable failure did not report: %+v", co.Status.Conditions)
+	}
+}
+
+// R10-U3: ready surplus in one NodeSet cannot compensate for a missing NodeSet,
+// even when both share one instance type.
+func TestR10LogicalNodeSetCoverage(t *testing.T) {
+	requests := []v1alpha1.NodeRequest{
+		{NodeSet: "a", NumberOfNodes: 1, BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: "shared"}},
+		{NodeSet: "b", NumberOfNodes: 1, BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: "shared"}},
+	}
+	workers := []v1alpha1.WorkerStatus{
+		newWorkerStatus("a", "shared", "a-0", "id-a0", workerPhaseReady),
+		newWorkerStatus("a", "shared", "a-1", "id-a1", workerPhaseReady),
+	}
+	r, co := workerCountsHarness(t, "r10-nodesets", requests, workers)
+	persistWorkerSummary(t, r, co, workers)
+	assertWorkerCounts(t, co, 2, 1, 1)
 }

@@ -1108,6 +1108,49 @@ var _ = Describe("ClusterOrder Controller", func() {
 			Expect(progressing.Reason).To(Equal(v1alpha1.ReasonAsExpected))
 		})
 
+		// R10-U5: parent readiness consumes the NodeSet-safe persisted summary and
+		// refuses to promote from a stale or blocked observation.
+		It("should gate BMaaS readiness on NodeSet-safe capacity and observation blockers", func() {
+			bareMetal := func(nodeSet string, count int) v1alpha1.NodeRequest {
+				return v1alpha1.NodeRequest{NodeSet: nodeSet, NumberOfNodes: count, BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: nodeSet}}
+			}
+			order := func(requests []v1alpha1.NodeRequest, desired, current, ready int32) *v1alpha1.ClusterOrder {
+				return &v1alpha1.ClusterOrder{
+					Spec: v1alpha1.ClusterOrderSpec{NodeRequests: requests},
+					Status: v1alpha1.ClusterOrderStatus{
+						DesiredWorkers: p32(desired),
+						CurrentWorkers: p32(current),
+						ReadyWorkers:   p32(ready),
+					},
+				}
+			}
+
+			Expect(bareMetalWorkersReady(order([]v1alpha1.NodeRequest{bareMetal("a", 2)}, 2, 0, 0))).To(BeFalse(),
+				"in-flight reservation is not ready")
+			Expect(bareMetalWorkersReady(order([]v1alpha1.NodeRequest{bareMetal("a", 1)}, 1, 1, 1))).To(BeTrue(),
+				"converged capacity is ready")
+			Expect(bareMetalWorkersReady(order([]v1alpha1.NodeRequest{bareMetal("a", 1)}, 1, 1, 1))).To(BeTrue(),
+				"surplus cleanup does not block readiness")
+			Expect(bareMetalWorkersReady(order([]v1alpha1.NodeRequest{bareMetal("a", 1), bareMetal("b", 1)}, 2, 2, 1))).To(BeFalse(),
+				"one missing NodeSet blocks readiness even when another is ready")
+			Expect(bareMetalWorkersReady(order([]v1alpha1.NodeRequest{bareMetal("a", 2)}, 1, 2, 2))).To(BeFalse(),
+				"a summary that lags the spec must not promote readiness")
+			Expect(bareMetalWorkersReady(order(nil, 0, 0, 0))).To(BeTrue(),
+				"orders without bare-metal workers are ready")
+			Expect(bareMetalWorkersReady(nil)).To(BeFalse(), "nil order is not ready")
+
+			blocked := order([]v1alpha1.NodeRequest{bareMetal("a", 1)}, 1, 1, 1)
+			blocked.SetStatusCondition(v1alpha1.ConditionFulfillmentServiceUnavailable,
+				metav1.ConditionTrue, "backend outage", "FulfillmentServiceUnavailable")
+			Expect(bareMetalWorkersReady(blocked)).To(BeFalse(),
+				"an unknown observation must not promote readiness from a stale ready summary")
+
+			failed := order([]v1alpha1.NodeRequest{bareMetal("a", 1)}, 1, 0, 0)
+			failed.SetStatusCondition(v1alpha1.ConditionWorkersFailed,
+				metav1.ConditionTrue, "retry 1", "WorkersRetrying")
+			Expect(bareMetalWorkersReady(failed)).To(BeFalse(), "a retrying worker blocks readiness")
+		})
+
 		It("should keep a CaaS order progressing until the HostedCluster is available", func() {
 			instance := &v1alpha1.ClusterOrder{
 				ObjectMeta: metav1.ObjectMeta{

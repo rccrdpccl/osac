@@ -72,6 +72,50 @@ var _ = Describe("production worker against real fulfillment", func() {
 		cluster := createCaaSClusterWithNodeSets(ctx, true)
 		client, scheme := workerClient()
 		order := workerOrder(ctx, client, cluster)
+		wanted := make(map[string]float64)
+		for _, nr := range order.Spec.NodeRequests {
+			wanted[nr.BareMetal.InstanceType] = float64(nr.NumberOfNodes)
+		}
+		Expect(wanted).To(HaveLen(2))
+		actualTenant, err := fulfillmentClient.GetCluster(ctx, cluster.GetId())
+		Expect(err).NotTo(HaveOccurred())
+		// R10-C1: the in-process registry must report requested capacity from the
+		// real order spec before any reservation exists, and keep ready at zero
+		// because no real Agent is bound here. This is the test-process registry,
+		// not a deployed metrics endpoint or real Agent health.
+		expectWorkerGauges := func() {
+			GinkgoHelper()
+			families, err := metrics.Registry.Gather()
+			Expect(err).NotTo(HaveOccurred(), "collect in-process worker metrics")
+			for _, name := range []string{"osac_caas_worker_desired", "osac_caas_worker_ready"} {
+				var samples map[string]float64
+				for _, family := range families {
+					if family.GetName() != name {
+						continue
+					}
+					samples = make(map[string]float64)
+					for _, sample := range family.GetMetric() {
+						labels := make(map[string]string)
+						for _, label := range sample.GetLabel() {
+							labels[label.GetName()] = label.GetValue()
+						}
+						Expect(labels).To(HaveKeyWithValue("tenant", actualTenant.GetMetadata().GetTenant()))
+						Expect(labels).To(HaveKeyWithValue("worker_type", "bare_metal"))
+						Expect(wanted).To(HaveKey(labels["instance_type"]))
+						samples[labels["instance_type"]] = sample.GetGauge().GetValue()
+					}
+				}
+				Expect(samples).NotTo(BeNil(), "%s must be registered", name)
+				Expect(samples).To(HaveLen(2), "no unrelated series in %s", name)
+				for instanceType, desired := range wanted {
+					value := float64(0)
+					if name == "osac_caas_worker_desired" {
+						value = desired
+					}
+					Expect(samples).To(HaveKeyWithValue(instanceType, value), name)
+				}
+			}
+		}
 		defaultFilter := fmt.Sprintf(
 			`this.metadata.labels['osac.openshift.io/default'] == 'true' && this.metadata.tenant == %q`, simTenantName)
 		subnets, err := privatev1.NewSubnetsClient(fulfillmentConn).List(ctx,
@@ -167,6 +211,8 @@ var _ = Describe("production worker against real fulfillment", func() {
 		Expect(client.Get(ctx, crclient.ObjectKey{Namespace: key.Namespace, Name: key.Name + "-infraenv"},
 			infraEnv)).To(Succeed(), "worker must create discovery InfraEnv")
 		Expect(envsim.New(client).MarkInfraEnvReady(ctx, infraEnv.GetName(), key.Namespace, ignition.URL())).To(Succeed())
+		// Desired is already reported from intent, before any reservation exists.
+		expectWorkerGauges()
 		// Explicit reserve -> single create/recover -> fresh observation calls.
 		// Only the one deliberately lost response is tolerated; no API error is
 		// hidden by an Eventually loop or by sleeping through backoff.
@@ -181,19 +227,12 @@ var _ = Describe("production worker against real fulfillment", func() {
 		}
 		latest := &v1alpha1.ClusterOrder{}
 		Expect(client.Get(ctx, key, latest)).To(Succeed())
-		actualTenant, err := fulfillmentClient.GetCluster(ctx, cluster.GetId())
-		Expect(err).NotTo(HaveOccurred())
 		Expect(latest.Status.DesiredWorkers).NotTo(BeNil())
 		Expect(*latest.Status.DesiredWorkers).To(Equal(int32(3)))
 		Expect(latest.Status.CurrentWorkers).NotTo(BeNil())
 		Expect(*latest.Status.CurrentWorkers).To(Equal(int32(3)))
 		Expect(latest.Status.ReadyWorkers).NotTo(BeNil())
 		Expect(*latest.Status.ReadyWorkers).To(Equal(int32(0)))
-		wanted := make(map[string]float64)
-		for _, nr := range order.Spec.NodeRequests {
-			wanted[nr.BareMetal.InstanceType] = float64(nr.NumberOfNodes)
-		}
-		Expect(wanted).To(HaveLen(2))
 		seen := make(map[string]bool)
 		for _, worker := range latest.Status.Workers {
 			Expect(worker.Phase).To(Equal("WaitingForAgent"))
@@ -202,36 +241,7 @@ var _ = Describe("production worker against real fulfillment", func() {
 			Expect(seen).NotTo(HaveKey(worker.Name), "each slot needs a distinct worker")
 			seen[worker.Name] = true
 		}
-		families, err := metrics.Registry.Gather()
-		Expect(err).NotTo(HaveOccurred(), "collect in-process worker metrics")
-		for _, name := range []string{"osac_caas_worker_desired", "osac_caas_worker_ready"} {
-			var samples map[string]float64
-			for _, family := range families {
-				if family.GetName() != name {
-					continue
-				}
-				samples = make(map[string]float64)
-				for _, sample := range family.GetMetric() {
-					labels := make(map[string]string)
-					for _, label := range sample.GetLabel() {
-						labels[label.GetName()] = label.GetValue()
-					}
-					Expect(labels).To(HaveKeyWithValue("tenant", actualTenant.GetMetadata().GetTenant()))
-					Expect(labels).To(HaveKeyWithValue("worker_type", "bare_metal"))
-					Expect(wanted).To(HaveKey(labels["instance_type"]))
-					samples[labels["instance_type"]] = sample.GetGauge().GetValue()
-				}
-			}
-			Expect(samples).NotTo(BeNil(), "%s must be registered", name)
-			Expect(samples).To(HaveLen(2), "no unrelated series in %s", name)
-			for instanceType, desired := range wanted {
-				value := desired
-				if name == "osac_caas_worker_ready" {
-					value = 0
-				}
-				Expect(samples).To(HaveKeyWithValue(instanceType, value), name)
-			}
-		}
+		expectWorkerGauges()
 		for _, worker := range latest.Status.Workers {
 			bmi, err := fulfillmentClient.GetBareMetalInstance(ctx, worker.BareMetalInstance.ID)
 			Expect(err).NotTo(HaveOccurred(), "worker %s", worker.Name)

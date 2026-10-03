@@ -190,6 +190,21 @@
 // deployed controller that ignores the optional field retains the old
 // parent-age timeout behavior and is not a guaranteed safe downgrade.
 //
+// R10 defines one intent-and-evidence count contract. Desired workers is the sum
+// of the positive bare-metal node counts in the order spec, so it is visible
+// before any reservation exists and ignores journal length. Current counts
+// retained slots holding a verified BMI identity in an active phase; ready is its
+// Ready subset. Identity-less reservations, Failed, retiring, surplus and
+// non-bare-metal entries never count, and retention is partitioned per NodeSet,
+// so ready surplus in one set cannot mask another. updateWorkerStatus persists the
+// workers, counts and WorkersFailed condition together; writeSelectedWorker stays
+// a post-mutation identity write that defers the next summary to a fresh
+// observation. An unavailable observation retains the last-known summary instead
+// of publishing zeros. Metrics derive desired from spec requests and ready from
+// the same retained eligibility, keeping the provisioned instance type. Parent
+// readiness requires the declared capacity, a desired count matching the current
+// spec, and no FulfillmentServiceUnavailable or WorkersFailed condition.
+//
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs
 // a fresh ownership/existence check. Worker and Agent writes use one authoritative

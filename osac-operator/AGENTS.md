@@ -265,6 +265,25 @@ with
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) and [QE]. An older
 independently deployed controller that ignores the optional status field keeps
 the old parent-age timeout behavior; this is not a guaranteed safe downgrade.
+R10 makes worker counts intent-based. `status.desiredWorkers` is the sum of the
+positive bare-metal `numberOfNodes` values, so it is visible before any
+reservation exists and is independent of the worker journal; `currentWorkers`
+counts retained slots with a verified BMI identity in an active phase and
+`readyWorkers` is its Ready subset. Identity-less reservations, `Failed`,
+retiring, surplus and non-bare-metal entries never count, and retention is
+partitioned per NodeSet so surplus in one set cannot mask a missing set sharing
+an instance type. `updateWorkerStatus` persists workers, counts and the
+`WorkersFailed` condition together, while `writeSelectedWorker` remains a
+post-mutation identity write whose summary waits for the next observation. An
+unavailable observation retains the last-known summary instead of publishing
+zeros. Metrics derive desired from spec requests and ready from the same retained
+eligibility with the provisioned instance type. Parent readiness additionally
+requires a `desiredWorkers` value matching the current spec and no
+`FulfillmentServiceUnavailable`/`WorkersFailed` condition. `R10-U1–U5` Unit and
+parent-controller cases plus `R10-E1–E4` Envtest traces in the acceptance suite
+cover this through real status persistence; the connected `R10-C1` in-process
+registry check could not run locally (`hack/sim.env` absent), so deployed
+metrics/readiness feedback and the [QE] journey remain with OSAC-4843/[QE].
 The Kind suite's LVMS-disabled case verifies the Volume controller remains
 ready without the TopoLVM `LogicalVolume` CRD; it does not exercise LVMS
 provisioning or the CSI data path.

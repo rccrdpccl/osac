@@ -410,8 +410,10 @@ spec:
                 type: array
               currentWorkers:
                 description: |-
-                  CurrentWorkers is the number of workers in a non-terminal phase
-                  (Provisioning, WaitingForAgent, Binding, or Ready).
+                  CurrentWorkers is the number of retained requested slots that hold a
+                  verified BareMetalInstance identity in an active phase (Provisioning,
+                  WaitingForAgent, Binding, or Ready). Identity-less reservations, Failed,
+                  retiring, surplus, and non-bare-metal entries are excluded.
                   Populated by the BareMetalWorkerReconciler.
                 format: int32
                 type: integer
@@ -422,8 +424,11 @@ spec:
                 type: string
               desiredWorkers:
                 description: |-
-                  DesiredWorkers is the total number of workers requested across all node sets.
-                  Populated by the BareMetalWorkerReconciler from Workers.
+                  DesiredWorkers is the sum of the positive numberOfNodes values of the
+                  requested bare-metal node sets. It reports the requested capacity even before
+                  any reservation or backing instance exists, and is independent of the length
+                  of status.workers.
+                  Populated by the BareMetalWorkerReconciler.
                 format: int32
                 type: integer
               fulfillmentTrustBundleHash:
@@ -547,7 +552,8 @@ spec:
                 type: array
               readyWorkers:
                 description: |-
-                  ReadyWorkers is the number of workers in the Ready phase.
+                  ReadyWorkers is the subset of CurrentWorkers in the Ready phase, limited to
+                  the requested node-set membership.
                   Populated by the BareMetalWorkerReconciler.
                 format: int32
                 type: integer

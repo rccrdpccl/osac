@@ -45,16 +45,39 @@ func coWithWorkers(name, tenant string, workers ...v1alpha1.WorkerStatus) v1alph
 	}
 }
 
+// coWithIntent builds an order whose requested capacity comes from its bare-metal
+// NodeRequests, which is the authoritative source for the desired gauge.
+func coWithIntent(name, tenant string, requests []v1alpha1.NodeRequest, workers ...v1alpha1.WorkerStatus) v1alpha1.ClusterOrder {
+	co := coWithWorkers(name, tenant, workers...)
+	co.Spec.NodeRequests = requests
+	return co
+}
+
+// backedWorker is a worker record that holds a verified BMI identity, which is
+// what makes it eligible for the current/ready gauges.
+func backedWorker(nodeSet, instanceType, name, id, phase string) v1alpha1.WorkerStatus {
+	return v1alpha1.WorkerStatus{
+		NodeSet:           nodeSet,
+		InstanceType:      instanceType,
+		Name:              name,
+		Kind:              workerKindBMI,
+		BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: name, ID: id},
+		Phase:             phase,
+	}
+}
+
 var _ = Describe("worker gauges", func() {
 	It("aggregates desired/ready by tenant and instance_type, labeled worker_type=bare_metal", func() {
 		updateWorkerGauges([]v1alpha1.ClusterOrder{
-			coWithWorkers("cluster-a", "tenant-1",
-				v1alpha1.WorkerStatus{NodeSet: "bm.large", InstanceType: "bm.large", Name: "a-0", Phase: workerPhaseReady},
-				v1alpha1.WorkerStatus{NodeSet: "bm.large", InstanceType: "bm.large", Name: "a-1", Phase: workerPhaseWaitingForAgent},
-				v1alpha1.WorkerStatus{NodeSet: "bm.gpu", InstanceType: "bm.gpu", Name: "a-2", Phase: workerPhaseFailed},
+			coWithIntent("cluster-a", "tenant-1",
+				[]v1alpha1.NodeRequest{nodeRequest("bm.large", 2), nodeRequest("bm.gpu", 1)},
+				backedWorker("bm.large", "bm.large", "a-0", "id-a0", workerPhaseReady),
+				backedWorker("bm.large", "bm.large", "a-1", "id-a1", workerPhaseWaitingForAgent),
+				backedWorker("bm.gpu", "bm.gpu", "a-2", "id-a2", workerPhaseFailed),
 			),
-			coWithWorkers("cluster-b", "tenant-2",
-				v1alpha1.WorkerStatus{NodeSet: "bm.large", InstanceType: "bm.large", Name: "b-0", Phase: workerPhaseReady},
+			coWithIntent("cluster-b", "tenant-2",
+				[]v1alpha1.NodeRequest{nodeRequest("bm.large", 1)},
+				backedWorker("bm.large", "bm.large", "b-0", "id-b0", workerPhaseReady),
 			),
 		})
 
@@ -76,8 +99,9 @@ osac_caas_worker_ready{instance_type="bm.large",tenant="tenant-2",worker_type="b
 
 	It("clears stale series for clusters that no longer have workers", func() {
 		updateWorkerGauges([]v1alpha1.ClusterOrder{
-			coWithWorkers("cluster-stale", "tenant-gone",
-				v1alpha1.WorkerStatus{NodeSet: "bm.large", InstanceType: "bm.large", Name: "s-0", Phase: workerPhaseReady},
+			coWithIntent("cluster-stale", "tenant-gone",
+				[]v1alpha1.NodeRequest{nodeRequest("bm.large", 1)},
+				backedWorker("bm.large", "bm.large", "s-0", "id-s0", workerPhaseReady),
 			),
 		})
 		Expect(testutil.CollectAndCount(workerDesired)).To(BeNumerically(">", 0))
@@ -87,9 +111,53 @@ osac_caas_worker_ready{instance_type="bm.large",tenant="tenant-2",worker_type="b
 		Expect(testutil.CollectAndCount(workerReady)).To(Equal(0))
 	})
 
-	It("emits nothing when a ClusterOrder has no workers", func() {
+	It("emits nothing when a ClusterOrder has no intent and no workers", func() {
 		updateWorkerGauges([]v1alpha1.ClusterOrder{coWithWorkers("empty", "tenant-1")})
 		Expect(testutil.CollectAndCount(workerDesired)).To(Equal(0))
+	})
+})
+
+// R10-U4: desired comes from spec intent, not the worker journal, and ready keeps
+// the provisioned instance-type provenance when spec hardware changes.
+var _ = Describe("worker gauges from intent", func() {
+	It("publishes desired before any reservation and drops removed type requests", func() {
+		updateWorkerGauges([]v1alpha1.ClusterOrder{
+			coWithIntent("cluster-intent", "tenant-i",
+				[]v1alpha1.NodeRequest{nodeRequest("bm.large", 2)}),
+		})
+		Expect(testutil.CollectAndCount(workerDesired)).To(Equal(1))
+		Expect(testutil.ToFloat64(workerDesired.WithLabelValues("tenant-i", workerTypeBareMetal, "bm.large"))).To(Equal(float64(2)))
+		Expect(testutil.ToFloat64(workerReady.WithLabelValues("tenant-i", workerTypeBareMetal, "bm.large"))).To(Equal(float64(0)))
+
+		// Removing a type request drops its stale desired series.
+		updateWorkerGauges([]v1alpha1.ClusterOrder{
+			coWithIntent("cluster-intent", "tenant-i", nil),
+		})
+		Expect(testutil.CollectAndCount(workerDesired)).To(Equal(0))
+	})
+
+	It("labels ready with the provisioned instance type, not the requested one", func() {
+		updateWorkerGauges([]v1alpha1.ClusterOrder{
+			coWithIntent("cluster-provenance", "tenant-p",
+				[]v1alpha1.NodeRequest{{NodeSet: "standard", NumberOfNodes: 1, BareMetal: &v1alpha1.BareMetalNodeSpec{InstanceType: "bm.new"}}},
+				backedWorker("standard", "bm.old", "p-0", "id-p0", workerPhaseReady),
+			),
+		})
+		Expect(testutil.ToFloat64(workerDesired.WithLabelValues("tenant-p", workerTypeBareMetal, "bm.new"))).To(Equal(float64(1)))
+		Expect(testutil.ToFloat64(workerReady.WithLabelValues("tenant-p", workerTypeBareMetal, "bm.old"))).To(Equal(float64(1)))
+		Expect(testutil.ToFloat64(workerReady.WithLabelValues("tenant-p", workerTypeBareMetal, "bm.new"))).To(Equal(float64(0)))
+	})
+
+	It("excludes retiring and identity-less workers from ready", func() {
+		updateWorkerGauges([]v1alpha1.ClusterOrder{
+			coWithIntent("cluster-cleanup", "tenant-c",
+				[]v1alpha1.NodeRequest{nodeRequest("bm.large", 1)},
+				backedWorker("bm.large", "bm.large", "ready-0", "id-r0", workerPhaseReady),
+				backedWorker("bm.large", "bm.large", "retiring-0", "id-x0", workerPhaseUnbinding),
+				v1alpha1.WorkerStatus{NodeSet: "bm.large", InstanceType: "bm.large", Name: "pending-0", Kind: workerKindBMI, Phase: workerPhaseProvisioning},
+			),
+		})
+		Expect(testutil.ToFloat64(workerReady.WithLabelValues("tenant-c", workerTypeBareMetal, "bm.large"))).To(Equal(float64(1)))
 	})
 })
 

@@ -289,18 +289,24 @@ type ClusterOrderStatus struct {
 	// +kubebuilder:validation:Optional
 	IngressEndpoint string `json:"ingressEndpoint,omitempty"`
 
-	// DesiredWorkers is the total number of workers requested across all node sets.
-	// Populated by the BareMetalWorkerReconciler from Workers.
+	// DesiredWorkers is the sum of the positive numberOfNodes values of the
+	// requested bare-metal node sets. It reports the requested capacity even before
+	// any reservation or backing instance exists, and is independent of the length
+	// of status.workers.
+	// Populated by the BareMetalWorkerReconciler.
 	// +kubebuilder:validation:Optional
 	DesiredWorkers *int32 `json:"desiredWorkers,omitempty"`
 
-	// CurrentWorkers is the number of workers in a non-terminal phase
-	// (Provisioning, WaitingForAgent, Binding, or Ready).
+	// CurrentWorkers is the number of retained requested slots that hold a
+	// verified BareMetalInstance identity in an active phase (Provisioning,
+	// WaitingForAgent, Binding, or Ready). Identity-less reservations, Failed,
+	// retiring, surplus, and non-bare-metal entries are excluded.
 	// Populated by the BareMetalWorkerReconciler.
 	// +kubebuilder:validation:Optional
 	CurrentWorkers *int32 `json:"currentWorkers,omitempty"`
 
-	// ReadyWorkers is the number of workers in the Ready phase.
+	// ReadyWorkers is the subset of CurrentWorkers in the Ready phase, limited to
+	// the requested node-set membership.
 	// Populated by the BareMetalWorkerReconciler.
 	// +kubebuilder:validation:Optional
 	ReadyWorkers *int32 `json:"readyWorkers,omitempty"`
