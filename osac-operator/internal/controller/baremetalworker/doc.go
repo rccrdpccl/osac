@@ -47,7 +47,8 @@
 //   - bmi.go handles BMI lookup, creation, request construction and deletion.
 //   - ownership.go validates authoritative tenant and resource identities.
 //   - agent.go handles Agent convergence, binding and registration timeouts.
-//   - correlation.go matches Agents to workers by binding or inventory MACs.
+//   - correlation.go owns the strict Agent association result (established /
+//     absent / ambiguous / invalid) shared by projection, binding and cleanup.
 //   - nodepool.go converges requested NodeSet replica counts.
 //
 // Worker policy and persistence are grouped by lifecycle responsibility:
@@ -90,6 +91,28 @@
 // Sim-backed R03-C1 is explicitly skipped and its fixture removed; it is not a
 // local completion gate. Unit/Envtest do not prove real fulfillment/provider
 // cleanup or resolve the archived-Cluster and targeted-remediation gaps.
+//
+// Agent association is one scoped policy shared by phase projection, late
+// binding and cleanup. Every observation stages the union of the InfraEnv
+// registration and cluster-order selectors, deduplicated by Kubernetes UID, so a
+// mixed population is never truncated to one selector; a failed selector List
+// makes the whole observation unknown rather than partial absence evidence.
+// Readiness and bound deletion use only a unique compatible established
+// worker-name binding. Initial discovery matches an unbound compatible Agent to
+// an eligible waiting worker by inventory NIC MACs only when the match is unique
+// in both directions; an already-labelled or bound Agent is never a MAC fallback,
+// an incompatible candidate is returned as an observable error, and ambiguity or
+// unreadable inventory never authorizes an Agent patch or deletion.
+// R06-U1–U4 Unit cases in correlation_test.go, agent_reconcile_test.go and
+// worker_projection_test.go characterize the selector union, duplicate-label and
+// bidirectional MAC ambiguity, incompatible/foreign bindings and malformed
+// inventory; R06-E1–E4 Envtest traces in the acceptance suites drive public
+// Reconcile through real UIDs/CRDs for mixed selectors and shared-object
+// deduplication, ambiguity refusal, same-name recreation under stale evidence,
+// and binding reconstruction from durable Agent evidence after a reconciler
+// restart. R06-C1 (real Assisted Service selector/UID/binding behavior) and
+// R06-Q1 (deployed CaaS create/scale/delete) remain owned by OSAC-4843/[QE]; no
+// identity or API contract was expanded.
 //
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs

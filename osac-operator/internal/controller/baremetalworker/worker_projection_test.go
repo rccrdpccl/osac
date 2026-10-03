@@ -26,9 +26,10 @@ type absentProjectionClient struct{ FulfillmentClient }
 func (absentProjectionClient) GetBareMetalInstance(context.Context, string) (*privatev1.BareMetalInstance, error) {
 	return nil, status.Error(codes.NotFound, "confirmed missing")
 }
-func observeWorkerFixture(t *testing.T, workers []v1alpha1.WorkerStatus, agents *unstructured.UnstructuredList, macs MACResolver, exists func(string) bool) ([]v1alpha1.WorkerStatus, []string) {
+func observeWorkerFixture(t *testing.T, workers []v1alpha1.WorkerStatus, agents *unstructured.UnstructuredList, exists func(string) bool) ([]v1alpha1.WorkerStatus, []string) {
 	t.Helper()
-	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "fixture"}, Status: v1alpha1.ClusterOrderStatus{Workers: append([]v1alpha1.WorkerStatus(nil), workers...)}}
+	// Match the Agent fixture (namespace osac, cluster-order label "order").
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}, Status: v1alpha1.ClusterOrderStatus{Workers: append([]v1alpha1.WorkerStatus(nil), workers...)}}
 	var bmis []*privatev1.BareMetalInstance
 	for _, w := range workers {
 		if w.Kind == workerKindBMI && w.BareMetalInstance.ID != "" && exists(w.BareMetalInstance.ID) {
@@ -37,7 +38,7 @@ func observeWorkerFixture(t *testing.T, workers []v1alpha1.WorkerStatus, agents 
 	}
 	observed := indexWorkerBMIs(bmis)
 	observed.agents = agents
-	r := &Reconciler{fulfillment: absentProjectionClient{}, macResolver: macs, recorder: events.NewFakeRecorder(10)}
+	r := &Reconciler{fulfillment: absentProjectionClient{}, recorder: events.NewFakeRecorder(10)}
 	workers, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)
 	if err != nil {
 		t.Fatal(err)
@@ -50,26 +51,40 @@ func observeWorkerFixture(t *testing.T, workers []v1alpha1.WorkerStatus, agents 
 	}
 	return workers, removed
 }
-func TestFindAgentForWorkerNameAndNICFallback(t *testing.T) {
-	for _, tt := range []struct {
-		name, mac, label string
-		want             bool
-	}{{"matching MAC", "aa", "", true}, {"case insensitive", "AA", "", true}, {"name takes precedence", "different", "worker", true}, {"no match", "different", "", false}} {
-		t.Run(tt.name, func(t *testing.T) {
-			a := agentPhaseFixture(tt.label, false)
-			_ = unstructured.SetNestedSlice(a.Object, []interface{}{map[string]interface{}{"macAddress": tt.mac}}, "status", "inventory", "interfaces")
-			agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*a}}
-			resolver := func(context.Context, string) []string {
-				if tt.label != "" {
-					return nil
-				}
-				return []string{"aa"}
-			}
-			got := findAgentForWorker(context.Background(), agents, "id", "worker", resolver)
-			if (got != nil) != tt.want {
-				t.Fatalf("agent=%v, want match=%v", got, tt.want)
-			}
-		})
+func TestEstablishedLabelPrecedesMACFallback(t *testing.T) {
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	worker := newWorkerStatus("standard", "standard", "worker", "bmi-0", workerPhaseWaitingForAgent)
+	resolver := func(context.Context, string) []string { return []string{"aa"} }
+
+	// An established worker-name label wins even when the inventory MAC differs.
+	labeled := agentPhaseFixture("worker", false)
+	labeled.SetUID("uid-labeled")
+	_ = unstructured.SetNestedSlice(labeled.Object, []interface{}{
+		map[string]interface{}{"macAddress": "ff"},
+	}, "status", "inventory", "interfaces")
+	association := associateEstablishedAgent([]unstructured.Unstructured{*labeled}, co, "worker")
+	if association.state != agentEstablished || association.agent.GetUID() != "uid-labeled" {
+		t.Fatalf("established label not preferred: %+v", association)
+	}
+
+	// An unbound Agent is not an established binding; MAC correlation is only
+	// initial-discovery evidence and must never override another worker's label.
+	unbound := agentPhaseFixture("", false)
+	unbound.SetUID("uid-unbound")
+	_ = unstructured.SetNestedSlice(unbound.Object, []interface{}{
+		map[string]interface{}{"macAddress": "aa"},
+	}, "status", "inventory", "interfaces")
+	if association := associateEstablishedAgent([]unstructured.Unstructured{*unbound}, co, "worker"); association.state != agentAbsent {
+		t.Fatalf("MAC fallback authorized an established binding: %+v", association)
+	}
+	other := agentPhaseFixture("other-worker", false)
+	other.SetUID("uid-other")
+	_ = unstructured.SetNestedSlice(other.Object, []interface{}{
+		map[string]interface{}{"macAddress": "aa"},
+	}, "status", "inventory", "interfaces")
+	associations := matchUnboundAgents(context.Background(), co, []unstructured.Unstructured{*other}, []v1alpha1.WorkerStatus{worker}, resolver)
+	if association, ok := associations["worker"]; ok {
+		t.Fatalf("used another worker's Agent as a MAC fallback: %+v", association)
 	}
 }
 func TestWorkerPhaseMapping(t *testing.T) {
@@ -128,7 +143,7 @@ func TestCombinedObservationMigratedPhaseAndHistoryCases(t *testing.T) {
 				}
 				agents.Items = append(agents.Items, *a)
 			}
-			got, removed := observeWorkerFixture(t, []v1alpha1.WorkerStatus{w}, agents, func(context.Context, string) []string { return nil }, func(string) bool { return tt.present })
+			got, removed := observeWorkerFixture(t, []v1alpha1.WorkerStatus{w}, agents, func(string) bool { return tt.present })
 			if tt.want == "" {
 				if len(got) != 0 || !reflect.DeepEqual(removed, []string{"worker"}) {
 					t.Fatalf("absence result=%v removed=%v", got, removed)
@@ -151,11 +166,11 @@ func TestCombinedObservationMigratedPhaseAndHistoryCases(t *testing.T) {
 func TestCombinedObservationMixedAndEmptyWorkers(t *testing.T) {
 	workers := []v1alpha1.WorkerStatus{newWorkerStatus("standard", "standard", "waiting", "id-0", workerPhaseProvisioning), newWorkerStatus("standard", "standard", "installed", "id-1", workerPhaseProvisioning), newWorkerStatus("standard", "standard", "missing", "id-2", workerPhaseReady), {Name: "vm", Kind: "VirtualMachine", Phase: "Running"}}
 	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture("installed", true)}}
-	got, removed := observeWorkerFixture(t, workers, agents, func(context.Context, string) []string { return nil }, func(id string) bool { return id != "id-2" })
+	got, removed := observeWorkerFixture(t, workers, agents, func(id string) bool { return id != "id-2" })
 	if len(got) != 3 || got[0].Phase != workerPhaseWaitingForAgent || got[1].Phase != workerPhaseReady || !reflect.DeepEqual(got[2], workers[3]) || !reflect.DeepEqual(removed, []string{"missing"}) {
 		t.Fatalf("mixed workers=%v removed=%v", got, removed)
 	}
-	got, removed = observeWorkerFixture(t, nil, agents, func(context.Context, string) []string { return nil }, func(string) bool { return true })
+	got, removed = observeWorkerFixture(t, nil, agents, func(string) bool { return true })
 	if got != nil || len(removed) != 0 {
 		t.Fatal("empty input changed")
 	}

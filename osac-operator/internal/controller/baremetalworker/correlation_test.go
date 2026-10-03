@@ -16,6 +16,7 @@ package baremetalworker
 import (
 	"context"
 	"errors"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -97,55 +98,71 @@ func (c *transientAgentConflictClient) Patch(
 	return c.Client.Patch(ctx, obj, patch, opts...)
 }
 
-var _ = Describe("matchAgentToBMI", func() {
-	makeAgent := func(macs ...string) *unstructured.Unstructured {
+func TestMACCorrelationMatchesAndSkips(t *testing.T) {
+	makeAgent := func(name string, macs ...string) *unstructured.Unstructured {
 		interfaces := make([]interface{}, 0, len(macs))
 		for _, mac := range macs {
 			interfaces = append(interfaces, map[string]interface{}{"macAddress": mac})
 		}
 		agent := &unstructured.Unstructured{Object: map[string]interface{}{}}
 		agent.SetGroupVersionKind(agentGVK)
+		agent.SetName(name)
+		agent.SetNamespace("osac")
+		agent.SetUID(types.UID(name + "-uid"))
 		_ = unstructured.SetNestedSlice(agent.Object, interfaces, "status", "inventory", "interfaces")
 		return agent
 	}
+	workers := []v1alpha1.WorkerStatus{
+		{Name: "w-0", Kind: workerKindBMI, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "w-0", ID: "bmi-0"}, Phase: workerPhaseWaitingForAgent},
+		{Name: "w-1", Kind: workerKindBMI, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "w-1", ID: "bmi-1"}, Phase: workerPhaseWaitingForAgent},
+		{Name: "w-2", Kind: workerKindBMI, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "w-2", ID: "bmi-2"}, Phase: workerPhaseBinding},
+	}
+	// bmi-1 reports two NICs — correlation must match against any of them.
+	hostMACs := map[string][]string{
+		"bmi-0": {"aa:bb:cc:dd:ee:00"},
+		"bmi-1": {"aa:bb:cc:dd:ee:11", "aa:bb:cc:dd:ee:1f"},
+		"bmi-2": {"aa:bb:cc:dd:ee:22"},
+	}
+	resolver := func(_ context.Context, id string) []string { return hostMACs[id] }
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
 
-	var (
-		workers  []v1alpha1.WorkerStatus
-		resolver MACResolver
-	)
-
-	BeforeEach(func() {
-		workers = []v1alpha1.WorkerStatus{
-			{Name: "w-0", Kind: workerKindBMI, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "w-0", ID: "bmi-0"}, Phase: workerPhaseWaitingForAgent},
-			{Name: "w-1", Kind: workerKindBMI, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "w-1", ID: "bmi-1"}, Phase: workerPhaseWaitingForAgent},
-			{Name: "w-2", Kind: workerKindBMI, BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: "w-2", ID: "bmi-2"}, Phase: workerPhaseBinding},
-		}
-		// bmi-1 reports two NICs — correlation must match against any of them.
-		hostMACs := map[string][]string{
-			"bmi-0": {"aa:bb:cc:dd:ee:00"},
-			"bmi-1": {"aa:bb:cc:dd:ee:11", "aa:bb:cc:dd:ee:1f"},
-			"bmi-2": {"aa:bb:cc:dd:ee:22"},
-		}
-		resolver = func(_ context.Context, id string) []string { return hostMACs[id] }
-	})
-
-	DescribeTable("matches agents to workers by MAC",
-		func(agentMACs []string, wantWorker string, wantAmbig bool) {
-			agent := makeAgent(agentMACs...)
-			gotWorker, gotAmbig := matchAgentToBMI(context.Background(), agent, workers, resolver)
-			Expect(gotWorker).To(Equal(wantWorker))
-			Expect(gotAmbig).To(Equal(wantAmbig))
-		},
-		Entry("unique match", []string{"aa:bb:cc:dd:ee:00"}, "w-0", false),
-		Entry("case-insensitive match", []string{"AA:BB:CC:DD:EE:11"}, "w-1", false),
-		Entry("no match", []string{"ff:ff:ff:ff:ff:ff"}, "", false),
-		Entry("empty agent MACs", nil, "", false),
-		Entry("ambiguous — agent MAC matches two BMIs", []string{"aa:bb:cc:dd:ee:00", "aa:bb:cc:dd:ee:11"}, "", true),
-		Entry("skips workers not in WaitingForAgent phase", []string{"aa:bb:cc:dd:ee:22"}, "", false),
-		Entry("multiple interfaces, one matches", []string{"ff:ff:ff:ff:ff:ff", "aa:bb:cc:dd:ee:00"}, "w-0", false),
-		Entry("matches a BMI's secondary NIC", []string{"aa:bb:cc:dd:ee:1f"}, "w-1", false),
-	)
-})
+	for _, tt := range []struct {
+		name       string
+		agentMACs  []string
+		wantWorker string
+	}{
+		{"unique match", []string{"aa:bb:cc:dd:ee:00"}, "w-0"},
+		{"case-insensitive match", []string{"AA:BB:CC:DD:EE:11"}, "w-1"},
+		{"no match", []string{"ff:ff:ff:ff:ff:ff"}, ""},
+		{"empty agent MACs", nil, ""},
+		// One Agent whose MAC matches two BMIs is ambiguous in the agent->worker
+		// direction and establishes nothing.
+		{"agent MAC matches several BMIs", []string{"aa:bb:cc:dd:ee:00", "aa:bb:cc:dd:ee:11"}, ""},
+		{"skips workers not in WaitingForAgent phase", []string{"aa:bb:cc:dd:ee:22"}, ""},
+		{"multiple interfaces, one matches", []string{"ff:ff:ff:ff:ff:ff", "aa:bb:cc:dd:ee:00"}, "w-0"},
+		{"matches a BMI's secondary NIC", []string{"aa:bb:cc:dd:ee:1f"}, "w-1"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := makeAgent("agent", tt.agentMACs...)
+			got := matchUnboundAgents(context.Background(), co, []unstructured.Unstructured{*agent}, workers, resolver)
+			var established []string
+			for name, association := range got {
+				if association.state == agentEstablished {
+					established = append(established, name)
+				}
+			}
+			if tt.wantWorker == "" {
+				if len(established) != 0 {
+					t.Fatalf("established %v, want no association", established)
+				}
+				return
+			}
+			if len(established) != 1 || established[0] != tt.wantWorker {
+				t.Fatalf("established %v, want %s", established, tt.wantWorker)
+			}
+		})
+	}
+}
 
 var _ = Describe("extractAgentMACs", func() {
 	DescribeTable("extracts MAC addresses from agent inventory",
@@ -229,7 +246,8 @@ var _ = Describe("Agent Installed phase projection", func() {
 				makeAgent("w-0", conditionStatus, debugInstalled),
 			}}
 
-			workers = projectAgentWorkerPhases(context.Background(), workers, agents, func(context.Context, string) []string { return nil })
+			workers, err := projectAgentWorkerPhases(&v1alpha1.ClusterOrder{}, workers, agents)
+			Expect(err).ToNot(HaveOccurred())
 
 			Expect(workers[0].Phase).To(Equal(wantPhase))
 		},
@@ -344,6 +362,148 @@ var _ = Describe("reconcileNodePoolReplicas", func() {
 		}
 	})
 })
+
+func TestR06SelectorUnion(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	s.AddKnownTypeWithName(agentGVK, &unstructured.Unstructured{})
+	agentListGVK := agentGVK
+	agentListGVK.Kind = "AgentList"
+	s.AddKnownTypeWithName(agentListGVK, &unstructured.UnstructuredList{})
+
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	makeAgent := func(name, uid string, labels map[string]string) *unstructured.Unstructured {
+		agent := &unstructured.Unstructured{Object: map[string]interface{}{}}
+		agent.SetGroupVersionKind(agentGVK)
+		agent.SetName(name)
+		agent.SetNamespace(co.Namespace)
+		agent.SetUID(types.UID(uid))
+		agent.SetLabels(labels)
+		return agent
+	}
+	infraOnly := makeAgent("infra-only", "uid-infra", map[string]string{
+		infraEnvAgentLabel: co.Name + infraEnvNameSuffix,
+	})
+	clusterOnly := makeAgent("cluster-only", "uid-cluster", map[string]string{
+		clusterOrderLabel: co.Name,
+	})
+	// One object carries both supported selectors; it must not become ambiguous.
+	both := makeAgent("both", "uid-both", map[string]string{
+		infraEnvAgentLabel: co.Name + infraEnvNameSuffix,
+		clusterOrderLabel:  co.Name,
+	})
+	// A matching selector in another namespace is out of scope.
+	foreignNS := makeAgent("foreign-ns", "uid-foreign", map[string]string{
+		infraEnvAgentLabel: co.Name + infraEnvNameSuffix,
+		clusterOrderLabel:  co.Name,
+	})
+	foreignNS.SetNamespace("other-namespace")
+	c := clientfake.NewClientBuilder().WithScheme(s).WithObjects(infraOnly, clusterOnly, both, foreignNS).Build()
+	r := &Reconciler{Client: c, apiReader: c}
+
+	agents, err := r.listAgents(context.Background(), co)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One observation stage queries both supported selectors and deduplicates by
+	// UID, so a mixed population is never silently truncated to one selector.
+	if len(agents.Items) != 3 {
+		t.Fatalf("selector union observed %d Agents, want 3", len(agents.Items))
+	}
+	counts := map[types.UID]int{}
+	for i := range agents.Items {
+		counts[agents.Items[i].GetUID()]++
+	}
+	for uid, count := range counts {
+		if count != 1 {
+			t.Fatalf("Agent %s observed %d times, want exactly once", uid, count)
+		}
+	}
+}
+
+func TestR06DuplicateWorkerLabelFailsClosed(t *testing.T) {
+	first := agentPhaseFixture("worker", true)
+	first.SetUID("uid-first")
+	second := agentPhaseFixture("worker", true)
+	second.SetName("agent-second")
+	second.SetUID("uid-second")
+	workers := []v1alpha1.WorkerStatus{
+		newWorkerStatus("standard", "standard", "worker", "bmi-0", workerPhaseWaitingForAgent),
+	}
+	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*first, *second}}
+
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	got, err := projectAgentWorkerPhases(co, workers, agents)
+	if err != nil {
+		t.Fatalf("duplicate worker labels returned an error instead of failing closed: %v", err)
+	}
+	// A shared worker-name label is not authorization: readiness needs exactly one
+	// distinct compatible UID, so two claimants must fail closed.
+	if got[0].Phase != workerPhaseWaitingForAgent {
+		t.Fatalf("duplicate worker labels selected a phase %q, want %q", got[0].Phase, workerPhaseWaitingForAgent)
+	}
+}
+
+func TestR06IncompatibleMACMatchFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	buildReconciler := func(agent *unstructured.Unstructured) (*Reconciler, client.Client) {
+		c := clientfake.NewClientBuilder().WithObjects(agent).Build()
+		return &Reconciler{
+			Client: c, apiReader: c, recorder: events.NewFakeRecorder(10),
+			macResolver: func(context.Context, string) []string { return []string{"aa"} },
+		}, c
+	}
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	worker := newWorkerStatus("standard", "standard", "worker", "bmi-0", workerPhaseWaitingForAgent)
+
+	t.Run("foreign cluster deployment", func(t *testing.T) {
+		agent := agentPhaseFixture("", false)
+		agent.SetUID("uid-foreign")
+		_ = unstructured.SetNestedSlice(agent.Object, []interface{}{
+			map[string]interface{}{"macAddress": "aa"},
+		}, "status", "inventory", "interfaces")
+		_ = unstructured.SetNestedMap(agent.Object, map[string]interface{}{
+			"name": "another-cluster", "namespace": "osac",
+		}, "spec", "clusterDeploymentName")
+		r, c := buildReconciler(agent)
+		workers := []v1alpha1.WorkerStatus{worker}
+		bound, err := r.matchAndBindAgents(ctx, co, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agent}}, workers, r.macResolver)
+		if err == nil {
+			t.Fatal("a conflicting cluster binding must fail closed, not correlate")
+		}
+		if bound != 0 {
+			t.Fatalf("bound %d workers despite a conflicting binding", bound)
+		}
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(agentGVK)
+		if err := c.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+			t.Fatal(err)
+		}
+		if got.GetLabels()[workerNameLabel] != "" {
+			t.Fatal("a conflicting Agent was taken over")
+		}
+	})
+
+	t.Run("malformed inventory is not a match", func(t *testing.T) {
+		agent := agentPhaseFixture("", false)
+		agent.SetUID("uid-malformed")
+		_ = unstructured.SetNestedSlice(agent.Object, []interface{}{
+			"not-a-map",
+		}, "status", "inventory", "interfaces")
+		r, _ := buildReconciler(agent)
+		workers := []v1alpha1.WorkerStatus{worker}
+		bound, err := r.matchAndBindAgents(ctx, co, &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agent}}, workers, r.macResolver)
+		if err != nil {
+			t.Fatalf("uninterpretable inventory is unknown, not invalid: %v", err)
+		}
+		// A MAC that cannot be read is unknown association, never a match.
+		if bound != 0 || workers[0].Phase != workerPhaseWaitingForAgent {
+			t.Fatalf("malformed inventory correlated: bound=%d phase=%s", bound, workers[0].Phase)
+		}
+	})
+}
 
 var _ = Describe("reconcileAgent with transient Agent conflicts", func() {
 	It("labels correlated Agents with their instance type and preserves the binding contract", func() {

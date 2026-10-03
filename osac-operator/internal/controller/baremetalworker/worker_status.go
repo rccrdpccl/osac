@@ -262,15 +262,6 @@ func countWorkersInPhase(workers []v1alpha1.WorkerStatus, phase string) int {
 	return n
 }
 
-func setWorkerPhase(workers []v1alpha1.WorkerStatus, name, phase string) {
-	for i := range workers {
-		if workers[i].Name == name {
-			workers[i].Phase = phase
-			return
-		}
-	}
-}
-
 func workerByName(workers []v1alpha1.WorkerStatus, name string) *v1alpha1.WorkerStatus {
 	for i := range workers {
 		if workers[i].Name == name {

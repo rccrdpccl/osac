@@ -8,52 +8,77 @@ import (
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
 
+// listAgents returns the union of both supported Agent selectors, scoped to the
+// cluster namespace. One observation stage issues two Kubernetes Lists — the
+// InfraEnv registration filter and the cluster-order watch filter — and unions
+// them by UID, so a mixed population is never truncated to whichever selector
+// matched first. If either List fails the observation is unknown: a partial list
+// is never treated as complete absence evidence.
 func (r *Reconciler) listAgents(ctx context.Context, co *v1alpha1.ClusterOrder) (*unstructured.UnstructuredList, error) {
-	agentList := &unstructured.UnstructuredList{}
-	agentList.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: agentGVK.Group, Version: agentGVK.Version, Kind: agentGVK.Kind + "List",
-	})
 	infraEnvName := co.Name + infraEnvNameSuffix
-	if err := r.List(ctx, agentList,
-		client.InNamespace(co.Namespace),
-		client.MatchingLabels{infraEnvAgentLabel: infraEnvName},
-	); err != nil {
-		return nil, fmt.Errorf("listing agents for %s by infraenv: %w", co.Name, err)
+	selectors := []client.MatchingLabels{
+		{infraEnvAgentLabel: infraEnvName},
+		{clusterOrderLabel: co.Name},
 	}
-	if len(agentList.Items) == 0 {
-		if err := r.List(ctx, agentList,
-			client.InNamespace(co.Namespace),
-			client.MatchingLabels{clusterOrderLabel: co.Name},
-		); err != nil {
-			return nil, fmt.Errorf("listing agents for %s by clusterOrderLabel: %w", co.Name, err)
+	union := &unstructured.UnstructuredList{}
+	union.SetGroupVersionKind(agentGVK.GroupVersion().WithKind(agentGVK.Kind + "List"))
+	seen := make(map[string]bool)
+	for _, selector := range selectors {
+		listed := &unstructured.UnstructuredList{}
+		listed.SetGroupVersionKind(union.GroupVersionKind())
+		if err := r.List(ctx, listed, client.InNamespace(co.Namespace), selector); err != nil {
+			return nil, fmt.Errorf("listing agents for %s: %w", co.Name, err)
+		}
+		for i := range listed.Items {
+			agent := listed.Items[i]
+			// Production identity is the Kubernetes UID; a namespaced name only
+			// disambiguates fixtures that predate UIDs, so it is never a substitute.
+			key := string(agent.GetUID())
+			if key == "" {
+				key = agent.GetNamespace() + "/" + agent.GetName()
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			union.Items = append(union.Items, agent)
 		}
 	}
-	return agentList, nil
+	return union, nil
 }
 
 // projectAgentWorkerPhases is the single pure Agent-phase projection: it neither
 // checks BMI existence, patches Agents, nor modifies the input workers or their
-// identity/retry fields. Protected Failed/Unbinding/Deleting workers are never
-// projected back into a normal phase.
+// identity/retry fields. Readiness comes only from a unique compatible
+// established binding; an absent, ambiguous or invalid association fails closed
+// (ambiguous stays WaitingForAgent; invalid is returned as an error). Protected
+// Failed/Unbinding/Deleting workers are never projected back into a normal phase.
 func projectAgentWorkerPhases(
-	ctx context.Context, workers []v1alpha1.WorkerStatus,
-	agents *unstructured.UnstructuredList, hostMACs MACResolver,
-) []v1alpha1.WorkerStatus {
+	co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, agents *unstructured.UnstructuredList,
+) ([]v1alpha1.WorkerStatus, error) {
 	result := append([]v1alpha1.WorkerStatus(nil), workers...)
 	for i := range result {
 		w := &result[i]
 		if !eligibleForAgentObservation(*w) {
 			continue
 		}
-		w.Phase = deriveWorkerPhase(findAgentForWorker(ctx, agents, w.BareMetalInstance.ID, w.Name, hostMACs), w.Name)
+		association := associateEstablishedAgent(agents.Items, co, w.Name)
+		if err := association.err(); err != nil {
+			return nil, err
+		}
+		if association.state == agentEstablished {
+			w.Phase = deriveWorkerPhase(association.agent, w.Name)
+			continue
+		}
+		// No established association (absent or ambiguous): never advance readiness.
+		w.Phase = workerPhaseWaitingForAgent
 	}
-	return result
+	return result, nil
 }
 
 func eligibleForAgentObservation(w v1alpha1.WorkerStatus) bool {

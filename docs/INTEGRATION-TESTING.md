@@ -411,6 +411,51 @@ startup and manager watch delivery with a deployed manager; no suitable harness
 exists yet, and the gap is owned by
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 
+### R06 strict shared Agent association implementation checkpoint
+
+`correlation.go` now owns one `agentAssociation` result — established, absent,
+ambiguous or invalid — used by phase projection, late binding and cleanup, with
+`agentBindingConflict` applying the same namespace/cluster/binding checks to
+observation, mutation and cleanup. `listAgents` stages the union of both
+supported selectors (InfraEnv registration and cluster-order watch filter) and
+deduplicates by Kubernetes UID, so a mixed population is never truncated to
+whichever selector matched first and a failed selector List makes the whole
+observation unknown. Readiness and bound deletion use only a unique compatible
+established worker-name binding; initial discovery matches an unbound compatible
+Agent to an eligible waiting worker by inventory NIC MACs only when the match is
+unique in both directions, and an already-labelled or bound Agent is never a MAC
+fallback. An incompatible candidate is a returned, observable error; ambiguity
+or unreadable inventory never authorizes an Agent patch or deletion. The
+first-match `findAgentForWorker`/`matchAgentToBMI` helpers and the
+InfraEnv-else-cluster-order fallback are removed.
+
+**R06-U1–U4 Unit / osac-operator [DEV]** in `correlation_test.go`,
+`agent_reconcile_test.go` and `worker_projection_test.go` characterize the
+selector union with shared-object deduplication, duplicate worker-label
+ambiguity, bidirectional MAC ambiguity (one Agent matching several workers and
+several Agents matching one worker), already-assigned Agents never used as a MAC
+fallback, incompatible/foreign bindings, malformed inventory treated as unknown,
+and an established worker-name label taking precedence over MAC correlation.
+
+**R06-E1–E4 Envtest / osac-operator [DEV]** in
+`acceptance/reconciler_test.go` and `acceptance/worker_reconcile_test.go` drive
+public `Reconcile` through real Kubernetes UIDs/CRDs and persistence: a mixed
+selector population binds the cluster-selector-only Agent while a shared-selector
+object is observed once and every Agent survives; duplicate MAC matches and
+duplicate worker-name claimants yield no readiness, no Agent patch or Delete, and
+no BMI Delete while the slot and finalizer remain; a same-name Agent recreated
+with a new UID between observation and action is not taken over under stale
+evidence, and a later fresh reconciler binds the replacement as a new
+incarnation; and a successful Agent patch followed by a lost worker-status write
+is reconstructed from the durable Agent label by a brand-new reconciler without a
+second Agent patch. These traces call `Reconcile` directly, so they do not
+establish manager watch delivery or deployed Assisted Service behavior.
+**R06-C1** (real Assisted Service selector/UID/binding behavior; the current
+connected suite has no Agent controller) and **R06-Q1** (the existing deployed
+CaaS create/scale/delete journey) remain owned by
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843)/[QE]; no identity or API
+contract was expanded.
+
 ### Coverage gaps
 
 The current component integration suite does not exercise real AAP,

@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -46,7 +47,10 @@ func reconcileAgentStage(
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
 	o := indexWorkerBMIs(nil)
 	o.agents = agents
-	projected := projectAgentWorkerPhases(context.Background(), workers, agents, r.workerMACResolver(o))
+	projected, err := projectAgentWorkerPhases(co, workers, agents)
+	if err != nil {
+		return nil, ctrl.Result{}, err
+	}
 	initializeReadySince(projected)
 	r.observeAgentReadiness(context.Background(), co, workers, projected)
 	return r.reconcileObservedAgents(context.Background(), co, projected, o)
@@ -182,7 +186,7 @@ func (c *failingAgentPatchClient) Patch(ctx context.Context, obj client.Object, 
 func TestAgentMatchingAndTimeoutProtectNonBMIAndReservations(t *testing.T) {
 	ctx := context.Background()
 	r := &Reconciler{recorder: events.NewFakeRecorder(10)}
-	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(time.Unix(100, 0))}}
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac", CreationTimestamp: metav1.NewTime(time.Unix(100, 0))}}
 	for _, kind := range []string{"Other", workerKindBMI} {
 		t.Run(kind, func(t *testing.T) {
 			id := "id"
@@ -198,9 +202,10 @@ func TestAgentMatchingAndTimeoutProtectNonBMIAndReservations(t *testing.T) {
 			}
 			a := agentPhaseFixture("", false)
 			_ = unstructured.SetNestedSlice(a.Object, []interface{}{map[string]interface{}{"macAddress": "aa"}}, "status", "inventory", "interfaces")
-			match, ambiguous := matchAgentToBMI(ctx, a, []v1alpha1.WorkerStatus{w}, func(context.Context, string) []string { return []string{"aa"} })
-			if match != "" || ambiguous {
-				t.Error("matched a protected worker")
+			associations := matchUnboundAgents(ctx, co, []unstructured.Unstructured{*a}, []v1alpha1.WorkerStatus{w},
+				func(context.Context, string) []string { return []string{"aa"} })
+			if association, ok := associations[w.Name]; ok {
+				t.Errorf("associated a protected worker: %+v", association)
 			}
 		})
 	}
@@ -269,6 +274,88 @@ func TestR02AgentConflictRestarts(t *testing.T) {
 	}
 	if patchClient.patches != 2 {
 		t.Fatalf("agent patches=%d after restart, want 2", patchClient.patches)
+	}
+}
+
+func TestR06MACAmbiguityBothDirections(t *testing.T) {
+	ctx := context.Background()
+	makeAgent := func(name, mac, assigned string) *unstructured.Unstructured {
+		agent := agentPhaseFixture(assigned, false)
+		agent.SetName(name)
+		agent.SetUID(types.UID(name + "-uid"))
+		_ = unstructured.SetNestedSlice(agent.Object, []interface{}{
+			map[string]interface{}{"macAddress": mac},
+		}, "status", "inventory", "interfaces")
+		return agent
+	}
+	worker := func(name, bmiID string) v1alpha1.WorkerStatus {
+		return newWorkerStatus("standard", "standard", name, bmiID, workerPhaseWaitingForAgent)
+	}
+	for _, tc := range []struct {
+		name    string
+		agents  []*unstructured.Unstructured
+		workers []v1alpha1.WorkerStatus
+		macs    map[string][]string
+	}{
+		{
+			name:    "one Agent matches several workers",
+			agents:  []*unstructured.Unstructured{makeAgent("agent-0", "aa", "")},
+			workers: []v1alpha1.WorkerStatus{worker("w-0", "bmi-0"), worker("w-1", "bmi-1")},
+			macs:    map[string][]string{"bmi-0": {"aa"}, "bmi-1": {"aa"}},
+		},
+		{
+			name:    "several Agents match one worker",
+			agents:  []*unstructured.Unstructured{makeAgent("agent-0", "aa", ""), makeAgent("agent-1", "aa", "")},
+			workers: []v1alpha1.WorkerStatus{worker("w-0", "bmi-0")},
+			macs:    map[string][]string{"bmi-0": {"aa"}},
+		},
+		{
+			name:    "assigned Agent is never a MAC fallback",
+			agents:  []*unstructured.Unstructured{makeAgent("agent-0", "aa", "other-worker")},
+			workers: []v1alpha1.WorkerStatus{worker("w-0", "bmi-0")},
+			macs:    map[string][]string{"bmi-0": {"aa"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objects := make([]client.Object, 0, len(tc.agents))
+			for _, agent := range tc.agents {
+				objects = append(objects, agent)
+			}
+			c := clientfake.NewClientBuilder().WithObjects(objects...).Build()
+			r := &Reconciler{
+				Client: c, apiReader: c, recorder: events.NewFakeRecorder(10),
+				macResolver: func(_ context.Context, id string) []string { return tc.macs[id] },
+			}
+			co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+			observed := &unstructured.UnstructuredList{}
+			for _, agent := range tc.agents {
+				observed.Items = append(observed.Items, *agent)
+			}
+			workers := append([]v1alpha1.WorkerStatus(nil), tc.workers...)
+
+			bound, err := r.matchAndBindAgents(ctx, co, observed, workers, r.macResolver)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if bound != 0 {
+				t.Fatalf("ambiguous MAC evidence bound %d workers, want none", bound)
+			}
+			for _, w := range workers {
+				if w.Phase != workerPhaseWaitingForAgent {
+					t.Fatalf("worker %s advanced to %s under ambiguous evidence", w.Name, w.Phase)
+				}
+			}
+			for _, agent := range tc.agents {
+				got := &unstructured.Unstructured{}
+				got.SetGroupVersionKind(agentGVK)
+				if err := c.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+					t.Fatal(err)
+				}
+				if assigned := got.GetLabels()[workerNameLabel]; assigned != agent.GetLabels()[workerNameLabel] {
+					t.Fatalf("Agent %s was reassigned to %q", agent.GetName(), assigned)
+				}
+			}
+		})
 	}
 }
 
@@ -343,7 +430,7 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 	r := &Reconciler{recorder: recorder, macResolver: func(context.Context, string) []string { return nil }}
 	fixed := metav1.NewTime(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
 	w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
-	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", CreationTimestamp: fixed}, Status: v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{w}}}
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac", CreationTimestamp: fixed}, Status: v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{w}}}
 	failures := workerProvisioningFailures.WithLabelValues(tenantOf(co), workerTypeBareMetal, w.InstanceType)
 	beforeFailures := testutil.ToFloat64(failures)
 	got, res, err := reconcileAgentStage(r, co, co.Status.Workers, &unstructured.UnstructuredList{})
@@ -409,7 +496,14 @@ func TestAgentObservationBeforeSlotSelectionAndStaleIgnition(t *testing.T) {
 		newWorkerStatus("standard", "standard", "missing", "id-2", workerPhaseReady),
 	}
 	agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture("installed", true)}}
-	co.Status.Workers = projectAgentWorkerPhases(context.Background(), co.Status.Workers, agents, func(context.Context, string) []string { return nil })
+	for i := range agents.Items {
+		agents.Items[i].SetNamespace(co.Namespace)
+	}
+	projected, err := projectAgentWorkerPhases(co, co.Status.Workers, agents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	co.Status.Workers = projected
 	plan := planWorkerSlots(co)
 	if len(plan.selected) != 1 || plan.selected[0].Name != "installed" {
 		t.Fatalf("incorrect early retention: %+v", plan)

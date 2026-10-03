@@ -196,7 +196,12 @@ func TestEarlyAgentObservationStopsOnConcurrentWorkerState(t *testing.T) {
 				concurrent = latest.Status.Workers[len(latest.Status.Workers)-1]
 			}}
 			r.Client = conflict
-			agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentPhaseFixture("slot", true)}}
+			agentFixture := agentPhaseFixture("slot", true)
+			agentFixture.SetNamespace(co.Namespace)
+			labels := agentFixture.GetLabels()
+			labels[clusterOrderLabel] = co.Name
+			agentFixture.SetLabels(labels)
+			agents := &unstructured.UnstructuredList{Items: []unstructured.Unstructured{*agentFixture}}
 			observed := indexWorkerBMIs([]*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "id")})
 			observed.agents = agents
 			workers, err := r.observeExistingWorkers(context.Background(), co, "tenant", observed)

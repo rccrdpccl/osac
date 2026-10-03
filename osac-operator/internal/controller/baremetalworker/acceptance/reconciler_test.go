@@ -1776,6 +1776,109 @@ var _ = Describe("BareMetalWorkerReconciler reconcileAgent", func() {
 
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
 	})
+
+	// registerAgentWithLabels registers a simulator Agent and applies the given
+	// selector labels, returning the apiserver object.
+	registerAgentWithLabels := func(agentName, mac string, labels map[string]string) *unstructured.Unstructured {
+		GinkgoHelper()
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: agentName, Namespace: testNamespace, MAC: mac,
+		})).To(Succeed())
+		agent := &unstructured.Unstructured{}
+		agent.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: testNamespace}, agent)).To(Succeed())
+		agent.SetLabels(labels)
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+		return agent
+	}
+	getAgentByName := func(agentName string) *unstructured.Unstructured {
+		GinkgoHelper()
+		agent := &unstructured.Unstructured{}
+		agent.SetGroupVersionKind(agentGVK)
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: agentName, Namespace: testNamespace}, agent)).To(Succeed())
+		return agent
+	}
+
+	It("R06-E1 unions both Agent selectors and deduplicates a shared object", func() {
+		preloadDiskImageChain()
+		const name = "bmw-r06-e1"
+		create(newBareMetalClusterOrder(name, 1))
+		createWorkersAndSetMAC(name, 1)
+		worker := getClusterOrder(name).Status.Workers[0]
+		const infraEnvLabel = "infraenvs.agent-install.openshift.io"
+
+		infraOnly := registerAgentWithLabels(name+"-infra-agent", "ff:ff:ff:ff:ff:01",
+			map[string]string{infraEnvLabel: name + "-infraenv"})
+		// The matching Agent carries only the cluster-order selector: an InfraEnv-only
+		// observation would omit it entirely.
+		clusterOnly := registerAgentWithLabels(name+"-cluster-agent", "aa:bb:cc:dd:ee:00",
+			map[string]string{"osac.openshift.io/cluster-order": name})
+		// This object carries both selectors; the union must not count it twice.
+		both := registerAgentWithLabels(name+"-both-agent", "ff:ff:ff:ff:ff:02", map[string]string{
+			infraEnvLabel: name + "-infraenv", "osac.openshift.io/cluster-order": name,
+		})
+
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+
+		co := getClusterOrder(name)
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).To(Equal("Binding"))
+		Expect(getAgentByName(clusterOnly.GetName()).GetLabels()).To(HaveKeyWithValue(
+			"osac.openshift.io/worker-name", worker.Name))
+		// Every observed Agent survives; the non-matching ones stay unassigned.
+		for _, preserved := range []string{infraOnly.GetName(), both.GetName()} {
+			Expect(getAgentByName(preserved).GetLabels()).ToNot(HaveKey("osac.openshift.io/worker-name"))
+		}
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+	})
+
+	It("R06-E2 refuses readiness and mutation under ambiguous Agent evidence", func() {
+		preloadDiskImageChain()
+		const name = "bmw-r06-e2"
+		const finalizer = "osac.openshift.io/baremetalworker-finalizer"
+		create(newBareMetalClusterOrder(name, 1))
+		createWorkersAndSetMAC(name, 1)
+		worker := getClusterOrder(name).Status.Workers[0]
+
+		// Two unbound Agents share the worker's MAC: a worker -> several Agents
+		// ambiguity that must not bind or patch either Agent.
+		first := registerAgentWithLabels(name+"-ambig-a", "aa:bb:cc:dd:ee:00",
+			map[string]string{"osac.openshift.io/cluster-order": name})
+		second := registerAgentWithLabels(name+"-ambig-b", "aa:bb:cc:dd:ee:00",
+			map[string]string{"osac.openshift.io/cluster-order": name})
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		co := getClusterOrder(name)
+		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		Expect(*co.Status.ReadyWorkers).To(Equal(int32(0)))
+		for _, agentName := range []string{first.GetName(), second.GetName()} {
+			Expect(getAgentByName(agentName).GetLabels()).ToNot(HaveKey("osac.openshift.io/worker-name"))
+		}
+
+		// Two Agents now claim the same worker-name label and report installed: a
+		// duplicate established association must not promote readiness or be deleted.
+		for _, agentName := range []string{first.GetName(), second.GetName()} {
+			agent := getAgentByName(agentName)
+			labels := agent.GetLabels()
+			labels["osac.openshift.io/worker-name"] = worker.Name
+			agent.SetLabels(labels)
+			Expect(unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+			Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		}
+		_, err = runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder(name)
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).ToNot(Equal("Ready"), "duplicate claims must not promote readiness")
+		Expect(co.Status.Workers[0].BareMetalInstance).To(Equal(worker.BareMetalInstance))
+		Expect(*co.Status.ReadyWorkers).To(Equal(int32(0)))
+		Expect(co.Finalizers).To(ContainElement(finalizer))
+		Expect(getAgentByName(first.GetName())).ToNot(BeNil())
+		Expect(getAgentByName(second.GetName())).ToNot(BeNil())
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+	})
 })
 
 var _ = Describe("BareMetalWorkerReconciler workerRetry", func() {

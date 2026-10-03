@@ -15,6 +15,7 @@ package baremetalworker
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -28,21 +29,106 @@ import (
 // multiple NICs; correlation matches an Agent to it if any NIC MAC matches.
 type MACResolver func(ctx context.Context, bmiID string) []string
 
-// matchAgentToBMI performs the three-dimension match: the Agent must be in the correct namespace,
-// carry the cluster-order label, and have an inventory MAC that uniquely matches one BMI's host
-// NIC MACs. Returns the matched worker name, or empty string with ambiguous=true if multiple match.
-func matchAgentToBMI(
-	ctx context.Context,
-	agent *unstructured.Unstructured,
-	workers []v1alpha1.WorkerStatus,
-	hostMACs MACResolver,
-) (workerName string, ambiguous bool) {
-	agentMACs := extractAgentMACs(agent)
-	if len(agentMACs) == 0 {
-		return "", false
-	}
+// agentAssociationState classifies how one worker's Agent was resolved from a complete scoped
+// observation. Only agentEstablished may authorize readiness or bound deletion; agentAbsent needs
+// authoritative evidence before destructive work, and ambiguous/invalid must fail closed.
+type agentAssociationState int
 
-	var matched string
+const (
+	agentAbsent agentAssociationState = iota
+	agentEstablished
+	agentAmbiguous
+	agentInvalid
+)
+
+// agentAssociation is the single association result shared by phase projection, late binding
+// and cleanup. A nil Agent is only meaningful for agentAbsent.
+type agentAssociation struct {
+	state  agentAssociationState
+	agent  *unstructured.Unstructured
+	reason string
+}
+
+// err surfaces an invalid association as a returned error. Ambiguous and absent results are
+// decisions, not errors; callers must still refuse to advance or delete on them.
+func (a agentAssociation) err() error {
+	if a.state != agentInvalid {
+		return nil
+	}
+	if a.reason == "" {
+		return fmt.Errorf("invalid agent association")
+	}
+	return fmt.Errorf("%s", a.reason)
+}
+
+// agentIdentityKey is the Kubernetes identity of an Agent. Production identity is the UID; a
+// namespaced name only disambiguates fixtures lacking one, so a recreated same-name Agent is a
+// different incarnation and never the object an earlier observation authorized.
+func agentIdentityKey(agent *unstructured.Unstructured) string {
+	if uid := agent.GetUID(); uid != "" {
+		return string(uid)
+	}
+	return agent.GetNamespace() + "/" + agent.GetName()
+}
+
+// distinctAgents preserves the first observation of each identity, so one object matched by both
+// supported selectors is not counted twice and never becomes ambiguous.
+func distinctAgents(agents []*unstructured.Unstructured) []*unstructured.Unstructured {
+	seen := make(map[string]bool, len(agents))
+	unique := make([]*unstructured.Unstructured, 0, len(agents))
+	for _, agent := range agents {
+		key := agentIdentityKey(agent)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		unique = append(unique, agent)
+	}
+	return unique
+}
+
+// associateEstablishedAgent resolves the unique compatible Agent carrying the worker's
+// worker-name label. It never falls back to MAC correlation: only an established label may
+// authorize readiness or bound deletion.
+func associateEstablishedAgent(agents []unstructured.Unstructured, co *v1alpha1.ClusterOrder, workerName string) agentAssociation {
+	var matches []*unstructured.Unstructured
+	for i := range agents {
+		agent := &agents[i]
+		if agent.GetLabels()[workerNameLabel] != workerName {
+			continue
+		}
+		matches = append(matches, agent)
+	}
+	switch unique := distinctAgents(matches); len(unique) {
+	case 0:
+		return agentAssociation{state: agentAbsent}
+	case 1:
+		if err := agentBindingConflict(unique[0], co, workerName); err != nil {
+			return agentAssociation{state: agentInvalid, reason: err.Error()}
+		}
+		return agentAssociation{state: agentEstablished, agent: unique[0]}
+	default:
+		return agentAssociation{state: agentAmbiguous,
+			reason: fmt.Sprintf("%d Agents claim worker %s", len(unique), workerName)}
+	}
+}
+
+// matchUnboundAgents resolves initial discovery from the observed snapshot: for every eligible
+// waiting worker it returns the unique unbound compatible Agent whose inventory MACs intersect
+// the worker's BMI host NICs. Ambiguity is preserved in both directions — one Agent matching
+// several workers and several Agents matching one worker are both ambiguous — and an
+// already-labelled or already-bound Agent is never a MAC fallback. An incompatible candidate is
+// invalid evidence, not absence.
+func matchUnboundAgents(
+	ctx context.Context, co *v1alpha1.ClusterOrder, agents []unstructured.Unstructured,
+	workers []v1alpha1.WorkerStatus, hostMACs MACResolver,
+) map[string]agentAssociation {
+	result := make(map[string]agentAssociation)
+	type candidate struct {
+		agent  *unstructured.Unstructured
+		worker string
+	}
+	var candidates []candidate
 	for i := range workers {
 		w := &workers[i]
 		if !eligibleForAgentObservation(*w) || w.Phase != workerPhaseWaitingForAgent {
@@ -52,14 +138,50 @@ func matchAgentToBMI(
 		if len(bmiMACs) == 0 {
 			continue
 		}
-		if macsIntersect(agentMACs, bmiMACs) {
-			if matched != "" {
-				return "", true
+		var invalid error
+		var matched []*unstructured.Unstructured
+		for j := range agents {
+			agent := &agents[j]
+			if agent.GetLabels()[workerNameLabel] != "" {
+				continue // already claimed by a worker; never a fallback candidate
 			}
-			matched = w.Name
+			if !macsIntersect(extractAgentMACs(agent), bmiMACs) {
+				continue
+			}
+			if err := agentBindingConflict(agent, co, w.Name); err != nil {
+				invalid = err
+				continue
+			}
+			matched = append(matched, agent)
+		}
+		unique := distinctAgents(matched)
+		switch {
+		case invalid != nil:
+			result[w.Name] = agentAssociation{state: agentInvalid, reason: invalid.Error()}
+		case len(unique) == 1:
+			candidates = append(candidates, candidate{agent: unique[0], worker: w.Name})
+		case len(unique) > 1:
+			result[w.Name] = agentAssociation{state: agentAmbiguous,
+				reason: fmt.Sprintf("%d unbound Agents match worker %s", len(unique), w.Name)}
 		}
 	}
-	return matched, false
+	// An Agent that is the unique candidate for more than one worker is ambiguous for all of
+	// them: never choose a worker arbitrarily.
+	claims := map[string][]string{}
+	for _, c := range candidates {
+		key := agentIdentityKey(c.agent)
+		claims[key] = append(claims[key], c.worker)
+	}
+	for _, c := range candidates {
+		key := agentIdentityKey(c.agent)
+		if len(claims[key]) > 1 {
+			result[c.worker] = agentAssociation{state: agentAmbiguous,
+				reason: fmt.Sprintf("unbound Agent %s matches several workers", key)}
+			continue
+		}
+		result[c.worker] = agentAssociation{state: agentEstablished, agent: c.agent}
+	}
+	return result
 }
 
 // macsIntersect reports whether any MAC in a matches any MAC in b, case-insensitively.
@@ -75,6 +197,8 @@ func macsIntersect(a, b []string) bool {
 }
 
 // extractAgentMACs reads all MAC addresses from the Agent's status.inventory.interfaces[].macAddress.
+// Uninterpretable entries are omitted (unknown, not a match); destructive association applies the
+// stricter cleanup inventory validation instead.
 func extractAgentMACs(agent *unstructured.Unstructured) []string {
 	interfaces, found, err := unstructured.NestedSlice(agent.Object, "status", "inventory", "interfaces")
 	if err != nil || !found {
@@ -93,26 +217,4 @@ func extractAgentMACs(agent *unstructured.Unstructured) []string {
 		macs = append(macs, mac)
 	}
 	return macs
-}
-
-// findAgentForWorker prefers the recorded worker-name binding, then uses the
-// existing inventory NIC MAC correlation fallback. It does not query providers.
-func findAgentForWorker(ctx context.Context, agents *unstructured.UnstructuredList, bmiID, workerName string, hostMACs MACResolver) *unstructured.Unstructured {
-	for idx := range agents.Items {
-		agent := &agents.Items[idx]
-		if agent.GetLabels()[workerNameLabel] == workerName {
-			return agent
-		}
-	}
-	bmiMACs := hostMACs(ctx, bmiID)
-	if len(bmiMACs) == 0 {
-		return nil
-	}
-	for idx := range agents.Items {
-		agent := &agents.Items[idx]
-		if macsIntersect(extractAgentMACs(agent), bmiMACs) {
-			return agent
-		}
-	}
-	return nil
 }
