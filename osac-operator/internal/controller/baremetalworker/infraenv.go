@@ -33,6 +33,7 @@ const (
 	eventReasonIgnitionSizeWarning   = "DiscoveryIgnitionSizeWarning"
 	reasonInfraEnvReady              = "InfraEnvReady"
 	reasonIgnitionPending            = "IgnitionPending"
+	reasonIgnitionPendingMessage     = "waiting for discovery ignition URL"
 	infraEnvUIDAnnotation            = "osac.openshift.io/infraenv-uid"
 	eventReasonStaleIgnition         = "StaleIgnition"
 	reasonInfraEnvRecreated          = "InfraEnvRecreated"
@@ -41,115 +42,199 @@ const (
 
 var infraEnvGVK = schema.GroupVersionKind{Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "InfraEnv"}
 
-// reconcileInfraEnvEvidence observes the cluster InfraEnv and its UID so stale
-// waiting workers are classified before a replacement UID is acknowledged. It
-// never resolves creation inputs: discovery ignition and the disk image belong
-// to the stage that needs them. Creating the InfraEnv or persisting a
-// stale-worker classification is a durable mutation and reports mutated=true; a
-// missing creation prerequisite is returned as an error for the caller to merge,
-// never as a global gate on existing-worker work.
-func (r *Reconciler) reconcileInfraEnvEvidence(ctx context.Context, co *v1alpha1.ClusterOrder) (ctrl.Result, bool, error) {
-	infraEnv, res, err := r.observeInfraEnv(ctx, co)
-	if err != nil {
-		return ctrl.Result{}, false, err
-	}
-	if !res.IsZero() {
-		return res, true, nil
-	}
-	// observeInfraEnv may have persisted InfraEnvReady. Refresh before stale
-	// worker classification so its next optimistic worker patch uses that
-	// successful write's resource version and status snapshot.
-	if err := r.readAuthoritativeOrder(ctx, co); err != nil {
-		return ctrl.Result{}, false, err
-	}
-	if uid := string(infraEnv.GetUID()); uid != "" {
-		changed, _, err := r.detectStaleIgnitionWorkers(ctx, co, uid)
-		if err != nil {
-			return ctrl.Result{}, false, err
-		}
-		if changed {
-			return workerBoundaryRequeue(), true, nil
-		}
-		if err := r.trackInfraEnvUID(ctx, co, uid); err != nil {
-			return ctrl.Result{}, false, err
-		}
-	}
-	return ctrl.Result{}, false, nil
+// infraEnvEvidence is the invocation-local result of the single InfraEnv
+// observation. object is nil only when absence was authoritative (an uncached
+// read confirmed NotFound). err is an unknown result or a missing creation
+// prerequisite and is never treated as absence: it can hold the invocation's
+// error for the caller to merge after prerequisite-free work has converged.
+type infraEnvEvidence struct {
+	object *unstructured.Unstructured
+	err    error
 }
 
-// observeInfraEnv returns the current InfraEnv, creating it (and the pull secret
-// it references) when absent. Recreating a deleted InfraEnv resets InfraEnvReady
-// so a replacement object's UID is never mistaken for the recorded one. A
-// non-zero result means the observation itself persisted a durable change.
-func (r *Reconciler) observeInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) (*unstructured.Unstructured, ctrl.Result, error) {
-	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(infraEnvGVK)
-
-	err := r.Get(ctx, key, existing)
-	switch {
-	case err == nil:
-		return existing, ctrl.Result{}, nil
-	case !apierrors.IsNotFound(err):
-		return nil, ctrl.Result{}, fmt.Errorf("getting infraenv %s: %w", key, err)
+// observeInfraEnvEvidence observes the cluster InfraEnv once per invocation and
+// records its UID so stale waiting workers are classified before a replacement
+// UID is acknowledged. It never resolves creation inputs: discovery ignition and
+// the disk image belong to the stage that needs them. A durable write made here
+// (creating the object, replacing stale Ready evidence, or persisting a
+// stale-worker classification) reports mutated=true and ends the invocation; a
+// missing creation prerequisite, an unknown lookup or a foreign object is
+// returned as evidence.err for the caller to merge, never as a global gate on
+// existing-worker work.
+func (r *Reconciler) observeInfraEnvEvidence(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+) (infraEnvEvidence, ctrl.Result, bool, error) {
+	infraEnv, err := r.observeInfraEnvObject(ctx, co)
+	if err != nil {
+		// Unknown existence or ownership is not absence and never authorizes a
+		// Create; prerequisite-free existing-worker work still converges.
+		return infraEnvEvidence{err: err}, ctrl.Result{}, false, nil
 	}
+	if infraEnv == nil {
+		return r.createMissingInfraEnv(ctx, co)
+	}
+	// Current artifact evidence replaces a stale Ready claim. A published URL is
+	// not itself a claim: only the create stage's validated fetch reports Ready. A
+	// condition-only write is not a boundary: the object is refreshed
+	// authoritatively and the invocation continues.
+	if err := r.deriveInfraEnvPending(ctx, co, infraEnv); err != nil {
+		return infraEnvEvidence{object: infraEnv, err: err}, ctrl.Result{}, false, nil
+	}
+	uid := string(infraEnv.GetUID())
+	if uid == "" {
+		return infraEnvEvidence{object: infraEnv}, ctrl.Result{}, false, nil
+	}
+	changed, _, err := r.detectStaleIgnitionWorkers(ctx, co, uid)
+	if err != nil {
+		return infraEnvEvidence{object: infraEnv, err: err}, ctrl.Result{}, false, nil
+	}
+	if changed {
+		return infraEnvEvidence{object: infraEnv}, workerBoundaryRequeue(), true, nil
+	}
+	if err := r.trackInfraEnvUID(ctx, co, uid); err != nil {
+		return infraEnvEvidence{object: infraEnv, err: err}, ctrl.Result{}, false, nil
+	}
+	return infraEnvEvidence{object: infraEnv}, ctrl.Result{}, false, nil
+}
 
+// observeInfraEnvObject performs the one InfraEnv Get of an invocation. A cached
+// omission is confirmed with an uncached read before it is treated as absence, and
+// a present object must be controlled by this ClusterOrder before its UID or boot
+// artifacts are consumed as evidence.
+func (r *Reconciler) observeInfraEnvObject(ctx context.Context, co *v1alpha1.ClusterOrder) (*unstructured.Unstructured, error) {
+	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
+	cached := &unstructured.Unstructured{}
+	cached.SetGroupVersionKind(infraEnvGVK)
+	err := r.Get(ctx, key, cached)
+	if err == nil {
+		return cached, validateInfraEnvOwner(co, cached)
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("getting infraenv %s: %w", key, err)
+	}
+	// Cache omission is not absence: an existing or recreated object must be
+	// confirmed gone before a Create is authorized.
+	reader := r.apiReader
+	if reader == nil {
+		reader = r.Client
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(infraEnvGVK)
+	switch err := reader.Get(ctx, key, current); {
+	case err == nil:
+		return current, validateInfraEnvOwner(co, current)
+	case !apierrors.IsNotFound(err):
+		return nil, fmt.Errorf("getting infraenv %s: %w", key, err)
+	}
+	return nil, nil
+}
+
+// validateInfraEnvOwner rejects a same-name InfraEnv this ClusterOrder does not
+// control. A foreign object (including one left by an earlier ClusterOrder
+// incarnation) is an error, not permission to recreate or to consume its UID and
+// boot artifacts.
+func validateInfraEnvOwner(co *v1alpha1.ClusterOrder, infraEnv *unstructured.Unstructured) error {
+	if infraEnv.GetNamespace() != co.Namespace {
+		return fmt.Errorf("infraenv %s/%s is not in ClusterOrder namespace %s",
+			infraEnv.GetNamespace(), infraEnv.GetName(), co.Namespace)
+	}
+	owner := metav1.GetControllerOf(infraEnv)
+	if owner == nil || owner.Kind != "ClusterOrder" || owner.Name != co.Name {
+		return fmt.Errorf("infraenv %s/%s is not controlled by ClusterOrder %s",
+			infraEnv.GetNamespace(), infraEnv.GetName(), co.Name)
+	}
+	if co.UID != "" && owner.UID != co.UID {
+		return fmt.Errorf("infraenv %s/%s is not controlled by ClusterOrder %s incarnation %s",
+			infraEnv.GetNamespace(), infraEnv.GetName(), co.Name, co.UID)
+	}
+	return nil
+}
+
+// deriveInfraEnvPending replaces a stale InfraEnvReady claim with current pending
+// evidence when the observed InfraEnv publishes no discovery ignition URL. A
+// present URL is not a claim: only the create stage's validated fetch reports
+// Ready, so a stable order never fetches discovery ignition for status alone. The
+// condition write is a one-shot worker-owned patch, not a boundary: the object is
+// refreshed authoritatively so later optimistic patches do not build on a stale
+// snapshot, and repeating the same evidence writes nothing.
+func (r *Reconciler) deriveInfraEnvPending(
+	ctx context.Context, co *v1alpha1.ClusterOrder, infraEnv *unstructured.Unstructured,
+) error {
+	key := client.ObjectKeyFromObject(infraEnv)
+	ignitionURL, _, err := unstructured.NestedString(infraEnv.Object, "status", "bootArtifacts", "discoveryIgnitionURL")
+	if err != nil {
+		return fmt.Errorf("reading infraenv %s ignition URL: %w", key, err)
+	}
+	if ignitionURL != "" {
+		return nil
+	}
+	cond := apimeta.FindStatusCondition(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady)
+	if cond != nil && cond.Status == metav1.ConditionFalse && cond.Reason == reasonIgnitionPending &&
+		cond.Message == reasonIgnitionPendingMessage {
+		return nil
+	}
+	if err := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonIgnitionPending,
+		reasonIgnitionPendingMessage); err != nil {
+		return err
+	}
+	return r.readAuthoritativeOrder(ctx, co)
+}
+
+// createMissingInfraEnv reacts to authoritative absence. A recorded Ready claim is
+// cleared first, so a replacement object never inherits a stale success and the
+// reset survives a missing pull secret. The pull secret and the owned,
+// deterministically named InfraEnv are then created; that Create is the durable
+// boundary. A missing prerequisite is returned as held evidence instead.
+func (r *Reconciler) createMissingInfraEnv(
+	ctx context.Context, co *v1alpha1.ClusterOrder,
+) (infraEnvEvidence, ctrl.Result, bool, error) {
+	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
 	if apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
 		ctrllog.FromContext(ctx).Info("InfraEnv deleted while InfraEnvReady=True, resetting condition", "infraenv", key)
-		if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonInfraEnvRecreated,
-			"InfraEnv was deleted; recreating"); condErr != nil {
-			return nil, ctrl.Result{}, condErr
+		if err := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonInfraEnvRecreated,
+			"InfraEnv was deleted; recreating"); err != nil {
+			return infraEnvEvidence{}, ctrl.Result{}, false, err
+		}
+		// The reset advanced the object's resource version; refresh before the
+		// remaining work so later optimistic patches are not based on a stale
+		// snapshot.
+		if err := r.readAuthoritativeOrder(ctx, co); err != nil {
+			return infraEnvEvidence{}, ctrl.Result{}, false, err
 		}
 	}
 	if err := r.ensurePullSecret(ctx, co); err != nil {
-		return nil, ctrl.Result{}, fmt.Errorf("ensuring pull secret: %w", err)
+		return infraEnvEvidence{err: fmt.Errorf("ensuring pull secret: %w", err)}, ctrl.Result{}, false, nil
 	}
-	res, createErr := r.createInfraEnv(ctx, co, key)
-	return nil, res, createErr
-}
-
-// ensureInfraEnv creates one InfraEnv per ClusterOrder (late binding, owned by the ClusterOrder),
-// then polls for and fetches its discovery ignition, setting the InfraEnvReady condition.
-// Returns the fetched ignition bytes and the InfraEnv's UID once ready.
-func (r *Reconciler) ensureInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder) ([]byte, string, ctrl.Result, error) {
-	key := client.ObjectKey{Name: co.Name + infraEnvNameSuffix, Namespace: co.Namespace}
-	existing, res, err := r.observeInfraEnv(ctx, co)
-	if err != nil || !res.IsZero() {
-		return nil, "", res, err
-	}
-	ign, res, err := r.fetchDiscoveryIgnition(ctx, co, key, existing)
-	return ign, string(existing.GetUID()), res, err
-}
-
-// createInfraEnv creates the InfraEnv and marks InfraEnvReady=False (ignition pending), requeuing.
-func (r *Reconciler) createInfraEnv(ctx context.Context, co *v1alpha1.ClusterOrder, key client.ObjectKey) (ctrl.Result, error) {
 	infraEnv, err := r.buildInfraEnv(co, key.Name)
 	if err != nil {
-		return ctrl.Result{}, err
+		return infraEnvEvidence{err: err}, ctrl.Result{}, false, nil
 	}
 	if err := r.Create(ctx, infraEnv); err != nil && !apierrors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("creating infraenv %s: %w", key, err)
+		return infraEnvEvidence{err: fmt.Errorf("creating infraenv %s: %w", key, err)}, ctrl.Result{}, false, nil
 	}
 	ctrllog.FromContext(ctx).Info("created InfraEnv", "infraenv", key.String())
 	if err := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonIgnitionPending,
-		"InfraEnv created; waiting for discovery ignition"); err != nil {
-		return ctrl.Result{}, err
+		reasonIgnitionPendingMessage); err != nil {
+		return infraEnvEvidence{}, ctrl.Result{}, true, err
 	}
-	return ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil
+	return infraEnvEvidence{}, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, true, nil
 }
 
-// fetchDiscoveryIgnition polls the InfraEnv's discovery ignition URL and, once available, fetches
-// the ignition (warning if oversized) and marks InfraEnvReady=True. Returns the fetched bytes.
+// fetchDiscoveryIgnition is the create stage's input reader: it fetches and
+// validates the observed InfraEnv's discovery ignition and reports Ready only for
+// bytes it actually verified. A missing URL reports pending evidence and waits;
+// a failed fetch or invalid JSON is an error and never a successful input.
 func (r *Reconciler) fetchDiscoveryIgnition(
-	ctx context.Context, co *v1alpha1.ClusterOrder, key client.ObjectKey, infraEnv *unstructured.Unstructured,
+	ctx context.Context, co *v1alpha1.ClusterOrder, infraEnv *unstructured.Unstructured,
 ) ([]byte, ctrl.Result, error) {
+	key := client.ObjectKeyFromObject(infraEnv)
 	ignitionURL, _, err := unstructured.NestedString(infraEnv.Object, "status", "bootArtifacts", "discoveryIgnitionURL")
 	if err != nil {
 		return nil, ctrl.Result{}, fmt.Errorf("reading infraenv %s ignition URL: %w", key, err)
 	}
 	if ignitionURL == "" {
 		if condErr := r.setInfraEnvReady(ctx, co, metav1.ConditionFalse, reasonIgnitionPending,
-			"waiting for discovery ignition URL"); condErr != nil {
+			reasonIgnitionPendingMessage); condErr != nil {
 			return nil, ctrl.Result{}, condErr
 		}
 		return nil, ctrl.Result{RequeueAfter: infraEnvRequeueInterval}, nil

@@ -14,11 +14,12 @@ import (
 
 // reconcileWorkers owns normal worker convergence. Finalization never enters
 // this flow. Stages run in dependency order and each ends at its own durable
-// boundary: observation and repair, InfraEnv UID evidence, existing-worker
-// lifecycle (retirement, reservation, failed cleanup), creation with lazily
-// resolved inputs, then teardown, Agent binding, NodePool replicas and summary.
-// Creation prerequisites never gate existing-worker work: a wait or error from
-// the create stage is merged into the final scheduling decision instead.
+// boundary: observation and repair, one InfraEnv observation (object, UID and
+// current artifact evidence), existing-worker lifecycle (retirement, reservation,
+// failed cleanup), creation with lazily resolved inputs, then teardown, Agent
+// binding, NodePool replicas and summary. Creation prerequisites never gate
+// existing-worker work: a wait or error from the create stage is merged into the
+// final scheduling decision instead.
 func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string) (ctrl.Result, error) {
 	// One local observation supplies identity, ownership and early Agent phases.
 	observed, res, err := r.observeWorkerResources(ctx, co)
@@ -36,12 +37,14 @@ func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterO
 		return workerBoundaryRequeue(), nil
 	}
 
-	// InfraEnv object and UID evidence. Creating the object or persisting a
-	// stale-worker classification is a durable boundary; a missing creation
-	// prerequisite is held so existing-worker work still runs.
-	prereqWait, prereqMutated, prereqErr := r.reconcileInfraEnvEvidence(ctx, co)
-	if prereqMutated {
-		return prereqWait, prereqErr
+	// InfraEnv object, UID evidence and current artifact evidence: one observation
+	// per invocation. Creating the object, replacing stale Ready evidence or
+	// persisting a stale-worker classification is a durable boundary; a missing
+	// creation prerequisite, an unknown lookup or a foreign object is held so
+	// existing-worker work still runs.
+	infra, infraRes, infraMutated, infraBoundaryErr := r.observeInfraEnvEvidence(ctx, co)
+	if infraMutated {
+		return infraRes, infraBoundaryErr
 	}
 
 	// Retirement, durable reservations and failed-incarnation cleanup need no
@@ -53,8 +56,8 @@ func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterO
 	}
 
 	// At most one Create for the selected due slot, with image, ignition and
-	// instance type resolved only now.
-	created, creationRes, creationErr := r.reconcileWorkerCreation(ctx, co, tenant, observed)
+	// instance type resolved only now, from the observation made above.
+	created, creationRes, creationErr := r.reconcileWorkerCreation(ctx, co, tenant, observed, infra)
 	if created {
 		return creationRes, creationErr
 	}
@@ -65,10 +68,11 @@ func (r *Reconciler) reconcileWorkers(ctx context.Context, co *v1alpha1.ClusterO
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	// Surface a creation-prerequisite failure only after independent lifecycle
-	// work has been persisted, instead of pretending the invocation completed.
-	if prereqErr != nil {
-		return ctrl.Result{}, prereqErr
+	// Surface a held observation or creation-prerequisite failure only after
+	// independent lifecycle work has been persisted, instead of pretending the
+	// invocation completed.
+	if infra.err != nil {
+		return ctrl.Result{}, infra.err
 	}
 	if creationErr != nil {
 		return ctrl.Result{}, creationErr

@@ -264,6 +264,73 @@ var _ = Describe("BareMetalWorkerReconciler ensureInfraEnv", func() {
 		Expect(events).To(ContainElement(ContainSubstring("DiscoveryIgnitionSizeWarning")))
 	})
 
+	It("R07-E1 reports pending evidence when boot artifacts disappear and records a recreated UID without a Ready transition", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-r07-e1")
+		create(co)
+
+		// Provision one worker so no further create is due, and let the recorded
+		// Ready claim settle.
+		_, err := runReconcile("bmw-r07-e1")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-r07-e1-infraenv", testNamespace, ign.URL())).To(Succeed())
+		for range 3 {
+			_, err = runReconcile("bmw-r07-e1")
+			Expect(err).ToNot(HaveOccurred())
+		}
+		co = getClusterOrder("bmw-r07-e1")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].BareMetalInstance.ID).NotTo(BeEmpty())
+		Expect(apimeta.IsStatusConditionTrue(
+			co.Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)).To(BeTrue())
+		storedUID := co.Annotations["osac.openshift.io/infraenv-uid"]
+		Expect(storedUID).NotTo(BeEmpty())
+
+		// The boot artifacts disappear while the recorded claim is still Ready and no
+		// create needs the ignition: the condition follows current evidence instead of
+		// holding an unverified success.
+		ie := newInfraEnv("bmw-r07-e1-infraenv")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(ie), ie)).To(Succeed())
+		unstructured.RemoveNestedField(ie.Object, "status", "bootArtifacts", "discoveryIgnitionURL")
+		Expect(k8sClient.Update(ctx, ie)).To(Succeed())
+		creates := len(fc.CreateCalls())
+		_, err = runReconcile("bmw-r07-e1")
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-r07-e1")
+		cond := apimeta.FindStatusCondition(co.Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)
+		Expect(cond).ToNot(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("IgnitionPending"))
+		Expect(co.Annotations["osac.openshift.io/infraenv-uid"]).To(Equal(storedUID),
+			"clearing evidence is not a recreation")
+		Expect(fc.CreateCalls()).To(HaveLen(creates), "missing boot artifacts never authorize a BMI create")
+
+		// Recreating the object advances the recorded UID while the condition stays
+		// False: the lookup and UID evidence are never authorized by a condition
+		// transition.
+		Expect(k8sClient.Delete(ctx, ie)).To(Succeed())
+		_, err = runReconcile("bmw-r07-e1")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-r07-e1-infraenv", testNamespace, ign.URL())).To(Succeed())
+		_, err = runReconcile("bmw-r07-e1")
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-r07-e1")
+		Expect(co.Status.Workers[0].Phase).To(Equal("Failed"), "a waiting worker on stale ignition is failed, not replaced")
+		Expect(co.Status.Workers[0].LastFailureReason).To(Equal("AgentRegistrationTimeout"))
+		_, err = runReconcile("bmw-r07-e1")
+		Expect(err).ToNot(HaveOccurred())
+		co = getClusterOrder("bmw-r07-e1")
+		recreated := newInfraEnv("bmw-r07-e1-infraenv")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(recreated), recreated)).To(Succeed())
+		Expect(string(recreated.GetUID())).NotTo(Equal(storedUID))
+		Expect(co.Annotations["osac.openshift.io/infraenv-uid"]).To(Equal(string(recreated.GetUID())))
+		cond = apimeta.FindStatusCondition(co.Status.Conditions, osacv1alpha1.ConditionInfraEnvReady)
+		Expect(cond).ToNot(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue),
+			"readiness follows the recreated object's published artifact without needing a create")
+		Expect(fc.CreateCalls()).To(HaveLen(creates), "no BMI is created while the stale worker waits for its retry")
+	})
+
 	It("ignores ClusterOrders without a bare-metal node set", func() {
 		co := &osacv1alpha1.ClusterOrder{
 			ObjectMeta: metav1.ObjectMeta{Name: "bmw-none", Namespace: testNamespace},

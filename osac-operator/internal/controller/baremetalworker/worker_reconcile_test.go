@@ -6,7 +6,9 @@ package baremetalworker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,10 +17,13 @@ import (
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -589,17 +594,8 @@ func TestR04SummaryBeforeCreateGate(t *testing.T) {
 	if err := r.Status().Update(ctx, co); err != nil {
 		t.Fatal(err)
 	}
-	infra := &unstructured.Unstructured{Object: map[string]interface{}{}}
-	infra.SetGroupVersionKind(infraEnvGVK)
-	infra.SetName(co.Name + infraEnvNameSuffix)
-	infra.SetNamespace(co.Namespace)
-	infra.SetUID("infra-uid")
-	if err := unstructured.SetNestedField(infra.Object, "http://ignition.test", "status", "bootArtifacts", "discoveryIgnitionURL"); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Create(ctx, infra); err != nil {
-		t.Fatal(err)
-	}
+	// The fixture InfraEnv is the object production creates: owned by this order.
+	r07CreateInfraEnv(t, r, r07InfraEnv(t, r, co, "infra-uid", "http://ignition.test"))
 	co.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, metav1.ConditionTrue, "ready", reasonInfraEnvReady)
 	if err := r.Status().Update(ctx, co); err != nil {
 		t.Fatal(err)
@@ -685,6 +681,436 @@ func (w *staleFailureWriter) Patch(ctx context.Context, obj client.Object, p cli
 	}
 	return w.SubResourceWriter.Patch(ctx, obj, p, opts...)
 }
+
+// R07 observes the cluster InfraEnv as one resource-driven path: InfraEnvReady is
+// evidence output, never the switch that decides whether the resource is looked
+// up, and the recorded UID stays the recovery checkpoint for stale workers.
+
+// r07Harness builds an order whose single worker already holds a recorded BMI, so
+// no create is due and the InfraEnv evidence is the only thing in play.
+func r07Harness(t *testing.T, phase string) (*Reconciler, *workerReadClient, *v1alpha1.ClusterOrder) {
+	t.Helper()
+	ctx := context.Background()
+	r, fc, co := workerReadHarness(t)
+	co.Spec.PullSecret = `{"auths":{}}`
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.Status.Workers[0].Phase = phase
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	fc.listed = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "recorded-id")}
+	fc.bmis = fc.listed
+	return r, fc, co
+}
+
+// r07InfraEnv builds the object production creates: deterministic name, controller
+// owner reference to the ClusterOrder, and optional boot-artifact evidence.
+func r07InfraEnv(t *testing.T, r *Reconciler, owner *v1alpha1.ClusterOrder, uid, ignitionURL string) *unstructured.Unstructured {
+	t.Helper()
+	return r07InfraEnvNamed(t, r, owner, owner.Name+infraEnvNameSuffix, uid, ignitionURL)
+}
+
+// r07InfraEnvNamed builds a controlled InfraEnv under an explicit name, so a
+// same-name object controlled by a different ClusterOrder can be forged.
+func r07InfraEnvNamed(t *testing.T, r *Reconciler, owner *v1alpha1.ClusterOrder, name, uid, ignitionURL string) *unstructured.Unstructured {
+	t.Helper()
+	infra := &unstructured.Unstructured{}
+	infra.SetGroupVersionKind(infraEnvGVK)
+	infra.SetName(name)
+	infra.SetNamespace(owner.Namespace)
+	if uid != "" {
+		infra.SetUID(types.UID(uid))
+	}
+	if err := controllerutil.SetControllerReference(owner, infra, r.scheme); err != nil {
+		t.Fatalf("setting infraenv owner reference: %v", err)
+	}
+	if ignitionURL != "" {
+		if err := unstructured.SetNestedField(infra.Object, ignitionURL, "status", "bootArtifacts", "discoveryIgnitionURL"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return infra
+}
+
+func r07CreateInfraEnv(t *testing.T, r *Reconciler, infra *unstructured.Unstructured) {
+	t.Helper()
+	if err := r.Create(context.Background(), infra); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// r07InfraEnvObjects returns the deterministic-name InfraEnv objects in the order's
+// namespace, so duplication and replacement are observable.
+func r07InfraEnvObjects(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder) []unstructured.Unstructured {
+	t.Helper()
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(infraEnvGVK)
+	if err := r.List(context.Background(), list, client.InNamespace(co.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	var found []unstructured.Unstructured
+	for i := range list.Items {
+		if list.Items[i].GetName() == co.Name+infraEnvNameSuffix {
+			found = append(found, list.Items[i])
+		}
+	}
+	return found
+}
+
+// TestR07ConditionDoesNotChooseLookup is R07-U1: absence and presence are decided
+// by the resource, not by the previous InfraEnvReady condition. Every prior
+// condition state creates exactly one object on authoritative absence, and a
+// present object whose discovery ignition URL is missing replaces a stale Ready
+// claim with current pending evidence.
+func TestR07ConditionDoesNotChooseLookup(t *testing.T) {
+	ctx := context.Background()
+	for _, present := range []bool{true, false} {
+		for _, prior := range []metav1.ConditionStatus{"", metav1.ConditionTrue, metav1.ConditionFalse} {
+			label := "absent"
+			if present {
+				label = "present"
+			}
+			t.Run(fmt.Sprintf("%s-prior-%q", label, string(prior)), func(t *testing.T) {
+				r, fc, co := r07Harness(t, workerPhaseReady)
+				if prior != "" {
+					co.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, prior, "PriorEvidence", "prior evidence")
+					if err := r.Status().Update(ctx, co); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var created []unstructured.Unstructured
+				if present {
+					r07CreateInfraEnv(t, r, r07InfraEnv(t, r, co, "infra-uid", ""))
+					created = r07InfraEnvObjects(t, r, co)
+					if len(created) != 1 {
+						t.Fatalf("fixture InfraEnv objects=%d", len(created))
+					}
+				}
+				// A finite trace: an evidence-condition boundary may consume the first
+				// invocation and the UID evidence is recorded by a later one.
+				for range 3 {
+					if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+						t.Fatalf("reconcile: %v", err)
+					}
+				}
+				found := r07InfraEnvObjects(t, r, co)
+				if len(found) != 1 {
+					t.Fatalf("InfraEnv objects=%d, want exactly one for present=%t prior=%q", len(found), present, prior)
+				}
+				if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+					t.Fatal(err)
+				}
+				cond := apimeta.FindStatusCondition(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady)
+				if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonIgnitionPending {
+					t.Fatalf("InfraEnv without boot artifacts reported %+v, want current pending evidence", cond)
+				}
+				if present {
+					if found[0].GetUID() != created[0].GetUID() {
+						t.Fatalf("present InfraEnv was replaced: uid=%q want %q", found[0].GetUID(), created[0].GetUID())
+					}
+					if co.Annotations[infraEnvUIDAnnotation] != string(found[0].GetUID()) {
+						t.Fatalf("present InfraEnv was not observed and recorded: annotations=%v uid=%q", co.Annotations, found[0].GetUID())
+					}
+				} else if co.Annotations[infraEnvUIDAnnotation] != "" {
+					t.Fatalf("absent InfraEnv recorded a UID: annotations=%v", co.Annotations)
+				}
+				if len(fc.names) != 0 {
+					t.Fatalf("InfraEnv lookup created a BMI: %v", fc.names)
+				}
+			})
+		}
+	}
+}
+
+// TestR07ExistingForeignInfraEnvRejected is R07-U2: a same-name InfraEnv this
+// ClusterOrder does not control is reported as an error and is never adopted,
+// replaced, or consumed as ignition evidence.
+func TestR07ExistingForeignInfraEnvRejected(t *testing.T) {
+	ctx := context.Background()
+	for name, build := range map[string]func(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder) *unstructured.Unstructured{
+		"ownerless": func(_ *testing.T, _ *Reconciler, co *v1alpha1.ClusterOrder) *unstructured.Unstructured {
+			infra := &unstructured.Unstructured{}
+			infra.SetGroupVersionKind(infraEnvGVK)
+			infra.SetName(co.Name + infraEnvNameSuffix)
+			infra.SetNamespace(co.Namespace)
+			infra.SetUID("foreign-uid")
+			return infra
+		},
+		"other ClusterOrder": func(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder) *unstructured.Unstructured {
+			foreign := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "other-order", Namespace: co.Namespace, UID: "other-uid"}}
+			return r07InfraEnvNamed(t, r, foreign, co.Name+infraEnvNameSuffix, "foreign-uid", "http://ignition.test")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, fc, co := r07Harness(t, workerPhaseWaitingForAgent)
+			ignition := &countingIgnition{}
+			r.ignition = ignition
+			foreign := build(t, r, co)
+			r07CreateInfraEnv(t, r, foreign)
+			_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+			if err == nil || !strings.Contains(err.Error(), "not controlled by ClusterOrder") {
+				t.Fatalf("err=%v, want a foreign-owner error", err)
+			}
+			found := r07InfraEnvObjects(t, r, co)
+			if len(found) != 1 || found[0].GetUID() != foreign.GetUID() {
+				t.Fatalf("foreign InfraEnv was replaced: %d object(s) %v", len(found), found)
+			}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+				t.Fatal(err)
+			}
+			if co.Annotations[infraEnvUIDAnnotation] != "" {
+				t.Fatalf("foreign InfraEnv UID was recorded: %v", co.Annotations)
+			}
+			if len(fc.names) != 0 || ignition.calls != 0 {
+				t.Fatalf("foreign InfraEnv authorized work: creates=%v ignition=%d", fc.names, ignition.calls)
+			}
+		})
+	}
+}
+
+// TestR07OwnerValidationRejectsForeignOwners is R07-U3: the ownership check
+// validates namespace, controller kind, name and (when recorded) the ClusterOrder
+// incarnation UID, so only this order's own object is consumed as evidence.
+func TestR07OwnerValidationRejectsForeignOwners(t *testing.T) {
+	order := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "ns", UID: "order-uid"}}
+	controller := true
+	infraEnv := func(kind, name string, uid types.UID, namespace string) *unstructured.Unstructured {
+		infra := &unstructured.Unstructured{}
+		infra.SetGroupVersionKind(infraEnvGVK)
+		infra.SetName(order.Name + infraEnvNameSuffix)
+		infra.SetNamespace(namespace)
+		if kind != "" {
+			infra.SetOwnerReferences([]metav1.OwnerReference{{
+				APIVersion: "osac.openshift.io/v1alpha1", Kind: kind, Name: name, UID: uid, Controller: &controller,
+			}})
+		}
+		return infra
+	}
+	for name, tc := range map[string]struct {
+		infra   *unstructured.Unstructured
+		wantErr bool
+	}{
+		"own object":              {infra: infraEnv("ClusterOrder", "order", "order-uid", "ns")},
+		"earlier incarnation":     {infra: infraEnv("ClusterOrder", "order", "previous-uid", "ns"), wantErr: true},
+		"another order":           {infra: infraEnv("ClusterOrder", "other", "other-uid", "ns"), wantErr: true},
+		"another controller kind": {infra: infraEnv("ClusterDeployment", "order", "order-uid", "ns"), wantErr: true},
+		"ownerless":               {infra: infraEnv("", "", "", "ns"), wantErr: true},
+		"another namespace":       {infra: infraEnv("ClusterOrder", "order", "order-uid", "other"), wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateInfraEnvOwner(order, tc.infra)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("err=%v, wantErr=%t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// r07StaleOrder prepares an order whose recorded InfraEnv UID is stale: the
+// recorded value is "old", the observed replacement is "new", and the waiting
+// worker must be failed before the replacement UID is acknowledged.
+func r07StaleOrder(t *testing.T) (*Reconciler, *workerReadClient, *v1alpha1.ClusterOrder) {
+	t.Helper()
+	ctx := context.Background()
+	r, fc, co := r07Harness(t, workerPhaseWaitingForAgent)
+	co.Annotations[infraEnvUIDAnnotation] = "old"
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, metav1.ConditionTrue, "ready", reasonInfraEnvReady)
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	r07CreateInfraEnv(t, r, r07InfraEnv(t, r, co, "new", "http://ignition.test"))
+	return r, fc, co
+}
+
+// r07AnnotationPatchFault fails ClusterOrder metadata patches carrying a recorded
+// InfraEnv UID, leaving status writes untouched, so a lost UID patch can be
+// injected without breaking failure persistence.
+type r07AnnotationPatchFault struct {
+	client.Client
+	err error
+}
+
+func (c *r07AnnotationPatchFault) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.PatchOption) error {
+	if co, ok := obj.(*v1alpha1.ClusterOrder); ok && co.Annotations[infraEnvUIDAnnotation] != "" {
+		return c.err
+	}
+	return c.Client.Patch(ctx, obj, p, opts...)
+}
+
+// r07IgnitionScripted returns fixed ignition bytes and an optional fetch failure for
+// the create stage's input path.
+type r07IgnitionScripted struct {
+	calls int
+	body  []byte
+	err   error
+}
+
+func (i *r07IgnitionScripted) FetchIgnition(context.Context, string) ([]byte, error) {
+	i.calls++
+	return i.body, i.err
+}
+
+// r07CountingStatusClient counts optimistic status patches so a stable order can
+// prove it writes no status at all.
+type r07CountingStatusClient struct {
+	client.Client
+	patches int
+}
+
+func (c *r07CountingStatusClient) Status() client.SubResourceWriter {
+	return &r07CountingStatusWriter{SubResourceWriter: c.Client.Status(), c: c}
+}
+
+type r07CountingStatusWriter struct {
+	client.SubResourceWriter
+	c *r07CountingStatusClient
+}
+
+func (w *r07CountingStatusWriter) Patch(ctx context.Context, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
+	w.c.patches++
+	return w.SubResourceWriter.Patch(ctx, obj, p, opts...)
+}
+
+// r07CreateHarness builds an order with no workers and a pull secret, so a BMI
+// create is due as soon as the InfraEnv's discovery ignition resolves. Callers
+// place the InfraEnv evidence they want observed and then drive explicit
+// invocations.
+func r07CreateHarness(t *testing.T) (*Reconciler, *workerReadClient, *v1alpha1.ClusterOrder) {
+	t.Helper()
+	ctx := context.Background()
+	r, fc, co := workerReadHarness(t)
+	co.Spec.PullSecret = `{"auths":{}}`
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.Status.Workers = nil
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	fc.listed = nil
+	fc.bmis = nil
+	// The unit harness has no ignition fetcher; default to a valid empty artifact so
+	// an invocation never depends on a case's scripted fetcher.
+	r.ignition = &r07IgnitionScripted{body: []byte(`{}`)}
+	return r, fc, co
+}
+
+// TestR07InvalidIgnitionCannotCreateBMI is R07-U4: only fetched, JSON-valid
+// discovery ignition authorizes a BMI create. A missing URL waits, and a fetch or
+// validation failure is reported without creating anything.
+func TestR07InvalidIgnitionCannotCreateBMI(t *testing.T) {
+	ctx := context.Background()
+	cases := map[string]struct {
+		ignitionURL string
+		body        []byte
+		fetchErr    error
+		wantErr     string
+	}{
+		"missing URL":   {wantErr: ""},
+		"invalid JSON":  {ignitionURL: "http://ignition.test", body: []byte("not-json"), wantErr: "not valid JSON"},
+		"fetch failure": {ignitionURL: "http://ignition.test", fetchErr: errors.New("tls: bad certificate"), wantErr: "fetching discovery ignition"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			r, fc, co := r07CreateHarness(t)
+			r07CreateInfraEnv(t, r, r07InfraEnv(t, r, co, "infra-uid", tc.ignitionURL))
+			ignition := &r07IgnitionScripted{body: tc.body, err: tc.fetchErr}
+			r.ignition = ignition
+			// A create is due (one requested node, no reserved slot): only validated
+			// ignition bytes may produce one, and the missing URL holds instead.
+			for i := range 2 {
+				_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+				switch {
+				case tc.wantErr == "":
+					if err != nil {
+						t.Fatalf("invocation %d: err=%v, want a bounded wait for the missing URL", i, err)
+					}
+				case err == nil || !strings.Contains(err.Error(), tc.wantErr):
+					t.Fatalf("invocation %d: err=%v, want %q", i, err, tc.wantErr)
+				}
+			}
+			if len(fc.names) != 0 {
+				t.Fatalf("unenforceable ignition authorized a BMI create: %v", fc.names)
+			}
+			if tc.ignitionURL == "" && ignition.calls != 0 {
+				t.Fatalf("missing URL was fetched anyway: %d call(s)", ignition.calls)
+			}
+		})
+	}
+}
+
+// TestR07ForeignInfraEnvCannotCreateBMI is R07-U5: a same-name object this
+// ClusterOrder does not control never becomes creation input, even when a BMI
+// create is due.
+func TestR07ForeignInfraEnvCannotCreateBMI(t *testing.T) {
+	ctx := context.Background()
+	r, fc, co := r07CreateHarness(t)
+	foreign := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "other-order", Namespace: co.Namespace, UID: "other-uid"}}
+	r07CreateInfraEnv(t, r, r07InfraEnvNamed(t, r, foreign, co.Name+infraEnvNameSuffix, "foreign-uid", "http://ignition.test"))
+	ignition := &r07IgnitionScripted{body: []byte(`{}`)}
+	r.ignition = ignition
+	for range 2 {
+		_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+		if err == nil || !strings.Contains(err.Error(), "not controlled by ClusterOrder") {
+			t.Fatalf("err=%v, want a foreign-owner error", err)
+		}
+	}
+	if len(fc.names) != 0 || ignition.calls != 0 {
+		t.Fatalf("foreign InfraEnv authorized work: creates=%v ignition=%d", fc.names, ignition.calls)
+	}
+}
+
+// TestR07StableReadyOrderDoesNoStatusWork is R07-U6: a converged order whose
+// InfraEnv publishes an artifact performs neither a discovery-ignition request nor
+// a status patch, so condition reporting cannot create a hot loop.
+func TestR07StableReadyOrderDoesNoStatusWork(t *testing.T) {
+	ctx := context.Background()
+	r, _, co := r07Harness(t, workerPhaseReady)
+	r07CreateInfraEnv(t, r, r07InfraEnv(t, r, co, "infra-uid", "http://ignition.test"))
+	co.Annotations[infraEnvUIDAnnotation] = "infra-uid"
+	if err := r.Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	co.SetStatusCondition(v1alpha1.ConditionInfraEnvReady, metav1.ConditionTrue, "ready", reasonInfraEnvReady)
+	if err := r.Status().Update(ctx, co); err != nil {
+		t.Fatal(err)
+	}
+	ignition := &countingIgnition{}
+	r.ignition = ignition
+	// Two invocations settle the worker projection (Agent observation and its
+	// ReadySince initialization); the order is stable from then on.
+	for range 2 {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+			t.Fatalf("settling invocation: %v", err)
+		}
+	}
+	counter := &r07CountingStatusClient{Client: r.Client}
+	r.Client = counter
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+			t.Fatalf("invocation %d: %v", i, err)
+		}
+	}
+	if counter.patches != 0 {
+		t.Fatalf("stable order wrote %d status patch(es)", counter.patches)
+	}
+	if ignition.calls != 0 {
+		t.Fatalf("stable order fetched discovery ignition %d time(s)", ignition.calls)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if co.Annotations[infraEnvUIDAnnotation] != "infra-uid" ||
+		!apimeta.IsStatusConditionTrue(co.Status.Conditions, v1alpha1.ConditionInfraEnvReady) {
+		t.Fatalf("stable evidence drifted: annotations=%v conditions=%v", co.Annotations, co.Status.Conditions)
+	}
+}
+
 func TestStaleIgnitionPersistenceFailureDoesNotAdvanceUID(t *testing.T) {
 	ctx := context.Background()
 	r, fc, co := workerReadHarness(t)
@@ -697,19 +1123,15 @@ func TestStaleIgnitionPersistenceFailureDoesNotAdvanceUID(t *testing.T) {
 	if err := r.Status().Update(ctx, co); err != nil {
 		t.Fatal(err)
 	}
-	infra := &unstructured.Unstructured{}
-	infra.SetGroupVersionKind(infraEnvGVK)
-	infra.SetName(co.Name + infraEnvNameSuffix)
-	infra.SetNamespace(co.Namespace)
-	infra.SetUID("new")
-	_ = unstructured.SetNestedField(infra.Object, "http://ignition.test", "status", "bootArtifacts", "discoveryIgnitionURL")
-	if err := r.Create(ctx, infra); err != nil {
-		t.Fatal(err)
-	}
+	// The replacement models the object the reconciler itself recreates: same
+	// deterministic name, owned by this order, new UID.
+	r07CreateInfraEnv(t, r, r07InfraEnv(t, r, co, "new", "http://ignition.test"))
 	fc.listed = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "recorded-id")}
+	fc.bmis = fc.listed
 	r.ignition = workerIgnition{}
 	injected := errors.New("stale failure persistence interrupted")
-	r.Client = &staleFailureClient{Client: r.Client, err: injected}
+	base := r.Client
+	r.Client = &staleFailureClient{Client: base, err: injected}
 	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)})
 	if !errors.Is(err, injected) {
 		t.Fatalf("error=%v, want persistence error", err)
@@ -719,5 +1141,92 @@ func TestStaleIgnitionPersistenceFailureDoesNotAdvanceUID(t *testing.T) {
 	}
 	if co.Annotations[infraEnvUIDAnnotation] != "old" || co.Status.Workers[0].Phase != workerPhaseWaitingForAgent || len(fc.names) != 0 {
 		t.Fatalf("advanced past failed stale-ignition persistence: %+v", co)
+	}
+
+	// The next explicit invocation retries the same classification and persists it.
+	// The recorded UID still does not advance in that invocation.
+	r.Client = base
+	r.fulfillment = &r04PrereqClient{workerReadClient: fc}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	failed := co.Status.Workers[0]
+	if failed.Phase != workerPhaseFailed || failed.LastFailureReason != eventReasonAgentRegistrationTimeout {
+		t.Fatalf("retry did not persist the stale classification: %+v", failed)
+	}
+	if co.Annotations[infraEnvUIDAnnotation] != "old" {
+		t.Fatalf("UID advanced in the same invocation as the repair: %v", co.Annotations)
+	}
+
+	// A later invocation records the replacement UID without re-accounting the
+	// already persisted failure.
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+		t.Fatalf("uid evidence: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	after := co.Status.Workers[0]
+	if co.Annotations[infraEnvUIDAnnotation] != "new" {
+		t.Fatalf("replacement UID was not recorded: %v", co.Annotations)
+	}
+	if after.LastFailureReason != failed.LastFailureReason || after.LastFailureMessage != failed.LastFailureMessage ||
+		!after.LastFailureTime.Equal(failed.LastFailureTime) {
+		t.Fatalf("UID recording re-emitted failure accounting: before=%+v after=%+v", failed, after)
+	}
+}
+
+// TestR07LostUIDEvidenceDoesNotDuplicateFailureAccounting is R07-U7: when the
+// stale-worker failure is already durable and only the replacement-UID patch is
+// lost, the next invocation records the UID without re-emitting failure
+// accounting or changing the worker's protected state.
+func TestR07LostUIDEvidenceDoesNotDuplicateFailureAccounting(t *testing.T) {
+	ctx := context.Background()
+	r, fc, co := r07StaleOrder(t)
+	// Deletion support keeps the failed incarnation's cleanup observable instead of
+	// panicking in the shared fake.
+	r.fulfillment = &r04PrereqClient{workerReadClient: fc}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+		t.Fatalf("persisting the stale failure: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	failed := co.Status.Workers[0]
+	if failed.Phase != workerPhaseFailed || co.Annotations[infraEnvUIDAnnotation] != "old" {
+		t.Fatalf("fixture did not persist the repair before the UID: %+v annotations=%v", failed, co.Annotations)
+	}
+
+	lost := errors.New("replacement UID patch lost")
+	base := r.Client
+	r.Client = &r07AnnotationPatchFault{Client: base, err: lost}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); !errors.Is(err, lost) {
+		t.Fatalf("error=%v, want the lost UID patch", err)
+	}
+	r.Client = base
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if co.Annotations[infraEnvUIDAnnotation] != "old" || co.Status.Workers[0].LastFailureReason != failed.LastFailureReason ||
+		!co.Status.Workers[0].LastFailureTime.Equal(failed.LastFailureTime) {
+		t.Fatalf("lost UID patch changed durable state: annotations=%v workers=%+v", co.Annotations, co.Status.Workers)
+	}
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(co)}); err != nil {
+		t.Fatalf("recording the UID: %v", err)
+	}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if co.Annotations[infraEnvUIDAnnotation] != "new" {
+		t.Fatalf("replacement UID was not recorded: %v", co.Annotations)
+	}
+	if co.Status.Workers[0].LastFailureReason != failed.LastFailureReason ||
+		co.Status.Workers[0].LastFailureMessage != failed.LastFailureMessage ||
+		!co.Status.Workers[0].LastFailureTime.Equal(failed.LastFailureTime) {
+		t.Fatalf("UID recording re-emitted failure accounting: before=%+v after=%+v", failed, co.Status.Workers[0])
 	}
 }
