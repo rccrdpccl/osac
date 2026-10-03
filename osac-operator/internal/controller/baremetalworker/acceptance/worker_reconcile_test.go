@@ -6,6 +6,7 @@ package acceptance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -648,6 +649,84 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(getOrder().Status.Workers).To(ConsistOf(old))
 		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
 	}, Entry("Get error", "Get"), Entry("List error", "List"), Entry("service unavailable", "Unavailable"))
+	It("R08-E1 keeps unavailability and semantic outcomes independent across orders", func() {
+		// Order A (the shared fixture) owns one provisioned worker.
+		workerA := provision()
+
+		// Order B (same tenant) records a BMI the provider no longer has, so its
+		// next fallback Get is an authoritative NotFound: a semantic absence.
+		other := &api.ClusterOrder{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "r08-" + uuid.NewString(),
+				Namespace:   testNamespace,
+				Labels:      map[string]string{"osac.openshift.io/clusterorder-uuid": "cluster"},
+				Annotations: map[string]string{"osac.openshift.io/tenant": tenant},
+			},
+			Spec: *co.Spec.DeepCopy(),
+		}
+		Expect(k8sClient.Create(ctx, other)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &api.ClusterOrder{}
+			if k8sClient.Get(ctx, client.ObjectKeyFromObject(other), latest) == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				if latest.DeletionTimestamp.IsZero() {
+					_ = k8sClient.Delete(ctx, latest)
+				}
+			}
+			_ = k8sClient.Delete(ctx, newInfraEnv(other.Name+"-infraenv"))
+			_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: other.Name + "-pull-secret", Namespace: other.Namespace}})
+		})
+		other.Status.Workers = []api.WorkerStatus{{
+			Name: "r08-b", Kind: "BareMetalInstance", NodeSet: "standard", InstanceType: "standard",
+			Phase: "WaitingForAgent", CreationTimestamp: metav1.Now(),
+			BareMetalInstance: api.BareMetalInstanceReference{Name: "r08-b", ID: "gone-bmi"},
+		}}
+		Expect(k8sClient.Status().Update(ctx, other)).To(Succeed())
+		reconcileOrder := func(order *api.ClusterOrder) (reconcile.Result, error) {
+			return r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(order)})
+		}
+		readOrder := func(order *api.ClusterOrder) *api.ClusterOrder {
+			GinkgoHelper()
+			latest := &api.ClusterOrder{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(order), latest)).To(Succeed())
+			return latest
+		}
+
+		// Order A: a transport outage persists an order-scoped condition with the
+		// bounded unavailable delay and retains the recorded incarnation.
+		fc.SetListEmptyOnce()
+		fc.SetGetError(workerA.BareMetalInstance.ID, fmt.Errorf("%w: %w",
+			baremetalworker.ErrFulfillmentServiceUnavailable, status.Error(codes.Unavailable, "R08 outage")))
+		result, err := reconcileOrder(co)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+		expectingOutage := readOrder(co)
+		Expect(apimeta.IsStatusConditionTrue(expectingOutage.Status.Conditions, api.ConditionFulfillmentServiceUnavailable)).To(BeTrue())
+		Expect(expectingOutage.Status.Workers).To(ConsistOf(workerA))
+
+		// Order B: an authoritative NotFound prunes the stale slot even while A is
+		// unavailable, and neither order's condition affects the other. The first
+		// invocation only records the finalizer; the second observes and prunes.
+		for range 2 {
+			result, err = reconcileOrder(other)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(time.Second))
+		}
+		pruned := readOrder(other)
+		Expect(pruned.Status.Workers).To(BeEmpty())
+		Expect(apimeta.IsStatusConditionTrue(pruned.Status.Conditions, api.ConditionFulfillmentServiceUnavailable)).To(BeFalse())
+		Expect(apimeta.IsStatusConditionTrue(readOrder(co).Status.Conditions, api.ConditionFulfillmentServiceUnavailable)).To(BeTrue(), "order B's success must not clear order A's outage")
+
+		// Recovery is explicit: the next successful invocation for A clears the
+		// condition and keeps the recorded incarnation.
+		fc.SetGetError(workerA.BareMetalInstance.ID, nil)
+		_, err = reconcileOrder(co)
+		Expect(err).NotTo(HaveOccurred())
+		recovered := readOrder(co)
+		Expect(apimeta.IsStatusConditionTrue(recovered.Status.Conditions, api.ConditionFulfillmentServiceUnavailable)).To(BeFalse())
+		Expect(recovered.Status.Workers).To(ConsistOf(workerA))
+	})
 	It("W-E3 repairs identity and early Ready phase before the InfraEnv gate", func() {
 		ready()
 		reserveExistingWorker(co, "recorded")

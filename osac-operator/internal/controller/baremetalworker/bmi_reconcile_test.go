@@ -244,8 +244,8 @@ func TestBMIStageListErrorAndMissingName(t *testing.T) {
 			before := co.DeepCopy()
 			_, res, err := runBMIStage(context.Background(), r, co)
 			if reason == "unavailable" {
-				if err != nil || res.RequeueAfter != unavailableBackoff {
-					t.Fatalf("backoff=%+v err=%v", res, err)
+				if !errors.Is(err, ErrFulfillmentServiceUnavailable) || !res.IsZero() {
+					t.Fatalf("unavailable result=%+v err=%v", res, err)
 				}
 			} else if err == nil {
 				t.Fatal("expected reference/list error")

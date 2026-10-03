@@ -75,9 +75,11 @@
 //     evidence into newer worker state.
 //   - metrics.go owns metric registration and observations.
 //
-// The fulfillment.go, ignition.go and resolver.go adapters retain their existing
-// boundaries. Tests are grouped by the behavior they exercise, with real API
-// server/etcd persistence coverage in acceptance and shared doubles in fake.
+// The fulfillment.go adapter classifies each call's transport outcome from that
+// call's own evidence with no shared failure state; ignition.go and resolver.go
+// retain their existing boundaries. Tests are grouped by the behavior they
+// exercise, with real API server/etcd persistence coverage in acceptance and
+// shared doubles in fake.
 // R03-E1–E5 drive public cleanup/retry/retirement with explicit completion and
 // real Agent Delete preconditions; fulfillment and owner detach remain simulated.
 // R02-E1/E2 drive public reconciles through real status and Agent binding
@@ -133,6 +135,31 @@
 // without a condition transition, and for a replacement that fails only the stale
 // waiting worker before the new UID is recorded, with blocked creation inputs.
 // R07-C1 (real Assisted Service artifact behavior) remains OSAC-4843.
+//
+// R08 removes the adapter-wide consecutive-failure counter from fulfillment.go.
+// Each call is classified from its own evidence: codes.Unavailable, and
+// codes.DeadlineExceeded while the parent context is still active, wrap the
+// original gRPC error with ErrFulfillmentServiceUnavailable so both errors.Is
+// and status.Code keep working, while semantic codes (NotFound, AlreadyExists,
+// InvalidArgument, FailedPrecondition, ResourceExhausted, PermissionDenied,
+// Unauthenticated, Internal, Unknown) and a canceled or expired parent context
+// pass through unchanged. No state is shared between calls, operations or
+// orders. Reconcile is the single orchestration boundary for availability
+// evidence: it persists the order-scoped FulfillmentServiceUnavailable condition
+// with the one bounded unavailable delay, surfaces a condition-write failure
+// instead of claiming the outage was recorded, and leaves every non-availability
+// error to its caller policy. A transport failure in the authoritative Cluster
+// lookup fails closed as unavailable rather than as an ownership mismatch, and a
+// success on one order cannot clear another order's condition. R08-U1–U3 Unit
+// cases in fulfillment_test.go and fulfillment_error_test.go characterize the
+// per-call policy, original-code preservation, wrapping, parent cancellation and
+// independence; R08-E1 Envtest in acceptance/worker_reconcile_test.go drives two
+// orders through real status persistence: an authoritative NotFound prunes a
+// stale slot while the other order's transport outage persists its condition,
+// neither changes the other, and the outage clears only on an explicit later
+// successful invocation. R08-C1 (real client/server outage behavior) is not
+// claimed without a test-local wrapper; real backend outages and authorization
+// visibility remain with OSAC-4843.
 //
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs

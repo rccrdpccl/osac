@@ -76,8 +76,7 @@ func (r *Reconciler) observeWorkerResources(ctx context.Context, co *v1alpha1.Cl
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
 	bmis, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
 	if err != nil {
-		res, err := r.handleFulfillmentError(ctx, co, fmt.Errorf("observing worker BMIs: %w", err))
-		return nil, res, err
+		return nil, ctrl.Result{}, fmt.Errorf("observing worker BMIs: %w", err)
 	}
 	o := indexWorkerBMIs(bmis)
 	o.agents, err = r.listAgents(ctx, co)

@@ -215,6 +215,29 @@ and `acceptance/worker_reconcile_test.go` drive public `Reconcile` through real
 owner UIDs, metadata and status. These cases do not prove real Assisted Service
 artifact behavior (`R07-C1`, owned by
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843)).
+R08 removes the adapter-wide consecutive-failure counter from `fulfillment.go`.
+The adapter now classifies each call from its own evidence: `codes.Unavailable`,
+and `codes.DeadlineExceeded` while the parent context is still active, wrap the
+original gRPC error with `ErrFulfillmentServiceUnavailable` so both `errors.Is`
+and `status.Code` keep working, while semantic codes and a canceled or expired
+parent context pass through unchanged. No state is shared between calls,
+operations or orders, so a success on one order cannot suppress or reset another
+order's evidence. Public `Reconcile` is the single orchestration boundary: it
+persists the order-scoped `FulfillmentServiceUnavailable` condition with the one
+bounded unavailable delay, surfaces a condition-write failure instead of
+pretending it was recorded, and leaves every non-availability error to its caller
+policy. A transport failure in `authoritativeWorkerTenant` fails closed as
+unavailable rather than emitting a `WorkerOwnershipMismatch` event, and the
+condition clears only after an explicit later invocation's required reads and
+actions succeed. `R08-U1–U3` Unit cases in `fulfillment_test.go` and
+`fulfillment_error_test.go` characterize the per-call policy, original-code
+preservation, wrapping, parent cancellation and cross-call independence;
+`R08-E1` Envtest in `acceptance/worker_reconcile_test.go` drives two orders
+through real status persistence for an authoritative NotFound and a transport
+outage with independent conditions and explicit recovery. These cases inject
+simulated gRPC outcomes; real backend outages and authorization visibility
+(`R08-C1`) remain with
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 The Kind suite's LVMS-disabled case verifies the Volume controller remains
 ready without the TopoLVM `LogicalVolume` CRD; it does not exercise LVMS
 provisioning or the CSI data path.

@@ -15,6 +15,7 @@ package baremetalworker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,12 @@ func (r *Reconciler) authoritativeWorkerTenant(ctx context.Context, co *v1alpha1
 	}
 	cluster, err := r.fulfillment.GetCluster(ctx, id)
 	if err != nil {
+		// Transport unavailability is not an ownership mismatch. Fail closed with
+		// the real blocker and let the reconciler persist the availability
+		// condition; only semantic failures are reported as ownership rejections.
+		if errors.Is(err, ErrFulfillmentServiceUnavailable) {
+			return "", fmt.Errorf("getting authoritative Cluster %s: %w", id, err)
+		}
 		return "", r.rejectWorkerIdentity(co, fmt.Sprintf("getting authoritative Cluster %s: %v", id, err))
 	}
 	if cluster == nil || cluster.GetId() != id {

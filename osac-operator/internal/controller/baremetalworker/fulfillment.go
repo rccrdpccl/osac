@@ -21,10 +21,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -34,13 +35,11 @@ import (
 // from blocking a worker.
 const callTimeout = 30 * time.Second
 
-// unavailableThreshold is the number of consecutive gRPC failures after which the client
-// reports the fulfillment-service as unavailable.
-const unavailableThreshold = 3
-
-// ErrFulfillmentServiceUnavailable is returned (wrapped, matchable with errors.Is) once the
-// fulfillment-service gRPC calls have failed unavailableThreshold times in a row. The
-// reconciler maps it to a FulfillmentServiceUnavailable condition.
+// ErrFulfillmentServiceUnavailable marks a call as transport unavailability: the service did
+// not answer (codes.Unavailable), or did not answer within this call's deadline while the
+// parent context was still active. It wraps the original gRPC error, so both errors.Is and
+// status.Code keep working. The reconciler maps it to an order-scoped
+// FulfillmentServiceUnavailable condition and a bounded unavailable delay.
 var ErrFulfillmentServiceUnavailable = errors.New("fulfillment service unavailable")
 
 // FulfillmentClient is the narrow seam the bare-metal worker reconciler uses to talk to the
@@ -70,8 +69,9 @@ type FulfillmentClient interface {
 	GetBareMetalInstanceType(ctx context.Context, id string) (*privatev1.BareMetalInstanceType, error)
 }
 
-// fulfillmentClient is the production FulfillmentClient. It wraps the generated gRPC clients,
-// applies a per-call deadline, and tracks consecutive gRPC failures for the unavailable signal.
+// fulfillmentClient is the production FulfillmentClient. It wraps the generated gRPC clients
+// and applies a per-call deadline. It keeps no cross-call state: each result is classified from
+// that call's own evidence so one order's or operation's outcome never changes another's.
 type fulfillmentClient struct {
 	bmis          privatev1.BareMetalInstancesClient
 	versions      privatev1.ClusterVersionsClient
@@ -79,9 +79,6 @@ type fulfillmentClient struct {
 	diskImages    privatev1.DiskImagesClient
 	catalogItems  privatev1.BareMetalInstanceCatalogItemsClient
 	instanceTypes privatev1.BareMetalInstanceTypesClient
-
-	mu                  sync.Mutex
-	consecutiveFailures int
 }
 
 // NewFulfillmentClient builds a FulfillmentClient from already-constructed generated clients.
@@ -112,25 +109,33 @@ func NewFulfillmentClientFromConn(conn *grpc.ClientConn) FulfillmentClient {
 	)
 }
 
-// call runs a fulfillment-service gRPC operation under the per-call deadline and updates the
-// consecutive-failure counter. After unavailableThreshold consecutive failures it wraps the
-// underlying error with ErrFulfillmentServiceUnavailable; a success resets the counter.
+// call runs a fulfillment-service gRPC operation under the per-call deadline and classifies
+// real transport unavailability from that call's own evidence. No state is shared between
+// calls, so one order's or operation's outcome can never change another's.
 func (c *fulfillmentClient) call(ctx context.Context, op func(ctx context.Context) error) error {
 	opCtx, cancel := context.WithTimeout(ctx, callTimeout)
 	defer cancel()
-	err := op(opCtx)
+	if err := op(opCtx); err != nil {
+		return classifyCallError(ctx, err)
+	}
+	return nil
+}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err != nil {
-		c.consecutiveFailures++
-		if c.consecutiveFailures >= unavailableThreshold {
-			return fmt.Errorf("%w: %w", ErrFulfillmentServiceUnavailable, err)
-		}
+// classifyCallError attaches ErrFulfillmentServiceUnavailable only to actual transport
+// unavailability. A canceled or expired parent context is the caller's own shutdown, not a
+// service outage. Every other gRPC code (NotFound, AlreadyExists, InvalidArgument,
+// FailedPrecondition, ResourceExhausted, PermissionDenied, Unauthenticated, Internal, Unknown,
+// ...) keeps its own semantics so each caller can apply its own policy.
+func classifyCallError(parent context.Context, err error) error {
+	if parent.Err() != nil {
 		return err
 	}
-	c.consecutiveFailures = 0
-	return nil
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return fmt.Errorf("%w: %w", ErrFulfillmentServiceUnavailable, err)
+	default:
+		return err
+	}
 }
 
 func (c *fulfillmentClient) CreateBareMetalInstance(

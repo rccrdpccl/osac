@@ -16,12 +16,15 @@ package baremetalworker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -30,9 +33,6 @@ func TestBareMetalWorker(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "BareMetalWorker Suite")
 }
-
-// errBackend is the canned error returned by the fakes when configured to fail.
-var errBackend = errors.New("backend boom")
 
 // expectCallDeadline asserts the given context carries a deadline within (25s, 30s].
 func expectCallDeadline(ctx context.Context) {
@@ -477,100 +477,61 @@ var _ = Describe("FulfillmentClient wrapper", func() {
 		})
 	})
 
-	Context("consecutive-failure signalling", func() {
-		It("surfaces ErrFulfillmentServiceUnavailable only after 3 consecutive failures", func() {
-			bmi.err = errBackend
-
-			_, err1 := fc.GetBareMetalInstance(ctx, "id")
-			Expect(err1).To(MatchError(errBackend))
-			Expect(errors.Is(err1, ErrFulfillmentServiceUnavailable)).To(BeFalse())
-
-			_, err2 := fc.GetBareMetalInstance(ctx, "id")
-			Expect(errors.Is(err2, ErrFulfillmentServiceUnavailable)).To(BeFalse())
-
-			_, err3 := fc.GetBareMetalInstance(ctx, "id")
-			Expect(errors.Is(err3, ErrFulfillmentServiceUnavailable)).To(BeTrue())
-			Expect(errors.Is(err3, errBackend)).To(BeTrue())
-		})
-
-		It("resets the counter after a success", func() {
-			bmi.err = errBackend
-			_, _ = fc.GetBareMetalInstance(ctx, "id")
-			_, _ = fc.GetBareMetalInstance(ctx, "id")
-
-			bmi.err = nil
+	Context("R08 transport classification", func() {
+		It("R08-U1 classifies the first transport failure immediately", func() {
+			bmi.err = status.Error(codes.Unavailable, "backend down")
 			_, err := fc.GetBareMetalInstance(ctx, "id")
-			Expect(err).ToNot(HaveOccurred())
-
-			bmi.err = errBackend
-			_, errAfter := fc.GetBareMetalInstance(ctx, "id")
-			Expect(errors.Is(errAfter, ErrFulfillmentServiceUnavailable)).To(BeFalse())
+			Expect(errors.Is(err, ErrFulfillmentServiceUnavailable)).To(BeTrue())
+			Expect(status.Code(err)).To(Equal(codes.Unavailable))
 		})
 
-		DescribeTable("surfaces unavailable on the 3rd failure for every gRPC method",
-			func(invoke func(FulfillmentClient) error) {
-				b := &fakeBMIClient{err: errBackend, object: &privatev1.BareMetalInstance{}}
-				v := &fakeCVClient{err: errBackend, object: &privatev1.ClusterVersion{}}
-				cl := &fakeClustersClient{err: errBackend, object: &privatev1.Cluster{}}
-				di := &fakeDiskImagesClient{err: errBackend, object: &privatev1.DiskImage{}}
-				ci := &fakeBMICatalogItemsClient{err: errBackend, object: &privatev1.BareMetalInstanceCatalogItem{}}
-				it := &fakeBMITypesClient{err: errBackend, object: &privatev1.BareMetalInstanceType{}}
-				c := NewFulfillmentClient(b, v, cl, di, ci, it)
-				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
-				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeFalse())
-				Expect(errors.Is(invoke(c), ErrFulfillmentServiceUnavailable)).To(BeTrue())
-			},
-			Entry("Create", func(c FulfillmentClient) error {
-				_, e := c.CreateBareMetalInstance(context.Background(), &privatev1.BareMetalInstance{})
-				return e
-			}),
-			Entry("Delete", func(c FulfillmentClient) error {
-				return c.DeleteBareMetalInstance(context.Background(), "id")
-			}),
-			Entry("Get", func(c FulfillmentClient) error {
-				_, e := c.GetBareMetalInstance(context.Background(), "id")
-				return e
-			}),
-			Entry("List", func(c FulfillmentClient) error {
-				_, e := c.ListBareMetalInstances(context.Background(), "")
-				return e
-			}),
-			Entry("GetClusterVersion", func(c FulfillmentClient) error {
-				_, e := c.GetClusterVersion(context.Background(), "4.18.0")
-				return e
-			}),
-			Entry("GetCluster", func(c FulfillmentClient) error {
-				_, e := c.GetCluster(context.Background(), "cluster-uuid")
-				return e
-			}),
-			Entry("GetDiskImage", func(c FulfillmentClient) error {
-				_, e := c.GetDiskImage(context.Background(), "rhcos-4.18")
-				return e
-			}),
-			Entry("CreateBareMetalInstanceCatalogItem", func(c FulfillmentClient) error {
-				_, e := c.CreateBareMetalInstanceCatalogItem(context.Background(), &privatev1.BareMetalInstanceCatalogItem{})
-				return e
-			}),
-			Entry("ListBareMetalInstanceCatalogItems", func(c FulfillmentClient) error {
-				_, e := c.ListBareMetalInstanceCatalogItems(context.Background(), "")
-				return e
-			}),
-			Entry("GetBareMetalInstanceType", func(c FulfillmentClient) error {
-				_, e := c.GetBareMetalInstanceType(context.Background(), "bm-standard")
-				return e
-			}),
-		)
+		It("R08-U2 keeps semantic failures semantic and never marks them unavailable", func() {
+			for _, code := range []codes.Code{
+				codes.NotFound, codes.AlreadyExists, codes.InvalidArgument,
+				codes.FailedPrecondition, codes.ResourceExhausted, codes.PermissionDenied,
+				codes.Unauthenticated, codes.Internal, codes.Unknown,
+			} {
+				bmi.err = status.Error(code, "semantic")
+				_, err := fc.GetBareMetalInstance(ctx, "id")
+				Expect(errors.Is(err, ErrFulfillmentServiceUnavailable)).To(BeFalse(), code.String())
+				Expect(status.Code(err)).To(Equal(code), code.String())
+			}
+		})
 
-		It("shares the counter across gRPC methods", func() {
-			bmi.err = errBackend
-			cv.err = errBackend
+		It("R08-U2 does not let an unrelated success suppress a transport failure", func() {
+			bmi.err = status.Error(codes.Unavailable, "backend down")
+			_, first := fc.GetBareMetalInstance(ctx, "id")
+			Expect(errors.Is(first, ErrFulfillmentServiceUnavailable)).To(BeTrue())
 
-			_, e1 := fc.GetBareMetalInstance(ctx, "id") // failure 1
-			Expect(errors.Is(e1, ErrFulfillmentServiceUnavailable)).To(BeFalse())
-			_, e2 := fc.GetClusterVersion(ctx, "4.18.0") // failure 2
-			Expect(errors.Is(e2, ErrFulfillmentServiceUnavailable)).To(BeFalse())
-			_, e3 := fc.GetBareMetalInstance(ctx, "id") // failure 3
-			Expect(errors.Is(e3, ErrFulfillmentServiceUnavailable)).To(BeTrue())
+			_, other := fc.GetCluster(ctx, "cluster-uuid")
+			Expect(other).ToNot(HaveOccurred())
+
+			_, second := fc.GetBareMetalInstance(ctx, "id")
+			Expect(errors.Is(second, ErrFulfillmentServiceUnavailable)).To(BeTrue())
+		})
+
+		It("R08-U3 preserves the sentinel and original code through repeated wrapping", func() {
+			bmi.err = status.Error(codes.Unavailable, "backend down")
+			_, err := fc.GetBareMetalInstance(ctx, "id")
+			wrapped := fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", err))
+			Expect(errors.Is(wrapped, ErrFulfillmentServiceUnavailable)).To(BeTrue())
+			Expect(status.Code(wrapped)).To(Equal(codes.Unavailable))
+		})
+
+		It("R08-U3 does not misreport parent cancellation as unavailability", func() {
+			parent, cancel := context.WithCancel(ctx)
+			cancel()
+			bmi.err = status.Error(codes.Canceled, "caller canceled")
+			_, err := fc.GetBareMetalInstance(parent, "id")
+			Expect(errors.Is(err, ErrFulfillmentServiceUnavailable)).To(BeFalse())
+			Expect(status.Code(err)).To(Equal(codes.Canceled))
+		})
+
+		It("R08-U3 classifies a call-local deadline while the parent is active", func() {
+			bmi.err = status.Error(codes.DeadlineExceeded, "call deadline")
+			_, err := fc.GetBareMetalInstance(ctx, "id")
+			Expect(errors.Is(err, ErrFulfillmentServiceUnavailable)).To(BeTrue())
+			Expect(status.Code(err)).To(Equal(codes.DeadlineExceeded))
 		})
 	})
 })
