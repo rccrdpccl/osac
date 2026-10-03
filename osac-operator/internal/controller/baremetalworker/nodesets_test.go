@@ -92,7 +92,7 @@ func nodeRequest(instanceType string, count int) v1alpha1.NodeRequest {
 }
 
 // capacityObservation lists the provider's current BMIs into the invocation-local
-// observation that production reconcileWorkerCapacity receives explicitly.
+// observation that production lifecycle/creation stages receive explicitly.
 func capacityObservation(t *testing.T, fc FulfillmentClient) *workerObservation {
 	t.Helper()
 	bmis, err := fc.ListBareMetalInstances(context.Background(), "")
@@ -101,6 +101,22 @@ func capacityObservation(t *testing.T, fc FulfillmentClient) *workerObservation 
 	}
 	return indexWorkerBMIs(bmis)
 }
+
+// runWorkerCapacityStage runs the production lifecycle stage and then the
+// reservation/create stage with unit-test inputs (no resolved image or
+// ignition). Prerequisite resolution and its deferral are covered by the public
+// Reconcile specs; unit fixtures keep asserting durable checkpoints.
+func runWorkerCapacityStage(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder) (ctrl.Result, error) {
+	t.Helper()
+	observed := capacityObservation(t, r.fulfillment)
+	res, err := r.reconcileWorkerLifecycle(context.Background(), co, "tenant")
+	if err != nil || !res.IsZero() {
+		return res, err
+	}
+	_, res, err = r.reconcileDueWorkerCapacity(context.Background(), co, "tenant", workerCreationInputs{}, observed)
+	return res, err
+}
+
 func reconcileNodeSetTest(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder) {
 	t.Helper()
 	n := len(co.Status.Workers)
@@ -109,7 +125,7 @@ func reconcileNodeSetTest(t *testing.T, r *Reconciler, co *v1alpha1.ClusterOrder
 	}
 	for range 16 + 8*n {
 		before := co.DeepCopy()
-		res, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+		res, err := runWorkerCapacityStage(t, r, co)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +272,7 @@ func TestNodeSetRejectsMissingRecordedBMIName(t *testing.T) {
 			if err := r.Status().Update(context.Background(), co); err != nil {
 				t.Fatal(err)
 			}
-			_, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment))
+			_, err := runWorkerCapacityStage(t, r, co)
 			if err == nil || !strings.Contains(err.Error(), "bareMetalInstance.name") {
 				t.Fatalf("expected a missing-reference error, got %v", err)
 			}
@@ -564,7 +580,7 @@ func TestNodeSetInterruptedCreateReusesReservation(t *testing.T) {
 	if err := r.apiReader.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment)); err == nil {
+	if _, err := runWorkerCapacityStage(t, r, co); err == nil {
 		t.Fatal("expected interrupted create")
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {

@@ -1014,4 +1014,177 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
 		Expect(getAgent(agent.GetName()).GetResourceVersion()).To(Equal(version))
 	})
+
+	It("R04-E1a retires and cleans up while InfraEnv, image and pull-secret prerequisites are unavailable", func() {
+		provision()
+		latest := getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		step() // Reserve the second slot.
+		step() // Create it.
+		workers := getOrder().Status.Workers
+		Expect(workers).To(HaveLen(2))
+		Expect(workers[1].BareMetalInstance.ID).NotTo(BeEmpty())
+		// Scale back down: one slot retires, and every creation prerequisite is
+		// then removed (pull secret, InfraEnv and resolvable disk image).
+		latest = getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 1
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		blocked := getOrder()
+		blocked.Spec.PullSecret = ""
+		Expect(k8sClient.Update(ctx, blocked)).To(Succeed())
+		infra := newInfraEnv(co.Name + "-infraenv")
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(infra), infra)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, infra)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: co.Name + "-pull-secret", Namespace: co.Namespace}})).To(Succeed())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: "version",
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: "missing-image"}.Build(),
+			}.Build(),
+		}.Build())
+		fetches, creates := ignition.Calls(), len(fc.CreateCalls())
+
+		result, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		var retiring api.WorkerStatus
+		marked := 0
+		for _, w := range getOrder().Status.Workers {
+			if w.Phase == "Unbinding" {
+				retiring = w
+				marked++
+			}
+		}
+		Expect(marked).To(Equal(1), "exactly one excess slot retires")
+		Expect(retiring.BareMetalInstance.ID).NotTo(BeEmpty())
+		Expect(ignition.Calls()).To(Equal(fetches))
+		Expect(fc.CreateCalls()).To(HaveLen(creates))
+
+		// Cleanup proceeds; the unavailable prerequisite is still reported instead of
+		// silently completing the invocation.
+		for i := 0; i < 4 && len(fc.DeleteCalls()) == 0; i++ {
+			_, err = run()
+		}
+		Expect(err).To(HaveOccurred())
+		Expect(fc.DeleteCalls()).To(ContainElement(retiring.BareMetalInstance.ID))
+		Expect(ignition.Calls()).To(Equal(fetches), "cleanup must not fetch discovery ignition")
+		Expect(fc.CreateCalls()).To(HaveLen(creates))
+	})
+
+	It("R04-E1b converges Agent binding while another worker waits for its retry", func() {
+		first := provision()
+		latest := getOrder()
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		step() // Reserve the independent second slot.
+		step() // Create it.
+		workers := getOrder().Status.Workers
+		Expect(workers).To(HaveLen(2))
+		second := workers[1]
+		Expect(second.BareMetalInstance.ID).NotTo(BeEmpty())
+		// The second worker fails and is not due for its retry yet.
+		failing := getOrder()
+		failing.Status.Workers[1].Phase = "Failed"
+		failing.Status.Workers[1].LastFailureReason = "InfrastructureError"
+		failure := metav1.NewTime(time.Now().Add(-time.Hour))
+		future := metav1.NewTime(time.Now().Add(time.Hour))
+		failing.Status.Workers[1].LastFailureTime = &failure
+		failing.Status.Workers[1].NextRetryTime = &future
+		Expect(k8sClient.Status().Update(ctx, failing)).To(Succeed())
+		// A MAC-correlated Agent makes the first worker bindable in this invocation.
+		const mac = "aa:bb:cc:dd:ee:74"
+		fc.SetHostMAC(first.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r04-e1b-agent", mac)
+		creates := len(fc.CreateCalls())
+
+		result, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(fc.DeleteCalls()).To(ContainElement(second.BareMetalInstance.ID))
+		bound, ok := workerStatusByName(getOrder().Status.Workers, first.Name)
+		Expect(ok).To(BeTrue())
+		Expect(bound.Phase).To(Equal("Binding"))
+		pending, ok := workerStatusByName(getOrder().Status.Workers, second.Name)
+		Expect(ok).To(BeTrue())
+		Expect(pending.Phase).To(Equal("Failed"))
+		Expect(pending.BareMetalInstance.ID).To(Equal(second.BareMetalInstance.ID))
+		Expect(fc.CreateCalls()).To(HaveLen(creates))
+
+		// The binding completes once the Agent reports installed.
+		installed := getAgent(agent.GetName())
+		Expect(unstructured.SetNestedField(installed.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, installed)).To(Succeed())
+		step()
+		reached, ok := workerStatusByName(getOrder().Status.Workers, first.Name)
+		Expect(ok).To(BeTrue())
+		Expect(reached.Phase).To(Equal("Ready"))
+	})
+
+	It("R04-E3 rechecks pending states without Agent or NodePool watch events", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:75"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		// Waiting for its Agent: the invocation schedules its own bounded recheck.
+		res, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(30 * time.Second))
+		// A registered but not yet installed Agent binds, and the pending state keeps
+		// a bounded recheck even though no Agent or NodePool event is delivered.
+		agent := registerUnboundAgent(co.Name+"-r04-e3-agent", mac)
+		res, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Binding"))
+		installed := getAgent(agent.GetName())
+		Expect(unstructured.SetNestedField(installed.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, installed)).To(Succeed())
+		res, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Ready"))
+		// A stable Ready order holds no polling timer and relies on watches.
+		res, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+	})
+
+	It("R04-E1c persists the worker summary while the image lookup is blocked", func() {
+		old := provision()
+		// A stale summary: the worker waits for its Agent while Ready is still 1.
+		stale := getOrder()
+		stale.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, stale)).To(Succeed())
+		one := int32(1)
+		stale.Status.ReadyWorkers = &one
+		Expect(k8sClient.Status().Update(ctx, stale)).To(Succeed())
+		// The resolved ClusterVersion now references an unknown disk image.
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: "version",
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: "missing-image"}.Build(),
+			}.Build(),
+		}.Build())
+		creates, deletes := len(fc.CreateCalls()), len(fc.DeleteCalls())
+
+		_, err := run()
+		Expect(err).To(HaveOccurred())
+		latest := getOrder()
+		Expect(latest.Status.ReadyWorkers).To(HaveValue(Equal(int32(0))))
+		Expect(latest.Status.DesiredWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(latest.Status.CurrentWorkers).To(HaveValue(Equal(int32(1))))
+		Expect(latest.Status.Workers[0].BareMetalInstance.ID).To(Equal(old.BareMetalInstance.ID))
+		Expect(fc.CreateCalls()).To(HaveLen(creates))
+		Expect(fc.DeleteCalls()).To(HaveLen(deletes))
+	})
 })
+
+// workerStatusByName returns the recorded worker with the given slot name.
+func workerStatusByName(workers []api.WorkerStatus, name string) (api.WorkerStatus, bool) {
+	for _, w := range workers {
+		if w.Name == name {
+			return w, true
+		}
+	}
+	return api.WorkerStatus{}, false
+}

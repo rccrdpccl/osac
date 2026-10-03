@@ -30,6 +30,7 @@ type IgnitionServer struct {
 	server  *httptest.Server
 	mu      sync.Mutex
 	content []byte
+	calls   int
 }
 
 // NewIgnitionServer starts a fake ignition endpoint serving a small default body. Call Close
@@ -38,6 +39,7 @@ func NewIgnitionServer() *IgnitionServer {
 	s := &IgnitionServer{content: append([]byte(nil), defaultIgnition...)}
 	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		s.mu.Lock()
+		s.calls++
 		body := s.content
 		s.mu.Unlock()
 		_, _ = w.Write(body)
@@ -47,6 +49,14 @@ func NewIgnitionServer() *IgnitionServer {
 
 // URL returns the endpoint's base URL (use as an InfraEnv discoveryIgnitionURL).
 func (s *IgnitionServer) URL() string { return s.server.URL }
+
+// Calls reports how many ignition fetches the endpoint has served, so a test can
+// assert that an invocation performed no discovery-ignition fetch at all.
+func (s *IgnitionServer) Calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
 
 // SetContent sets the exact body the endpoint serves.
 func (s *IgnitionServer) SetContent(b []byte) {

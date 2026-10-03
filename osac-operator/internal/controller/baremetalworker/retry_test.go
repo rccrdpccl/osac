@@ -86,6 +86,52 @@ func TestR03RetryKeepsIDUntilAbsent(t *testing.T) {
 	}
 }
 
+func TestR04WorkerRecheckDeadline(t *testing.T) {
+	r := &Reconciler{}
+	future := metav1.NewTime(time.Now().Add(2 * time.Minute))
+	readySince := metav1.NewTime(time.Now().Add(-time.Minute))
+	bmi := func(name, id, phase string) v1alpha1.WorkerStatus {
+		w := newWorkerStatus("standard", "standard", name, id, phase)
+		return w
+	}
+	pendingCleanup := bmi("cleanup", "cleanup-id", workerPhaseFailed)
+	futureRetry := bmi("retry", "", workerPhaseFailed)
+	futureRetry.NextRetryTime = &future
+	healthyReset := bmi("ready", "ready-id", workerPhaseReady)
+	healthyReset.AttemptCount = 1
+	healthyReset.ReadySince = &readySince
+	tests := []struct {
+		name    string
+		workers []v1alpha1.WorkerStatus
+		want    time.Duration
+		max     time.Duration
+	}{
+		{"stable ready order holds no timer", []v1alpha1.WorkerStatus{bmi("a", "a-id", workerPhaseReady), bmi("b", "b-id", workerPhaseReady)}, 0, 0},
+		{"provisioning is rechecked", []v1alpha1.WorkerStatus{bmi("a", "", workerPhaseProvisioning)}, agentRequeueInterval, agentRequeueInterval},
+		{"waiting for agent is rechecked", []v1alpha1.WorkerStatus{bmi("a", "a-id", workerPhaseWaitingForAgent)}, agentRequeueInterval, agentRequeueInterval},
+		{"binding is rechecked", []v1alpha1.WorkerStatus{bmi("a", "a-id", workerPhaseBinding)}, agentRequeueInterval, agentRequeueInterval},
+		{"pending cleanup is rechecked", []v1alpha1.WorkerStatus{pendingCleanup}, teardownRequeueInterval, teardownRequeueInterval},
+		{"deleting is rechecked", []v1alpha1.WorkerStatus{bmi("a", "a-id", workerPhaseDeleting)}, teardownRequeueInterval, teardownRequeueInterval},
+		{"future retry waits for its deadline", []v1alpha1.WorkerStatus{futureRetry}, time.Second, 2 * time.Minute},
+		{"healthy reset keeps a timer", []v1alpha1.WorkerStatus{healthyReset}, time.Second, minHealthyDuration},
+		{"shortest positive deadline wins", []v1alpha1.WorkerStatus{futureRetry, bmi("a", "", workerPhaseProvisioning), pendingCleanup}, agentRequeueInterval, agentRequeueInterval},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.workerRecheckDeadline(tt.workers)
+			if tt.want == 0 {
+				if !got.IsZero() {
+					t.Fatalf("stable workers must rely on watches, got %+v", got)
+				}
+				return
+			}
+			if got.RequeueAfter < tt.want || got.RequeueAfter > tt.max {
+				t.Fatalf("deadline=%v, want within [%v, %v]", got.RequeueAfter, tt.want, tt.max)
+			}
+		})
+	}
+}
+
 var _ = Describe("ClassifyFailure", func() {
 	DescribeTable("maps failure reasons to categories",
 		func(reason string, want FailureCategory) {

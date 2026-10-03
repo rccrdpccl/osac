@@ -9,8 +9,16 @@
 // No file defines an independent controller or a separate persistence boundary.
 //
 // Entry points and controller/watch setup live in reconciler.go. Normal stage
-// ordering lives in worker_reconcile.go: observe and persist repairs, prepare
-// provisioning, satisfy capacity, then converge teardown, Agents and NodePools.
+// ordering lives in worker_reconcile.go: observe resources and persist repairs,
+// observe InfraEnv UID evidence, run the input-free existing-worker lifecycle
+// (retirement intent and failed-incarnation cleanup), resolve creation inputs for
+// a due reservation or create, then converge teardown, Agents, NodePools and the
+// worker summary. A missing pull secret, discovery ignition, disk image or
+// instance type never starves retirement, cleanup, Agent binding, NodePool
+// replicas or the summary: the prerequisite wait or error is merged into the
+// final scheduling decision instead of returning early. A future retry deadline
+// likewise contributes one bounded recheck rather than a global gate, and a
+// stable order with no pending work relies on watches instead of a polling timer.
 // Allocation planning starts from the authoritative order, not a cached parent.
 // Finalizer addition, worker repair (including stale ignition), new reservations,
 // a failed worker's retry Delete and each completed BMI create are return
@@ -71,6 +79,14 @@
 // independent per-order observation state; R05-E1–E3 drive public reconciles
 // through real status persistence for interrupted binding recovery, demotion and
 // protected history with blocked prerequisites, and no pre-bind Ready decision.
+// R04-U1–U5 characterize prerequisite-free existing-worker progress, the
+// ignition/image/instance-type input budget, shortest recheck-deadline selection,
+// fairness across blocked and actionable workers, and error propagation;
+// R04-E1–E3 drive public reconciles through real status persistence for
+// retirement and cleanup with unavailable prerequisites, Agent binding past a
+// pending retry, a summary written before the create gate, stale-ignition
+// failure persistence with a blocked image, and bounded rechecks without
+// delivered Agent/NodePool events.
 // Sim-backed R03-C1 is explicitly skipped and its fixture removed; it is not a
 // local completion gate. Unit/Envtest do not prove real fulfillment/provider
 // cleanup or resolve the archived-Cluster and targeted-remediation gaps.

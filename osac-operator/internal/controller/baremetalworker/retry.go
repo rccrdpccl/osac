@@ -171,27 +171,43 @@ func isRetryDue(w v1alpha1.WorkerStatus) bool {
 	return !time.Now().Before(w.NextRetryTime.Time)
 }
 
-// earliestRetryRequeue returns a RequeueAfter result for the earliest pending retry
-// among Failed workers, or a zero result if no retries are pending.
-func (r *Reconciler) earliestRetryRequeue(workers []v1alpha1.WorkerStatus) ctrl.Result {
-	var earliest time.Time
+// workerRecheckDeadline contributes the earliest bounded recheck the worker set
+// needs when no stage already produced a boundary. Agent and NodePool watches are
+// optional, so provisioning, waiting, binding and cleanup states are rechecked
+// explicitly. A retry deadline is one such wait among others rather than a global
+// gate, and a stable no-op order returns a zero result and relies on watches. A
+// Ready worker with retry history keeps a timer for the healthy-reset deadline.
+func (r *Reconciler) workerRecheckDeadline(workers []v1alpha1.WorkerStatus) ctrl.Result {
+	now := time.Now()
+	earliest := time.Duration(0)
+	consider := func(delay time.Duration) {
+		if delay < time.Second {
+			delay = time.Second
+		}
+		if earliest == 0 || delay < earliest {
+			earliest = delay
+		}
+	}
 	for i := range workers {
 		w := &workers[i]
-		if w.Phase != workerPhaseFailed || w.NextRetryTime == nil {
-			continue
-		}
-		if earliest.IsZero() || w.NextRetryTime.Time.Before(earliest) {
-			earliest = w.NextRetryTime.Time
+		switch {
+		case w.Phase == workerPhaseFailed && w.BareMetalInstance.ID != "":
+			// Provider cleanup is still pending; recheck its completion.
+			consider(teardownRequeueInterval)
+		case w.Phase == workerPhaseFailed && w.NextRetryTime != nil:
+			consider(time.Until(w.NextRetryTime.Time))
+		case w.Phase == workerPhaseProvisioning, w.Phase == workerPhaseWaitingForAgent, w.Phase == workerPhaseBinding:
+			consider(agentRequeueInterval)
+		case w.Phase == workerPhaseUnbinding, w.Phase == workerPhaseDeleting:
+			consider(teardownRequeueInterval)
+		case w.Phase == workerPhaseReady && w.AttemptCount > 0 && w.ReadySince != nil:
+			consider(minHealthyDuration - now.Sub(w.ReadySince.Time))
 		}
 	}
-	if earliest.IsZero() {
+	if earliest == 0 {
 		return ctrl.Result{}
 	}
-	delay := time.Until(earliest)
-	if delay < time.Second {
-		delay = time.Second
-	}
-	return ctrl.Result{RequeueAfter: delay}
+	return ctrl.Result{RequeueAfter: earliest}
 }
 
 // resetHealthyWorkers resets attemptCount for workers that have been Ready for at least

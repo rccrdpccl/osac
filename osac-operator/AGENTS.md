@@ -126,6 +126,25 @@ The Unit/Envtest cases above are [DEV] work, not fulfillment wire,
 manager-watch, or deployed-provider coverage; those
 remaining boundaries belong to
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+R04 independent-convergence coverage keeps creation inputs lazy while
+prerequisite-free work proceeds. Unit cases (`worker_reconcile_test.go`,
+`worker_capacity_test.go`, `retry_test.go`) assert that retirement and BMI
+cleanup run with an absent pull secret, a deleted InfraEnv and an unresolvable
+disk image while fetching no discovery ignition and creating nothing; that a
+pending failed-worker cleanup does not stop another worker's Agent binding; that
+the aggregate worker summary is persisted before the create gate rejects a
+blocked image lookup; that the recheck deadline prefers the shortest positive
+wait among Provisioning/WaitingForAgent/Binding/cleanup states and holds no timer
+for a stable Ready order; and that a Ready worker keeps its retry history when
+another worker is delayed. R04-E1–E3 in `acceptance/worker_reconcile_test.go`
+drive the same boundaries through public `Reconcile` with real status
+persistence and simulated fulfillment/ignition outcomes, within the shared
+`16 + 8*N` explicit-call bound. The existing stale-ignition Envtest suite adds
+`R04-E2`, which persists the WaitingForAgent failure classification before
+recording the recreated InfraEnv UID even though the create input cannot resolve.
+The Envtest traces invoke `Reconcile` directly, so they do not establish manager
+watch delivery or deployed Assisted Service behavior; those remain with
+[OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
 R03 cleanup Unit tests in `cleanup_test.go`, `retry_test.go` and
 `worker_teardown_test.go` cover delayed/lost Delete acknowledgements, retention
 until fresh Get NotFound, once-only retry scheduling, retirement before cleanup,

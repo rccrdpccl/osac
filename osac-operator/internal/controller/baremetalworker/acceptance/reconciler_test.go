@@ -2301,10 +2301,18 @@ var _ = Describe("BareMetalWorkerReconciler scale-up", func() {
 
 		_, err := runReconcile("bmw-scalefail")
 		Expect(err).ToNot(HaveOccurred())
-		Expect(getClusterOrder("bmw-scalefail").Status.Workers[1].BareMetalInstance.ID).To(Equal(failed.BareMetalInstance.ID))
-		_, err = runReconcile("bmw-scalefail") // Confirm cleanup and schedule retry.
+		// The scale-up reservation is independent of the failed worker's provider
+		// cleanup; the failed incarnation keeps its recorded name, completes its
+		// cleanup only on a fresh authoritative absence and schedules its retry.
+		co = getClusterOrder("bmw-scalefail")
+		Expect(co.Status.Workers).To(HaveLen(3))
+		Expect(co.Status.Workers[1].Name).To(Equal(failed.Name))
+		Expect(co.Status.Workers[1].BareMetalInstance.Name).To(Equal(failed.BareMetalInstance.Name))
+		Expect(co.Status.Workers[1].Phase).To(Equal("Failed"))
+		Expect(co.Status.Workers[1].NextRetryTime).ToNot(BeNil())
+		_, err = runReconcile("bmw-scalefail") // The independent reservation still converges.
 		Expect(err).ToNot(HaveOccurred())
-		_, err = runReconcile("bmw-scalefail") // Provision the independent reservation.
+		_, err = runReconcile("bmw-scalefail")
 		Expect(err).ToNot(HaveOccurred())
 
 		co = getClusterOrder("bmw-scalefail")
@@ -2616,6 +2624,56 @@ var _ = Describe("BareMetalWorkerReconciler stale ignition", func() {
 		Expect(co.Status.Workers[1].LastFailureReason).To(Equal("AgentRegistrationTimeout"))
 
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentObj) })
+	})
+
+	It("R04-E2 persists stale-ignition failures while the image lookup is blocked", func() {
+		preloadDiskImageChain()
+		co := newBareMetalClusterOrder("bmw-stale-blocked")
+		create(co)
+
+		_, err := runReconcile("bmw-stale-blocked")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-stale-blocked-infraenv", testNamespace, ign.URL())).To(Succeed())
+		_, err = runReconcile("bmw-stale-blocked")
+		Expect(err).ToNot(HaveOccurred())
+		_, err = runReconcile("bmw-stale-blocked")
+		Expect(err).ToNot(HaveOccurred())
+
+		co = getClusterOrder("bmw-stale-blocked")
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		oldUID := co.Annotations["osac.openshift.io/infraenv-uid"]
+		Expect(oldUID).ToNot(BeEmpty())
+		original := co.Status.Workers[0]
+
+		// A create is genuinely pending, but its image input cannot resolve.
+		latest := getClusterOrder("bmw-stale-blocked")
+		latest.Spec.NodeRequests[0].NumberOfNodes = 2
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, newInfraEnv("bmw-stale-blocked-infraenv"))).To(Succeed())
+		_, err = runReconcile("bmw-stale-blocked")
+		Expect(err).ToNot(HaveOccurred())
+		Expect(sim.MarkInfraEnvReady(ctx, "bmw-stale-blocked-infraenv", testNamespace, ign.URL())).To(Succeed())
+		fc.AddClusterVersion(privatev1.ClusterVersion_builder{
+			Id: cvID,
+			Spec: privatev1.ClusterVersionSpec_builder{
+				DiskImage: privatev1.DiskImageReference_builder{Id: "missing-image"}.Build(),
+			}.Build(),
+		}.Build())
+		creates := len(fc.CreateCalls())
+
+		res, err := r.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "bmw-stale-blocked", Namespace: testNamespace},
+		})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(time.Second), "stale-ignition repair is a durable boundary")
+
+		co = getClusterOrder("bmw-stale-blocked")
+		Expect(co.Annotations["osac.openshift.io/infraenv-uid"]).To(Equal(oldUID), "must not advance past the worker repair")
+		Expect(co.Status.Workers[0].Phase).To(Equal("Failed"))
+		Expect(co.Status.Workers[0].LastFailureReason).To(Equal("AgentRegistrationTimeout"))
+		Expect(co.Status.Workers[0].BareMetalInstance).To(Equal(original.BareMetalInstance))
+		Expect(fc.CreateCalls()).To(HaveLen(creates), "no create is possible while the image input is blocked")
 	})
 })
 
