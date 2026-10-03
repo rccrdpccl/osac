@@ -68,6 +68,8 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 		workers[i].Phase = workerPhaseUnbinding
 		now := metav1.Now()
 		workers[i].LastFailureTime = &now
+		// Cluster deletion is a lifecycle demotion: the healthy interval ends.
+		workers[i].ReadySince = nil
 		changed = true
 	}
 

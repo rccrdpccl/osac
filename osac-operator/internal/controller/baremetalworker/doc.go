@@ -161,6 +161,35 @@
 // claimed without a test-local wrapper; real backend outages and authorization
 // visibility remain with OSAC-4843.
 //
+// R09 gives each provisioning attempt one durable registration clock. An
+// optional WorkerStatus.AttemptStartedAt is written with the reservation (and,
+// for a legacy ID-less attempt or a due retry, immediately before its Create)
+// and is never refreshed by an error, Get or re-observation. The agent
+// registration timeout compares that origin with an orchestration-captured now,
+// so a worker added to an old order and a retry attempt are not aged by the
+// parent ClusterOrder or an unrelated LastFailureTime. Confirmed old-attempt
+// cleanup clears the origin together with the old ID and ReadySince; the retry
+// checkpoint keeps its own NextRetryTime, and the replacement attempt persists a
+// fresh origin before its Create. Legacy workers are migrated once: a recorded
+// BMI contributes its creation timestamp when usable, otherwise a single
+// observation-time origin is persisted with a compatibility diagnostic.
+// ReadySince is a continuous interval: entering Ready starts it, every demotion,
+// failure or cleanup transition clears it, and the healthy-history reset fires
+// only after MinHealthyDuration of uninterrupted readiness. Policy helpers
+// (registration timeout, retry due, ReadySince projection and healthy reset)
+// take that captured now instead of reading the clock themselves.
+// R09-U1–U6 Unit cases in agent_reconcile_test.go, retry_test.go,
+// worker_projection_test.go and worker_capacity_test.go characterize the origin,
+// lost-acknowledgement recovery, one-time backfill, continuous interval and
+// exact/just-before/just-after policy boundaries with fixed clocks;
+// R09-E1–E4 Envtest traces in the acceptance suites drive public Reconcile
+// through real CRD status persistence for the timeout origin, a lost Create
+// acknowledgement plus restart, one-time legacy backfill and Ready
+// demotion/re-entry. R09-C1 (real provider timeout/health) and the deployed
+// scale/retry journey remain with OSAC-4843/[QE]; an older independently
+// deployed controller that ignores the optional field retains the old
+// parent-age timeout behavior and is not a guaranteed safe downgrade.
+//
 // Observation is not destructive authorization: List omission remains unknown
 // until an authoritative Get confirms absence, and each BMI deletion performs
 // a fresh ownership/existence check. Worker and Agent writes use one authoritative

@@ -120,6 +120,10 @@ func (r *Reconciler) handleFailedWorkers(
 		w.NextRetryTime = &retryTime
 		w.BareMetalInstance.ID = ""
 		w.ReadySince = nil
+		// The attempt origin belongs to the attempt that just ended. A fresh one
+		// is persisted before the replacement Create, so retry backoff is never
+		// counted against the next registration timeout.
+		w.AttemptStartedAt = nil
 		r.recorder.Eventf(co, nil, corev1.EventTypeWarning, eventReasonWorkerFailed, "HandleFailedWorker",
 			"worker %s: failed (attempt %d, reason %s), next retry in %s",
 			w.Name, w.AttemptCount, w.LastFailureReason, backoff)
@@ -145,7 +149,7 @@ func (r *Reconciler) retryFailedWorker(
 	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
 	image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string,
 ) (ctrl.Result, error) {
-	if prev.Phase != workerPhaseFailed || prev.BareMetalInstance.ID != "" || prev.NextRetryTime == nil || !isRetryDue(*prev) {
+	if prev.Phase != workerPhaseFailed || prev.BareMetalInstance.ID != "" || prev.NextRetryTime == nil || !isRetryDue(*prev, time.Now()) {
 		return ctrl.Result{}, nil
 	}
 	log := ctrllog.FromContext(ctx)
@@ -164,11 +168,11 @@ func (r *Reconciler) retryFailedWorker(
 }
 
 // isRetryDue returns true if a Failed worker's NextRetryTime has passed (or is nil).
-func isRetryDue(w v1alpha1.WorkerStatus) bool {
+func isRetryDue(w v1alpha1.WorkerStatus, now time.Time) bool {
 	if w.NextRetryTime == nil {
 		return true
 	}
-	return !time.Now().Before(w.NextRetryTime.Time)
+	return !now.Before(w.NextRetryTime.Time)
 }
 
 // workerRecheckDeadline contributes the earliest bounded recheck the worker set
@@ -177,8 +181,7 @@ func isRetryDue(w v1alpha1.WorkerStatus) bool {
 // explicitly. A retry deadline is one such wait among others rather than a global
 // gate, and a stable no-op order returns a zero result and relies on watches. A
 // Ready worker with retry history keeps a timer for the healthy-reset deadline.
-func (r *Reconciler) workerRecheckDeadline(workers []v1alpha1.WorkerStatus) ctrl.Result {
-	now := time.Now()
+func (r *Reconciler) workerRecheckDeadline(workers []v1alpha1.WorkerStatus, now time.Time) ctrl.Result {
 	earliest := time.Duration(0)
 	consider := func(delay time.Duration) {
 		if delay < time.Second {
@@ -212,8 +215,7 @@ func (r *Reconciler) workerRecheckDeadline(workers []v1alpha1.WorkerStatus) ctrl
 
 // resetHealthyWorkers resets attemptCount for workers that have been Ready for at least
 // MinHealthyDuration, clearing their failure history.
-func resetHealthyWorkers(log logr.Logger, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus) {
-	now := time.Now()
+func resetHealthyWorkers(log logr.Logger, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, now time.Time) {
 	for i := range workers {
 		w := &workers[i]
 		if w.Phase != workerPhaseReady || w.AttemptCount == 0 || w.ReadySince == nil {

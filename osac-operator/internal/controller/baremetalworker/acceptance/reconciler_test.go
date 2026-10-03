@@ -1576,8 +1576,9 @@ var _ = Describe("BareMetalWorkerReconciler reconcileAgent", func() {
 			co := getClusterOrder(name)
 			Expect(co.Status.Workers).To(HaveLen(1))
 			Expect(co.Status.Workers[0].Phase).To(Equal(wantPhase))
-			// This refactor retains the historical ReadySince on demotion.
+			// R09: leaving Ready clears the continuous healthy interval.
 			before.Phase = wantPhase
+			before.ReadySince = nil
 			Expect(co.Status.Workers[0]).To(Equal(before))
 			Expect(co.Status.DesiredWorkers).To(Equal(ptrInt32(1)))
 			Expect(co.Status.CurrentWorkers).To(Equal(ptrInt32(1)))
@@ -1591,6 +1592,40 @@ var _ = Describe("BareMetalWorkerReconciler reconcileAgent", func() {
 		Entry("Installed=Unknown", "Unknown", "Binding"),
 		Entry("Agent disappeared", "disappeared", "WaitingForAgent"),
 	)
+
+	It("R09-E4 restarts the healthy interval after a demotion and re-entry", func() {
+		preloadDiskImageChain()
+		name := "bmw-r09-e4"
+		create(newBareMetalClusterOrder(name, 1))
+		createWorkersAndSetMAC(name, 1)
+		agent := registerClusterAgent(name)
+		installClusterAgent(name, agent)
+		before := getClusterOrder(name).Status.Workers[0]
+		Expect(before.ReadySince).ToNot(BeNil())
+
+		// A demotion clears the continuous healthy interval.
+		Expect(unstructured.SetNestedSlice(agent.Object, []interface{}{
+			map[string]interface{}{"type": "Installed", "status": "False"},
+		}, "status", "conditions")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		_, err := runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		demoted := getClusterOrder(name).Status.Workers[0]
+		Expect(demoted.Phase).To(Equal("Binding"))
+		Expect(demoted.ReadySince).To(BeNil())
+
+		// Re-entry starts a fresh interval instead of inheriting the old one.
+		Expect(unstructured.SetNestedSlice(agent.Object, []interface{}{
+			map[string]interface{}{"type": "Installed", "status": "True"},
+		}, "status", "conditions")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		_, err = runReconcile(name)
+		Expect(err).ToNot(HaveOccurred())
+		ready := getClusterOrder(name).Status.Workers[0]
+		Expect(ready.Phase).To(Equal("Ready"))
+		Expect(ready.ReadySince).ToNot(BeNil())
+		Expect(ready.ReadySince.Time).To(BeTemporally(">=", before.ReadySince.Time))
+	})
 
 	DescribeTable("repairs interrupted worker status without rebinding or creating a BMI",
 		func(installed bool, wantPhase string) {
@@ -1652,6 +1687,8 @@ var _ = Describe("BareMetalWorkerReconciler reconcileAgent", func() {
 			co.Status.Workers[0].LastFailureReason = "InfrastructureError"
 			now := metav1.Now()
 			co.Status.Workers[0].LastFailureTime = &now
+			// R09: a protected lifecycle phase is a demotion; no healthy interval remains.
+			co.Status.Workers[0].ReadySince = nil
 			Expect(k8sClient.Status().Update(ctx, co)).To(Succeed())
 			before := co.Status.Workers[0]
 			// Keep provider deletion pending. Installed Agents likewise hold Unbinding.

@@ -99,8 +99,10 @@ func (r *Reconciler) updateWorkerStatusWithAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
 ) error {
 	log := ctrllog.FromContext(ctx)
+	now := time.Now()
 	workers = append([]v1alpha1.WorkerStatus(nil), workers...)
-	resetHealthyWorkers(log, co, workers)
+	projectReadySince(workers, now)
+	resetHealthyWorkers(log, co, workers, now)
 	next := co.DeepCopy()
 	next.Status.Workers = workers
 	desired, current, ready := computeWorkerAggregates(workers)
@@ -205,6 +207,7 @@ func FormatWorkersFailed(workers []v1alpha1.WorkerStatus) string {
 }
 
 func newWorkerStatus(nodeSet, instanceType, name, resourceID, phase string) v1alpha1.WorkerStatus {
+	now := metav1.Now()
 	return v1alpha1.WorkerStatus{
 		NodeSet:           nodeSet,
 		InstanceType:      instanceType,
@@ -212,7 +215,10 @@ func newWorkerStatus(nodeSet, instanceType, name, resourceID, phase string) v1al
 		Kind:              workerKindBMI,
 		BareMetalInstance: v1alpha1.BareMetalInstanceReference{Name: name, ID: resourceID},
 		Phase:             phase,
-		CreationTimestamp: metav1.Now(),
+		CreationTimestamp: now,
+		// A freshly constructed slot starts its attempt now; the origin is part of
+		// the reservation write, so it is durable before any external Create.
+		AttemptStartedAt: &now,
 	}
 }
 
@@ -226,12 +232,20 @@ func workerCreated(w *v1alpha1.WorkerStatus, name, id string) {
 	}
 }
 
-func initializeReadySince(workers []v1alpha1.WorkerStatus) {
-	now := metav1.Now()
+// projectReadySince maintains the continuous healthy interval. Entering Ready
+// starts an interval; leaving Ready for any reason, including a demotion,
+// failure or cleanup transition, clears the previous interval. Disjoint healthy
+// periods are therefore never accumulated for the healthy-reset decision.
+func projectReadySince(workers []v1alpha1.WorkerStatus, now time.Time) {
 	for i := range workers {
-		if eligibleForAgentObservation(workers[i]) && workers[i].Phase == workerPhaseReady && workers[i].ReadySince == nil {
-			workers[i].ReadySince = &now
+		if workers[i].Phase == workerPhaseReady && eligibleForAgentObservation(workers[i]) {
+			if workers[i].ReadySince == nil {
+				stamp := metav1.NewTime(now)
+				workers[i].ReadySince = &stamp
+			}
+			continue
 		}
+		workers[i].ReadySince = nil
 	}
 }
 

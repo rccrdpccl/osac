@@ -358,6 +358,15 @@ type WorkerStatus struct {
 	// AttemptCount tracks how many times this worker slot has been provisioned.
 	AttemptCount int32 `json:"attemptCount"`
 
+	// AttemptStartedAt is the durable start of the current provisioning attempt.
+	// It is recorded before the first BMI Create and survives lost acknowledgements,
+	// so the agent registration timeout is measured from the attempt, not from the
+	// parent ClusterOrder or an unrelated failure timestamp. It is not refreshed on
+	// errors or re-observation, and is cleared only after the old attempt's cleanup
+	// completes.
+	// +kubebuilder:validation:Optional
+	AttemptStartedAt *metav1.Time `json:"attemptStartedAt,omitempty"`
+
 	// LastFailureReason is a machine-readable reason for the last failure
 	// (e.g. AgentRegistrationTimeout).
 	// +kubebuilder:validation:Optional

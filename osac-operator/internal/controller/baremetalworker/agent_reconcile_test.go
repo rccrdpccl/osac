@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/osac-project/osac/osac-operator/api/v1alpha1"
 )
@@ -51,7 +52,7 @@ func reconcileAgentStage(
 	if err != nil {
 		return nil, ctrl.Result{}, err
 	}
-	initializeReadySince(projected)
+	projectReadySince(projected, time.Now())
 	r.observeAgentReadiness(context.Background(), co, workers, projected)
 	return r.reconcileObservedAgents(context.Background(), co, projected, o)
 }
@@ -112,6 +113,12 @@ func TestAgentConvergence(t *testing.T) {
 				t.Errorf("phase = %s, want %s", got[0].Phase, tt.want)
 			}
 			got[0].Phase = before.Phase
+			if tt.want != workerPhaseReady {
+				// A demotion clears the healthy interval; only a still-Ready worker
+				// keeps the ReadySince captured before the projection.
+				got[0].ReadySince = nil
+				before.ReadySince = nil
+			}
 			if !reflect.DeepEqual(got[0], before) {
 				t.Errorf("observation changed worker identity/history: %+v", got[0])
 			}
@@ -196,7 +203,7 @@ func TestAgentMatchingAndTimeoutProtectNonBMIAndReservations(t *testing.T) {
 			w := newWorkerStatus("standard", "standard", "worker", id, workerPhaseWaitingForAgent)
 			w.Kind = kind
 			co.Status.Workers = []v1alpha1.WorkerStatus{w}
-			got := r.checkAgentRegistrationTimeout(ctx, co, []v1alpha1.WorkerStatus{w})
+			got := r.checkAgentRegistrationTimeout(ctx, co, []v1alpha1.WorkerStatus{w}, time.Now())
 			if !reflect.DeepEqual(got[0], w) {
 				t.Error("timeout changed a protected worker")
 			}
@@ -402,26 +409,106 @@ func TestAgentBindingCrashRecovery(t *testing.T) {
 	}
 }
 
-func TestWorkerPhaseStartTimeBoundaries(t *testing.T) {
-	created := metav1.NewTime(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
-	failure := metav1.NewTime(created.Add(agentRegistrationTimeout))
-	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: created}}
-	r := &Reconciler{}
+func TestR09NewWorkerOnOldOrder(t *testing.T) {
+	oldOrder := metav1.NewTime(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+	recent := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
 	w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
-	co.Status.Workers = []v1alpha1.WorkerStatus{w}
-	if got := r.workerPhaseStartTime(co, w.Name); !got.Equal(created.Time) {
-		t.Fatalf("start = %v, want creation time", got)
+	w.AttemptStartedAt = &recent
+	co := &v1alpha1.ClusterOrder{
+		ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac", CreationTimestamp: oldOrder},
+		Status:     v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{w}},
 	}
-	co.Status.Workers[0].LastFailureTime = &failure
-	if got := r.workerPhaseStartTime(co, w.Name); !got.Equal(failure.Time) {
-		t.Fatalf("start = %v, want failure time", got)
+	r := &Reconciler{recorder: events.NewFakeRecorder(10), macResolver: func(context.Context, string) []string { return nil }}
+	got, res, err := reconcileAgentStage(r, co, co.Status.Workers, &unstructured.UnstructuredList{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	co.Status.Workers[0].Phase = workerPhaseBinding
-	if got := r.workerPhaseStartTime(co, w.Name); !got.IsZero() {
-		t.Fatalf("binding start = %v, want zero", got)
+	if got[0].Phase != workerPhaseWaitingForAgent || res.RequeueAfter != agentRequeueInterval {
+		t.Fatalf("new worker on old order inherited parent age: %+v result=%+v", got[0], res)
 	}
-	if got := r.workerPhaseStartTime(co, "new-worker"); !got.IsZero() {
-		t.Fatalf("new worker start = %v, want zero", got)
+}
+
+// TestR09RetryClockExcludesBackoff proves an old failure timestamp is not reused
+// as the next attempt's registration origin, so retry backoff is not counted
+// against the fresh attempt.
+func TestR09RetryClockExcludesBackoff(t *testing.T) {
+	oldFailure := metav1.NewTime(time.Now().Add(-2 * time.Hour).Truncate(time.Second))
+	recent := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
+	w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
+	w.LastFailureTime = &oldFailure
+	w.LastFailureReason = eventReasonAgentRegistrationTimeout
+	w.AttemptStartedAt = &recent
+	co := &v1alpha1.ClusterOrder{
+		ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"},
+		Status:     v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{w}},
+	}
+	r := &Reconciler{recorder: events.NewFakeRecorder(10), macResolver: func(context.Context, string) []string { return nil }}
+	got, res, err := reconcileAgentStage(r, co, co.Status.Workers, &unstructured.UnstructuredList{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Phase != workerPhaseWaitingForAgent || res.RequeueAfter != agentRequeueInterval {
+		t.Fatalf("retry attempt inherited backoff failure age: %+v result=%+v", got[0], res)
+	}
+}
+
+// TestR09PolicyClockBoundaries fixes the policy clock so exact, just-before and
+// just-after boundaries are evaluated without sleeps.
+func TestR09PolicyClockBoundaries(t *testing.T) {
+	base := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	origin := metav1.NewTime(base)
+	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac"}}
+	timeoutWorker := func() v1alpha1.WorkerStatus {
+		w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
+		w.AttemptStartedAt = &origin
+		return w
+	}
+	for _, tt := range []struct {
+		name string
+		now  time.Time
+		want string
+	}{
+		{"just before timeout", base.Add(agentRegistrationTimeout - time.Second), workerPhaseWaitingForAgent},
+		{"exact timeout", base.Add(agentRegistrationTimeout), workerPhaseFailed},
+		{"just after timeout", base.Add(agentRegistrationTimeout + time.Second), workerPhaseFailed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Reconciler{recorder: events.NewFakeRecorder(10)}
+			got := r.checkAgentRegistrationTimeout(context.Background(), co, []v1alpha1.WorkerStatus{timeoutWorker()}, tt.now)
+			if got[0].Phase != tt.want {
+				t.Fatalf("phase=%s want %s", got[0].Phase, tt.want)
+			}
+		})
+	}
+
+	due := metav1.NewTime(base.Add(time.Minute))
+	retry := v1alpha1.WorkerStatus{Phase: workerPhaseFailed, NextRetryTime: &due}
+	if isRetryDue(retry, base) || !isRetryDue(retry, due.Time) || !isRetryDue(retry, due.Time.Add(time.Second)) {
+		t.Fatal("retry due boundary is not inclusive of the deadline")
+	}
+	if !isRetryDue(v1alpha1.WorkerStatus{Phase: workerPhaseFailed}, base) {
+		t.Fatal("nil retry deadline must be due")
+	}
+
+	ready := newWorkerStatus("standard", "standard", "ready", "ready-id", workerPhaseReady)
+	ready.AttemptCount = 1
+	ready.ReadySince = &origin
+	for _, tt := range []struct {
+		name string
+		now  time.Time
+		want int32
+	}{
+		{"just before healthy threshold", base.Add(minHealthyDuration - time.Second), 1},
+		{"exact healthy threshold", base.Add(minHealthyDuration), 0},
+		{"just after healthy threshold", base.Add(minHealthyDuration + time.Second), 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workers := []v1alpha1.WorkerStatus{ready}
+			resetHealthyWorkers(ctrllog.FromContext(context.Background()), co, workers, tt.now)
+			if workers[0].AttemptCount != tt.want {
+				t.Fatalf("attemptCount=%d want %d", workers[0].AttemptCount, tt.want)
+			}
+		})
 	}
 }
 
@@ -430,6 +517,7 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 	r := &Reconciler{recorder: recorder, macResolver: func(context.Context, string) []string { return nil }}
 	fixed := metav1.NewTime(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
 	w := newWorkerStatus("standard", "standard", "worker", "id", workerPhaseWaitingForAgent)
+	w.AttemptStartedAt = &fixed
 	co := &v1alpha1.ClusterOrder{ObjectMeta: metav1.ObjectMeta{Name: "order", Namespace: "osac", CreationTimestamp: fixed}, Status: v1alpha1.ClusterOrderStatus{Workers: []v1alpha1.WorkerStatus{w}}}
 	failures := workerProvisioningFailures.WithLabelValues(tenantOf(co), workerTypeBareMetal, w.InstanceType)
 	beforeFailures := testutil.ToFloat64(failures)
@@ -454,9 +542,11 @@ func TestAgentTimeoutAndReadinessObservations(t *testing.T) {
 	if delta := testutil.ToFloat64(failures) - beforeFailures; delta != 1 {
 		t.Fatalf("failure metric delta = %v, want 1", delta)
 	}
-	// A recent failure time is the existing registration-clock approximation.
-	w.LastFailureTime = new(metav1.Time)
-	*w.LastFailureTime = metav1.Now()
+	// A recent attempt origin must not time out even with stale failure history:
+	// the failure timestamp is not the registration clock.
+	recent := metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second))
+	w.AttemptStartedAt = &recent
+	w.LastFailureTime = &fixed
 	co.Status.Workers = []v1alpha1.WorkerStatus{w}
 	got, res, err = reconcileAgentStage(r, co, co.Status.Workers, &unstructured.UnstructuredList{})
 	if err != nil || got[0].Phase != workerPhaseWaitingForAgent || res.RequeueAfter != agentRequeueInterval {

@@ -104,6 +104,8 @@ func (r *Reconciler) handleScaleDown(
 		log.Info("marking worker for scale-down", "worker", w.Name, "previousPhase", w.Phase)
 		w.Phase = workerPhaseUnbinding
 		w.LastFailureTime = &now
+		// Retirement is a lifecycle demotion: the continuous healthy interval ends.
+		w.ReadySince = nil
 		r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerDeleted, "ScaleDown",
 			"worker %s marked for unbinding during scale-down", w.Name)
 		workers = append(workers, w)

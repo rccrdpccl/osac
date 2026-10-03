@@ -88,8 +88,9 @@ func TestR03RetryKeepsIDUntilAbsent(t *testing.T) {
 
 func TestR04WorkerRecheckDeadline(t *testing.T) {
 	r := &Reconciler{}
-	future := metav1.NewTime(time.Now().Add(2 * time.Minute))
-	readySince := metav1.NewTime(time.Now().Add(-time.Minute))
+	now := time.Now()
+	future := metav1.NewTime(now.Add(2 * time.Minute))
+	readySince := metav1.NewTime(now.Add(-time.Minute))
 	bmi := func(name, id, phase string) v1alpha1.WorkerStatus {
 		w := newWorkerStatus("standard", "standard", name, id, phase)
 		return w
@@ -118,7 +119,7 @@ func TestR04WorkerRecheckDeadline(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := r.workerRecheckDeadline(tt.workers)
+			got := r.workerRecheckDeadline(tt.workers, now)
 			if tt.want == 0 {
 				if !got.IsZero() {
 					t.Fatalf("stable workers must rely on watches, got %+v", got)
