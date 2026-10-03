@@ -49,7 +49,9 @@ func (w *fulfillmentConditionFailureWriter) Patch(context.Context, client.Object
 }
 
 func TestFulfillmentErrorCallers(t *testing.T) {
-	for _, operation := range []string{"observation", "capacity", "instance type", "create"} {
+	// Capacity no longer performs its own fulfillment read: it consumes the
+	// explicit observation, so list outages belong to the observation caller.
+	for _, operation := range []string{"observation", "instance type", "create"} {
 		for _, outcome := range []string{"ordinary error", "unavailable", "condition persistence error"} {
 			t.Run(operation+"/"+outcome, func(t *testing.T) {
 				ctx := context.Background()
@@ -74,8 +76,6 @@ func TestFulfillmentErrorCallers(t *testing.T) {
 				switch operation {
 				case "observation":
 					_, res, err = r.observeWorkerResources(ctx, co)
-				case "capacity":
-					res, err = r.reconcileWorkerCapacity(ctx, co, "tenant", nil, nil)
 				case "instance type":
 					_, res, err = r.resolveNodeSetInstanceType(ctx, co, "standard")
 				case "create":

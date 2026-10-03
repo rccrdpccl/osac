@@ -292,7 +292,9 @@ func TestFinalWorkerStatusStopsOnConflict(t *testing.T) {
 	}
 }
 
-func TestFinalAgentStageReusesEarlyPhaseProjection(t *testing.T) {
+// R05-U1/U3: phase derivation happens exactly once, in the observation
+// projection; the Agent action stage never re-derives phases from the snapshot.
+func TestR05SingleProjectionStage(t *testing.T) {
 	r, fc, co := workerReadHarness(t)
 	fc.listed = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "recorded-id")}
 	calls := 0
@@ -313,12 +315,12 @@ func TestFinalAgentStageReusesEarlyPhaseProjection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, _, err = r.reconcileObservedAgents(context.Background(), co, observed)
+	_, _, err = r.reconcileObservedAgents(context.Background(), co, co.Status.Workers, observed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
-		t.Fatalf("phase MAC resolutions=%d, want only early observation", calls)
+		t.Fatalf("phase MAC resolutions=%d, want exactly one projection", calls)
 	}
 }
 

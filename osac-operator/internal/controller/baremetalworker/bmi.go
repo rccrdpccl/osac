@@ -27,21 +27,20 @@ const (
 
 // ensureBMI creates a single BareMetalInstance, handling the AlreadyExists race by re-listing.
 // Returns the BMI, a non-zero result on unavailability backoff, or an error.
+// A successful create is not written back into the invocation's observation:
+// the caller persists the returned identity and the next invocation re-observes.
 func (r *Reconciler) ensureBMI(
 	ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, nodeSet v1alpha1.NodeRequest,
-	workerName string, image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string, observations ...*workerObservation,
+	workerName string, image *privatev1.DiskImageReference, ignitionRaw, filter, fabricInterface string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
 	req := r.buildBMICreateRequest(co, tenant, nodeSet, workerName, image, ignitionRaw, fabricInterface)
 	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
 	if err == nil {
-		for _, o := range observations {
-			o.recordBMI(created)
-		}
 		return created, ctrl.Result{}, nil
 	}
 
 	if st, ok := status.FromError(err); ok && st.Code() == codes.AlreadyExists {
-		bmi, listErr := r.findBMIByName(ctx, co, tenant, filter, workerName, observations...)
+		bmi, listErr := r.findBMIByName(ctx, co, tenant, filter, workerName)
 		if listErr != nil {
 			return nil, ctrl.Result{}, listErr
 		}
@@ -53,7 +52,7 @@ func (r *Reconciler) ensureBMI(
 }
 
 // findBMIByName re-lists BMIs and returns the one matching the given name.
-func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrder, tenant, filter, name string, observations ...*workerObservation) (*privatev1.BareMetalInstance, error) {
+func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrder, tenant, filter, name string) (*privatev1.BareMetalInstance, error) {
 	ctrllog.FromContext(ctx).Info("BMI create returned AlreadyExists, re-listing", "name", name)
 	refreshed, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
 	if err != nil {
@@ -78,9 +77,6 @@ func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrde
 		}
 		if err := checkBMIRecoveryCandidate(bmi); err != nil {
 			return nil, err
-		}
-		for _, o := range observations {
-			o.recordBMI(bmi)
 		}
 		return bmi, nil
 	}

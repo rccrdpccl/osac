@@ -37,22 +37,19 @@ func (r *Reconciler) listAgents(ctx context.Context, co *v1alpha1.ClusterOrder) 
 	return agentList, nil
 }
 
-// projectAgentWorkerPhases is observation only: it neither checks BMI existence,
-// patches Agents, nor modifies the input workers or their identity/retry fields.
+// projectAgentWorkerPhases is the single pure Agent-phase projection: it neither
+// checks BMI existence, patches Agents, nor modifies the input workers or their
+// identity/retry fields. Protected Failed/Unbinding/Deleting workers are never
+// projected back into a normal phase.
 func projectAgentWorkerPhases(
 	ctx context.Context, workers []v1alpha1.WorkerStatus,
-	agents *unstructured.UnstructuredList, hostMACs MACResolver, knownPhases ...map[string]v1alpha1.WorkerStatus,
+	agents *unstructured.UnstructuredList, hostMACs MACResolver,
 ) []v1alpha1.WorkerStatus {
 	result := append([]v1alpha1.WorkerStatus(nil), workers...)
 	for i := range result {
 		w := &result[i]
 		if !eligibleForAgentObservation(*w) {
 			continue
-		}
-		if len(knownPhases) > 0 {
-			if previous, ok := knownPhases[0][w.Name]; ok && previous.Kind == w.Kind && previous.BareMetalInstance == w.BareMetalInstance && previous.Phase == w.Phase {
-				continue
-			}
 		}
 		w.Phase = deriveWorkerPhase(findAgentForWorker(ctx, agents, w.BareMetalInstance.ID, w.Name, hostMACs), w.Name)
 	}

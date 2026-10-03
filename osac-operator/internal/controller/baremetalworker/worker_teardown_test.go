@@ -57,7 +57,7 @@ func TestTeardownUsesOneFreshOwnedReadWithoutInventingAbsence(t *testing.T) {
 			}
 			observed := indexWorkerBMIs(nil)
 			observed.agents = &unstructured.UnstructuredList{}
-			kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w}, observed)
+			kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w})
 			wantDeletes := 0
 			if state == "present" {
 				wantDeletes = 1
@@ -108,7 +108,7 @@ func TestFinalizationRetainsFinalizerForConcurrentAppendedWorker(t *testing.T) {
 	r.Client = c
 	o := indexWorkerBMIs(nil)
 	o.agents = &unstructured.UnstructuredList{}
-	res, err := r.handleClusterDeletion(context.Background(), co, o)
+	res, err := r.handleClusterDeletion(context.Background(), co)
 	if !apierrors.IsConflict(err) || !res.IsZero() {
 		t.Fatalf("result=%+v err=%v, want one-shot conflict", res, err)
 	}
@@ -162,7 +162,7 @@ func TestR03UnknownCleanupDoesNotRelease(t *testing.T) {
 			}
 			o := indexWorkerBMIs(nil)
 			o.agents = &unstructured.UnstructuredList{}
-			kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w}, o)
+			kept := r.reconcileTeardownWorkers(context.Background(), co, []v1alpha1.WorkerStatus{w})
 			if len(kept) != 1 || kept[0].BareMetalInstance != w.BareMetalInstance || fc.deletes != 0 {
 				t.Fatalf("unknown released: workers=%+v deletes=%d", kept, fc.deletes)
 			}
@@ -172,11 +172,9 @@ func TestR03UnknownCleanupDoesNotRelease(t *testing.T) {
 
 func TestStableConvergenceDoesNotRelistAgentsForTeardown(t *testing.T) {
 	r, _, co := workerReadHarness(t)
-	observed := indexWorkerBMIs(nil)
-	observed.agents = &unstructured.UnstructuredList{}
 	c := &agentListCountingClient{Client: r.Client}
 	r.Client = c
-	_, err := r.reconcileWorkerTeardown(context.Background(), co, observed)
+	_, err := r.reconcileWorkerTeardown(context.Background(), co)
 	if err != nil {
 		t.Fatal(err)
 	}

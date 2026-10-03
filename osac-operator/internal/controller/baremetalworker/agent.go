@@ -40,34 +40,20 @@ var agentGVK = schema.GroupVersionKind{
 	Group: "agent-install.openshift.io", Version: agentInstallAPIVersion, Kind: "Agent",
 }
 
-// reconcileAgent converges every eligible worker from the shared Agent snapshot,
-// then matches and binds unbound Agents. Status persistence remains in the caller.
-func (r *Reconciler) reconcileAgent(
-	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus,
-	agents *unstructured.UnstructuredList, resolvers ...MACResolver,
+// reconcileObservedAgents performs Agent actions against the invocation snapshot:
+// it matches and binds unbound Agents, then enforces the registration timeout.
+// Phase projection already happened once in observeExistingWorkers; this stage
+// never re-derives phases from the Agent list, and after a bind or delete it
+// leaves further observation to the next explicit invocation. Status persistence
+// remains in the caller.
+func (r *Reconciler) reconcileObservedAgents(
+	ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, o *workerObservation,
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
-	macs := r.workerMACResolver(nil)
-	if len(resolvers) > 0 {
-		macs = resolvers[0]
-	}
-	return r.reconcileAgentWithProjection(ctx, co, workers, agents, macs, nil)
-}
-
-func (r *Reconciler) reconcileObservedAgents(ctx context.Context, co *v1alpha1.ClusterOrder, o *workerObservation) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
-	known := o.projected
-	if o.agentsInvalidated {
-		known = nil
-	}
-	return r.reconcileAgentWithProjection(ctx, co, co.Status.Workers, o.agents, r.workerMACResolver(o), known)
-}
-
-func (r *Reconciler) reconcileAgentWithProjection(ctx context.Context, co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus, agents *unstructured.UnstructuredList, macs MACResolver, known map[string]v1alpha1.WorkerStatus) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
-	observed := projectAgentWorkerPhases(ctx, workers, agents, macs, known)
-	r.observeAgentReadiness(ctx, co, workers, observed)
-	workers = observed
-	initializeReadySince(workers)
-	if _, err := r.matchAndBindAgents(ctx, co, agents, workers, macs); err != nil {
-		return nil, ctrl.Result{}, err
+	workers = append([]v1alpha1.WorkerStatus(nil), workers...)
+	if o.agents != nil {
+		if _, err := r.matchAndBindAgents(ctx, co, o.agents, workers, r.workerMACResolver(o)); err != nil {
+			return nil, ctrl.Result{}, err
+		}
 	}
 	workers = r.checkAgentRegistrationTimeout(ctx, co, workers)
 
@@ -77,13 +63,18 @@ func (r *Reconciler) reconcileAgentWithProjection(ctx context.Context, co *v1alp
 	return workers, ctrl.Result{}, nil
 }
 
-// Preserve the late stage's existing Binding -> Ready emissions. Early phase
-// observation and interrupted-status recovery remain quiet, as before this refactor.
+// observeAgentReadiness reports an actual Binding -> Ready transition from the
+// single projection pass. Workers are matched by name because the projection may
+// have removed entries; a missing previous entry is not a transition.
 func (r *Reconciler) observeAgentReadiness(
 	ctx context.Context, co *v1alpha1.ClusterOrder, previous, observed []v1alpha1.WorkerStatus,
 ) {
 	for i := range observed {
-		if previous[i].Phase != workerPhaseBinding || observed[i].Phase != workerPhaseReady {
+		if observed[i].Phase != workerPhaseReady {
+			continue
+		}
+		before := workerByName(previous, observed[i].Name)
+		if before == nil || before.Phase != workerPhaseBinding {
 			continue
 		}
 		ctrllog.FromContext(ctx).Info("worker ready", "worker", observed[i].Name)
@@ -97,7 +88,7 @@ func (r *Reconciler) observeAgentReadiness(
 // Returns the number of newly bound workers.
 func (r *Reconciler) matchAndBindAgents(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
-	agents *unstructured.UnstructuredList, workers []v1alpha1.WorkerStatus, resolvers ...MACResolver,
+	agents *unstructured.UnstructuredList, workers []v1alpha1.WorkerStatus, macs MACResolver,
 ) (int, error) {
 	bound := 0
 	for idx := range agents.Items {
@@ -105,7 +96,7 @@ func (r *Reconciler) matchAndBindAgents(
 		if agent.GetLabels()[workerNameLabel] != "" {
 			continue
 		}
-		matched, err := r.matchAndBindAgent(ctx, co, agent, workers, resolvers...)
+		matched, err := r.matchAndBindAgent(ctx, co, agent, workers, macs)
 		if err != nil {
 			return bound, err
 		}
@@ -120,14 +111,10 @@ func (r *Reconciler) matchAndBindAgents(
 // Returns true if a worker was successfully bound.
 func (r *Reconciler) matchAndBindAgent(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
-	agent *unstructured.Unstructured, workers []v1alpha1.WorkerStatus, resolvers ...MACResolver,
+	agent *unstructured.Unstructured, workers []v1alpha1.WorkerStatus, macs MACResolver,
 ) (bool, error) {
 	log := ctrllog.FromContext(ctx)
 
-	macs := r.workerMACResolver(nil)
-	if len(resolvers) > 0 {
-		macs = resolvers[0]
-	}
 	workerName, isAmbiguous := matchAgentToBMI(ctx, agent, workers, macs)
 	if isAmbiguous {
 		log.Error(nil, "multiple BMIs match agent MAC, skipping bind", "agent", agent.GetName())

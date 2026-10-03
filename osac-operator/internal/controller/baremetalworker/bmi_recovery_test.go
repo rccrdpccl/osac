@@ -159,10 +159,8 @@ func TestBMIRecoveryDoesNotOverwriteNewerReservation(t *testing.T) {
 
 func TestBMIProvisioningRecoversAuthoritativeReservation(t *testing.T) {
 	r, fc, co := bmiStageHarness(t, workerPhaseProvisioning, "")
-	stale := co.DeepCopy()
-	stale.Status.Workers = nil
 	fc.bmis = []*privatev1.BareMetalInstance{ownedBMIFixture(co, "recorded-bmi", "created-id")}
-	if _, err := r.reconcileWorkerCapacity(context.Background(), stale, "tenant", nil, nil); err != nil {
+	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment)); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
@@ -179,7 +177,10 @@ func TestBMIMissingSlotIsReplacedWithANewReservation(t *testing.T) {
 	if _, _, err := runBMIStage(context.Background(), r, co); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil); err != nil {
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment)); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {
@@ -191,7 +192,7 @@ func TestBMIMissingSlotIsReplacedWithANewReservation(t *testing.T) {
 	if co.Status.Workers[0].BareMetalInstance.ID != "" || len(fc.names) != 0 {
 		t.Fatal("reservation did not return before create")
 	}
-	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil); err != nil {
+	if _, err := r.reconcileWorkerCapacity(context.Background(), co, "tenant", nil, nil, capacityObservation(t, r.fulfillment)); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(co), co); err != nil {

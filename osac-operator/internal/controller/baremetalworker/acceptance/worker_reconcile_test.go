@@ -878,4 +878,140 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
 		Expect(fc.GetInstanceTypeCalls()).To(BeEmpty())
 	})
+
+	// registerUnboundAgent places a MAC-correlated but not-yet-bound Agent in the
+	// cluster-order watch filter, so the next reconcile may late-bind it.
+	registerUnboundAgent := func(name, mac string) *unstructured.Unstructured {
+		GinkgoHelper()
+		Expect(sim.RegisterAgent(ctx, envsim.AgentOptions{
+			Name: name, Namespace: co.Namespace, MAC: mac,
+		})).To(Succeed())
+		agent := getAgent(name)
+		labels := agent.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels["osac.openshift.io/cluster-order"] = co.Name
+		agent.SetLabels(labels)
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+		return getAgent(name)
+	}
+
+	It("R05-E1 recovers interrupted binding from the Agent without a second patch or Create", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:71"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r05-e1-agent", mac)
+		createsBefore := len(fc.CreateCalls())
+
+		// The Agent patch succeeds, then the worker status write is lost.
+		statusErr := errors.New("worker status write interrupted")
+		r = buildReconciler(&workerStatusFaultClient{Client: k8sClient, err: statusErr, fail: func(candidate *api.ClusterOrder) bool {
+			return len(candidate.Status.Workers) > 0 && candidate.Status.Workers[0].Phase == "Binding"
+		}})
+		_, err := run()
+		Expect(err).To(MatchError(statusErr))
+		Expect(getAgent(agent.GetName()).GetLabels()).To(HaveKeyWithValue("osac.openshift.io/worker-name", old.Name))
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+
+		// A fresh invocation derives Binding from the labeled Agent without repatching it.
+		r = buildReconciler(k8sClient)
+		version := getAgent(agent.GetName()).GetResourceVersion()
+		_, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Binding"))
+		Expect(getOrder().Status.Workers[0].BareMetalInstance).To(Equal(old.BareMetalInstance))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+		Expect(getAgent(agent.GetName()).GetResourceVersion()).To(Equal(version), "status repair must not rebind the Agent")
+
+		// Installed progression is observed by another fresh invocation, still without a rebind.
+		installed := getAgent(agent.GetName())
+		Expect(unstructured.SetNestedField(installed.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, installed)).To(Succeed())
+		version = getAgent(agent.GetName()).GetResourceVersion()
+		_, err = run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Ready"))
+		Expect(getOrder().Status.Workers[0].ReadySince).NotTo(BeNil())
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+		Expect(getAgent(agent.GetName()).GetResourceVersion()).To(Equal(version))
+	})
+
+	It("R05-E2 keeps demotion and protected history independent of blocked prerequisites", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:72"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r05-e2-agent", mac)
+		// Bind, then report installed so the worker reaches Ready.
+		step()
+		installed := getAgent(agent.GetName())
+		Expect(unstructured.SetNestedField(installed.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, installed)).To(Succeed())
+		step()
+		ready := getOrder().Status.Workers[0]
+		Expect(ready.Phase).To(Equal("Ready"))
+		Expect(ready.ReadySince).NotTo(BeNil())
+		createsBefore := len(fc.CreateCalls())
+
+		// Block provisioning prerequisites. Ready demotion still happens on the next
+		// explicit observation and retains identity/history.
+		blocked := getOrder()
+		blocked.Spec.PullSecret = ""
+		Expect(k8sClient.Update(ctx, blocked)).To(Succeed())
+		uninstalled := getAgent(agent.GetName())
+		Expect(unstructured.SetNestedSlice(uninstalled.Object, []interface{}{
+			map[string]interface{}{"type": "Installed", "status": "False"},
+		}, "status", "conditions")).To(Succeed())
+		Expect(k8sClient.Update(ctx, uninstalled)).To(Succeed())
+		step()
+		demoted := getOrder().Status.Workers[0]
+		Expect(demoted.Phase).To(Equal("Binding"))
+		Expect(demoted.BareMetalInstance).To(Equal(old.BareMetalInstance))
+		Expect(demoted.ReadySince).To(Equal(ready.ReadySince))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+
+		// A protected phase is not resurrected from an installed Agent while provider
+		// cleanup is blocked, and its identity/history survive.
+		protected := getOrder()
+		protected.Status.Workers[0].Phase = "Unbinding"
+		protected.Status.Workers[0].AttemptCount = 3
+		protected.Status.Workers[0].LastFailureReason = "previous"
+		Expect(k8sClient.Status().Update(ctx, protected)).To(Succeed())
+		before := getOrder().Status.Workers[0]
+		fc.SetDeleteError(errors.New("provider deletion pending"))
+		step()
+		got := getOrder().Status.Workers[0]
+		Expect(got.Phase).To(Equal("Unbinding"))
+		Expect(got.BareMetalInstance).To(Equal(before.BareMetalInstance))
+		Expect(got.AttemptCount).To(Equal(int32(3)))
+		Expect(got.LastFailureReason).To(Equal("previous"))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+	})
+
+	It("R05-E3 makes no Ready decision from the pre-bind snapshot", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:73"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r05-e3-agent", mac)
+		// The Agent already reports installed before this invocation, but binding is
+		// a separate action and the pre-bind snapshot must not report Ready.
+		Expect(unstructured.SetNestedField(agent.Object, "installed", "status", "debugInfo", "state")).To(Succeed())
+		Expect(k8sClient.Update(ctx, agent)).To(Succeed())
+		createsBefore := len(fc.CreateCalls())
+
+		step()
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Binding"))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+
+		// A fresh invocation observes the labeled installed Agent and reports Ready
+		// without repatching the Agent or allocating again.
+		version := getAgent(agent.GetName()).GetResourceVersion()
+		_, err := run()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Ready"))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+		Expect(getAgent(agent.GetName()).GetResourceVersion()).To(Equal(version))
+	})
 })

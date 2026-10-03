@@ -83,7 +83,7 @@ func sortByDeletionPriority(workers []v1alpha1.WorkerStatus) {
 // retirement intent as Unbinding before shared cleanup may touch infrastructure.
 func (r *Reconciler) handleScaleDown(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
-	workers []v1alpha1.WorkerStatus, excess []v1alpha1.WorkerStatus, observations ...*workerObservation,
+	workers []v1alpha1.WorkerStatus, excess []v1alpha1.WorkerStatus,
 ) []v1alpha1.WorkerStatus {
 	log := ctrllog.FromContext(ctx)
 

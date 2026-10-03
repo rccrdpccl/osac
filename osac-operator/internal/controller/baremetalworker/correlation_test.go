@@ -423,7 +423,7 @@ var _ = Describe("reconcileAgent with transient Agent conflicts", func() {
 
 		agents, err := r.listAgents(context.Background(), co)
 		Expect(err).ToNot(HaveOccurred())
-		workers, result, err := r.reconcileAgent(context.Background(), co, co.Status.Workers, agents)
+		workers, result, err := reconcileAgentStage(r, co, co.Status.Workers, agents)
 		Expect(err).To(HaveOccurred())
 		Expect(workers).To(BeNil())
 		Expect(result).To(BeZero())
@@ -445,7 +445,7 @@ var _ = Describe("reconcileAgent with transient Agent conflicts", func() {
 		agentGPU.SetGroupVersionKind(agentGVK)
 		Expect(baseClient.Get(context.Background(), types.NamespacedName{Name: "agent-gpu", Namespace: namespace}, agentGPU)).To(Succeed())
 		agents.Items = append(agents.Items, *agentGPU)
-		workers, result, err = r.reconcileAgent(context.Background(), co, co.Status.Workers, agents)
+		workers, result, err = reconcileAgentStage(r, co, co.Status.Workers, agents)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(workers).To(HaveLen(2))
 		Expect(workers[0].Phase).To(Equal(workerPhaseBinding), "workers=%+v agents=%+v", workers, agents.Items)
