@@ -369,6 +369,16 @@ Agent with UID/resourceVersion preconditions. It waits for actual old Agent
 removal before requesting infrastructure deletion; it never clears Machine or
 CAP-Agent hooks or decrements NodePool replicas to force a particular worker out.
 
+Agent association is one scoped policy shared by phase projection, late binding
+and cleanup. Each observation stages the union of the InfraEnv registration and
+cluster-order selectors, deduplicated by Kubernetes UID, so a mixed population is
+never truncated to one selector. Readiness and bound deletion use only a unique
+compatible established worker-name binding; initial discovery matches an unbound
+compatible Agent and an eligible BMI by inventory NIC MACs only when the match is
+unique in both directions. An already-labelled or bound Agent is never a MAC
+fallback, an incompatible candidate fails closed as an observable error, and
+ambiguity or unreadable inventory never authorizes an Agent patch or deletion.
+
 A BMI Delete response is only a request. Deletion metadata causes a wait, and
 only fresh Get NotFound confirms the recorded incarnation is absent. Until then,
 retry retains the Failed phase and old ID; retirement retains the slot and ID.

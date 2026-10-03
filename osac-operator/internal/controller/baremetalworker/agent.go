@@ -85,58 +85,41 @@ func (r *Reconciler) observeAgentReadiness(
 }
 
 // matchAndBindAgents correlates unbound Agents to BMIs by MAC and performs late binding.
+// It requires a unique unbound compatible candidate in both directions before patching: an
+// Agent matching several workers and several Agents matching one worker are both ambiguous and
+// bind nothing. Incompatible candidates are returned as an error so the blocker is observable.
 // Returns the number of newly bound workers.
 func (r *Reconciler) matchAndBindAgents(
 	ctx context.Context, co *v1alpha1.ClusterOrder,
 	agents *unstructured.UnstructuredList, workers []v1alpha1.WorkerStatus, macs MACResolver,
 ) (int, error) {
+	log := ctrllog.FromContext(ctx)
+	associations := matchUnboundAgents(ctx, co, agents.Items, workers, macs)
 	bound := 0
-	for idx := range agents.Items {
-		agent := &agents.Items[idx]
-		if agent.GetLabels()[workerNameLabel] != "" {
+	for i := range workers {
+		w := &workers[i]
+		association, ok := associations[w.Name]
+		if !ok || association.state == agentAbsent {
 			continue
 		}
-		matched, err := r.matchAndBindAgent(ctx, co, agent, workers, macs)
-		if err != nil {
+		if err := association.err(); err != nil {
 			return bound, err
 		}
-		if matched {
-			bound++
+		if association.state == agentAmbiguous {
+			log.Info("ambiguous Agent association, skipping bind", "worker", w.Name, "reason", association.reason)
+			continue
 		}
+		if err := r.bindAgent(ctx, co, association.agent, w); err != nil {
+			return bound, err
+		}
+		w.Phase = workerPhaseBinding
+		observeCorrelationDuration(tenantOf(co), *w)
+		log.Info("agent correlated", "agent", association.agent.GetName(), "worker", w.Name)
+		r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
+			"agent %s correlated to worker %s", association.agent.GetName(), w.Name)
+		bound++
 	}
 	return bound, nil
-}
-
-// matchAndBindAgent matches a single Agent to a BMI by MAC, then binds it.
-// Returns true if a worker was successfully bound.
-func (r *Reconciler) matchAndBindAgent(
-	ctx context.Context, co *v1alpha1.ClusterOrder,
-	agent *unstructured.Unstructured, workers []v1alpha1.WorkerStatus, macs MACResolver,
-) (bool, error) {
-	log := ctrllog.FromContext(ctx)
-
-	workerName, isAmbiguous := matchAgentToBMI(ctx, agent, workers, macs)
-	if isAmbiguous {
-		log.Error(nil, "multiple BMIs match agent MAC, skipping bind", "agent", agent.GetName())
-		return false, nil
-	}
-	if workerName == "" {
-		return false, nil
-	}
-
-	worker := workerByName(workers, workerName)
-	if err := r.bindAgent(ctx, co, agent, worker); err != nil {
-		return false, err
-	}
-
-	setWorkerPhase(workers, workerName, workerPhaseBinding)
-	if worker != nil {
-		observeCorrelationDuration(tenantOf(co), *worker)
-	}
-	log.Info("agent correlated", "agent", agent.GetName(), "worker", workerName)
-	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonAgentCorrelated, "CorrelateAgent",
-		"agent %s correlated to worker %s", agent.GetName(), workerName)
-	return true, nil
 }
 
 // bindAgent sets the Agent's clusterDeploymentName (late binding), marks it approved,
@@ -197,8 +180,18 @@ func (r *Reconciler) bindAgent(
 // verifyAgentBinding prevents reassigning an Agent, including when its binding
 // changed after the reconcile snapshot or during an optimistic-lock conflict.
 func verifyAgentBinding(agent *unstructured.Unstructured, co *v1alpha1.ClusterOrder, worker *v1alpha1.WorkerStatus) error {
-	if worker == nil || agent.GetNamespace() != co.Namespace {
+	if worker == nil {
 		return fmt.Errorf("agent %s has no eligible worker in the cluster namespace", agent.GetName())
+	}
+	return agentBindingConflict(agent, co, worker.Name)
+}
+
+// agentBindingConflict reports why an Agent may not be associated with the named worker, or nil
+// when the ownership/binding contract permits it. Observation, late binding and cleanup share it
+// so every consumer applies the same namespace, cluster and binding scope rules.
+func agentBindingConflict(agent *unstructured.Unstructured, co *v1alpha1.ClusterOrder, workerName string) error {
+	if agent.GetNamespace() != co.Namespace {
+		return fmt.Errorf("agent %s is outside cluster namespace %s", agent.GetName(), co.Namespace)
 	}
 	labels := agent.GetLabels()
 	for _, key := range []string{clusterOrderLabel, "osac.openshift.io/clusterorder"} {
@@ -206,7 +199,7 @@ func verifyAgentBinding(agent *unstructured.Unstructured, co *v1alpha1.ClusterOr
 			return fmt.Errorf("agent %s belongs to another cluster", agent.GetName())
 		}
 	}
-	if labels[workerNameLabel] != "" && labels[workerNameLabel] != worker.Name {
+	if labels[workerNameLabel] != "" && labels[workerNameLabel] != workerName {
 		return fmt.Errorf("agent %s belongs to another worker", agent.GetName())
 	}
 	name, _, _ := unstructured.NestedString(agent.Object, "spec", "clusterDeploymentName", "name")

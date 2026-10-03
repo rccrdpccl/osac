@@ -144,6 +144,30 @@ recording the recreated InfraEnv UID even though the create input cannot resolve
 The Envtest traces invoke `Reconcile` directly, so they do not establish manager
 watch delivery or deployed Assisted Service behavior; those remain with
 [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843).
+Agent association is one scoped policy shared by phase projection, late binding
+and cleanup in `correlation.go`: `agentAssociation` resolves established,
+absent, ambiguous or invalid, and `agentBindingConflict` applies the same
+namespace/cluster/binding checks to observation, mutation and cleanup. Every
+observation stages the union of the InfraEnv registration and cluster-order
+selectors, deduplicated by Kubernetes UID, so a mixed population is never
+truncated to whichever selector matched first and a failed selector List makes
+the observation unknown rather than partial absence evidence. Readiness and bound
+deletion use only a unique compatible established worker-name binding; initial
+discovery matches an unbound compatible Agent to an eligible waiting worker by
+inventory NIC MACs only when the match is unique in both directions, and an
+already-labelled or bound Agent is never a MAC fallback. An incompatible
+candidate is returned as an observable error; ambiguity or unreadable inventory
+never authorizes an Agent patch or deletion. `R06-U1–U4` Unit cases in
+`correlation_test.go`, `agent_reconcile_test.go` and `worker_projection_test.go`
+characterize the selector union, duplicate-label and bidirectional MAC
+ambiguity, incompatible/foreign bindings and malformed inventory; `R06-E1–E4`
+Envtest traces in `acceptance/reconciler_test.go` and
+`acceptance/worker_reconcile_test.go` drive public `Reconcile` through real
+UIDs/CRDs for mixed selectors and shared-object deduplication, ambiguity refusal,
+same-name recreation under stale evidence, and binding reconstruction after a
+reconciler restart. Real Assisted Service selector/UID/binding behavior
+(`R06-C1`) and the deployed CaaS create/scale/delete journey (`R06-Q1`) remain
+owned by OSAC-4843/[QE]; no identity or API contract was expanded.
 R03 cleanup Unit tests in `cleanup_test.go`, `retry_test.go` and
 `worker_teardown_test.go` cover delayed/lost Delete acknowledgements, retention
 until fresh Get NotFound, once-only retry scheduling, retirement before cleanup,

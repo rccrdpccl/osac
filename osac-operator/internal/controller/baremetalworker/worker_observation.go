@@ -108,7 +108,6 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 	if err := validateWorkerBMIReferences(co); err != nil {
 		return nil, err
 	}
-	macs := r.workerMACResolver(o)
 	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	for i := 0; i < len(workers); i++ {
 		w := workers[i]
@@ -134,7 +133,11 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 	// The pure helper is the single Agent-phase projection owner; this stage only
 	// supplies the snapshot and never re-derives phases elsewhere.
 	if o.agents != nil {
-		workers = projectAgentWorkerPhases(ctx, workers, o.agents, macs)
+		var err error
+		workers, err = projectAgentWorkerPhases(co, workers, o.agents)
+		if err != nil {
+			return nil, err
+		}
 	}
 	initializeReadySince(workers)
 	// Readiness telemetry belongs to this single projection boundary. It is

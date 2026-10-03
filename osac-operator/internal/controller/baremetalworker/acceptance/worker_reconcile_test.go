@@ -1015,6 +1015,77 @@ var _ = Describe("Unified worker reconciliation", func() {
 		Expect(getAgent(agent.GetName()).GetResourceVersion()).To(Equal(version))
 	})
 
+	It("R06-E3 does not take over a same-name Agent recreated under stale evidence", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:76"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r06-e3-agent", mac)
+		createsBefore := len(fc.CreateCalls())
+
+		// Between the reconciler's observation and its optimistic patch, the Agent is
+		// deleted and replaced by a same-name object with a new UID.
+		recreated := false
+		var replacement *unstructured.Unstructured
+		r = buildReconciler(&agentPatchFaultClient{Client: k8sClient, beforeAgentPatch: func(callbackCtx context.Context, observed *unstructured.Unstructured) error {
+			if recreated {
+				return nil
+			}
+			recreated = true
+			latest := getAgent(observed.GetName())
+			replacement = latest.DeepCopy()
+			Expect(k8sClient.Delete(callbackCtx, latest)).To(Succeed())
+			replacement.SetUID("")
+			replacement.SetResourceVersion("")
+			replacement.SetCreationTimestamp(metav1.Time{})
+			replacement.SetManagedFields(nil)
+			replacement.SetLabels(map[string]string{"osac.openshift.io/cluster-order": co.Name})
+			return k8sClient.Create(callbackCtx, replacement)
+		}})
+		_, err := run()
+		Expect(err).To(HaveOccurred(), "a recreated Agent must not be patched under stale evidence")
+		Expect(recreated).To(BeTrue())
+		Expect(replacement.GetUID()).ToNot(Equal(agent.GetUID()))
+		Expect(getAgent(agent.GetName()).GetLabels()).ToNot(HaveKey("osac.openshift.io/worker-name"))
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+
+		// A fresh reconciler observes the replacement as a new incarnation and binds it.
+		r = buildReconciler(k8sClient)
+		_, err = run()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Binding"))
+		Expect(getAgent(agent.GetName()).GetLabels()).To(HaveKeyWithValue("osac.openshift.io/worker-name", old.Name))
+	})
+
+	It("R06-E4 reconstructs binding from durable Agent evidence after a restart", func() {
+		old := provision()
+		const mac = "aa:bb:cc:dd:ee:77"
+		fc.SetHostMAC(old.BareMetalInstance.ID, mac)
+		agent := registerUnboundAgent(co.Name+"-r06-e4-agent", mac)
+		createsBefore := len(fc.CreateCalls())
+
+		// The Agent patch succeeds but the worker status write is lost.
+		statusErr := errors.New("worker status write interrupted")
+		r = buildReconciler(&workerStatusFaultClient{Client: k8sClient, err: statusErr, fail: func(candidate *api.ClusterOrder) bool {
+			return len(candidate.Status.Workers) > 0 && candidate.Status.Workers[0].Phase == "Binding"
+		}})
+		_, err := run()
+		Expect(err).To(MatchError(statusErr))
+		Expect(getAgent(agent.GetName()).GetLabels()).To(HaveKeyWithValue("osac.openshift.io/worker-name", old.Name))
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		patchedVersion := getAgent(agent.GetName()).GetResourceVersion()
+
+		// A brand-new reconciler with no in-memory association state reconstructs the
+		// Binding from the durable Agent label alone, with no second Agent or BMI patch.
+		r = buildReconciler(k8sClient)
+		_, err = run()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(getOrder().Status.Workers[0].Phase).To(Equal("Binding"))
+		Expect(getOrder().Status.Workers[0].BareMetalInstance).To(Equal(old.BareMetalInstance))
+		Expect(fc.CreateCalls()).To(HaveLen(createsBefore))
+		Expect(getAgent(agent.GetName()).GetResourceVersion()).To(Equal(patchedVersion), "restart must not rebind the Agent")
+	})
+
 	It("R04-E1a retires and cleans up while InfraEnv, image and pull-secret prerequisites are unavailable", func() {
 		provision()
 		latest := getOrder()
