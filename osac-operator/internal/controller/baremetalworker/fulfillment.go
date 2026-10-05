@@ -98,7 +98,7 @@ func NewFulfillmentClient(
 
 // NewFulfillmentClientFromConn wires the production FulfillmentClient from the shared gRPC
 // connection dialed in main(). This is what the reconciler is constructed with.
-func NewFulfillmentClientFromConn(conn *grpc.ClientConn) FulfillmentClient {
+func NewFulfillmentClientFromConn(conn grpc.ClientConnInterface) FulfillmentClient {
 	return NewFulfillmentClient(
 		privatev1.NewBareMetalInstancesClient(conn),
 		privatev1.NewClusterVersionsClient(conn),

@@ -18,7 +18,6 @@ import contextlib
 import json
 import logging
 import os
-from pathlib import Path
 from uuid import uuid4
 
 from tests.e2e.core.fulfillment_trust import assert_cluster_trust
