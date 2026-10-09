@@ -11,7 +11,15 @@ For general AAP configuration see [AAP Configuration](aap-configuration.md).
 
 | `DNS_CLASS` | Collection | Description |
 |-------------|------------|-------------|
-| `dns.route53.dns` (default) | `dns.route53` | AWS Route 53 |
+| `dns.route53.dns` (default) | `dns.route53` | AWS Route 53; creates and deletes records using the configured AWS credentials |
+| `dns.noop.dns` | `dns.noop` | Runtime no-op role; leaves records unchanged, so manage them externally. The current umbrella chart schema does not accept this value; see the [customer guide workaround](../../docs/guides/installation/customer-install-guide.md#84-installing-without-dns-management). |
+
+The `dns.noop.dns` role is present in the AAP runtime, but it cannot currently
+be selected through the chart's `DNS_CLASS` value because the chart schema
+excludes it. Use the documented post-install `cluster-fulfillment-ig`
+`ConfigMap` patch to select it. This limitation does not make AWS credentials
+an install-time requirement: credentials are needed only when Route 53 is used
+to manage records.
 
 ## ConfigMap Variables
 
