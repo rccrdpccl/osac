@@ -319,6 +319,35 @@ if changed "$@"; then echo yes; else echo no; fi
         self.assertTrue(any(step.get("uses") == "./.github/actions/setup-python" for step in steps))
         self.assertTrue(any("agentic-ci-validation-smoke.py" in step.get("run", "") for step in steps))
 
+    def test_build_filters_cover_the_operator_replace_cycle(self) -> None:
+        """A go.mod bump in one operator must build and unit test the other.
+
+        The two operators replace each other's module locally (a replace
+        cycle in their go.mod; osac-operator also replaces ../proto), and
+        the build-* filters are the only PR-time gating for their unit
+        tests -- neither has a unit leg in ci-tests.yml. PR #1763 bumped
+        prometheus/client_golang in osac-operator only; the BMF operator's
+        go.mod went stale and `make fmt` failed (fixed by PR #1811)
+        because its build filter never matched osac-operator paths.
+        """
+        filters = yaml.safe_load((ROOT / ".github/filters/ci-filters.yml").read_text())
+        expected = {
+            "build-osac-operator": ("osac-operator", "bare-metal-fulfillment-operator", "proto"),
+            "build-bare-metal-fulfillment-operator": ("bare-metal-fulfillment-operator", "osac-operator"),
+        }
+        for name, trees in expected.items():
+            with self.subTest(filter=name):
+                patterns = filters[name]
+                self.assertGreater(len(patterns), 1)
+                alternatives = patterns[0].strip("{}").split(",")
+                for tree in trees:
+                    self.assertIn(f"{tree}/**", alternatives)
+                    # Ownership, license and docs-only changes must not build images.
+                    for excluded in ("OWNERS", "LICENSE", "**/*.md", "docs/**"):
+                        self.assertIn(f"!{tree}/{excluded}", patterns)
+                for workspace_file in ("go.work", "go.work.sum"):
+                    self.assertIn(workspace_file, alternatives)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

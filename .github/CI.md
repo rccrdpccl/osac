@@ -44,8 +44,8 @@ change also runs `pre-commit` and `dependency-review`. `ci-tests.yml` and `filte
 | Directory | Required parts of `CI` |
 |---|---|
 | `fulfillment-service/` | Go and proto checks, Python checks, unit tests, integration test, Helm chart lint |
-| `osac-operator/` | unit tests and image build, integration test, Helm chart lint and CRD sync |
-| `bare-metal-fulfillment-operator/` | unit tests and image build, integration test, Helm chart lint and CRD sync |
+| `osac-operator/` | unit tests and image build, integration test, Helm chart lint and CRD sync; also the BMF operator's unit tests and image build (the two operators replace each other's module locally) |
+| `bare-metal-fulfillment-operator/` | unit tests and image build, integration test, Helm chart lint and CRD sync; also the osac-operator unit tests and image build (mutual local replace) |
 | `osac-aap/` | `ansible-lint`, integration test, Helm chart lint |
 | `osac-installer/` | integration test, Helm chart lint |
 | `osac-metering/` | unit tests (service, adapters, schema), Helm chart lint |

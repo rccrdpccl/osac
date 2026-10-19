@@ -286,24 +286,51 @@ fulfillment-service-checks:
   - '!fulfillment-service/**/*.md'
   - '!fulfillment-service/docs/**'
 
-# Gates build-image.yaml.
+# Gates build-image.yaml. osac-operator's go.mod replaces
+# ../bare-metal-fulfillment-operator and ../proto, and its `make test`
+# compiles packages from both (the local-replace cycle also documented at
+# the unit/integration legs below): a dependency bump merged into either of
+# those modules alone leaves osac-operator's go.mod/go.sum stale and
+# `make fmt` failing, so a change under either tree must build and unit
+# test osac-operator too. go.work/go.work.sum for the same reason as every
+# other Go component's filter.
 build-osac-operator:
-  - '{osac-operator/**,.github/workflows/build-image.yaml}'
+  - '{osac-operator/**,bare-metal-fulfillment-operator/**,proto/**,go.work,go.work.sum,.github/workflows/build-image.yaml}'
   - '!osac-operator/OWNERS'
   - '!osac-operator/LICENSE'
   - '!osac-operator/**/*.md'
   - '!osac-operator/docs/**'
+  - '!bare-metal-fulfillment-operator/OWNERS'
+  - '!bare-metal-fulfillment-operator/LICENSE'
+  - '!bare-metal-fulfillment-operator/**/*.md'
+  - '!bare-metal-fulfillment-operator/docs/**'
+  - '!proto/OWNERS'
+  - '!proto/LICENSE'
+  - '!proto/**/*.md'
+  - '!proto/docs/**'
 
 # Gates build-bmf-image.yaml. The workflow file itself is folded into the
 # brace-alternation entry: as a second bare positive entry it would make the
 # filter unsatisfiable under 'every' (no file is both under
 # bare-metal-fulfillment-operator/** and the workflow file).
+# bare-metal-fulfillment-operator's go.mod replaces ../osac-operator and
+# ../osac-operator/api and compiles their packages in `make test`, so an
+# osac-operator change must also build and unit test the BMF operator: the
+# client_golang bump merged into osac-operator alone (#1763) left this
+# module's go.mod stale and `make fmt` failing until #1811 tidied it,
+# because this filter never matched osac-operator paths. proto stays out:
+# no proto package is in this module's compile closure. go.work/go.work.sum
+# for the same reason as every other Go component's filter.
 build-bare-metal-fulfillment-operator:
-  - '{bare-metal-fulfillment-operator/**,.github/workflows/build-bmf-image.yaml}'
+  - '{bare-metal-fulfillment-operator/**,osac-operator/**,go.work,go.work.sum,.github/workflows/build-bmf-image.yaml}'
   - '!bare-metal-fulfillment-operator/OWNERS'
   - '!bare-metal-fulfillment-operator/LICENSE'
   - '!bare-metal-fulfillment-operator/**/*.md'
   - '!bare-metal-fulfillment-operator/docs/**'
+  - '!osac-operator/OWNERS'
+  - '!osac-operator/LICENSE'
+  - '!osac-operator/**/*.md'
+  - '!osac-operator/docs/**'
 
 # Gates ansible-lint.yml.
 ansible-osac-aap:
