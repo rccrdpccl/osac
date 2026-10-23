@@ -36,6 +36,23 @@ configAsCode:
   eeImagePull: ""
   projectGitUri: ""
   projectGitBranch: ""
+  # Frozen playbook archive: when set, config-as-code creates the Controller
+  # project with scm_type: archive (AAP fetches and unpacks a tarball over
+  # HTTP) instead of cloning projectGitUri, so playbook content comes from
+  # this archive exactly as built -- no git dependency at deploy time.
+  projectArchive:
+    # External URL of a tar.gz containing the playbooks (e.g. an artifact
+    # server). Takes precedence over data when both are set.
+    uri: ""
+    # base64-encoded tar.gz with the osac-aap/ tree (top-level osac-aap/
+    # directory preserved: job template playbook paths are osac-aap/...).
+    # When set without uri, the chart serves the tarball from an in-cluster
+    # ConfigMap-backed HTTP server and points AAP_PROJECT_ARCHIVE_URI at it.
+    data: ""
+    # Image used by the in-cluster archive server; must provide python3.12
+    # at /usr/bin/python3.12 (the OSAC execution environment does). Defaults
+    # to bootstrap.image when empty.
+    image: ""
   manifest:
     create: false
     data: {}

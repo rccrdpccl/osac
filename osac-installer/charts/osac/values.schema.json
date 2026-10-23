@@ -1275,6 +1275,25 @@
               "type": "string",
               "description": "Git branch for config-as-code project"
             },
+            "projectArchive": {
+              "type": "object",
+              "description": "Frozen playbook archive served to the AAP Controller project instead of a git clone. Development and CI value: not operator-facing in the Enclave Wizard (the data field carries a large generated blob).",
+              "properties": {
+                "uri": {
+                  "type": "string",
+                  "description": "External URL of a tar.gz containing the playbooks; takes precedence over data"
+                },
+                "data": {
+                  "type": "string",
+                  "description": "base64-encoded tar.gz with the osac-aap/ tree; served in-cluster when uri is empty"
+                },
+                "image": {
+                  "type": "string",
+                  "description": "Image for the in-cluster archive server (needs python3.12); defaults to aap.bootstrap.image"
+                }
+              },
+              "additionalProperties": false
+            },
             "eeImagePull": {
               "type": "string",
               "description": "Execution environment image pull specification for config-as-code"

@@ -271,6 +271,18 @@ the certificate. The Kind
 `SUITE=fulfillment` target exercises deployed startup and API behavior, subject
 to the profile's configured CA and enabled services.
 
+The `make aap-archive-render-test` Helm contract renders the frozen AAP
+playbook archive in all value states. It asserts that the default keeps the
+git project variables, that `aap.configAsCode.projectArchive.data` renders
+the in-cluster ConfigMap, Deployment, and Service plus the
+`AAP_PROJECT_ARCHIVE_URI` secret entry pointing at the Service URL, that an
+explicit `uri` suppresses the server and wins over `data`, that oversized
+`data` fails at render time with the ConfigMap-limit guard, and that the
+umbrella chart's values schema accepts the field. It checks rendered
+manifests only; a deployed archive fetch by AAP Controller and the resulting
+`scm_type: archive` project sync are covered by the Ansible config-as-code
+contract targets in [osac-aap](#osac-aap), not by this render test.
+
 ### OSAC-5343 deployed enablement coverage
 
 The release E2E path adds these assertions to existing user journeys. The

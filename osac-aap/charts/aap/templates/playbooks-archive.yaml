@@ -1,0 +1,118 @@
+{{- /*
+Frozen playbook archive server.
+
+Rendered when aap.configAsCode.projectArchive.data is set and no explicit
+projectArchive.uri overrides it. The base64 tarball is stored in a ConfigMap
+(kept under the 1 MiB limit by the guard below) and served over HTTP by a
+single-replica python http.server pod, so the AAP Controller project
+(scm_type: archive) can fetch it without any external dependency. The URI
+handed to config-as-code is rendered by config-as-code-secret.yaml and must
+match the Service name and port below.
+*/ -}}
+{{- $archive := .Values.configAsCode.projectArchive | default dict }}
+{{- if and $archive.data (not $archive.uri) }}
+{{-   if gt (len $archive.data) 1300000 }}
+{{-     fail "aap.configAsCode.projectArchive.data is too large: the decoded tarball must stay under the 1 MiB ConfigMap limit (base64 input over ~1.3 MB). Exclude vendor/, tests/, .venv/, execution-environment/, and charts/ from the archive, or host the tarball externally and set projectArchive.uri instead." }}
+{{-   end }}
+{{-   $serverImage := $archive.image | default .Values.bootstrap.image }}
+{{-   if not $serverImage }}
+{{-     fail "aap.configAsCode.projectArchive.data requires projectArchive.image or bootstrap.image to be set (the server image must provide /usr/bin/python3.12)." }}
+{{-   end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-playbooks
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+    osac.openshift.io/project: osac-aap
+binaryData:
+  osac-aap.tgz: {{ $archive.data | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-playbooks
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+    osac.openshift.io/project: osac-aap
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "osac-aap.selectorLabels" . | nindent 6 }}
+      osac.openshift.io/project: osac-aap
+  template:
+    metadata:
+      labels:
+        {{- include "osac-aap.selectorLabels" . | nindent 8 }}
+        osac.openshift.io/project: osac-aap
+    spec:
+      containers:
+        - name: serve
+          image: {{ $serverImage }}
+          command:
+            - /usr/bin/python3.12
+            - -m
+            - http.server
+            - "8080"
+            - --directory
+            - /srv
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: playbooks
+              mountPath: /srv
+              readOnly: true
+      volumes:
+        - name: playbooks
+          configMap:
+            name: {{ include "osac-aap.fullname" . }}-playbooks
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-playbooks
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+    osac.openshift.io/project: osac-aap
+spec:
+  selector:
+    {{- include "osac-aap.selectorLabels" . | nindent 4 }}
+    osac.openshift.io/project: osac-aap
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- end }}

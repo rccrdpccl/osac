@@ -45,6 +45,52 @@ Instance group ConfigMaps and Secrets are managed by the osac-aap subchart
 via Helm values under `aap.instanceGroups.*`. Configure them in your values
 file and they are applied during `make install-osac`.
 
+## Frozen Playbook Archive
+
+By default the AAP Controller project clones `aap.configAsCode.projectGitUri`
+(`https://github.com/osac-project/osac`, branch `main`) at deploy time, so
+the playbooks that run are whatever that ref holds. Setting
+`aap.configAsCode.projectArchive` switches the project to AAP's archive SCM
+type instead: AAP fetches a tarball over HTTP and unpacks it, with no git
+dependency.
+
+Two forms are supported:
+
+| Value | Behavior |
+|-------|----------|
+| `aap.configAsCode.projectArchive.uri` | URL of an externally hosted `tar.gz` (e.g. an artifact server). No extra resources are created. |
+| `aap.configAsCode.projectArchive.data` | base64-encoded `tar.gz` of the `osac-aap/` tree. The chart stores it in a ConfigMap and serves it from an in-cluster `<fullname>-playbooks` HTTP server, then points `AAP_PROJECT_ARCHIVE_URI` at that Service. |
+
+When both are set, `uri` wins. The archive must preserve the top-level
+`osac-aap/` directory: job template playbook paths are
+`osac-aap/playbook_osac_*.yml`. The `osac.*` collections under
+`osac-aap/collections/` must be included — playbook-adjacent collection
+resolution makes the project copy shadow the execution environment's baked-in
+copies. `vendor/`, `tests/`, `.venv/`, and `execution-environment/` are
+runtime-irrelevant and excluded by the build script.
+
+The `dev` profile on OpenShift builds this archive from the **working tree**
+(committed or not) automatically:
+
+```bash
+make install-osac PLATFORM=openshift PROFILE=dev NS=osac
+# AAP playbooks: serving frozen working-tree archive /tmp/osac-aap-playbooks-*.b64
+```
+
+Opt in or out for any profile with `AAP_PROJECT_ARCHIVE=true|false`. The
+archive stays under the 1 MiB ConfigMap limit (enforced at render time); for
+larger content, host the tarball externally and set
+`aap.configAsCode.projectArchive.uri` instead. To build the archive by hand:
+
+```bash
+scripts/build-aap-playbooks-archive.sh /tmp/osac-aap.b64
+helm ... --set-file aap.configAsCode.projectArchive.data=/tmp/osac-aap.b64
+```
+
+The archive server image defaults to `aap.bootstrap.image` (the OSAC EE,
+which ships python3.12); override with
+`aap.configAsCode.projectArchive.image` if needed.
+
 ## ConfigMap Variables
 
 | Variable | Default | Description |

@@ -29,6 +29,14 @@ SHELL := /usr/bin/env bash -o pipefail
 
 # Extra helm --set/--set-string args appended to the OSAC chart command.
 EXTRA_HELM_ARGS ?=
+
+# Serve the AAP Controller project from a frozen playbook archive built from
+# the working tree (osac-aap/) instead of cloning aap.configAsCode.projectGitUri
+# at deploy time. Defaults on for the dev profile on OpenShift (the only dev
+# combination deploying chart-managed AAP); opt in or out anywhere with
+# AAP_PROJECT_ARCHIVE=true/false.
+AAP_PROJECT_ARCHIVE ?= $(if $(and $(filter dev,$(PROFILE)),$(filter openshift,$(PLATFORM))),true,false)
+
 FULFILLMENT_GINKGO_ARGS ?=
 MCP_TEST_ENABLED ?= false
 
@@ -386,6 +394,11 @@ ifneq ($(PLATFORM),kind)
 	$(eval DOMAIN := $(shell oc get ingresses.config/cluster -o jsonpath='{.spec.domain}'))
 	@[ -n "$(DOMAIN)" ] || { echo "ERROR: Could not determine cluster domain. Is oc logged in?" >&2; exit 1; }
 endif
+ifeq ($(AAP_PROJECT_ARCHIVE),true)
+	$(eval AAP_ARCHIVE_B64 := $(shell scripts/build-aap-playbooks-archive.sh))
+	$(eval INSTANCE_HELM_ARGS += --set-file aap.configAsCode.projectArchive.data=$(AAP_ARCHIVE_B64))
+	@echo "AAP playbooks: serving frozen working-tree archive $(AAP_ARCHIVE_B64)"
+endif
 	@helm upgrade --install osac $(OSAC_CHART) \
 		-f $(INSTANCE_VALUES) $(INSTANCE_VALUES_EXTRA) \
 		--namespace $(NS) --create-namespace \
@@ -684,6 +697,10 @@ dev-full-render-test: helm-deps helm-infra-deps ## Check dev-full TLS and Helm p
 openbao-security-context-test: helm-infra-deps ## Check OpenBao securityContext renders numeric UID on Kind, omits on OpenShift
 	./scripts/test-openbao-security-context.sh
 
+.PHONY: aap-archive-render-test
+aap-archive-render-test: helm-deps ## Check frozen AAP playbook archive rendering and schema
+	./scripts/test-aap-archive-render.sh
+
 .PHONY: kind-runtime-test
 kind-runtime-test: ## Check Kind runtime, sudo, image loading, and cluster cleanup with command stubs
 	python3 scripts/test-kind-runtime.py
@@ -693,7 +710,7 @@ bmf-netbox-render-test: helm-deps ## Check NetBox, Metal3 management, and Secret
 	uv run --project .. python scripts/test-bmf-netbox-render.py
 
 .PHONY: helm-validate
-helm-validate: helm-lint csi-render-test helm-networking-test fulfillment-trust-render-test fulfillment-auth-test metering-auth-render-test mce-render-test dev-full-render-test openbao-security-context-test bmf-netbox-render-test ## Validate all charts (lint + template)
+helm-validate: helm-lint csi-render-test helm-networking-test fulfillment-trust-render-test fulfillment-auth-test metering-auth-render-test mce-render-test dev-full-render-test openbao-security-context-test bmf-netbox-render-test aap-archive-render-test ## Validate all charts (lint + template)
 	@# bmaas-netbox-ci layers bmaas-ci as its base (see the profile-selection
 	@# block); validate the same combination the installer deploys.
 	@for d in values/*/; do \

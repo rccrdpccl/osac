@@ -32,6 +32,14 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
 
 {{/*
+Selector labels
+*/}}
+{{- define "osac-aap.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "osac-aap.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
 AAP instance name
 */}}
 {{- define "osac-aap.instanceName" -}}

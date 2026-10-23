@@ -304,6 +304,18 @@ aap:
     eeImage: ""
     projectGitUri: ""
     projectGitBranch: ""
+    # Frozen playbook archive: when set, the AAP Controller project fetches
+    # this tarball (scm_type: archive) instead of cloning projectGitUri.
+    projectArchive:
+      # External URL of a tar.gz containing the playbooks; takes precedence
+      # over data when both are set.
+      uri: ""
+      # base64-encoded tar.gz with the osac-aap/ tree (top-level osac-aap/
+      # directory preserved). Served in-cluster when uri is empty.
+      data: ""
+      # Image for the in-cluster archive server; must provide python3.12 at
+      # /usr/bin/python3.12. Defaults to aap.bootstrap.image when empty.
+      image: ""
   instanceGroups:
     clusterFulfillment:
       enabled: false
