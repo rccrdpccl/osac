@@ -1,9 +1,23 @@
+.DEFAULT_GOAL := help
+
 IMAGE_NAME ?= osac-dev
 DISTROBOX_NAME ?= osac
 HOME_DIR ?= $(HOME)
 CONTAINER_CMD ?= $(shell command -v podman 2>/dev/null || echo docker)
 DISTROBOX_CONTEXT := tools/distrobox
 ARGS ?=
+
+# Export verbatim: Python translates legacy settings and parses ARGS, not a shell.
+export HUB BM_CNV REMOTE_HOST OSAC_DEV_PLATFORM PULL_SECRET_FILE AAP_LICENSE_FILE
+export SNO_FLAVOR OSAC_DEV_COMMAND ARGS
+
+.PHONY: osac-dev osac-dev-test
+osac-dev: ## Development tool (HUB required; OSAC_DEV_COMMAND=plan; ARGS for CLI overrides)
+	@tools/osac-dev/osac-dev --make-wrapper
+
+osac-dev-test: ## Run development tool Unit and Contract suites (no live cluster)
+	PYTHONPATH=tools/osac-dev python3 -m unittest discover -s tools/osac-dev/tests/unit -p 'test_*.py' -v
+	PYTHONPATH=tools/osac-dev python3 -m unittest discover -s tools/osac-dev/tests/contract -p 'test_*.py' -v
 
 .PHONY: image enter claude stop rm rebuild status help
 

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "cluster_tool": {
+    "repository": "https://github.com/osac-project/cluster-tool.git",
+    "revision": "f9c5469a3b46380f2690854907b42dd61a29f697",
+    "executable_sha256": "78a21dd97f099bb14084e03aa37f7f5a777b832a5120b1a20f6461b58940cb9c"
+  },
+  "cluster_flavor": {
+    "repository": "quay.io/osac-project/cluster-flavors",
+    "tag": "sno-4-22",
+    "digest": "sha256:b3c3ed5cb10151e55474be1ec38a6681716a8de5deef03bfb00af5120e5421fb",
+    "media_type": "application/vnd.oci.image.manifest.v1+json"
+  },
+  "poc_reference": {
+    "repository": "https://github.com/osac-project/osac.git",
+    "revision": "5f8a1beac9927892d8aed7ad7f475cf356815572"
+  }
+}

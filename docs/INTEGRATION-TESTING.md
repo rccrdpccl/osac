@@ -161,6 +161,20 @@ Before opening a pull request:
   there is no owner or ticket, state that explicitly; never claim the boundary
   is covered.
 
+## Development tool
+
+Repository-root `make osac-dev-test` runs `tools/osac-dev/tests/unit` (Unit:
+target/input/platform safety, host/state boundaries, fingerprints, reconciliation)
+and `tools/osac-dev/tests/contract` (Contract: actual Make/launcher forwarding,
+recorded API/native/SSH/Helm calls and release JSON, plus installed Helm offline
+CLI/render checks). `OSAC_DEV_TEST_HELM4` optionally names a second Helm executable.
+The tool [README](../tools/osac-dev/README.md) records the touched boundaries.
+No real cluster, native lifecycle, SSH host, or Helm release is exercised. Those
+component-integration boundaries and deployed CaaS E2E remain unresolved gaps in
+[OSAC-6535](https://issues.redhat.com/browse/OSAC-6535), planned for later tasks;
+separate owning follow-up tickets have not been assigned. Offline tests are
+[DEV] coverage, not live acceptance or [QE] evidence.
+
 ## Agentic CI sandbox
 
 The repository overlay provides early Autofix feedback. It does not replace
