@@ -167,7 +167,13 @@ Repository-root `make osac-dev-test` runs `tools/osac-dev/tests/unit` (Unit:
 target/input/platform safety, host/state boundaries, fingerprints, reconciliation)
 and `tools/osac-dev/tests/contract` (Contract: actual Make/launcher forwarding,
 recorded API/native/SSH/Helm calls and release JSON, plus installed Helm offline
-CLI/render checks). `OSAC_DEV_TEST_HELM4` optionally names a second Helm executable.
+CLI/render checks). The prerequisite Unit cases cover physical-target capability
+union, explicit external-operator version contracts, owned-field drift, and the
+webhook barrier. `tests/contract/test_installer_layers.py` records API/Helm calls
+and renders the hardware-only profile; operand renders require
+`make -C osac-installer helm-infra-deps` first. These internal adapters are not
+operational CLI wiring or real operator/operand readiness evidence.
+`OSAC_DEV_TEST_HELM4` optionally names a second Helm executable.
 The tool [README](../tools/osac-dev/README.md) records the touched boundaries.
 No real cluster, native lifecycle, SSH host, or Helm release is exercised. Those
 component-integration boundaries and deployed CaaS E2E remain unresolved gaps in

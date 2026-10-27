@@ -1,0 +1,34 @@
+# Hardware-only prerequisites. Storage must already be provisioned and verified.
+# Explicit toggles suppress every hub service in both prerequisite charts.
+certManager:
+  enabled: false
+trustManager:
+  enabled: false
+caIssuer:
+  enabled: false
+aapOperator:
+  enabled: false
+keycloak:
+  enabled: false
+kafka:
+  enabled: false
+mce:
+  enabled: false
+cnv:
+  enabled: true
+lvms:
+  enabled: false
+metallb:
+  enabled: false
+bundledPostgres:
+  enabled: false
+bundledVault:
+  enabled: false
+fakeCrds:
+  enabled: false
+envoygateway:
+  enabled: false
+topolvm:
+  enabled: false
+netbox:
+  enabled: false

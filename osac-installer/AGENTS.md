@@ -45,6 +45,7 @@ respective areas.
 
 | Touched area | Required validation | Command / follow-up |
 |---|---|---|
+| Development-tool hardware-only prerequisite profile | Helm contract | From repository root: `make -C osac-installer helm-infra-deps` then `PYTHONPATH=tools/osac-dev python3 -m unittest discover -s tools/osac-dev/tests/contract -p test_installer_layers.py -v`; real operator/operand readiness remains an unresolved [OSAC-6535](https://issues.redhat.com/browse/OSAC-6535) gap with no separate follow-up ticket. |
 | MCE defaults, lifecycle gate, image overrides, or compatibility RBAC | Helm contract | `make mce-render-test` |
 | Kind runtime selection, sudo authentication, image loading, device-mapper permissions, cluster/storage lifecycle, or devstack Helm apply flags | Unit with command stubs | `make kind-runtime-test` |
 | Deployed dev-full OSAC UI Gateway reachability | Component integration | `./scripts/test-ui-gateway.sh` |

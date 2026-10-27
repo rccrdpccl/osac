@@ -10,6 +10,16 @@ creation exists only at the internal adapter boundary. No live acceptance is
 claimed. The PoC is a reference, not a runtime dependency. Full documentation is
 the final planned task. Run `tools/osac-dev/osac-dev plan --help` for current inputs.
 
+Task 4 prerequisite foundations now cover role-capability grouping, explicit
+operator package/channel/catalog/CSV contracts, a cert-manager endpoint/CA and
+server-dry-run admission barrier, and live-owned-field Helm layer inspection.
+The hardware-only installer overlay is
+`osac-installer/values/osac-dev/infra-bm-cnv.yaml`; it requires existing storage.
+These internal adapters are **not yet wired to the operational CLI**. Concrete
+operand/storage health contracts, reviewed operator version/ownership inputs,
+and live readiness/no-op acceptance remain outstanding. No infrastructure
+operation is enabled or claimed by these offline foundations.
+
 ## Native compatibility and gaps
 
 [`dependencies.lock.json`](dependencies.lock.json) records the inspected
@@ -46,7 +56,8 @@ independent and must not require cluster-tool.
 
 Run `make osac-dev-test` for Unit and Contract tests. They exercise selector and
 input safety, recording native/SSH/API/Helm boundaries, Make argument forwarding,
-content identity and reconciliation failures/no-op reruns. Installed Helm runs
+content identity and reconciliation failures/no-op reruns, prerequisite barriers,
+and hardware-only chart rendering. Installed Helm runs
 only offline CLI/render checks; set `OSAC_DEV_TEST_HELM4` to a Helm 4 executable
 to include that version. Release-state JSON fixtures are simulated, not live
 Helm evidence. Real native/SSH/API/release integration and CaaS E2E acceptance
