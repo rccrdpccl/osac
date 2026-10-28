@@ -28,6 +28,20 @@ def test_wait_for_new_vmi_retries_lookup_errors_until_timestamp_changes(monkeypa
     assert k8s.get_vmi_creation_timestamp.call_count == 4
 
 
+def test_wait_for_grpc_security_group_ready_polls_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    grpc = Mock(spec=GRPCClient)
+    grpc.get_security_group.side_effect = [
+        {"object": {"status": {"state": "SECURITY_GROUP_STATE_PENDING"}}},
+        {"object": {"status": {"state": "SECURITY_GROUP_STATE_READY"}}},
+    ]
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+
+    helpers.wait_for_grpc_security_group_ready(grpc=grpc, sg_id="sg-id")
+
+    assert grpc.get_security_group.call_count == 2
+    grpc.get_security_group.assert_called_with(sg_id="sg-id")
+
+
 def test_delete_instance_type_if_present_ignores_not_found() -> None:
     grpc = Mock(spec=GRPCClient)
     grpc.delete_instance_type.side_effect = subprocess.CalledProcessError(

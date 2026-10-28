@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import os
 import re
 import subprocess
@@ -929,6 +930,30 @@ def wait_for_security_group_deletion(*, k8s: K8sClient, name: str) -> None:
 
 
 # Tenant helpers
+
+
+def wait_for_grpc_tenant_default_networking_ready(*, grpc: GRPCClient, name: str) -> None:
+    """Wait for Fulfillment's aggregate networking condition using a private client."""
+
+    def _ready() -> bool:
+        tenants = grpc.list_with_filter(
+            service=f"{PRIVATE_API}.Tenants/List", filter_expr=f"this.metadata.name == {json.dumps(name)}"
+        )
+        return any(
+            condition.get("type") == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY"
+            and condition.get("status") == "CONDITION_STATUS_TRUE"
+            for tenant in tenants
+            for condition in tenant.get("status", {}).get("conditions", [])
+        )
+
+    poll_until(
+        fn=_ready,
+        until=lambda ready: ready,
+        retries=120,
+        delay=5,
+        description=f"Tenant {name} DefaultNetworkingReady=True",
+        retry_on_error=True,
+    )
 
 
 def wait_for_tenant_cr(*, k8s: K8sClient, name: str) -> None:

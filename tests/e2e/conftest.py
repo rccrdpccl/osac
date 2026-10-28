@@ -12,7 +12,7 @@ import pytest
 
 from tests.e2e.core.caas_versions import ensure_caas_disk_image_version
 from tests.e2e.core.grpc_client import PRIVATE_API, GRPCClient
-from tests.e2e.core.helpers import unique_name, wait_for_grpc_subnet_ready, wait_for_tenant_condition
+from tests.e2e.core.helpers import unique_name, wait_for_grpc_tenant_default_networking_ready, wait_for_tenant_condition
 from tests.e2e.core.k8s_client import K8sClient
 from tests.e2e.core.keycloak import get_jwt
 from tests.e2e.core.keycloak_admin import (
@@ -25,7 +25,7 @@ from tests.e2e.core.keycloak_admin import (
 )
 from tests.e2e.core.metering import MeteringCollector
 from tests.e2e.core.osac_cli import OsacCLI
-from tests.e2e.core.runner import env, poll_until, run, run_unchecked
+from tests.e2e.core.runner import env, run, run_unchecked
 
 
 @pytest.fixture(scope="session")
@@ -239,46 +239,16 @@ def caas_disk_image_version(private_grpc: GRPCClient) -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def ensure_tenants(ensure_k8s_only_network_class: None, private_grpc: GRPCClient) -> None:
-    for name in ("tenant1", "tenant2"):
-        private_grpc.ensure_tenant(name=name)
+    """Create both test tenants and wait for their default networking to be ready.
 
-
-@pytest.fixture(scope="session", autouse=True)
-def _wait_for_default_subnets_ready(
-    ensure_jwt_users: None, setup_organization_memberships: None, grpc: GRPCClient
-) -> None:
-    """Wait for tenant-default subnets to reach READY in the fulfillment database.
-
-    Tenant creation triggers the DefaultNetworkingProvisioner which creates a
-    default VirtualNetwork, Subnet, and SecurityGroup in SUBNET_STATE_PENDING.
-    The osac-operator marks the K8s CRs Ready, then the subnet feedback
-    controller syncs that state back to PostgreSQL.  Tests that implicitly
-    reference these subnets (e.g. BareMetalInstance creation inherits the
-    tenant's default subnet) hit FailedPrecondition if the DB update hasn't
-    landed yet.
-
-    Depends on ``ensure_jwt_users`` (which itself depends on ``ensure_tenants``)
-    so that the ``grpc`` client's first call does not trigger JIT user
-    provisioning before ``ensure_jwt_users`` creates the RoleBinding.
-
-    Depends on ``setup_organization_memberships`` so that the Keycloak
-    organization membership is in place before the first JWT is obtained;
-    without it the token may lack the tenant claim and
-    ``list_subnet_ids()`` returns an empty list (``WHERE tenant = $1``
-    receives an empty string).
+    The private API exposes the tenant's aggregate readiness condition without
+    depending on JWT users or organization memberships initialized afterward.
     """
-    # Timeout must exceed 2x the operator's statusPollInterval (30s) to
-    # accommodate two sequential polling cycles (VirtualNetwork -> Subnet).
-    subnet_ids: list[str] = poll_until(
-        fn=lambda: grpc.list_subnet_ids(),
-        until=lambda ids: len(ids) > 0,
-        retries=60,
-        delay=2,
-        description="at least one subnet to appear in gRPC",
-        retry_on_error=True,
-    )
-    for subnet_id in subnet_ids:
-        wait_for_grpc_subnet_ready(grpc=grpc, subnet_id=subnet_id)
+    names = ("tenant1", "tenant2")
+    for name in names:
+        private_grpc.ensure_tenant(name=name)
+    for name in names:
+        wait_for_grpc_tenant_default_networking_ready(grpc=private_grpc, name=name)
 
 
 @pytest.fixture(scope="session", autouse=True)
