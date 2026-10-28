@@ -1,0 +1,4 @@
+# Enable CNV for the recyclable OSAC SNO development cluster.
+cnv:
+  enabled: true
+  channel: stable
