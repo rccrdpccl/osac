@@ -160,6 +160,7 @@ __pycache__
 *.vault
 /osac-aap/.ansible
 /osac-aap/context/
+/osac-aap/execution-environment/context/
 .plugin-cache.yaml
 /osac-aap/charts/*/charts/
 /osac-aap/charts/*/Chart.lock

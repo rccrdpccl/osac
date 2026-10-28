@@ -1,0 +1,15 @@
+# osac-dev overlay: noop DNS backend for CaaS external-access records.
+#
+# The default Route53 backend requires AWS credentials for the
+# box.massopen.cloud zone, which this environment does not have; without
+# them every cluster deprovision job fails at "Delete DNS record via
+# Route 53" and the ClusterOrder finalizers never clear. The workstation
+# reaches the cluster through a private hosts mapping anyway (see
+# tools/osac-dev/osac-dev-e2e.sh), so real DNS records are not consumed here. The
+# noop driver makes the external-access create/delete tasks succeed
+# without managing DNS.
+aap:
+  instanceGroups:
+    clusterFulfillment:
+      config:
+        DNS_CLASS: "dns.noop.dns"

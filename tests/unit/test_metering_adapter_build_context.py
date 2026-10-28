@@ -1,4 +1,4 @@
-"""Keep E2E echo-adapter image builds aligned with their Containerfile."""
+"""Keep E2E and local echo-adapter builds aligned with their Containerfile."""
 
 from __future__ import annotations
 
@@ -21,4 +21,16 @@ def test_echo_adapter_build_uses_repository_root(suite: str) -> None:
     assert len(adapters) == 1
     assert adapters[0]["context"] == "."
     assert (ROOT / adapters[0]["context"] / "go.work").is_file()
+    assert "COPY --chown=1001:0 go.work ./" in (ROOT / CONTAINERFILE).read_text()
+
+
+def test_skaffold_echo_adapter_build_uses_repository_root() -> None:
+    config = yaml.safe_load((ROOT / "skaffold.yaml").read_text())
+    adapters = [artifact for artifact in config["build"]["artifacts"] if artifact["image"] == "metering-echo-adapter"]
+
+    assert len(adapters) == 1
+    adapter = adapters[0]
+    assert adapter["context"] == "."
+    assert adapter["docker"]["dockerfile"] == CONTAINERFILE
+    assert (ROOT / adapter["context"] / "go.work").is_file()
     assert "COPY --chown=1001:0 go.work ./" in (ROOT / CONTAINERFILE).read_text()

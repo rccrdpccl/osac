@@ -47,6 +47,7 @@ respective areas.
 |---|---|---|
 | MCE defaults, lifecycle gate, image overrides, or compatibility RBAC | Helm contract | `make mce-render-test` |
 | Kind runtime selection, sudo authentication, image loading, device-mapper permissions, cluster/storage lifecycle, or devstack Helm apply flags | Unit with command stubs | `make kind-runtime-test` |
+| `install-osac` source-image handoff, shared Helm values/flags, namespace/domain, registry, one-shot/watch parity, fail-fast guards, temporary configuration or graceful signal shutdown | [DEV] Unit/Contract under [OSAC-6091](https://redhat.atlassian.net/browse/OSAC-6091); actual Makefile and adapter with command stubs, no cluster or image build | `make skaffold-deploy-test` and `make kind-runtime-test`; wrapper coverage: root `make osac-dev-test` |
 | Deployed dev-full OSAC UI Gateway reachability | Component integration | `./scripts/test-ui-gateway.sh` |
 | TopoLVM chart dependency download, cache reuse, build scoping, or install preparation | Unit with command stubs | `make kind-runtime-test` |
 | Fulfillment integration report opt-in and output paths | Unit with expanded Makefile commands | `make kind-runtime-test` |

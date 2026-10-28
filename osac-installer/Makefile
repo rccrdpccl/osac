@@ -29,7 +29,7 @@
 SHELL := /usr/bin/env bash -o pipefail
 .SHELLFLAGS := -ec
 
-# Extra helm --set/--set-string args appended to the OSAC chart command.
+# Extra Helm arguments appended to the OSAC chart command (DRY_RUN restricts these).
 EXTRA_HELM_ARGS ?=
 FULFILLMENT_GINKGO_ARGS ?=
 FULFILLMENT_IT_REPORT_DIR ?=
@@ -40,6 +40,11 @@ ifeq ($(MCP_TEST_ENABLED),true)
 MCP_TEST_HELM_ARGS := --set service.mcp.enabled=true --set-string service.mcp.externalHostname=mcp.osac.localhost --set service.mcp.externalPort=8443
 MCP_TEST_URL := https://mcp.osac.localhost:8443
 endif
+# Opt-in source-image deployment; normal installs do not require Skaffold/uv.
+DEV_MODE ?= 0
+SKAFFOLD_MODE ?= run
+OSAC_DEV_REGISTRY ?=
+export SKAFFOLD_MODE OSAC_DEV_REGISTRY
 DRY_RUN ?= 0
 DRY_RUN_HELM_FLAGS := $(filter --%,$(EXTRA_HELM_ARGS))
 DRY_RUN_INVALID_HELM_FLAGS := $(filter-out --set --set-string --set=% --set-string=%,$(DRY_RUN_HELM_FLAGS))
@@ -79,6 +84,22 @@ $(error PROFILE=$(PROFILE) is invalid; must be dev, dev-full, vmaas-ci, bmaas-ci
 endif
 ifndef NS
 $(error NS is required (namespace for OSAC instance, e.g. NS=osac))
+endif
+ifneq ($(filter install install-osac,$(MAKECMDGOALS)),)
+ifneq ($(DEV_MODE),0)
+ifneq ($(DEV_MODE),1)
+$(error DEV_MODE must be 0 or 1)
+endif
+ifneq ($(PLATFORM),openshift)
+$(error DEV_MODE=1 requires PLATFORM=openshift)
+endif
+ifeq ($(DRY_RUN),1)
+$(error DEV_MODE=1 does not support DRY_RUN=1)
+endif
+ifneq ($(strip $(OSAC_CHART_OCI_REF)$(OSAC_CHART_OCI_VERSION)),)
+$(error DEV_MODE=1 requires the local checkout chart)
+endif
+endif
 endif
 ifeq ($(PLATFORM),kind)
 ifeq ($(filter $(PROFILE),dev dev-full),)
@@ -242,6 +263,16 @@ OSAC_HELM_FORCE_CONFLICTS :=
 else
 DEV_FULL_HELM_POST_RENDERER :=
 OSAC_HELM_FORCE_CONFLICTS :=
+endif
+
+OSAC_APPLY := helm upgrade --install
+ifeq ($(DEV_MODE),1)
+OSAC_APPLY := uv run --frozen --project "$(abspath ..)" python scripts/skaffold-deploy.py
+ifneq ($(filter install install-osac,$(MAKECMDGOALS)),)
+ifeq ($(filter $(HELM_MAJOR),3 4),)
+$(error could not determine the Helm version or unsupported major; DEV_MODE=1 requires Helm 3 or 4)
+endif
+endif
 endif
 
 # Container tool and Kind cluster config.
@@ -441,7 +472,11 @@ endif
 
 AAP_LICENSE_FILE ?= values/$(PROFILE)/license.zip
 .PHONY: install-osac
-install-osac: ## Install OSAC instance (PLATFORM= PROFILE= NS= required)
+install-osac: ## Install OSAC instance (PLATFORM= PROFILE= NS= required; DEV_MODE=1 builds with Skaffold)
+ifeq ($(DEV_MODE),1)
+	@command -v uv >/dev/null || { echo "ERROR: DEV_MODE=1 requires uv; run 'make osac-dev-setup'" >&2; exit 1; }
+	@uv run --frozen --project "$(abspath ..)" python scripts/skaffold-deploy.py --check
+endif
 ifdef OSAC_CHART_OCI_REF
 	@[ -n "$(OSAC_CHART_OCI_VERSION)" ] || { echo "ERROR: OSAC_CHART_OCI_VERSION is required when OSAC_CHART_OCI_REF is set" >&2; exit 1; }
 else
@@ -484,7 +519,7 @@ endif
 			--set-string "aap.configAsCode.remoteClusterKubeconfigSecretKey=$${REMOTE_KUBECONFIG_SECRET_KEY}" \
 		); \
 	fi; \
-	helm upgrade --install osac $(if $(OSAC_CHART_OCI_REF),$(OSAC_CHART_OCI_REF) --version $(OSAC_CHART_OCI_VERSION),$(OSAC_CHART)) \
+	$(OSAC_APPLY) osac $(if $(OSAC_CHART_OCI_REF),$(OSAC_CHART_OCI_REF) --version $(OSAC_CHART_OCI_VERSION),$(OSAC_CHART)) \
 		-f $(INSTANCE_VALUES) $(INSTANCE_VALUES_EXTRA) \
 		--namespace $(NS) --create-namespace \
 		--set-string global.osacDeploymentId=$(NS)/osac \
@@ -846,6 +881,10 @@ dev-full-render-test: helm-deps helm-infra-deps ## Check dev-full TLS and Helm p
 .PHONY: openbao-security-context-test
 openbao-security-context-test: helm-infra-deps ## Check OpenBao securityContext renders numeric UID on Kind, omits on OpenShift
 	./scripts/test-openbao-security-context.sh
+
+.PHONY: skaffold-deploy-test
+skaffold-deploy-test: ## Check shared installer/Skaffold configuration with command stubs
+	uv run --frozen --offline --project "$(abspath ..)" python scripts/test-skaffold-deploy.py
 
 .PHONY: kind-runtime-test
 kind-runtime-test: ## Check Kind runtime, sudo, image loading, and cluster cleanup with command stubs

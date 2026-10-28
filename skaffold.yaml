@@ -1,0 +1,87 @@
+# Source-image build and Helm image-substitution mapping for DEV_MODE=1.
+# Do not deploy this template directly: osac-installer/scripts/skaffold-deploy.py
+# supplies the chart, namespace, ordered values and Helm arguments resolved by
+# `make install-osac`. Both one-shot and watch mode use that same adapter.
+# Workstation inputs (KUBECONFIG, DOCKER_HOST, license fetch) are
+# prepared by tools/osac-dev/osac-dev-deploy.sh. OSAC_DEV_REGISTRY selects the
+# registry passed to Skaffold's --default-repo.
+apiVersion: skaffold/v3
+kind: Config
+
+build:
+  # Use the docker CLI (shimmed to podman on this workstation, see
+  # tools/osac-dev/README.md) instead of the Docker Engine API: rootless podman's
+  # compat API cannot build from tar contexts that record the host user's
+  # UID, while the podman CLI handles directory contexts natively.
+  local:
+    useDockerCLI: true
+  artifacts:
+    - image: fulfillment-service
+      context: .
+      docker:
+        dockerfile: fulfillment-service/Containerfile
+    - image: osac-operator
+      context: .
+      docker:
+        dockerfile: osac-operator/Containerfile
+    - image: bare-metal-fulfillment-operator
+      context: .
+      docker:
+        dockerfile: bare-metal-fulfillment-operator/Containerfile
+    - image: metering-service
+      context: .
+      docker:
+        dockerfile: osac-metering/metering-service/Containerfile
+    - image: metering-echo-adapter
+      context: .
+      docker:
+        dockerfile: osac-metering/adapters/Containerfile.echo-adapter
+    - image: osac-csi-driver
+      context: .
+      docker:
+        dockerfile: osac-csi-driver/Containerfile
+    - image: osac-ui
+      context: osac-ui
+      docker:
+        dockerfile: Containerfile
+    # Watch original inputs, not ansible-builder's copies. Regenerate into a
+    # fresh temporary context on every build, including watch-mode rebuilds.
+    - image: osac-aap-ee
+      context: .
+      custom:
+        buildCommand: bash tools/osac-dev/osac-dev-build-ee.sh
+        dependencies:
+          paths:
+            - tools/osac-dev/osac-dev-build-ee.sh
+            - osac-aap/collections/**
+            - osac-aap/vendor/**
+            - osac-aap/execution-environment/execution-environment.yaml
+            - osac-aap/execution-environment/requirements.txt
+
+deploy:
+  # The chart creates many CRD-based resources (AAP, ClusterOrders, ...) that
+  # Skaffold's status checker cannot assess; rely on Helm's own --wait.
+  statusCheck: false
+  helm:
+    releases:
+      - name: osac
+        setValueTemplates:
+          # Branch-built images, Helm "split repository/tag" strategy,
+          # digest-pinned. Artifact names are sanitized (- -> _) in the
+          # template variables.
+          service.images.service.repository: "{{.IMAGE_REPO_fulfillment_service}}"
+          service.images.service.tag: "{{.IMAGE_TAG_fulfillment_service}}@{{.IMAGE_DIGEST_fulfillment_service}}"
+          operator.image.repository: "{{.IMAGE_REPO_osac_operator}}"
+          operator.image.tag: "{{.IMAGE_TAG_osac_operator}}@{{.IMAGE_DIGEST_osac_operator}}"
+          bmf.image.repository: "{{.IMAGE_REPO_bare_metal_fulfillment_operator}}"
+          bmf.image.tag: "{{.IMAGE_TAG_bare_metal_fulfillment_operator}}@{{.IMAGE_DIGEST_bare_metal_fulfillment_operator}}"
+          metering.image.repository: "{{.IMAGE_REPO_metering_service}}"
+          metering.image.tag: "{{.IMAGE_TAG_metering_service}}@{{.IMAGE_DIGEST_metering_service}}"
+          metering.echoAdapter.image.repository: "{{.IMAGE_REPO_metering_echo_adapter}}"
+          metering.echoAdapter.image.tag: "{{.IMAGE_TAG_metering_echo_adapter}}@{{.IMAGE_DIGEST_metering_echo_adapter}}"
+          csiDriver.image.repository: "{{.IMAGE_REPO_osac_csi_driver}}"
+          csiDriver.image.tag: "{{.IMAGE_TAG_osac_csi_driver}}@{{.IMAGE_DIGEST_osac_csi_driver}}"
+          # Single full-reference image values (fqn strategy).
+          ui.images.ui: "{{.IMAGE_FULLY_QUALIFIED_osac_ui}}"
+          aap.bootstrap.image: "{{.IMAGE_FULLY_QUALIFIED_osac_aap_ee}}"
+          aap.configAsCode.eeImage: "{{.IMAGE_FULLY_QUALIFIED_osac_aap_ee}}"

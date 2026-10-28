@@ -725,8 +725,12 @@ fi
                         env=self.env, text=True, capture_output=True, timeout=15,
                     )
                     self.assert_success(result)
-                    commands = [shlex.split(line) for line in result.stdout.replace("\\\n", " ").splitlines()
-                                if line.startswith("helm upgrade --install ")]
+                    # install-osac's Helm command follows the remote-cluster
+                    # argument setup in the same continued shell recipe.
+                    prefix = "helm upgrade --install "
+                    commands = [shlex.split(prefix + line.split(prefix, 1)[1])
+                                for line in result.stdout.replace("\\\n", " ").splitlines()
+                                if prefix in line]
                     self.assertEqual(len(commands), 1, result.stdout)
                     args = commands[0]
                     self.assertEqual(args[3], release)

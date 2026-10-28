@@ -158,7 +158,10 @@ make install-osac  PLATFORM=openshift PROFILE=<profile> NS=<namespace>   # OSAC 
 | `PLATFORM` | `kind` or `openshift` (required) |
 | `PROFILE` | `dev`, `dev-full`, `vmaas-ci`, `bmaas-ci`, `caas-ci`, `full-ci`, or `cudn-evpn-netris-test` (required; `dev-full` is kind only) |
 | `NS` | Target namespace (required) |
-| `EXTRA_HELM_ARGS` | Extra `--set`/`--set-string` args for the OSAC chart only |
+| `EXTRA_HELM_ARGS` | Extra Helm args for the OSAC chart only, including ordered `-f` overlays and `--set`/`--set-string`/`--set-file` overrides; dry run accepts only `--set`/`--set-string` |
+| `DEV_MODE=1` | Opt in to source-image deployment through Skaffold; OpenShift and local checkout charts only, default `0` |
+| `OSAC_DEV_REGISTRY` | Required registry/repository prefix for source-image builds when `DEV_MODE=1` |
+| `SKAFFOLD_MODE` | `run` (default, one-shot) or `dev` (watch), only used with `DEV_MODE=1` |
 | `DRY_RUN=1` | Render all releases from `make install` with `helm template`; no cluster connections or cluster commands are used |
 | `DRY_RUN_CLUSTER_DOMAIN` | Cluster ingress domain required for an OpenShift dry run |
 | `DRY_RUN_OCP_VERSION` | OpenShift major.minor version required for an OpenShift dry run, e.g. `4.20` |
@@ -183,6 +186,48 @@ dev-full host setup script. Since `helm template` does not connect to a cluster,
 no Kubernetes resources are changed. The generated manifests are printed to
 the terminal; `EXTRA_HELM_ARGS` still applies to the OSAC chart. Do not include a
 Helm `--dry-run` flag in `EXTRA_HELM_ARGS`; rendering is intrinsic to this mode.
+
+#### Source-image development deployment (OpenShift)
+
+Normal installation runs Helm directly and requires neither uv nor Skaffold.
+For branch-built images, `DEV_MODE=1` keeps the same preparation (namespace,
+license Secret, PostgreSQL checks and chart dependencies) and swaps only the
+final apply command for a Skaffold adapter. The adapter inherits the selected
+chart, namespace, ordered values files, domain, deployment ID and all Helm
+arguments; the repository's `skaffold.yaml` supplies only builds and image
+substitutions. Skaffold refreshes chart dependencies again on redeployment so
+watch mode does not reuse stale local subcharts.
+
+```bash
+KUBECONFIG=/path/to/hub.kubeconfig \
+OSAC_DEV_REGISTRY=quay.io/example/dev \
+make install-osac PLATFORM=openshift PROFILE=caas-ci NS=osac DEV_MODE=1 \
+  AAP_LICENSE_FILE=/path/to/license.zip
+
+# Same installer configuration, continuous rebuild/redeploy:
+# Add SKAFFOLD_MODE=dev to the command above.
+```
+
+Direct callers must prepare registry authentication and Docker or the Podman
+CLI shim/runtime. Skaffold's AAP EE custom builder regenerates a fresh temporary
+context from the original collection/vendor sources, EE definition and compiled
+requirements before each build; watch mode observes those inputs too. The root
+`make osac-dev-deploy` (and `make osac-dev-dev` for watch) prepares local runtime
+inputs and fetches an absent license before calling this same installer path; see
+[development tooling](../tools/osac-dev/README.md). Infrastructure remains a
+separate prerequisite. The convenience wrapper also selects the existing dev
+noop-DNS overlay; direct callers select overlays explicitly with
+`EXTRA_HELM_ARGS`.
+
+`DEV_MODE=1` requires uv, Skaffold, the Docker CLI and a readable Helm 3/4 version.
+Kind, OCI-chart installation and `DRY_RUN=1` are rejected rather than silently
+changing deployment semantics. The generated configuration is a private
+temporary file, removed after Skaffold exits, including after graceful cleanup
+on Ctrl-C or SIGTERM; relative Helm file arguments keep
+the installer's working directory and license contents are not copied into it.
+Restart watch mode after changing installer arguments or the build template.
+Run the offline handoff tests with `make skaffold-deploy-test` after preparing
+the root Python environment (`uv sync`).
 
 #### Two-cluster VMaaS installation (OpenShift)
 
