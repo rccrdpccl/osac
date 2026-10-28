@@ -43,6 +43,10 @@
 #   OSAC_DEV_KUBECONFIG              kubeconfig path (default ~/.kube/osac-dev.kubeconfig)
 set -euo pipefail
 
+tool_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+template_dir="$tool_dir/templates/bmh"
+node_script_dir="$tool_dir/node-scripts"
+
 OSAC_DEV_KUBECONFIG=${OSAC_DEV_KUBECONFIG:-$HOME/.kube/${DEV_ENV_NAME:-osac}-dev.kubeconfig}
 OSAC_DEV_BMH_COUNT=${OSAC_DEV_BMH_COUNT:-2}
 OSAC_DEV_BMH_NAMESPACE=${OSAC_DEV_BMH_NAMESPACE:-host-inventory}
@@ -80,8 +84,9 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-[[ "$OSAC_DEV_BMH_COUNT" =~ ^[0-9]+$ ]] && ((OSAC_DEV_BMH_COUNT >= 1 && OSAC_DEV_BMH_COUNT <= 15)) || \
+if [[ ! "$OSAC_DEV_BMH_COUNT" =~ ^[0-9]+$ ]] || ! ((OSAC_DEV_BMH_COUNT >= 1 && OSAC_DEV_BMH_COUNT <= 15)); then
     fail "OSAC_DEV_BMH_COUNT must be an integer from 1 through 15 (got: $OSAC_DEV_BMH_COUNT)"
+fi
 [[ "$OSAC_DEV_BMH_TIMEOUT_MIN" =~ ^[1-9][0-9]*$ ]] || \
     fail "OSAC_DEV_BMH_TIMEOUT_MIN must be a positive integer (got: $OSAC_DEV_BMH_TIMEOUT_MIN)"
 [[ "$OSAC_DEV_BMH_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || \
@@ -103,6 +108,17 @@ require_local_command python3
 [[ -f "$OSAC_DEV_KUBECONFIG" ]] || \
     fail "kubeconfig not found at $OSAC_DEV_KUBECONFIG; run 'make osac-dev-kubeconfig' (requires REMOTE_HOST) first"
 export KUBECONFIG="$OSAC_DEV_KUBECONFIG"
+
+# Clean mode only deletes existing resources; it does not need render inputs.
+if [[ "$mode" == create ]]; then
+    for template in namespace network-attachment bmc-secret baremetalhost virtual-host; do
+        [[ -r "$template_dir/$template.yaml.tmpl" ]] || fail "missing BMH template: $template_dir/$template.yaml.tmpl"
+    done
+    for asset in "$tool_dir/osac-dev-render-template.py" \
+            "$node_script_dir/ensure-bmh-bridge.sh" "$node_script_dir/inspect-nics.sh"; do
+        [[ -r "$asset" ]] || fail "missing BMH source file: $asset"
+    done
+fi
 
 # The kubeconfig file is shared with other workflows, and unrelated
 # `oc config` merges can repoint its current-context at a different
@@ -252,186 +268,7 @@ ensure_node_bridge() {
     # script is idempotent and short-circuits when the bridge is already
     # healthy, so re-running it (e.g. between host-creation attempts) is
     # free and never flaps a working bridge.
-    script_b64=$(base64 -w0 <<'NODESCRIPT'
-set -euo pipefail
-nic=$1
-bridge=$2
-
-bridge_ipv4() { ip -4 -o addr show dev "$bridge" 2>/dev/null | awk '{print $4}' | head -1; }
-nic_enslaved() { ip link show "$nic" 2>/dev/null | grep -q "master $bridge"; }
-nic_has_ipv4() { ip -4 -o addr show dev "$nic" 2>/dev/null | grep -q .; }
-
-# Evaluate the bridge configuration; sets state_ok (0/1) and state_reason.
-bridge_state() {
-    state_ok=1
-    state_reason=
-    if ! ip link show "$bridge" &>/dev/null; then
-        state_ok=0
-        state_reason="bridge $bridge does not exist"
-    elif ! nic_enslaved; then
-        state_ok=0
-        state_reason="$nic is not enslaved to $bridge"
-    elif nic_has_ipv4; then
-        state_ok=0
-        state_reason="$nic still carries its own IPv4 address"
-    elif [[ -z "$(bridge_ipv4)" ]]; then
-        state_ok=0
-        state_reason="$bridge has no IPv4 address"
-    fi
-}
-
-bridge_state
-if [[ "$state_ok" == 1 ]]; then
-    echo "node bridge $bridge already healthy over $nic"
-    echo "BRIDGE_IPV4=$(bridge_ipv4 | cut -d/ -f1)"
-    exit 0
-fi
-echo "node bridge needs convergence: $state_reason"
-
-# --- detect NetworkManager --------------------------------------------------
-use_nm=0
-if command -v nmcli >/dev/null 2>&1 && nmcli device show "$nic" >/dev/null 2>&1; then
-    nm_state=$(nmcli -g GENERAL.STATE device show "$nic" 2>/dev/null) || nm_state=
-    if [[ "$nm_state" != *unmanaged* ]]; then
-        use_nm=1
-    fi
-fi
-
-if [[ "$use_nm" == 1 ]]; then
-    # NetworkManager owns the NIC. Converge on an NM-owned bridge so
-    # renewals happen on the bridge and can never steal the uplink.
-
-    # Collect foreign ports (VM taps) on the bridge first: they must
-    # survive both a bridge recreation and NM taking the device over --
-    # NM detaches interfaces it does not know as its own slaves when it
-    # activates the bridge connection, even on a bridge it merely adopted.
-    ports=()
-    if ip link show "$bridge" &>/dev/null; then
-        while IFS= read -r p; do
-            if [[ -n "$p" && "$p" != "$nic" ]]; then
-                ports+=("$p")
-            fi
-        done < <(ls "/sys/class/net/$bridge/brif" 2>/dev/null || true)
-        # An unmanaged externally created bridge cannot be activated on;
-        # delete it and let NM recreate it (collected ports are re-attached
-        # below). A bridge NM already manages -- e.g. through an
-        # auto-created profile -- is kept and taken over in place.
-        bridge_mgmt=$(nmcli -g GENERAL.STATE device show "$bridge" 2>/dev/null) || bridge_mgmt=
-        if [[ "$bridge_mgmt" == *unmanaged* ]]; then
-            ip link del "$bridge"
-        fi
-    fi
-
-    nic_mac=$(cat "/sys/class/net/$nic/address")
-    if ! nmcli con show "$bridge" &>/dev/null; then
-        nmcli con add type bridge ifname "$bridge" con-name "$bridge"
-    fi
-
-    # Copy the NIC connection's IPv4 identity onto the bridge: the same MAC
-    # (a DHCP server keyed on MAC re-issues the same address) and the same
-    # addressing, so DHCP and static profiles both survive the move.
-    v4_method=auto
-    nic_con=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null \
-        | awk -F: -v dev="$nic" '$2 == dev {print $1; exit}') || nic_con=
-    v4_args=()
-    if [[ -n "$nic_con" ]]; then
-        m=$(nmcli -g ipv4.method con show "$nic_con" 2>/dev/null) || m=
-        if [[ "$m" == manual || "$m" == disabled ]]; then
-            v4_method=$m
-        fi
-        for prop in ipv4.addresses ipv4.gateway ipv4.dns; do
-            val=$(nmcli -g "$prop" con show "$nic_con" 2>/dev/null) || val=
-            if [[ -n "$val" ]]; then
-                v4_args+=("$prop" "$val")
-            fi
-        done
-    fi
-    nmcli con mod "$bridge" bridge.mac-address "$nic_mac" \
-        connection.autoconnect yes ipv6.method auto \
-        ipv4.method "$v4_method" "${v4_args[@]}"
-
-    # The NIC becomes a bridge port owned by its own connection profile.
-    slave_con="$bridge-$nic"
-    if ! nmcli con show "$slave_con" &>/dev/null; then
-        nmcli con add type bridge-slave ifname "$nic" master "$bridge" \
-            con-name "$slave_con"
-    fi
-    nmcli con mod "$slave_con" connection.autoconnect yes
-
-    # Demote every connection that is not ours on either device: the
-    # NIC's standalone profile (whose renewal re-asserts the NIC and steals
-    # the uplink) and any foreign profile active on the bridge device
-    # (e.g. an NM auto-created one). The profiles themselves are kept for
-    # a manual revert, but nothing can re-assert them behind our backs.
-    for target_dev in "$bridge" "$nic"; do
-        while IFS= read -r c; do
-            if [[ -n "$c" && "$c" != "$bridge" && "$c" != "$slave_con" ]]; then
-                nmcli con mod "$c" connection.autoconnect no 2>/dev/null || true
-                nmcli con down "$c" 2>/dev/null || true
-            fi
-        done < <(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null \
-            | awk -F: -v dev="$target_dev" '$2 == dev {print $1}')
-    done
-
-    nmcli con up "$bridge" >/dev/null
-    if ! nic_enslaved; then
-        nmcli con up "$slave_con" >/dev/null
-    fi
-    # nmcli may report a controller as activated while it is still waiting
-    # for ports. Default bridge STP takes about 30s before forwarding, then
-    # DHCP needs its own budget (45s on RHCOS). Do not disable STP or declare
-    # failure after 20s while NetworkManager is still converging normally.
-    bridge_wait=120
-    echo "waiting up to ${bridge_wait}s for $bridge uplink and IPv4 (including STP and DHCP)"
-    for ((attempt = 0; attempt < bridge_wait; attempt++)); do
-        bridge_state
-        if [[ "$state_ok" == 1 ]]; then
-            break
-        fi
-        sleep 1
-    done
-
-    # Re-attach preserved VM tap ports to the recreated bridge.
-    for p in "${ports[@]}"; do
-        if ip link show "$p" &>/dev/null; then
-            ip link set "$p" master "$bridge"
-        fi
-    done
-else
-    # No NetworkManager, or it does not manage the NIC: a manual bridge is
-    # stable, nothing re-asserts a profile on the NIC behind its back.
-    ip link add "$bridge" type bridge 2>/dev/null || true
-    ip link set "$bridge" up
-    if ! nic_enslaved; then
-        nic_addrs=$(ip -4 -o addr show dev "$nic" | awk '{print $4}' || true)
-        if [[ -z "$nic_addrs" ]] && ! ip -4 -o addr show dev "$bridge" | grep -q .; then
-            echo "ERROR: no IPv4 address on $nic or $bridge" >&2
-            exit 1
-        fi
-        if [[ -n "$nic_addrs" ]]; then
-            ip addr flush dev "$nic"
-        fi
-        ip link set "$nic" master "$bridge"
-        for addr in $nic_addrs; do
-            ip addr add "$addr" dev "$bridge" 2>/dev/null || true
-        done
-        ip link set "$nic" up
-    fi
-fi
-
-bridge_state
-if [[ "$state_ok" != 1 ]]; then
-    echo "ERROR: node bridge $bridge did not converge: $state_reason" >&2
-    exit 1
-fi
-managed_by=manual
-if [[ "$use_nm" == 1 ]]; then
-    managed_by=NetworkManager
-fi
-echo "node bridge $bridge ready over $nic (managed by: $managed_by)"
-echo "BRIDGE_IPV4=$(bridge_ipv4 | cut -d/ -f1)"
-NODESCRIPT
-)
+    script_b64=$(base64 -w0 "$node_script_dir/ensure-bmh-bridge.sh")
     out=$(oc debug "node/$node" -- chroot /host bash -c \
         "printf %s '$script_b64' | base64 -d | bash -s -- '$OSAC_DEV_BMH_NODE_NIC' '$NODE_BRIDGE'" 2>&1) \
         || {
@@ -528,51 +365,36 @@ ensure_ironic_api() {
 
 ensure_ironic_api "$NODE_BRIDGE_IP"
 
+# Render completely before starting oc: a missing value must not apply a
+# partial manifest. Only explicit arguments are substituted, never shell code
+# or arbitrary environment variables.
+apply_resource_template() {
+    local template=$1 rendered
+    shift
+    rendered=$(python3 "$tool_dir/osac-dev-render-template.py" "$template_dir/$template.yaml.tmpl" \
+        "namespace=$OSAC_DEV_BMH_NAMESPACE" "bridge=$NODE_BRIDGE" \
+        "cpu=$OSAC_DEV_BMH_CPU" "memory=$OSAC_DEV_BMH_MEMORY" \
+        "disk=$OSAC_DEV_BMH_DISK" "storage_class=$OSAC_DEV_BMH_STORAGE_CLASS" "$@") || \
+        fail "could not render BMH template $template"
+    printf '%s\n' "$rendered" | oc apply -f -
+}
+
 # --- namespace ---------------------------------------------------------------
 info "ensuring namespace $OSAC_DEV_BMH_NAMESPACE"
-oc apply -f - <<EOF
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: ${OSAC_DEV_BMH_NAMESPACE}
-EOF
+apply_resource_template namespace
 
 # --- host network NAD ---------------------------------------------------------
 # cniVersion is required by the multus thin CNI conversion on OpenShift
 # (without it every sandbox creation fails with "cannot convert: no valid
 # IP addresses"); no ipam is intended: the VMs DHCP from the lab network.
 info "ensuring host network attachment $NODE_BRIDGE-nad"
-oc apply -f - <<EOF
-apiVersion: k8s.cni.cncf.io/v1
-kind: NetworkAttachmentDefinition
-metadata:
-  name: ${NODE_BRIDGE}-nad
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-spec:
-  config: |
-    {
-      "name": "${NODE_BRIDGE}-nad",
-      "type": "cnv-bridge",
-      "cniVersion": "1.1.0",
-      "bridge": "${NODE_BRIDGE}"
-    }
-EOF
+apply_resource_template network-attachment
 
 # --- per-host helpers ---------------------------------------------------------
 
 apply_bmc_secret() {
     local name=$1
-    oc apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${name}-bmc
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-type: Opaque
-stringData:
-  username: admin
-  password: password
-EOF
+    apply_resource_template bmc-secret "name=$name"
 }
 
 wait_vmbmc_ready() {
@@ -630,28 +452,7 @@ reset_host_for_reuse() {
 apply_bmh() {
     local name=$1 mac=$2
     info "creating BareMetalHost $name"
-    oc apply -f - <<EOF
-apiVersion: metal3.io/v1alpha1
-kind: BareMetalHost
-metadata:
-  name: ${name}
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-  annotations:
-    osac.openshift.io/interface-macs: '{"data-0":"${mac}"}'
-  labels:
-    osac.openshift.io/host-type: default
-spec:
-  online: true
-  bootMACAddress: "${mac}"
-  bootMode: UEFI
-  automatedCleaningMode: metadata
-  rootDeviceHints:
-    deviceName: /dev/vda
-  bmc:
-    address: "redfish-virtualmedia+http://${name}-virtbmc.${OSAC_DEV_BMH_NAMESPACE}.svc.cluster.local:80/redfish/v1/Systems/1"
-    credentialsName: ${name}-bmc
-    disableCertificateVerification: true
-EOF
+    apply_resource_template baremetalhost "name=$name" "mac=$mac"
 }
 
 # Never delete a host a consumer (a provisioned BareMetalInstance) holds.
@@ -680,95 +481,7 @@ for ((i = 1; i <= OSAC_DEV_BMH_COUNT; i++)); do
         VMBMC_EXISTED[$name]=1
     fi
     info "creating virtual host $name (MAC $mac)"
-    oc apply -f - <<EOF
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ${name}-root
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-spec:
-  accessModes:
-  - ReadWriteOnce
-  volumeMode: Block
-  resources:
-    requests:
-      storage: ${OSAC_DEV_BMH_DISK}
-  storageClassName: ${OSAC_DEV_BMH_STORAGE_CLASS}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${name}-bmc
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-type: Opaque
-stringData:
-  username: admin
-  password: password
----
-apiVersion: kubevirt.io/v1
-kind: VirtualMachine
-metadata:
-  name: ${name}
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-spec:
-  runStrategy: Halted
-  template:
-    spec:
-      domain:
-        cpu:
-          cores: ${OSAC_DEV_BMH_CPU}
-        memory:
-          guest: ${OSAC_DEV_BMH_MEMORY}
-        resources:
-          requests:
-            memory: ${OSAC_DEV_BMH_MEMORY}
-            cpu: 500m
-        firmware:
-          bootloader:
-            efi:
-              secureBoot: false
-        devices:
-          disks:
-          - name: rootdisk
-            disk:
-              bus: virtio
-          - name: cdrom
-            cdrom:
-              bus: sata
-          interfaces:
-          - name: default
-            bridge: {}
-            macAddress: "${mac}"
-      volumes:
-      - name: rootdisk
-        persistentVolumeClaim:
-          claimName: ${name}-root
-      networks:
-      - name: default
-        multus:
-          networkName: ${NODE_BRIDGE}-nad
----
-apiVersion: bmc.kubevirt.io/v1beta1
-kind: VirtualMachineBMC
-metadata:
-  name: ${name}
-  namespace: ${OSAC_DEV_BMH_NAMESPACE}
-  annotations:
-    # LVMS scratch-space overhead exceeds CDI's 6% assumption, which makes
-    # same-size ramdisk ISOs fail with "virtual image size is larger than
-    # the reported available storage"; pad the virtual-media DataVolume.
-    bmc.kubevirt.io/datavolume-size-margin: "30"
-spec:
-  virtualMachineRef:
-    name: ${name}
-  authSecretRef:
-    name: ${name}-bmc
-  redfish:
-    virtualMedia:
-      storage:
-        storageClassName: ${OSAC_DEV_BMH_STORAGE_CLASS}
-EOF
+    apply_resource_template virtual-host "name=$name" "mac=$mac"
     wait_vmbmc_ready "$name"
 done
 

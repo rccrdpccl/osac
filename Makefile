@@ -99,6 +99,7 @@ osac-dev-e2e: ## Run selected e2e suites; REMOTE_HOST adds a SOCKS hop for CaaS 
 osac-dev-test: ## Run offline unit and shell contract tests for the osac-dev workflow (remote and localhost targets)
 	@uv run --frozen --offline python osac-installer/scripts/test-skaffold-deploy.py
 	@uv run --frozen --offline python tools/osac-dev/tests/test_osac_dev_ee.py
+	@uv run --frozen --offline python tools/osac-dev/tests/test_osac_dev_bmh_templates.py
 	@python3 tools/osac-dev/tests/test_osac_dev_nic.py
 	@python3 tools/osac-dev/tests/test_osac_dev_bridge.py
 	@python3 tools/osac-dev/tests/test_osac_dev_api_wait.py

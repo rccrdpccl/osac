@@ -1,0 +1,20 @@
+apiVersion: metal3.io/v1alpha1
+kind: BareMetalHost
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  annotations:
+    osac.openshift.io/interface-macs: '{"data-0":"${mac}"}'
+  labels:
+    osac.openshift.io/host-type: default
+spec:
+  online: true
+  bootMACAddress: "${mac}"
+  bootMode: UEFI
+  automatedCleaningMode: metadata
+  rootDeviceHints:
+    deviceName: /dev/vda
+  bmc:
+    address: "redfish-virtualmedia+http://${name}-virtbmc.${namespace}.svc.cluster.local:80/redfish/v1/Systems/1"
+    credentialsName: ${name}-bmc
+    disableCertificateVerification: true

@@ -1,0 +1,87 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${name}-root
+  namespace: ${namespace}
+spec:
+  accessModes:
+  - ReadWriteOnce
+  volumeMode: Block
+  resources:
+    requests:
+      storage: ${disk}
+  storageClassName: ${storage_class}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${name}-bmc
+  namespace: ${namespace}
+type: Opaque
+stringData:
+  username: admin
+  password: password
+---
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+spec:
+  runStrategy: Halted
+  template:
+    spec:
+      domain:
+        cpu:
+          cores: ${cpu}
+        memory:
+          guest: ${memory}
+        resources:
+          requests:
+            memory: ${memory}
+            cpu: 500m
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false
+        devices:
+          disks:
+          - name: rootdisk
+            disk:
+              bus: virtio
+          - name: cdrom
+            cdrom:
+              bus: sata
+          interfaces:
+          - name: default
+            bridge: {}
+            macAddress: "${mac}"
+      volumes:
+      - name: rootdisk
+        persistentVolumeClaim:
+          claimName: ${name}-root
+      networks:
+      - name: default
+        multus:
+          networkName: ${bridge}-nad
+---
+apiVersion: bmc.kubevirt.io/v1beta1
+kind: VirtualMachineBMC
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  annotations:
+    # LVMS scratch-space overhead exceeds CDI's 6% assumption, which makes
+    # same-size ramdisk ISOs fail with "virtual image size is larger than
+    # the reported available storage"; pad the virtual-media DataVolume.
+    bmc.kubevirt.io/datavolume-size-margin: "30"
+spec:
+  virtualMachineRef:
+    name: ${name}
+  authSecretRef:
+    name: ${name}-bmc
+  redfish:
+    virtualMedia:
+      storage:
+        storageClassName: ${storage_class}

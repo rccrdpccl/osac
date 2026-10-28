@@ -764,6 +764,25 @@ attach to them the same way they do to the e2e CI virtual hosts
 inspection imports the Ironic ramdisk ISO into a DataVolume before the VM
 boots (about four minutes end to end for both hosts on osac-dev).
 
+### Source layout
+
+The BMH wrapper keeps orchestration, retry ordering and safety checks in
+`osac-dev-bmh.sh`. Resource definitions live in `templates/bmh/*.yaml.tmpl`:
+namespace, network attachment, BMC Secret, BareMetalHost and the per-host
+PVC/Secret/VM/VirtualMachineBMC stack. `osac-dev-render-template.py` renders
+these files with explicit `KEY=VALUE` arguments using Python's standard
+library. Missing values, malformed placeholders and duplicate keys fail before
+any partial manifest is passed to `oc apply`; substitution never executes shell
+code or implicitly imports environment variables. Defaults and resource wiring
+remain unchanged.
+
+`node-scripts/ensure-bmh-bridge.sh` and `node-scripts/inspect-nics.sh` are ordinary
+Bash source files, directly testable and lintable. They are base64-encoded only
+at the `oc debug` transport boundary because it does not forward local stdin.
+The bridge script receives the NIC and bridge as positional arguments; neither
+script is interpolated as a manifest template. Cleanup needs no template or
+node-script assets.
+
 ### Self-healing and re-runs
 
 `make osac-dev-bmh` is idempotent and safe to re-run at any point; a re-run
@@ -1138,8 +1157,9 @@ Run the offline suite once after a source change:
 make osac-dev-test
 ```
 
-That runs six Python suites (the installer's `test-skaffold-deploy.py`,
-`test_osac_dev_ee.py`, `test_osac_dev_nic.py`, `test_osac_dev_bridge.py`,
+That runs seven Python suites (the installer's `test-skaffold-deploy.py`,
+`test_osac_dev_ee.py`, `test_osac_dev_bmh_templates.py`,
+`test_osac_dev_nic.py`, `test_osac_dev_bridge.py`,
 `test_osac_dev_api_wait.py`, `test_osac_dev_dns.py`) and thirteen shell suites
 (`test-osac-dev-target.sh`, `-setup`, `-dns`, `-workflow`, `-provisioning`,
 `-bootstrap`, `-clusters`, `-install-infra`, `-snapshot`, `-deploy`, `-bmh`, `-e2e`,

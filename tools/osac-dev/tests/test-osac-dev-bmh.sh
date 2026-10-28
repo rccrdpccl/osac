@@ -13,11 +13,14 @@
 # stuck or erroring BareMetalHosts, and a node bridge broken by
 # NetworkManager reclaiming the bridged NIC (healed by re-running the
 # node-bridge ensure, both at startup and between host-creation attempts).
+# Script-payload assertions and template fixtures intentionally contain literal $variables.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 wrapper="$repo/tools/osac-dev/osac-dev-bmh.sh"
 tmpdir=$(mktemp -d)
+trap 'rm -rf -- "$tmpdir"' EXIT
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -261,6 +264,7 @@ case "$cmd" in
             printf '%s' "$b64" | base64 -d > "$FAKE_ROOT/node-script.sh"
         fi
         if grep -q OSAC_NIC_DISCOVERY "$FAKE_ROOT/node-script.sh"; then
+            cp -- "$FAKE_ROOT/node-script.sh" "$FAKE_ROOT/inventory-script.sh"
             printf '%s\n' 'OSAC_NIC_links=[{"ifname":"ens3","link_type":"ether","flags":["UP","LOWER_UP"]},{"ifname":"enp2s0","link_type":"ether","flags":["UP","LOWER_UP"]}]'
             if [[ -e "$FAKE_ROOT/no-lab-nic" ]]; then
                 printf '%s\n' 'OSAC_NIC_addresses=[{"ifname":"ens3","addr_info":[{"family":"inet","scope":"global","local":"192.168.161.10"}]}]'
@@ -387,6 +391,42 @@ if run_wrapper "$CASE_ROOT/out" OSAC_DEV_BMH_TIMEOUT_MIN=0; then
 fi
 assert_contains 'OSAC_DEV_BMH_TIMEOUT_MIN must be a positive integer' "$CASE_ROOT/out"
 [[ ! -s "$CASE_ROOT/commands" ]] || fail 'cluster commands ran with an invalid timeout'
+
+# Missing source assets fail before any cluster command. Clean mode still
+# works from the wrapper alone because it does not render or carry scripts.
+setup_case missing-template
+original_wrapper=$wrapper
+mkdir -p "$CASE_ROOT/tool"
+cp -- "$wrapper" "$CASE_ROOT/tool/osac-dev-bmh.sh"
+wrapper="$CASE_ROOT/tool/osac-dev-bmh.sh"
+if run_wrapper "$CASE_ROOT/out"; then
+    fail 'wrapper accepted a missing resource template'
+fi
+assert_contains 'missing BMH template:' "$CASE_ROOT/out"
+[[ ! -s "$CASE_ROOT/commands" ]] || fail 'cluster commands ran before the template preflight'
+run_wrapper "$CASE_ROOT/clean-out" -- --clean || fail 'cleanup should not require template or script assets'
+wrapper=$original_wrapper
+
+# A rendering error must not feed partial YAML to oc apply. Use a disposable
+# copy so this check never changes the real templates or source scripts.
+setup_case invalid-template
+mkdir -p "$CASE_ROOT/tool"
+for source in osac-dev-bmh.sh osac-dev-render-template.py; do
+    cp -- "$repo/tools/osac-dev/$source" "$CASE_ROOT/tool/$source"
+done
+cp -R -- "$repo/tools/osac-dev/templates" "$repo/tools/osac-dev/node-scripts" "$CASE_ROOT/tool/"
+for source in osac-dev-nic.py osac-dev-provisioning.sh; do
+    ln -s "$repo/tools/osac-dev/$source" "$CASE_ROOT/tool/$source"
+done
+printf '%s\n' 'kind: Namespace' 'metadata:' '  name: ${missing}' > "$CASE_ROOT/tool/templates/bmh/namespace.yaml.tmpl"
+touch "$CASE_ROOT/kvbmc-installed" "$CASE_ROOT/gate-present"
+wrapper="$CASE_ROOT/tool/osac-dev-bmh.sh"
+if run_wrapper "$CASE_ROOT/out"; then
+    fail 'wrapper accepted an incomplete template'
+fi
+assert_contains 'could not render BMH template namespace' "$CASE_ROOT/out"
+assert_not_contains 'oc apply' "$CASE_ROOT/commands"
+wrapper=$original_wrapper
 
 # CNV not being Available fails before the helm install or any apply.
 setup_case cnv-not-ready
@@ -596,6 +636,10 @@ assert_contains 'oc config use-context system:admin' "$CASE_ROOT/commands"
 # the IPv4 identity, falls back to a manual bridge without NM, and
 # short-circuits on an already-healthy bridge.
 [[ -f "$CASE_ROOT/node-script.sh" ]] || fail 'the node-bridge script was not captured'
+cmp -s "$repo/tools/osac-dev/node-scripts/ensure-bmh-bridge.sh" "$CASE_ROOT/node-script.sh" || \
+    fail 'the transported bridge script differs from its readable source'
+cmp -s "$repo/tools/osac-dev/node-scripts/inspect-nics.sh" "$CASE_ROOT/inventory-script.sh" || \
+    fail 'the transported inventory script differs from its readable source'
 assert_contains 'nmcli con add type bridge' "$CASE_ROOT/node-script.sh"
 assert_contains 'type bridge-slave' "$CASE_ROOT/node-script.sh"
 assert_contains 'connection.autoconnect no' "$CASE_ROOT/node-script.sh"
