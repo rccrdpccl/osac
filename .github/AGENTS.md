@@ -75,6 +75,18 @@ Its path filter uses one brace-alternation entry because `predicate-quantifier:
 every` combines separate entries with AND. Keep overlay/helper, test, and Python
 setup paths in that entry. See the [sandbox coverage boundary](../docs/INTEGRATION-TESTING.md#agentic-ci-sandbox).
 
+## Tool pins
+
+A tool version that more than one surface installs lives in one file, not in a
+literal per workflow. Helm is the current example: `.github/helm-version` is
+read by `.github/actions/setup-helm` (and therefore by every job that installs
+Helm), by `tools/osac-dev/osac-dev-setup.sh` and by
+`fulfillment-service/scripts/setup-e2e-tools.sh`. Give a Helm-using job
+`uses: ./.github/actions/setup-helm` after its checkout instead of
+`azure/setup-helm` and a version literal. Rendering parity for a changed
+version is checked per `tools/osac-dev/README.md` ("Helm version") before the
+file changes.
+
 ## Release safety
 
 Nightly builds use provisional `sha-*` image tags while all build, unit,

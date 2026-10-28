@@ -110,7 +110,8 @@ toggles and values to set.
 
 - The OpenShift CLI (`oc`), matching the cluster version. The installation and
   its hooks call `oc` and `kubectl`.
-- Helm 3.8 or later, for OCI registry support.
+- Helm 3.8 or later, for OCI registry support. The installer adapts to Helm 3
+  and Helm 4; CI and the development tooling install `v4.3.1`.
 - The `osac` CLI, latest release, for postinstallation hub registration and
   day-2 operations (see [Section 8.2](#82-installing-the-osac-cli)). Not
   required for the Helm installation.

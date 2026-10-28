@@ -30,6 +30,22 @@ error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# The Helm pin lives in .github/helm-version so this script, make osac-dev-setup
+# and every CI job install one version.
+helm_pinned_version() {
+    local pin_file="${PROJECT_ROOT}/../.github/helm-version" version
+    if [[ ! -r "${pin_file}" ]]; then
+        error "cannot read the Helm version pin at ${pin_file}"
+        exit 1
+    fi
+    version=$(tr -d '[:space:]' <"${pin_file}")
+    if [[ -z "${version}" ]]; then
+        error "the Helm version pin at ${pin_file} is empty"
+        exit 1
+    fi
+    printf '%s\n' "${version}"
+}
+
 check_tool() {
     local tool=$1
     local install_func=$2
@@ -123,10 +139,34 @@ install_kubectl() {
 }
 
 install_helm() {
-    info "Installing Helm..."
+    # Pinned in .github/helm-version, the same file CI installs through
+    # .github/actions/setup-helm and make osac-dev-setup reads: the charts and
+    # the installer Makefile are validated against that version, and an
+    # unpinned installer would silently move to a new major.
+    local version
+    version=$(helm_pinned_version)
+    info "Installing Helm ${version}..."
 
-    # Use the official helm install script
-    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    local os arch archive tmpdir
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    arch=$(uname -m)
+    case "${arch}" in
+        x86_64) arch="amd64" ;;
+        aarch64 | arm64) arch="arm64" ;;
+    esac
+
+    archive="helm-${version}-${os}-${arch}.tar.gz"
+    tmpdir=$(mktemp -d)
+    if ! curl -fsSL -o "${tmpdir}/${archive}" "https://get.helm.sh/${archive}" || \
+        ! tar -xzf "${tmpdir}/${archive}" -C "${tmpdir}"; then
+        rm -rf "${tmpdir}"
+        error "Helm ${version} download failed (${os}-${arch})"
+        exit 1
+    fi
+
+    mkdir -p "${HOME}/.local/bin"
+    install -m 0755 "${tmpdir}/${os}-${arch}/helm" "${HOME}/.local/bin/helm"
+    rm -rf "${tmpdir}"
 
     if command -v helm &> /dev/null; then
         info "Helm installed successfully: $(helm version --short)"

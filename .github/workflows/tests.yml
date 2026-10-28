@@ -117,7 +117,7 @@ jobs:
           install_only: true
       - name: Install Helm
         if: inputs.kind == 'it-fulfillment-service'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        uses: ./.github/actions/setup-helm
       - name: Install infrastructure on Kind
         if: inputs.kind == 'it-fulfillment-service'
         env:
@@ -181,7 +181,7 @@ jobs:
 
       - name: Install Helm
         if: inputs.kind == 'it-osac-operator'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        uses: ./.github/actions/setup-helm
 
       - name: Install ginkgo
         if: inputs.kind == 'it-osac-operator'
@@ -239,7 +239,7 @@ jobs:
 
       - name: Install Helm
         if: inputs.kind == 'it-bare-metal-fulfillment-operator'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+        uses: ./.github/actions/setup-helm
 
       - name: Install ginkgo
         if: inputs.kind == 'it-bare-metal-fulfillment-operator'
@@ -319,9 +319,7 @@ jobs:
 
       - name: Set up Helm
         if: inputs.kind == 'it-osac-aap'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
-        with:
-          version: v3.22.0
+        uses: ./.github/actions/setup-helm
 
       - name: Run integration tests
         if: inputs.kind == 'it-osac-aap'
@@ -348,9 +346,7 @@ jobs:
 
       - name: Set up Helm
         if: inputs.kind == 'it-osac-installer'
-        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
-        with:
-          version: v3.22.0
+        uses: ./.github/actions/setup-helm
 
       - name: Install Kind
         if: inputs.kind == 'it-osac-installer'

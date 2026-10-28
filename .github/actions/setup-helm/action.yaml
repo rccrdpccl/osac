@@ -1,0 +1,55 @@
+#
+# Copyright (c) 2026 Red Hat Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+#
+
+# One Helm version for every surface that installs it: CI jobs call this action,
+# tools/osac-dev/osac-dev-setup.sh and fulfillment-service/scripts/setup-e2e-tools.sh
+# read the same file, so bumping .github/helm-version moves all of them together.
+# Rendering parity for a new pin is checked per tools/osac-dev/README.md
+# ("Helm version") before the file changes.
+name: Setup Helm
+description: Install the Helm version pinned in .github/helm-version
+inputs:
+  version:
+    description: Helm version to install instead of the pin in .github/helm-version
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+  - id: pin
+    shell: bash
+    env:
+      INPUT_VERSION: ${{ inputs.version }}
+      # github.action_path is this action's own directory, so the pin resolves
+      # inside the caller's checkout without depending on its working directory.
+      PIN_FILE: ${{ github.action_path }}/../../helm-version
+    run: |
+      set -euo pipefail
+      version=${INPUT_VERSION:-}
+      if [[ -z ${version} ]]; then
+        if [[ ! -r ${PIN_FILE} ]]; then
+          echo "::error::cannot read the Helm version pin at ${PIN_FILE}"
+          exit 1
+        fi
+        version=$(tr -d '[:space:]' <"${PIN_FILE}")
+      fi
+      if [[ -z ${version} ]]; then
+        echo "::error::the Helm version pin at ${PIN_FILE} is empty"
+        exit 1
+      fi
+      printf 'Installing Helm %s\n' "${version}"
+      printf 'version=%s\n' "${version}" >>"${GITHUB_OUTPUT}"
+  - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
+    with:
+      version: ${{ steps.pin.outputs.version }}
