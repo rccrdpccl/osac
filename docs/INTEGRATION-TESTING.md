@@ -161,6 +161,98 @@ Before opening a pull request:
   there is no owner or ticket, state that explicitly; never claim the boundary
   is covered.
 
+## Development environment tooling (remote host or localhost)
+
+`make osac-dev-test` runs the suites under `tools/osac-dev/tests/` from the
+repository root. These Unit and Contract tests belong to DEV work under
+[OSAC-6091](https://redhat.atlassian.net/browse/OSAC-6091). Every suite runs
+offline and is mode-parameterised: `ssh`, `scp`, `cluster-tool`, `virsh`, `oc`,
+`helm`, `systemctl` and `skaffold` are recording doubles, and each affected
+suite exercises both the remote-host and the localhost target. The EE suite
+also runs an optional real Skaffold dependency-hashing probe when the binary is
+installed, using `build --dry-run` with no daemon, registry or cluster.
+
+| Behavior | Tier | Boundary / dependencies |
+|---|---|---|
+| Target resolution from `REMOTE_HOST` (unset and `localhost` local; any other value, including loopback, remote), rejection of a preset `OSAC_DEV_TARGET`, root and transport guards per mode, host execution/copy/temp-dir/removal/forward operations, DNS helper installation and host address resolution | Unit | `test-osac-dev-target.sh`: actual seam sourced in a fresh process per probe; `ssh`, `scp`, `getent` and `id` doubles; no transport, no root, no mutation |
+| Idempotent prerequisite installation without prompting or `sudo`: workstation scope (pinned Helm install and replacement of a stale version, Skaffold download and verification, `docker`→`podman` shim, rootless socket) always on this machine, cluster-host scope (`dnf` packages, `cluster-tool`) only with root already available there, exact command printed otherwise, `DRY_RUN` plan with no mutation, non-zero exit while anything is still missing | Contract | `test-osac-dev-setup.sh`: actual wrapper in both modes; `dnf`, `rpm`, `curl`, `systemctl`, `ssh`, `sh` and `id` doubles; a restricted `PATH` keeps absent tools genuinely absent; no download, no install and no service change |
+| DNS rendering, namespace-scoped correlation, VIP discovery, clone-scoped foreground service generation, environment/preflight, unchanged PID, API-independent recovery, supervised activation/rollback, migration and baseline cleanup | Unit | `test_osac_dev_dns.py`: real Python/files; systemd, libvirt and API command doubles; no real listener |
+| API readiness after 441 seconds, readiness on rerun without fresh restoration, immediate success and bounded explicit timeouts | Unit | `test_osac_dev_api_wait.py`: actual Bash polling/defaults with virtual time and transport/liveness doubles; no real waits or SSH |
+| Repair missing listeners before kubeconfig/API access, preserve healthy listeners, validate API timeout inputs and fail clearly on repair errors | Contract | `test-osac-dev-install-infra.sh` and `test-osac-dev-dns.sh`: actual wrappers; SSH, API and service commands are recording doubles |
+| Adopt operator-created objects that Helm refuses to import (CRDs and any other kind) and retry `install-infra` (bounded, logged), disabled by `OSAC_DEV_ADOPT_CRDS=0`, in both modes; a failure that is not an ownership conflict, or an adoption that `oc` rejects, is reported as its own cause and keeps the Helm log | Contract | `test-osac-dev-install-infra.sh`: actual wrapper in both modes; `make` double emits Helm's real conflict and unrelated-error messages, `oc label`/`oc annotate` are recorded (and can be made to fail); no cluster |
+| Infrastructure check-only mode verifies expected release versions/status and CNV without repairing drift, rejects invalid flags, and cannot be combined with kubeconfig-only mode | Contract | `test-osac-dev-install-infra.sh`: real installer and JSON checks, recording Helm/API/host doubles; no cluster and no upgrades |
+| All-state release listing uses `--all` only on Helm 3, omits the removed flag on Helm 4, and retains failed/pending release visibility for infra checks and the snapshot platform guard; unreadable versions fail listing | Contract | `test-osac-dev-install-infra.sh` and `test-osac-dev-snapshot.sh`: real shared `osac-dev-helm.sh` helper; strict Helm 3/4 parser/status-filter doubles, JSON checks and recording host/API/stage doubles; no deployed Helm discovery |
+| Infra-only snapshot sequence in both target modes: default builder osac-dev and 200G disks; boot or reuse the selected existing builder without a creation-time flag; refuse validation/flavor name collisions and unreadable host state; reject platform releases before storage/infra changes; grow disks only when needed and skip the entire growth helper when both already meet the target; gate API/node/operator/workload/hook readiness; capture only after health; boot a separate validation clone; verify restored infrastructure and both disk capacities without upgrade or disk-growth repair; retain resources and never publish; stop at every failure | Contract | `test-osac-dev-snapshot.sh`: actual coordinator and target seam; recording stage, `cluster-tool`, `virsh`, Helm, API, root and SSH doubles; no real VM, capture, disk growth or restore |
+| Deploy delegates to `make install-osac DEV_MODE=1`, passes the same noop-DNS overlay in one-shot/watch, prepares local license/runtime without creating a second license Secret, preserves kubeconfig/runtime environment and installer failures | Contract | `test-osac-dev-deploy.sh`: actual wrapper with recording `make` and host/API doubles; direct Skaffold execution fails the test; no cluster or build |
+| Shared installer preparation and source-image handoff: direct Helm default without dev tools; selected chart/namespace/domain/deployment ID, ordered values and opaque Helm overrides, Helm 3/4 flags, registry and one-shot/watch parity, private temporary-file cleanup and failure propagation, graceful SIGINT/SIGTERM forwarding and waiting with the config retained until child cleanup finishes, PostgreSQL prerequisite failure, invalid modes/Kind/OCI/dry-run/missing-tool rejection before deployment | Unit/Contract | `osac-installer/scripts/test-skaffold-deploy.py`, included in root `make osac-dev-test` and installer `make skaffold-deploy-test`: actual Makefile in a disposable checkout and actual adapter, recording Helm/API/Skaffold/uv doubles; real signals to adapter-only and foreground-group targets with a slow cooperative child; no registry, build or deployed Helm behavior |
+| AAP EE source refresh across deployments and watch rebuilds: collection/vendor edits and deletions, watched EE definition/requirements/helper, no generated-context rebuild loop, image tag/platform/push contract, failure propagation and temporary-context removal | Unit/Contract ([DEV] OSAC-6091) | `tools/osac-dev/tests/test_osac_dev_ee.py`, included in root `make osac-dev-test`: real adapter and configured builder in a disposable checkout, recording Skaffold/ansible-builder/Docker doubles with real source copies; optional real Skaffold dry-run verifies dependency hashing; no image build, push, live watcher or deployed AAP behavior |
+| Localhost access setup copies the cluster kubeconfig unchanged, never rewrites the API endpoint or pins TLS SNI, never opens a tunnel, and names the local remedy when the API is unreachable; remote access setup keeps the rewrite, SNI pin and tunnel fallback | Contract | `test-osac-dev-install-infra.sh`: actual wrapper in both modes; `cluster-tool`, `oc`, `python3`/DNS-helper and `id` doubles; kubeconfig files real |
+| Localhost DNS helper installation and action arguments, localhost deploy licence handling (mode 0600, no `scp`), localhost `virsh` disk growth with the clone check and 200 GiB floor, localhost e2e without SOCKS/`HTTPS_PROXY`/`NO_PROXY`/`/etc/hosts` namespace but with a local DNS-timer check | Contract | `test-osac-dev-dns.sh`, `test-osac-dev-deploy.sh`, `test-osac-dev-grow-storage.sh`, `test-osac-dev-e2e.sh`: actual wrappers re-run without `REMOTE_HOST`; failing `ssh`/`scp` doubles prove zero transport calls |
+| Fresh bridge delayed by STP/DHCP, immediate readiness, bounded no-DHCP failure and healthy no-op | Unit | `test_osac_dev_bridge.py`: executes the actual carried node Bash script with NM/ip/clock command doubles; no real node changes |
+| BMH setup failure diagnostics and resource fail-fast behavior | Contract | `test-osac-dev-bmh.sh`: actual wrapper with an oc double; asserts the underlying node error is visible before host creation |
+| Host DNS helper installation, recovery/remove actions, selected-clone teardown, failed helper upload/destruction and repeated cleanup | Contract | `test-osac-dev-dns.sh`, `test-osac-dev-bootstrap.sh`, `test-osac-dev-clusters.sh`: actual wrappers; SSH/helper/cluster-tool are recording doubles |
+| Listeners survive completed/failed/stopped refresh oneshots with stable PIDs; UDP/TCP DNS, DHCP acquisition/renewal, record replacement, rollback, migration, baseline retention and final cleanup | Component integration | Opt-in `test_osac_dev_dns_systemd.py`: real systemd, dnsmasq, lease helper, isolated libvirt networks and DHCP namespaces; Kubernetes/NTP inputs only are simulated |
+| 200 GiB minimum, clone disk resizing, carried guest script and repeated growth | Unit | `test-osac-dev-grow-storage.sh`: actual wrapper and guest Bash script; virsh, oc and guest tools are doubles |
+| Full provisioning order, early failure, test SSH defaults and persistent DNS lifetime | Contract | `test-osac-dev-workflow.sh` and `test-osac-dev-e2e.sh`: actual wrappers with recorded external calls |
+| Remote host operations keep their order and argument quoting, and a dropped SSH connection is reported instead of being mistaken for a missing dependency | Contract | `test-osac-dev-target.sh` and the unchanged remote cases of the bootstrap, clusters, install-infra, dns, grow-storage, deploy and e2e suites; `ssh` exit 255 double |
+
+Helm has one pin for every surface that installs it, `.github/helm-version`:
+`make osac-dev-setup` installs or replaces that version,
+`fulfillment-service/scripts/setup-e2e-tools.sh` installs it, and every CI job
+that installs Helm calls `.github/actions/setup-helm`, which reads the same
+file. `install-osac` selects Helm 3/4 apply flags once; the source-image
+adapter forwards the same flags to Skaffold in one-shot and watch mode.
+The wrapper's pin resolution is covered by
+`test-osac-dev-setup.sh`, which derives its expected version from the file
+rather than repeating it; the evidence for the version itself is the
+render-parity check recorded in
+[`tools/osac-dev/README.md`](../tools/osac-dev/README.md#helm-version).
+
+Snapshot factory component-integration validation is DEV-owned under
+[OSAC-6091](https://redhat.atlassian.net/browse/OSAC-6091): run
+`make osac-dev-snapshot SNAPSHOT_NAME=<new-private-flavor>`
+with the documented `REMOTE_HOST`/pull-secret inputs and a prepared real root
+cluster-tool host, once per target mode. It creates or reuses the selected SNO
+builder and boots a fresh validation SNO, captures both source disks, and exercises API/node/operator/workload/hook readiness plus
+upgrade-free restored release/CNV checks and read-only libvirt disk-capacity
+checks. Host capacity, downloads and registry
+pull credentials are real dependencies, not simulated integration coverage.
+Record actual disk capacity and filesystem/LVMS sizes after booting the new
+flavor, along with checkout revision/local changes. This check does not verify
+all restored Keycloak/OpenBao endpoint identities or tenant connectivity; those
+remain live application checks and the QE-owned CaaS journey below. No offline
+pass implies capture/restore, application, or QE acceptance evidence.
+
+The offline tests do not validate actual daemon lifetimes. The separate
+component-integration command is:
+
+```bash
+sudo env OSAC_DEV_DNS_SYSTEMD_TEST=1 python3 tools/osac-dev/tests/test_osac_dev_dns_systemd.py
+```
+
+It requires a disposable root/systemd host, libvirt with the nftables backend,
+dnsmasq, the lease helper, NetworkManager, `ip`, `nft` and `dig`. It refuses
+fixture name/subnet collisions, checks generated units with `systemd-analyze
+verify`, and samples PID/cgroup ownership and DNS every second for 30 seconds
+after each lifecycle trigger. It is excluded from `make osac-dev-test`; no
+component-integration result is implied by an offline pass. DEV owns this
+lifecycle coverage under OSAC-6091.
+
+Neither suite validates filesystem growth, real NTP reachability or worker
+installation. Deployed coverage uses
+`make osac-dev` followed by `make osac-dev-e2e TESTS="tests/e2e/caas/sanity"`
+with a real cluster-tool host and the documented credentials/prerequisites,
+once per target mode. That cross-component E2E validation belongs to QE.
+Fresh-boot coverage remains a delivery requirement under OSAC-6091; no separate
+owning QE task is currently identified. A source clone that is unavailable
+cannot satisfy that validation.
+
+Unresolved gap for the localhost target: NetworkManager client setup and
+MetalLB VIP reachability have no component-integration tier. The opt-in
+root/systemd suite above needs a disposable host and covers only the host DNS
+helper. Both boundaries are validated only by the deployed localhost run, so no
+offline pass claims them as covered.
+
 ## Agentic CI sandbox
 
 The repository overlay provides early Autofix feedback. It does not replace
@@ -351,6 +443,17 @@ modifying host privileges. It does not exercise real password entry, TopoLVM
 devices, or a deployed KubeVirt installation.
 The chart dependency cases stub Helm; upstream chart downloads are not
 exercised by this unit suite.
+
+The `make -C osac-installer skaffold-deploy-test` Unit/Contract suite belongs
+to DEV work under [OSAC-6091](https://redhat.atlassian.net/browse/OSAC-6091).
+It exercises the actual installer and source-image adapter with recording
+commands, including default direct Helm without dev tools, shared preparation,
+ordered configuration/overrides, Helm 3/4 flags, run/watch parity, registry,
+fail-fast guards and temporary-file security/cleanup. It does not establish
+actual image builds/pushes, deployed Helm ownership, AAP startup, provider
+connectivity or CaaS onboarding. Execute the deployed dev-environment and QE
+CaaS checks described above for those boundaries; an offline pass is not
+that evidence.
 
 The `make fulfillment-trust-render-test` Helm contract renders the production
 umbrella chart with trust enabled and disabled. It asserts the operator trust
@@ -756,8 +859,18 @@ Touched-area requirements: [component guide](../osac-metering/AGENTS.md#integrat
 
 Touched-area requirements: [component guide](../tests/e2e/AGENTS.md#touched-area-map).
 
+Shared tenant setup creates `tenant1` and `tenant2`, then waits for each private
+Fulfillment Tenant's `DefaultNetworkingReady` condition to be true before dependent
+fixtures run. This uses the product's aggregate readiness contract, including
+no-defaults/provider-disabled cases, rather than enumerating Subnets and
+SecurityGroups. Each tenant wait allows 120 API attempts with five-second
+intervals (595 seconds of scheduled sleeps; API calls add time). Missing or false
+conditions and API errors cannot satisfy the gate. Workload Create/reconcile
+behavior is unchanged.
+
 | Tier | Location / command | Exercises for real | Faked or omitted |
 |---|---|---|---|
+| Unit ([DEV], tenant networking setup, [OSAC-6091](https://redhat.atlassian.net/browse/OSAC-6091)) | From the repository root: `uv run pytest -n 0 tests/unit/test_e2e_tenant_setup.py` | Fixture ordering, private tenant-name scoping, exact networking condition, pending/missing/unrelated conditions, ready without individual network queries, API retries, and bounded credential-safe timeout | Private API responses and time are mocked. Collection checks fixture wiring only; neither proves deployed tenant onboarding, network feedback, or provider connectivity. |
 | Unit ([DEV], VMaaS deletion-test finalizer retries) | From the repository root: `uv run pytest -n 0 tests/unit/test_vmaas_deletion_finalizer.py` | Test-helper retry policy: reread versions and finalizers after Aborted, preserve concurrent finalizers, stop after bounded attempts, skip no-op updates, and propagate other errors | gRPC responses and time are mocked; no production behavior changes or deployed deletion coverage. |
 | E2E (VMaaS deletion feedback, [QE] [OSAC-6513](https://redhat.atlassian.net/browse/OSAC-6513)) | From the repository root: `uv run pytest -n 0 tests/e2e/vmaas/regression/test_compute_instance_disk_image.py -k deletion_feedback_with_removed_disk_image` | Deployed Fulfillment/database accept private DELETING feedback carrying the removed DiskImage reference; the operator, AAP, and VM provider remove the ComputeInstance, permitting explicit SecurityGroup, Subnet, and VirtualNetwork deletion | Requires a configured VMaaS template, instance type, storage tier, and networking provider; no deletion completion is mocked. |
 | E2E ([DEV] OSAC-5530 lab journey) | From the repository root: `AAP_PROJECT_GIT_BRANCH=OSAC-5530-subnet-vlan-dhcp AAP_PROJECT_EXPECTED_REVISION=<runtime-sha> bash ./vlan-e2e.sh` | Deployed Fulfillment/database/operator/AAP/SSH/Linux/dnsmasq/Cumulus VX; real DHCP leases from BusyBox clients, gateway pings, same-Subnet L2 across leaves, DHCP restart/renewal, Subnet retry, `/30` single-address allocation, deletion, and cleanup | Uses client containers and virtual switches; it does not establish physical-hardware, BMaaS lease-status, NAT, or full-install CI coverage. A successful run is required to claim deployed behavior. |
