@@ -1,0 +1,183 @@
+# Skaffold pipeline for the OSAC instance (the `osac` Helm release).
+#
+# Do not run this file bare: tools/dev-env/osac.sh computes what Skaffold cannot
+# (namespace, AAP license Secret, chart dependencies, cluster domain) and then
+# execs skaffold with the environment this file templates. Use
+#
+#   make osac-dev-prep       build + push every image, record the tags
+#   make osac-dev-deploy     `skaffold deploy` those tags, wait for the rollout
+#   make osac-dev-watch      prep's build, then rebuild+redeploy on change
+#   make osac-dev            cluster prep, then prep + deploy
+#
+# or, once OSAC_NAMESPACE and OSAC_CLUSTER_DOMAIN are exported,
+# `skaffold dev --default-repo quay.io/<you>` directly.
+#
+# build    every in-tree OSAC image, through the component's own Makefile
+#          (`image-build` + `image-push`, `execution-environment-build` +
+#          `-push` for osac-aap) so the build flags stay owned by the component.
+#          Podman is used because that is each Makefile's default.
+# deps     each artifact's cache key and `dev` watcher inputs are read from its
+#          Containerfile (`dependencies.dockerfile`) and filtered by
+#          .dockerignore, so nothing needs a hand-maintained glob list. A glob
+#          list is only as correct as its last edit, and an under-inclusive one
+#          fails silently: the tag does not change, so a stale image is
+#          deployed and nothing rolls out.
+# push     straight to IMAGE_PREFIX, which osac.sh passes as `--default-repo`:
+#          no in-cluster registry, and no image reference to edit after a build.
+# deploy   `helm upgrade --install osac osac-installer/charts/osac` with
+#          values/full-ci/instance.yaml plus the domain-derived values
+#          `make -C osac-installer install-osac` sets from the live cluster.
+#          `skaffold build` + `skaffold deploy` split is what makes a redeploy
+#          cheap: the second half replays the built tags, Helm --wait included.
+#
+# Phase 1 (osac-deps + osac-infra: CRDs, cert-manager, Keycloak, PostgreSQL,
+# Kafka, Metal3) is NOT part of this file: `make osac-dev` installs it, and
+# `helm upgrade --install` here only refreshes the application layer on top.
+#
+# The osac chart depends on the sibling components through local file:// charts,
+# so osac-installer/charts/osac/charts must be built before Helm renders:
+# osac.sh does that on every deploy, and by hand it is
+#   helm --repository-config /dev/null dependency build osac-installer/charts/osac
+---
+apiVersion: skaffold/v4beta14
+kind: Config
+metadata:
+  name: osac
+
+build:
+  local:
+    # Custom builders push through the component Makefiles, so this only tells
+    # Skaffold that the images live in a registry ($PUSH_IMAGE=true).
+    push: true
+    concurrency: 2
+  tagPolicy:
+    # Content-addressed tags: the tag changes exactly when the watched inputs of
+    # an artifact change, which is also what makes the rollouts happen. A
+    # timestamp tagger (dateTime) is the fallback if a rebuild ever fails to
+    # roll a Deployment.
+    inputDigest: {}
+  artifacts:
+    # Inputs come from each Containerfile: Skaffold parses the COPY/ADD sources,
+    # resolves them against the context and filters them with .dockerignore,
+    # which is a symlink to .containerignore so Podman and Skaffold agree on the
+    # context contents. That is tighter than one glob per component: a
+    # fulfillment-service change no longer rebuilds the operator, and a change
+    # under osac-operator/api/ still reaches the services that import it.
+    # osac-aap is the exception (see below).
+    - image: osac-operator
+      context: .
+      custom:
+        buildCommand: 'make -C osac-operator image-build image-push IMG="$IMAGE"'
+        dependencies:
+          dockerfile:
+            path: osac-operator/Containerfile
+    - image: fulfillment-service
+      context: .
+      custom:
+        buildCommand: 'make -C fulfillment-service image-build image-push IMG="$IMAGE"'
+        dependencies:
+          dockerfile:
+            path: fulfillment-service/Containerfile
+    - image: bare-metal-fulfillment-operator
+      context: .
+      custom:
+        buildCommand: 'make -C bare-metal-fulfillment-operator image-build image-push IMG="$IMAGE"'
+        dependencies:
+          dockerfile:
+            path: bare-metal-fulfillment-operator/Containerfile
+    - image: metering-service
+      context: .
+      custom:
+        buildCommand: 'make -C osac-metering/metering-service image-build image-push IMG="$IMAGE"'
+        dependencies:
+          dockerfile:
+            path: osac-metering/metering-service/Containerfile
+    - image: metering-echo-adapter
+      context: .
+      custom:
+        buildCommand: 'make -C osac-metering/adapters image-build-echo-adapter image-push-echo-adapter IMG_ECHO_ADAPTER="$IMAGE"'
+        dependencies:
+          # The adapters directory holds one Containerfile per adapter; this
+          # artifact builds the echo one.
+          dockerfile:
+            path: osac-metering/adapters/Containerfile.echo-adapter
+    - image: osac-ui
+      context: .
+      custom:
+        buildCommand: 'make -C osac-ui image-build image-push IMG="$IMAGE"'
+        dependencies:
+          dockerfile:
+            path: osac-ui/Containerfile
+    # Ansible execution environment: ansible-builder generates its own
+    # Containerfile in a temporary context, so there is nothing here for
+    # `dependencies.dockerfile` to read. The checked-in osac-aap/Containerfile
+    # is the Tekton one, not this build, and it pulls files from external images
+    # (COPY --from=quay.io/...), which dependency resolution would try to
+    # resolve through the registry. Watch the component directory instead.
+    # Slowest artifact by far (~minutes); drop it while iterating on the Go
+    # services.
+    - image: osac-aap
+      context: .
+      custom:
+        buildCommand: 'make -C osac-aap execution-environment-build execution-environment-push IMG="$IMAGE"'
+        dependencies:
+          paths:
+            - osac-aap/**
+
+deploy:
+  # The chart creates CRDs and other resources Skaffold's status checker cannot
+  # assess; Helm's own --wait is authoritative.
+  statusCheck: false
+  helm:
+    flags:
+      # The osac chart only depends on local file:// charts. Ignore user Helm
+      # repositories so resolution never reaches the network, exactly like
+      # install-osac does.
+      global: [--repository-config, /dev/null]
+      install: [--timeout=40m]
+      upgrade: [--timeout=40m]
+    releases:
+      - name: osac
+        chartPath: osac-installer/charts/osac
+        namespace: "{{.OSAC_NAMESPACE}}"
+        createNamespace: true
+        wait: true
+        valuesFiles:
+          - osac-installer/values/full-ci/instance.yaml
+        setValueTemplates:
+          # What install-osac derives from the live cluster and NS.
+          global.osacDeploymentId: "{{.OSAC_NAMESPACE}}/osac"
+          global.clusterDomain: "{{.OSAC_CLUSTER_DOMAIN}}"
+          service.externalHostname: "fulfillment-api-{{.OSAC_NAMESPACE}}.{{.OSAC_CLUSTER_DOMAIN}}"
+          service.internalHostname: "fulfillment-internal-api-{{.OSAC_NAMESPACE}}.{{.OSAC_CLUSTER_DOMAIN}}"
+          ui.auth.oidcIssuerURL: "https://keycloak-keycloak.{{.OSAC_CLUSTER_DOMAIN}}/realms/osac"
+          ui.externalHostname: "osac-ui-{{.OSAC_NAMESPACE}}.{{.OSAC_CLUSTER_DOMAIN}}"
+          # The images built above. Skaffold sanitizes an artifact name into a
+          # template variable by replacing '-' with '_'; values that hold a full
+          # reference take repository and tag in one string.
+          operator.image.repository: "{{.IMAGE_REPO_osac_operator}}"
+          operator.image.tag: "{{.IMAGE_TAG_osac_operator}}"
+          service.images.service.repository: "{{.IMAGE_REPO_fulfillment_service}}"
+          service.images.service.tag: "{{.IMAGE_TAG_fulfillment_service}}"
+          bmf.image.repository: "{{.IMAGE_REPO_bare_metal_fulfillment_operator}}"
+          bmf.image.tag: "{{.IMAGE_TAG_bare_metal_fulfillment_operator}}"
+          metering.image.repository: "{{.IMAGE_REPO_metering_service}}"
+          metering.image.tag: "{{.IMAGE_TAG_metering_service}}"
+          metering.echoAdapter.image.repository: "{{.IMAGE_REPO_metering_echo_adapter}}"
+          metering.echoAdapter.image.tag: "{{.IMAGE_TAG_metering_echo_adapter}}"
+          ui.images.ui: "{{.IMAGE_REPO_osac_ui}}:{{.IMAGE_TAG_osac_ui}}"
+          aap.bootstrap.image: "{{.IMAGE_REPO_osac_aap}}:{{.IMAGE_TAG_osac_aap}}"
+          aap.configAsCode.eeImage: "{{.IMAGE_REPO_osac_aap}}:{{.IMAGE_TAG_osac_aap}}"
+
+profiles:
+  # `skaffold dev` activates this automatically: the watch loop must not block
+  # on Helm --wait (up to 40m) or on Skaffold's status checker after every
+  # source edit. Watch the rollout yourself instead:
+  #   kubectl -n osac get pods -w
+  - name: watch
+    activation:
+      - command: dev
+    patches:
+      - op: replace
+        path: /deploy/helm/releases/0/wait
+        value: false
