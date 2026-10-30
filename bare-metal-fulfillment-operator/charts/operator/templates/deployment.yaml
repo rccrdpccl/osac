@@ -5,7 +5,6 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
-    control-plane: controller-manager
 spec:
   selector:
     matchLabels:

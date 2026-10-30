@@ -3,7 +3,6 @@ kind: Service
 metadata:
   labels:
     {{- include "bare-metal-fulfillment-operator.labels" . | nindent 4 }}
-    control-plane: controller-manager
   name: {{ include "bare-metal-fulfillment-operator.fullname" . }}-controller-manager-metrics-service
   namespace: {{ .Release.Namespace }}
 spec:
