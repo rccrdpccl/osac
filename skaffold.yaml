@@ -181,3 +181,16 @@ profiles:
       - op: replace
         path: /deploy/helm/releases/0/wait
         value: false
+
+  # Helm 4 applies server-side, and the AAP operator owns
+  # app.kubernetes.io/managed-by on the osac-aap CR, so every upgrade after the
+  # first install fails with "conflict with OpenAPI-Generator". Helm 4 is the
+  # only release with --force-conflicts, so osac.sh exports this variable only
+  # for Helm 4, mirroring osac-installer/Makefile.
+  - name: helm4-force-conflicts
+    activation:
+      - env: OSAC_DEV_HELM_FORCE_CONFLICTS=1
+    patches:
+      - op: replace
+        path: /deploy/helm/flags/upgrade
+        value: [--timeout=40m, --force-conflicts]

@@ -171,6 +171,27 @@ license_secret_present() {
 	"${kubectl}" get secret "${LICENSE_SECRET}" -n "${ns}" >/dev/null 2>&1
 }
 
+# A prep that never finished leaves {"builds":null} behind: the file exists, so
+# a -f test alone hands an empty artifact list to Skaffold, which fails with
+# "no tag provided for image [x]" instead of naming the missing prep.
+artifacts_have_tags() {
+	local artifacts=$1
+	grep -q '"imageName"' "${artifacts}"
+}
+
+# Helm 4 applies server-side by default, and the AAP operator takes field
+# ownership of app.kubernetes.io/managed-by on the osac-aap CR, so every upgrade
+# after the first install conflicts. Helm 4 is the only release with
+# --force-conflicts, so gate the flag on the major version exactly like
+# osac-installer/Makefile does, and let skaffold.yaml decide through a profile.
+enable_helm4_conflict_overrides() {
+	local major
+	major=$({ "${HELM}" version --short 2>/dev/null || true; } |
+		sed -nE 's/^v([0-9]+).*/\1/p')
+	[ "${major}" = "4" ] || return 0
+	export OSAC_DEV_HELM_FORCE_CONFLICTS=1
+}
+
 # The hub pulls with the Red Hat pull secret only, whose quay.io token is scoped
 # to openshift-release-dev. Our own images are pulled anonymously, so a quay
 # repository created by the first push -- private by default -- reaches the
@@ -270,6 +291,7 @@ main() {
 	kubeconfig=$(hub_kubeconfig)
 	kubectl=$(kubectl_bin)
 	[ -n "${kubectl}" ] || die "neither kubectl nor oc found in PATH"
+	enable_helm4_conflict_overrides
 
 	# prep/deploy/dev/delete act on the cluster; render and diagnose do not.
 	case ${command} in
@@ -317,6 +339,8 @@ main() {
 	deploy)
 		[ -f "${ARTIFACTS_FILE}" ] ||
 			die "no image tags in ${ARTIFACTS_FILE}; run 'make osac-dev-prep' first"
+		artifacts_have_tags "${ARTIFACTS_FILE}" ||
+			die "${ARTIFACTS_FILE} holds no image tags; run 'make osac-dev-prep' first"
 		license_secret_present "${kubectl}" "${NS}" ||
 			die "AAP license Secret ${NS}/${LICENSE_SECRET} is missing; run 'make osac-dev-prep' first"
 		check_image_pullability "${ARTIFACTS_FILE}"
