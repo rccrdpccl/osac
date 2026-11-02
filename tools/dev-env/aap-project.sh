@@ -3,7 +3,7 @@
 #
 # aap-project.sh — serve this worktree as the AAP config-as-code project.
 #
-# Usage: tools/dev-env/aap-project.sh [--force] [--delete]
+# Usage: tools/dev-env/aap-project.sh [--force] [--delete] [--from-skaffold]
 #
 # The bootstrap job creates job templates whose playbook paths have to exist in
 # the controller project. That project was a git clone of an upstream branch,
@@ -29,11 +29,24 @@
 # artifact from ARTIFACTS_FILE, which the node has already cached for the
 # bootstrap job, so this pulls nothing new.
 #
+# skaffold runs this with --from-skaffold after it rebuilds the osac-aap
+# artifact (see the hook in skaffold.yaml), which is exactly the moment the
+# playbooks the execution environment carries can change, so a watch session
+# republishes the payload with no manual step. That mode only acts when osac.sh
+# asked for the archive (OSAC_DEV_AAP_PROJECT_SERVE=1), so a plain
+# `skaffold build` stays a pure build, and it warns instead of failing while no
+# osac-aap tag exists yet (a first prep has not written ARTIFACTS_FILE).
+#
 # Inputs (defaults in common.sh):
 #   NS=osac               namespace of the server and of the release
 #   ARTIFACTS_FILE        image tags written by osac-dev-prep, default
 #                         ~/.cache/osac-dev/builds.json
 #   OSAC_DEV_HUB_KUBECONFIG  kubeconfig of the hub, else ~/.kube/<CLUSTER_NAME>
+#   SKAFFOLD_IMAGE        osac-aap tag Skaffold sets for its build hooks; wins
+#                         over ARTIFACTS_FILE so a rebuild serves what it built
+#   OSAC_DEV_AAP_PROJECT_SERVE  set to 1 by osac.sh to allow the build hook to
+#                         publish the archive; anything else makes --from-skaffold
+#                         a no-op
 #
 # --force re-applies the server and re-uploads the archive even when both look
 # current (shortcut: make osac-dev-aap-project FORCE=1). --delete removes the
@@ -61,7 +74,7 @@ archive_sum=""
 
 usage() {
 	cat <<'EOF'
-Usage: tools/dev-env/aap-project.sh [--force] [--delete]
+Usage: tools/dev-env/aap-project.sh [--force] [--delete] [--from-skaffold]
 
 Pack osac-aap/ from this worktree, serve it in the cluster, and print the URL to
 hand to aap.configAsCode.projectArchiveUri. The AAP config-as-code project then
@@ -71,6 +84,9 @@ which is what keeps the bootstrap job's playbook paths resolvable.
 The server is a Deployment plus a Service named osac-dev-aap-project in NS; it
 runs the osac-aap image recorded in ARTIFACTS_FILE, so run osac-dev-prep first.
 
+--from-skaffold is for the build hook in skaffold.yaml: it adds nothing but
+OSAC_DEV_AAP_PROJECT_SERVE=1 to the run, skips the work when that is unset, and
+lets a missing image tag be a warning.
 --force re-applies the Deployment and re-uploads the archive even when the tree
 has not changed (shortcut: make osac-dev-aap-project FORCE=1).
 --delete removes the Deployment and the Service.
@@ -78,10 +94,14 @@ EOF
 }
 
 # Image reference of the osac-aap artifact, taken from the tags prep recorded.
+# With $2=soft an unknown tag is an empty result instead of an error, which the
+# build hook needs: it can run before --file-output has ever been written.
 aap_image() {
-	local artifacts=$1 image
-	[ -f "${artifacts}" ] ||
+	local artifacts=$1 soft=${2:-} image
+	[ -f "${artifacts}" ] || {
+		[ -n "${soft}" ] && return 0
 		die "no image tags in ${artifacts}; run 'make osac-dev-prep' first"
+	}
 	image=$(python3 - "${artifacts}" <<-'EOF'
 		import json, sys
 
@@ -91,8 +111,10 @@ aap_image() {
 		        break
 	EOF
 	) || image=""
-	[ -n "${image}" ] ||
+	[ -n "${image}" ] || {
+		[ -n "${soft}" ] && return 0
 		die "${artifacts} has no osac-aap tag; run 'make osac-dev-prep' first"
+	}
 	printf '%s\n' "${image}"
 }
 
@@ -240,12 +262,13 @@ remove_server() {
 }
 
 main() {
-	local delete=0 kubectl kubeconfig image
+	local delete=0 from_skaffold=0 soft kubectl kubeconfig image
 
 	while [ $# -gt 0 ]; do
 		case $1 in
 		-f | --force) OSAC_DEV_FORCE=1 ;;
 		--delete) delete=1 ;;
+		--from-skaffold) from_skaffold=1 ;;
 		-h | --help)
 			usage
 			return 0
@@ -254,6 +277,18 @@ main() {
 		esac
 		shift
 	done
+
+	# The build hook must not turn `skaffold build` into a cluster mutation:
+	# osac.sh sets OSAC_DEV_AAP_PROJECT_SERVE only for the commands that serve
+	# this worktree as the AAP project.
+	if [ "${from_skaffold}" = "1" ] &&
+		[ "${OSAC_DEV_AAP_PROJECT_SERVE:-}" != "1" ]; then
+		log "not publishing the archive: OSAC_DEV_AAP_PROJECT_SERVE is not 1"
+		return 0
+	fi
+	if [ "${from_skaffold}" = "1" ]; then
+		soft=1
+	fi
 
 	require_non_root
 	kubectl=$(kubectl_bin)
@@ -268,7 +303,14 @@ main() {
 		return 0
 	fi
 
-	image=$(aap_image "${ARTIFACTS_FILE}")
+	# Skaffold hands its build hooks the tag it just built, which is newer than
+	# the one prep recorded and is the image the next deploy will run.
+	image=${SKAFFOLD_IMAGE:-}
+	[ -n "${image}" ] || image=$(aap_image "${ARTIFACTS_FILE}" "${soft}")
+	if [ -z "${image}" ]; then
+		log "no osac-aap image tag yet; the deploy publishes the archive"
+		return 0
+	fi
 	pack_archive
 	ensure_server "${kubectl}" "${image}"
 	upload_archive "${kubectl}"

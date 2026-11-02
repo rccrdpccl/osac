@@ -123,6 +123,16 @@ build:
         dependencies:
           paths:
             - osac-aap/**
+      hooks:
+        # Rebuilding the execution environment is the moment the playbooks it
+        # carries can change, so republish osac-aap/ as the config-as-code
+        # archive right after the build and before the deploy that runs the
+        # bootstrap job. Without this a watch session would keep serving the
+        # tree from the moment it started. The script exits immediately unless
+        # osac.sh asked for the archive (OSAC_DEV_AAP_PROJECT_SERVE), so a bare
+        # `skaffold build` still mutates nothing but the registry.
+        after:
+          - command: [tools/dev-env/aap-project.sh, --from-skaffold]
 
 deploy:
   # The chart creates CRDs and other resources Skaffold's status checker cannot

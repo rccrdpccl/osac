@@ -79,6 +79,8 @@
 #                            where the AAP config-as-code project reads the
 #                            playbooks its job templates name; unset serves
 #                            this worktree, a value pins that source instead
+#                            (serving also refreshes the archive after each
+#                            osac-aap rebuild through a Skaffold build hook)
 #   SKAFFOLD=skaffold  HELM=helm
 #
 # Re-run with --force (make osac-dev-prep FORCE=1) to re-upload the license and
@@ -377,8 +379,9 @@ main() {
 	# project, so the project has to be the tree these images were built from.
 	# A caller pin wins; otherwise this worktree becomes the project source,
 	# served by aap-project.sh. The served URL never changes, so a watch session
-	# keeps pointing at it: after editing a playbook, re-run aap-project.sh
-	# (make osac-dev-aap-project) and the next deploy picks the new tree up.
+	# keeps pointing at it, and Skaffold republishes the archive itself after
+	# every osac-aap rebuild (the build hook in skaffold.yaml, which needs this
+	# marker to act).
 	case ${command} in
 	deploy | dev)
 		if [ -n "${OSAC_DEV_AAP_PROJECT_GIT_BRANCH}" ]; then
@@ -386,6 +389,7 @@ main() {
 		elif [ -n "${OSAC_DEV_AAP_PROJECT_ARCHIVE_URI}" ]; then
 			log "AAP project: ${OSAC_DEV_AAP_PROJECT_ARCHIVE_URI} (pinned)"
 		else
+			export OSAC_DEV_AAP_PROJECT_SERVE=1
 			OSAC_DEV_AAP_PROJECT_ARCHIVE_URI=$("${DEV_ENV_DIR}/aap-project.sh") ||
 				die "cannot serve this worktree as the AAP project"
 			export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI
