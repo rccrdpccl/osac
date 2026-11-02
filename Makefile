@@ -30,6 +30,8 @@
 #                             license, rebuild the chart dependencies
 #   make osac-dev-deploy      `skaffold deploy` with the tags prep recorded;
 #                             no build, no push, then wait for the rollout
+#   make osac-dev-aap-project serve this worktree as the AAP config-as-code
+#                             project and print its URL (deploy does it too)
 #   make osac-dev-watch       `skaffold dev`: prep's initial build, then
 #                             rebuild and redeploy on every source change
 #   make osac-dev-delete      uninstall the release
@@ -112,7 +114,8 @@ export OSAC_DEV_AAP_PROJECT_GIT_BRANCH := $(OSAC_DEV_AAP_PROJECT_GIT_BRANCH)
 export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI := $(OSAC_DEV_AAP_PROJECT_ARCHIVE_URI)
 
 .PHONY: osac-dev osac-dev-cluster osac-dev-setup osac-dev-deps osac-dev-bmh \
-	osac-dev-dns osac-dev-prep osac-dev-deploy osac-dev-watch osac-dev-delete help
+	osac-dev-dns osac-dev-prep osac-dev-deploy osac-dev-aap-project \
+	osac-dev-watch osac-dev-delete help
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
@@ -146,6 +149,9 @@ osac-dev-prep: ## Build and push every image, upload the AAP license, rebuild ch
 
 osac-dev-deploy: ## Deploy OSAC with the images prep recorded and wait for the rollout
 	@$(OSAC_DEV_ENV)/osac.sh deploy $(SKAFFOLD_ARGS)
+
+osac-dev-aap-project: ## Serve this worktree as the config-as-code project, print its URL
+	@$(OSAC_DEV_ENV)/aap-project.sh
 
 osac-dev-watch: ## Rebuild and redeploy OSAC on every change (skaffold dev)
 	@$(OSAC_DEV_ENV)/osac.sh dev $(SKAFFOLD_ARGS)

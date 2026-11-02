@@ -14,7 +14,7 @@
 #                     Helm waits for the rollout (no build, no push)
 #            dev      the watch loop: build, deploy, then rebuild and redeploy
 #                     on every source change (`skaffold dev`, cleanup off)
-#            delete   uninstall the release
+#            delete   uninstall the release, and the archive server with it
 #            render   print the rendered manifests (debugging)
 #            diagnose print Skaffold's resolved configuration
 #   ARGS     appended verbatim to the Skaffold command line
@@ -38,6 +38,16 @@
 # deploy adds the cluster domain (read from the live cluster into
 # OSAC_CLUSTER_DOMAIN, which skaffold.yaml templates every hostname from) and
 # replays the recorded image tags, so it never touches a build.
+#
+# deploy and dev also serve this worktree as the AAP config-as-code project.
+# The bootstrap job creates job templates whose playbook paths must exist in the
+# controller project, and a project cloned from a branch drifts away from the
+# images this worktree builds: e5187180c moved every networking template onto
+# osac-aap/playbook_osac_network_task.yml, the execution environment still named
+# the per-operation playbooks, and the bootstrap failed with "Playbook not
+# found for project" until the project was served from the built tree instead.
+# aap-project.sh packs osac-aap/, serves it in the cluster, and prints the URL
+# that aap.configAsCode.projectArchiveUri takes; a caller pin wins over it.
 #
 # Both exec skaffold with `--default-repo` set to IMAGE_PREFIX, so no in-cluster
 # registry is involved: every image is pushed straight to quay.io/<you> (podman
@@ -67,8 +77,8 @@
 #                            ~/.cache/osac-dev/builds.json
 #   OSAC_DEV_AAP_PROJECT_GIT_BRANCH, OSAC_DEV_AAP_PROJECT_ARCHIVE_URI
 #                            where the AAP config-as-code project reads the
-#                            playbooks its job templates name; unset leaves the
-#                            chart default (the upstream git branch)
+#                            playbooks its job templates name; unset serves
+#                            this worktree, a value pins that source instead
 #   SKAFFOLD=skaffold  HELM=helm
 #
 # Re-run with --force (make osac-dev-prep FORCE=1) to re-upload the license and
@@ -363,6 +373,26 @@ main() {
 	export OSAC_DEV_AAP_PROJECT_GIT_BRANCH="${OSAC_DEV_AAP_PROJECT_GIT_BRANCH:-}"
 	export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI="${OSAC_DEV_AAP_PROJECT_ARCHIVE_URI:-}"
 
+	# The bootstrap job names playbooks that have to exist in the controller
+	# project, so the project has to be the tree these images were built from.
+	# A caller pin wins; otherwise this worktree becomes the project source,
+	# served by aap-project.sh. The served URL never changes, so a watch session
+	# keeps pointing at it: after editing a playbook, re-run aap-project.sh
+	# (make osac-dev-aap-project) and the next deploy picks the new tree up.
+	case ${command} in
+	deploy | dev)
+		if [ -n "${OSAC_DEV_AAP_PROJECT_GIT_BRANCH}" ]; then
+			log "AAP project: git branch ${OSAC_DEV_AAP_PROJECT_GIT_BRANCH} (pinned)"
+		elif [ -n "${OSAC_DEV_AAP_PROJECT_ARCHIVE_URI}" ]; then
+			log "AAP project: ${OSAC_DEV_AAP_PROJECT_ARCHIVE_URI} (pinned)"
+		else
+			OSAC_DEV_AAP_PROJECT_ARCHIVE_URI=$("${DEV_ENV_DIR}/aap-project.sh") ||
+				die "cannot serve this worktree as the AAP project"
+			export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI
+		fi
+		;;
+	esac
+
 	local -a args
 	case ${command} in
 	prep)
@@ -374,6 +404,11 @@ main() {
 		;;
 	dev)
 		args=(dev --cleanup=false)
+		;;
+	delete)
+		args=(delete)
+		"${DEV_ENV_DIR}/aap-project.sh" --delete ||
+			warn "could not remove the AAP project archive server"
 		;;
 	render)
 		args=(render --digest-source=tag)
