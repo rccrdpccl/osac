@@ -103,6 +103,14 @@ export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
 	BMH_LABELS SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
 export OSAC_DEV_FORCE := $(FORCE)
 
+# Skaffold turns an environment variable it cannot find into the literal string
+# `<no value>`, and skaffold.yaml feeds these two into the config-as-code project
+# source. Exporting them, empty by default, keeps an unset value empty so the
+# chart drops the key instead of handing AAP a bogus source. osac.sh repeats it
+# so running that script directly behaves the same.
+export OSAC_DEV_AAP_PROJECT_GIT_BRANCH := $(OSAC_DEV_AAP_PROJECT_GIT_BRANCH)
+export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI := $(OSAC_DEV_AAP_PROJECT_ARCHIVE_URI)
+
 .PHONY: osac-dev osac-dev-cluster osac-dev-setup osac-dev-deps osac-dev-bmh \
 	osac-dev-dns osac-dev-prep osac-dev-deploy osac-dev-watch osac-dev-delete help
 

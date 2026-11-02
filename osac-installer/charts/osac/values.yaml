@@ -314,6 +314,7 @@ aap:
     eeImage: ""
     projectGitUri: ""
     projectGitBranch: ""
+    projectArchiveUri: ""
     remoteClusterKubeconfigSecretName: ""
     remoteClusterKubeconfigSecretKey: kubeconfig
   instanceGroups:
