@@ -31,7 +31,8 @@
 #   make osac-dev-deploy      `skaffold deploy` with the tags prep recorded;
 #                             no build, no push, then wait for the rollout
 #   make osac-dev-aap-project serve this worktree as the AAP config-as-code
-#                             project and print its URL (deploy does it too)
+#                             project and print its URL (deploy does it too,
+#                             and watch mode refreshes it on every rebuild)
 #   make osac-dev-watch       `skaffold dev`: prep's initial build, then
 #                             rebuild and redeploy on every source change
 #   make osac-dev-delete      uninstall the release
