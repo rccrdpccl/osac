@@ -1853,6 +1853,7 @@ Helm directly; the installation command in Section 4.3 supplies both.
 | `aap.configAsCode.manifestSecret` | Secret that holds `license.zip`. |
 | `aap.configAsCode.secret` | Secret with config-as-code runtime flags. |
 | `aap.configAsCode.projectGitUri`, `aap.configAsCode.projectGitBranch` | Git source for the Ansible content that the bootstrap job imports. |
+| `aap.configAsCode.projectArchiveUri` | Tar or zip archive used as the project source instead of git. Takes precedence over `projectGitUri`/`projectGitBranch`; use it to serve a tree that is not published as a branch, such as the working tree a development environment just built. |
 | `aap.configAsCode.remoteClusterKubeconfigSecretName`, `aap.configAsCode.remoteClusterKubeconfigSecretKey` | Secret name and key that AAP config-as-code uses for VM operations on a separate workload cluster. The key defaults to `kubeconfig`. This scenario is not fully supported in this release; see [Section 9.4](#94-not-supported). |
 | `aap.configAsCode.importAgentsEnabled`, `aap.configAsCode.importBcmAgentsEnabled` | Enable bare-metal agent import and the BCM inventory backend. |
 | `aap.instanceGroups.clusterFulfillment.enabled`, `aap.instanceGroups.clusterFulfillment.config`, `aap.instanceGroups.clusterFulfillment.secret` | The `cluster-fulfillment` instance group for CaaS provisioning. See [Section 6.2](#62-installing-osac-for-caas). |

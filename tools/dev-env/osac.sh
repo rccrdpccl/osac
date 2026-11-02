@@ -65,6 +65,10 @@
 #                            osac-installer/values/<profile>/license.zip
 #   ARTIFACTS_FILE           image tags written by prep, default
 #                            ~/.cache/osac-dev/builds.json
+#   OSAC_DEV_AAP_PROJECT_GIT_BRANCH, OSAC_DEV_AAP_PROJECT_ARCHIVE_URI
+#                            where the AAP config-as-code project reads the
+#                            playbooks its job templates name; unset leaves the
+#                            chart default (the upstream git branch)
 #   SKAFFOLD=skaffold  HELM=helm
 #
 # Re-run with --force (make osac-dev-prep FORCE=1) to re-upload the license and
@@ -352,6 +356,12 @@ main() {
 	export OSAC_NAMESPACE="${NS}"
 	export OSAC_CLUSTER_DOMAIN="${domain}"
 	export IMAGE_PREFIX
+	# Skaffold expands an environment variable it cannot find into the literal
+	# string `<no value>`, which Helm then reads as the config-as-code project
+	# source. Export both empty so an unset value stays empty: the chart drops
+	# an empty source instead of pointing AAP at `no value`.
+	export OSAC_DEV_AAP_PROJECT_GIT_BRANCH="${OSAC_DEV_AAP_PROJECT_GIT_BRANCH:-}"
+	export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI="${OSAC_DEV_AAP_PROJECT_ARCHIVE_URI:-}"
 
 	local -a args
 	case ${command} in
