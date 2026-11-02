@@ -168,6 +168,13 @@ deploy:
           ui.images.ui: "{{.IMAGE_REPO_osac_ui}}:{{.IMAGE_TAG_osac_ui}}"
           aap.bootstrap.image: "{{.IMAGE_REPO_osac_aap}}:{{.IMAGE_TAG_osac_aap}}"
           aap.configAsCode.eeImage: "{{.IMAGE_REPO_osac_aap}}:{{.IMAGE_TAG_osac_aap}}"
+          # Where the config-as-code project reads the Ansible content the job
+          # templates name. Both are empty unless the caller exports them: an
+          # empty value leaves the chart default (upstream git branch) in place.
+          # osac-dev exports the archive URI so the project is the tree it just
+          # built instead of a branch that may have moved past the images.
+          aap.configAsCode.projectGitBranch: "{{.OSAC_DEV_AAP_PROJECT_GIT_BRANCH}}"
+          aap.configAsCode.projectArchiveUri: "{{.OSAC_DEV_AAP_PROJECT_ARCHIVE_URI}}"
 
 profiles:
   # `skaffold dev` activates this automatically: the watch loop must not block

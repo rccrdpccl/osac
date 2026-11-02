@@ -34,8 +34,16 @@ configAsCode:
   # alongside its own eeImage override, since that image only exists in the
   # node's local store and was never pushed to a real registry.
   eeImagePull: ""
+  # Controller project source. Set projectGitUri/projectGitBranch to clone a git
+  # repository whose checkout holds the playbooks the job templates name. Set
+  # projectArchiveUri instead to fetch a tar or zip archive of that tree, which
+  # the controller extracts as the project; it takes precedence over the git
+  # settings. The archive lets an environment serve the tree it built instead of
+  # tracking a branch, so the project content cannot drift from the playbooks in
+  # the execution environment.
   projectGitUri: ""
   projectGitBranch: ""
+  projectArchiveUri: ""
   remoteClusterKubeconfigSecretName: ""
   remoteClusterKubeconfigSecretKey: kubeconfig
   manifest:

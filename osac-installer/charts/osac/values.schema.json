@@ -1236,6 +1236,10 @@
               "type": "string",
               "description": "Git branch for config-as-code project"
             },
+            "projectArchiveUri": {
+              "type": "string",
+              "description": "Tar or zip archive URI used as the config-as-code project source instead of git"
+            },
             "remoteClusterKubeconfigSecretName": {
               "type": "string",
               "description": "Secret name provided to AAP config-as-code for VM operations on a remote cluster.",
