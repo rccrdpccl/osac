@@ -178,6 +178,15 @@ deploy:
           ui.images.ui: "{{.IMAGE_REPO_osac_ui}}:{{.IMAGE_TAG_osac_ui}}"
           aap.bootstrap.image: "{{.IMAGE_REPO_osac_aap}}:{{.IMAGE_TAG_osac_aap}}"
           aap.configAsCode.eeImage: "{{.IMAGE_REPO_osac_aap}}:{{.IMAGE_TAG_osac_aap}}"
+          # The chart default is 15. Every attempt re-runs the whole config-as-
+          # code playbook (~1m) and Job backoff grows to ~10m between attempts,
+          # so a deterministic failure such as a bad project archive spends
+          # ~40m — the whole Helm --timeout — retrying itself before it admits
+          # defeat, and can still succeed minutes after Helm gave up. Two
+          # attempts keep a transient AAP hiccup recoverable while a real
+          # misconfiguration fails in ~3m, where a rerun of make osac-dev-deploy
+          # retries immediately instead of waiting out a backoff.
+          aap.bootstrap.backoffLimit: "2"
           # Where the config-as-code project reads the Ansible content the job
           # templates name. Both are empty unless the caller exports them: an
           # empty value leaves the chart default (upstream git branch) in place.
