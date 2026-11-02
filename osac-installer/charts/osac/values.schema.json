@@ -1190,6 +1190,11 @@
               "default": 3,
               "minimum": 1
             },
+            "skipWhenUnchanged": {
+              "type": "boolean",
+              "description": "Skip the config-as-code playbook when the inputs the last successful run applied are unchanged",
+              "default": true
+            },
             "gateway": {
               "type": "object",
               "properties": {

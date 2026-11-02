@@ -302,6 +302,11 @@ aap:
     enabled: true
     image: ghcr.io/osac-project/osac-aap:latest  # PLACEHOLDER -- overwritten at release time by osac-build-and-publish.yaml
     backoffLimit: 15
+    # The bootstrap job is a post-upgrade hook, so it runs on every upgrade.
+    # Skip it when the inputs the last successful run applied are unchanged
+    # (archive projects only: a git ref cannot be fingerprinted in the cluster).
+    # Delete the <release>-osac-aap-bootstrap-state ConfigMap to force a run.
+    skipWhenUnchanged: true
     readinessConsecutiveSuccesses: 3
     gateway:
       hostname: ""
