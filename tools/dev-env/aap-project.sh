@@ -13,11 +13,11 @@
 # playbooks, the execution environment came from a tree that still named them,
 # and every bootstrap since failed with "Playbook not found for project".
 #
-# This packs osac-aap/ from the working tree, serves it from a small HTTP server
-# in the cluster, and prints the URL for aap.configAsCode.projectArchiveUri.
-# That value switches the project to scm_type=archive, so the project content is
-# exactly the playbooks the execution environment carries and nothing has to be
-# published to a branch first.
+# This packs the repo root (osac-aap/ plus the top-level files) from the working
+# tree, serves it from a small HTTP server in the cluster, and prints the URL for
+# aap.configAsCode.projectArchiveUri. That value switches the project to
+# scm_type=archive, so the project content is exactly the playbooks the execution
+# environment carries and nothing has to be published to a branch first.
 #
 # Prints the URL on stdout and progress on stderr, so callers capture only the
 # URL:  OSAC_DEV_AAP_PROJECT_ARCHIVE_URI=$(tools/dev-env/aap-project.sh)
@@ -118,18 +118,46 @@ aap_image() {
 	printf '%s\n' "${image}"
 }
 
-# Pack the tracked and not-ignored files of osac-aap/ into a tarball. The paths
-# keep the osac-aap/ prefix because every job template names its playbook that
-# way. gzip runs with -n so an unchanged tree hashes the same on every run,
-# which is what makes the upload check below cheap.
+# Pack the repo root as the project: the tracked and not-ignored files of
+# osac-aap/ plus the repo's top-level files. Both parts matter.
+#
+#   - osac-aap/ keeps its prefix because every job template names its playbook
+#     that way ("osac-aap/playbook_osac_create_hosted_cluster.yml"), so the
+#     project root has to be the repo root, exactly like the git project it
+#     replaces. Packing osac-aap/ alone would put its contents at the project
+#     root once AAP strips the single top-level directory.
+#   - the top-level files are what makes the archive "a project in the archive
+#     root" to AAP rather than "a project in one base directory", so nothing
+#     gets stripped.
+#
+# The tree is staged through rsync --copy-links before it is tarred, for two
+# reasons the AAP side forces:
+#   - its project_archive action plugin only creates a directory when the
+#     archive has a directory member, so a file list alone fails with a bare
+#     FileNotFoundError on the first nested path of an empty project directory;
+#   - that plugin writes every link member as an empty regular file, so the
+#     role aliases under collections/ (osac_csi_driver -> osac_csi_storage)
+#     have to arrive resolved rather than as links.
+#
+# gzip runs with -n so an unchanged tree hashes the same on every run, which is
+# what makes the upload check below cheap.
 pack_archive() {
-	local cache_dir
+	local cache_dir staging
 	cache_dir=$(dirname "${ARTIFACTS_FILE}")
 	mkdir -p "${cache_dir}"
 	archive_local="${cache_dir}/osac-aap-project.tar.gz"
+	staging=$(mktemp -d)
 	log "packing osac-aap/ from ${REPO_ROOT}"
-	git -C "${REPO_ROOT}" ls-files -co --exclude-standard -z -- osac-aap |
-		tar -C "${REPO_ROOT}" --null -T - -cf - | gzip -n -9 >"${archive_local}"
+	git -C "${REPO_ROOT}" ls-files -co --exclude-standard -z -- \
+		':(glob)*' ':(glob)osac-aap/**' |
+		rsync -aLr --from0 --files-from=- \
+			"${REPO_ROOT}/" "${staging}/"
+	# Unprefixed members (osac-aap/, AGENTS.md, ...) so the archive has several
+	# roots, which is what keeps AAP from stripping the top level.
+	(cd "${staging}" &&
+		find . -mindepth 1 -maxdepth 1 -printf '%P\0' |
+		tar --null -T - -cf -) | gzip -n -9 >"${archive_local}"
+	rm -rf "${staging}"
 	archive_sum=$(sha256sum "${archive_local}" | cut -d' ' -f1)
 	log "packed $(du -h "${archive_local}" | cut -f1) of osac-aap/"
 }
@@ -262,7 +290,7 @@ remove_server() {
 }
 
 main() {
-	local delete=0 from_skaffold=0 soft kubectl kubeconfig image
+	local delete=0 from_skaffold=0 soft="" kubectl kubeconfig image
 
 	while [ $# -gt 0 ]; do
 		case $1 in
