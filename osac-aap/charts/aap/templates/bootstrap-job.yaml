@@ -36,6 +36,35 @@ subjects:
     name: {{ include "osac-aap.fullname" . }}-bootstrap
     namespace: {{ .Release.Namespace }}
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-record-bootstrap-state
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{ include "osac-aap.bootstrapStateName" . }}"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "osac-aap.fullname" . }}-record-bootstrap-state
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "osac-aap.fullname" . }}-record-bootstrap-state
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "osac-aap.fullname" . }}-bootstrap
+    namespace: {{ .Release.Namespace }}
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -50,7 +79,7 @@ metadata:
     "helm.sh/hook-output-log-policy": hook-failed
 spec:
   backoffLimit: {{ .Values.bootstrap.backoffLimit }}
-  # Cumulative across all backoffLimit retries; must exceed both init containers'
+  # Cumulative across all backoffLimit retries; must exceed all init containers'
   # combined worst-case runtime (see _helpers.tpl) so a stuck attempt exits
   # cleanly instead of being SIGKILLed.
   activeDeadlineSeconds: 8400
@@ -77,13 +106,23 @@ spec:
           - |
             {{- include "osac-aap.waitForAapScript" . | nindent 12 }}
         {{- include "osac-aap.waitForAapContainerSpec" . | nindent 8 }}
+      - name: bootstrap-state
+        image: {{ .Values.bootstrap.cliImage }}
+        command:
+          - /bin/bash
+          - -c
+          - |
+            {{- include "osac-aap.bootstrapIdentityScript" . | nindent 12 }}
+        {{- include "osac-aap.bootstrapStateContainerSpec" . | nindent 8 }}
       containers:
       - name: bootstrap
         image: {{ .Values.bootstrap.image }}
+        command:
+          - /bin/bash
+          - -c
         args:
-        - ansible-playbook
-        - osac.config_as_code.subscription
-        - osac.config_as_code.configure
+          - |
+            {{- include "osac-aap.bootstrapRunScript" . | nindent 12 }}
         envFrom:
         - secretRef:
             name: {{ .Values.configAsCode.secret }}
@@ -101,10 +140,19 @@ spec:
         - name: config-as-code-manifest-volume
           mountPath: /var/secrets/config-as-code-manifest
           readOnly: true
+        - name: bootstrap-state
+          mountPath: /state
       volumes:
       - name: config-as-code-manifest-volume
         secret:
           secretName: {{ .Values.configAsCode.manifestSecret }}
+      - name: bootstrap-state
+        emptyDir: {}
+      # optional: a missing marker only costs a run, and must never block the pod.
+      - name: bootstrap-state-marker
+        configMap:
+          name: {{ include "osac-aap.bootstrapStateName" . }}
+          optional: true
       - name: tmp
         emptyDir: {}
       restartPolicy: Never

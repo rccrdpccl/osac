@@ -1,0 +1,24 @@
+{{- if .Values.bootstrap.enabled }}
+{{- $name := include "osac-aap.bootstrapStateName" . }}
+{{/*
+Records the fingerprint of the inputs the last successful bootstrap applied, so
+an upgrade whose inputs are unchanged can skip the playbook (see
+bootstrap-job.yaml). The value is carried over from the live object: the
+bootstrap job writes it, and without the lookup every upgrade would render an
+empty marker and the recorded fingerprint would be lost.
+*/}}
+{{- $identity := "" }}
+{{- $live := lookup "v1" "ConfigMap" .Release.Namespace $name }}
+{{- if and $live $live.data }}
+{{- $identity = $live.data.identity | default "" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "osac-aap.labels" . | nindent 4 }}
+data:
+  identity: {{ $identity | quote }}
+{{- end }}

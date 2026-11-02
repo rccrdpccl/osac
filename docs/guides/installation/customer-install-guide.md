@@ -615,6 +615,7 @@ subchart's own `values.yaml` file.
 | `aap.aap.instance.redisMode` | `standalone` or `cluster`. |
 | `aap.aap.instance.routeTlsTerminationMechanism` | `Edge`, `Passthrough`, or `Reencrypt` for the AAP routes. |
 | `aap.bootstrap.enabled`, `aap.bootstrap.image`, `aap.bootstrap.eeImage`, `aap.bootstrap.backoffLimit` | The postinstallation bootstrap job that loads config-as-code. |
+| `aap.bootstrap.skipWhenUnchanged` | Skip the config-as-code playbook when the inputs the last successful run applied are unchanged. The job is a `post-upgrade` hook, so it runs on every Helm upgrade; the playbook is idempotent but takes minutes. Only archive projects can be skipped, because a Git ref cannot be fingerprinted from inside the cluster. The fingerprint is stored in the `<release>-osac-aap-bootstrap-state` ConfigMap. |
 | `aap.configAsCode.manifestSecret` | Secret that holds `license.zip`. |
 | `aap.configAsCode.secret` | Secret with config-as-code runtime flags. |
 | `aap.configAsCode.projectGitUri`, `aap.configAsCode.projectGitBranch` | Git source for the Ansible content that the bootstrap job imports. |
@@ -1770,6 +1771,18 @@ Common causes:
   times.
 - The config-as-code Git source (`aap.configAsCode.projectGitUri` and
   `aap.configAsCode.projectGitBranch`) is unreachable.
+
+With `aap.bootstrap.skipWhenUnchanged` (the default) an upgrade whose inputs did
+not change completes the job in seconds: it logs `Bootstrap inputs unchanged`
+and applies nothing. That is not a failure. When you need the playbook to run
+again, delete the fingerprint so the next upgrade cannot match it:
+
+```console
+oc delete configmap osac-aap-bootstrap-state -n <namespace>
+```
+
+The job skips only for an archive project (`aap.configAsCode.projectArchiveUri`);
+with a Git project it always runs.
 
 ### 11.9 The `osac-publish-templates` hook fails
 

@@ -20,6 +20,11 @@ bootstrap:
   cliImage: quay.io/openshift/origin-cli:4.20.0
   backoffLimit: 15
   readinessConsecutiveSuccesses: 3
+  # Skip the config-as-code playbook when the inputs the last successful run
+  # applied are unchanged (fingerprint in <fullname>-bootstrap-state). The
+  # playbook is idempotent but takes minutes, and a post-upgrade hook runs on
+  # every helm upgrade. Delete the ConfigMap to force a run.
+  skipWhenUnchanged: true
 
 configAsCode:
   manifestSecret: "config-as-code-manifest-ig"

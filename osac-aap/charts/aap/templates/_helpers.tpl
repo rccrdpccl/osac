@@ -304,3 +304,119 @@ securityContext:
   capabilities:
     drop: ["ALL"]
 {{- end }}
+
+{{/*
+Name of the ConfigMap recording the fingerprint of the inputs applied by the
+last successful bootstrap run.
+*/}}
+{{- define "osac-aap.bootstrapStateName" -}}
+{{- printf "%s-bootstrap-state" (include "osac-aap.fullname" .) }}
+{{- end }}
+
+{{/*
+Fingerprint of everything the config-as-code playbook reads, except the project
+content, which is only known at run time (see bootstrapIdentityScript): the
+rendered templates that become the config-as-code secrets and the instance
+groups, plus the images the run uses. Bump algorithm= whenever the inputs or the
+way they are folded in change, so existing markers stop matching.
+*/}}
+{{- define "osac-aap.bootstrapInputsHash" -}}
+{{- $config := printf "%s\n---\n%s\n---\n%s"
+  (include (print $.Template.BasePath "/config-as-code-secret.yaml") .)
+  (include (print $.Template.BasePath "/config-as-code-manifest.yaml") .)
+  (include (print $.Template.BasePath "/instance-groups.yaml") .) -}}
+{{- $images := printf "algorithm=v1\nbootstrap=%s\nee=%s\neePull=%s"
+  .Values.bootstrap.image
+  (.Values.configAsCode.eeImage | default "")
+  (.Values.configAsCode.eeImagePull | default "") -}}
+{{- printf "%s\n---\n%s" $config $images | sha256sum -}}
+{{- end }}
+
+{{/*
+Fingerprints the bootstrap inputs before the playbook runs and decides whether
+the run can be skipped. Writes the fingerprint to /state/identity for the
+bootstrap container, and /state/skip when the playbook can be skipped.
+*/}}
+{{- define "osac-aap.bootstrapIdentityScript" -}}
+set -eu
+if [ -n "${AAP_PROJECT_ARCHIVE_URI}" ]; then
+  echo "Fingerprinting the project archive ${AAP_PROJECT_ARCHIVE_URI}"
+  project="archive:$(curl -fsS --max-time 300 "${AAP_PROJECT_ARCHIVE_URI}" | sha256sum | cut -d' ' -f1)"
+else
+  # A git ref can move without any chart change, and this image carries no git
+  # client to resolve it, so a git project can never be proven unchanged.
+  echo "Project is a git ref, which cannot be fingerprinted: always running."
+  project="git:${AAP_PROJECT_GIT_URI:-default}:${AAP_PROJECT_GIT_BRANCH:-default}:$(date +%s%N)"
+fi
+identity=$(printf '%s\n%s\n' "{{ include "osac-aap.bootstrapInputsHash" . }}" "${project}" | sha256sum | cut -d' ' -f1)
+printf '%s' "${identity}" > /state/identity
+echo "Bootstrap identity ${identity}"
+if [ "${BOOTSTRAP_SKIP_WHEN_UNCHANGED}" != "true" ]; then
+  echo "bootstrap.skipWhenUnchanged is off: running."
+  exit 0
+fi
+marker=""
+if [ -r /marker/identity ]; then
+  marker=$(cat /marker/identity)
+fi
+if [ -n "${marker}" ] && [ "${marker}" = "${identity}" ]; then
+  echo "Inputs unchanged since the last successful run ${marker}: skipping."
+  : > /state/skip
+  exit 0
+fi
+echo "Inputs changed since the last successful run ${marker:-none}: running."
+{{- end }}
+
+{{/*
+Bootstrap container entrypoint: honour the skip decision, run the playbook and
+record the fingerprint of what was applied. Recording after the playbook is what
+makes the next identical upgrade skippable.
+*/}}
+{{- define "osac-aap.bootstrapRunScript" -}}
+set -eu
+if [ -f /state/skip ]; then
+  echo "Bootstrap inputs unchanged: nothing to apply."
+  exit 0
+fi
+ansible-playbook osac.config_as_code.subscription osac.config_as_code.configure
+identity=$(cat /state/identity)
+echo "Recording bootstrap identity ${identity}"
+oc -n "${NAMESPACE}" patch configmap {{ include "osac-aap.bootstrapStateName" . }} \
+  --type=merge -p "{\"data\":{\"identity\":\"${identity}\"}}" ||
+  echo "WARNING: could not record the bootstrap identity; the next upgrade reruns."
+{{- end }}
+
+{{/* Shared bootstrap-state init container env/volumeMounts/resources/securityContext. */}}
+{{- define "osac-aap.bootstrapStateContainerSpec" -}}
+env:
+- name: HOME
+  value: /tmp
+- name: AAP_PROJECT_ARCHIVE_URI
+  value: {{ .Values.configAsCode.projectArchiveUri | default "" | quote }}
+- name: AAP_PROJECT_GIT_URI
+  value: {{ .Values.configAsCode.projectGitUri | default "" | quote }}
+- name: AAP_PROJECT_GIT_BRANCH
+  value: {{ .Values.configAsCode.projectGitBranch | default "" | quote }}
+- name: BOOTSTRAP_SKIP_WHEN_UNCHANGED
+  value: {{ .Values.bootstrap.skipWhenUnchanged | quote }}
+volumeMounts:
+- name: tmp
+  mountPath: /tmp
+- name: bootstrap-state
+  mountPath: /state
+- name: bootstrap-state-marker
+  mountPath: /marker
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  capabilities:
+    drop: ["ALL"]
+{{- end }}
