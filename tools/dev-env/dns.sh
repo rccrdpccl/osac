@@ -16,7 +16,9 @@
 # restarts systemd-resolved and verifies the API name resolves. Skipped when the
 # hub name already resolves. The same dnsmasq entry is then added on REMOTE_HOST,
 # which runs the hub and therefore has to resolve its own API name; both halves
-# are skipped when the entry is already in place.
+# are skipped when the entry is already in place. With REMOTE_HOST=local that
+# host is this machine and cluster-tool's boot already wrote the entry, so the
+# second half usually only confirms it.
 #
 # The zone comes from OSAC_DEV_HUB_KUBECONFIG (or CLUSTER_DOMAIN when set).
 # Needs sudo locally; run it as your normal user.

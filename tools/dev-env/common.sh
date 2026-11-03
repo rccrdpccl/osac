@@ -6,6 +6,11 @@
 #
 # Every input can be overridden through the environment (the repo root Makefile
 # exports them) or, where noted, with a command line flag.
+#
+# REMOTE_HOST is where the hub runs. It is either an SSH target (root@host) or
+# `local`, cluster-tool's own spelling, meaning the hub's libvirt VMs, haproxy,
+# and dnsmasq entries all live on this machine. `local` also survives a new
+# shell: it is read back from cluster-tool's servers.json like any other host.
 
 set -euo pipefail
 
@@ -92,9 +97,52 @@ expand_path() {
 	esac
 }
 
-ssh_remote() {
-	ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE_HOST}" "$@"
+# True when the hub runs on this machine instead of a remote hypervisor.
+# cluster-tool spells that host `local` (`--host local`), and stores it
+# verbatim in servers.json, so the value survives the derivation above.
+remote_is_local() {
+	[ "${REMOTE_HOST}" = "local" ]
 }
+
+# Run a command on the hub's host. A real REMOTE_HOST goes over ssh; `local`
+# runs in a bash here. ssh joins its arguments with spaces and hands them to
+# the remote shell, so `bash -c "$*"` is the same contract, heredoc stdin
+# included. Locally it runs as the invoking user, whose $HOME holds the
+# kubeconfig, the sushy state, and cluster-tool's client files — use
+# ssh_remote_root for hub-host work the remote side did as root.
+ssh_remote() {
+	if remote_is_local; then
+		bash -c "$*"
+	else
+		ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE_HOST}" "$@"
+	fi
+}
+
+# The same command, but as root on the hub's host: over ssh a real REMOTE_HOST
+# already runs as root, so only the local branch differs, escalating through
+# sudo. Use this for libvirt, /etc, and systemctl work — the things the remote
+# flow got from ssh-ing in as root — and ssh_remote for anything that must see
+# the invoking user's $HOME.
+ssh_remote_root() {
+	if remote_is_local; then
+		sudo bash -c "$*"
+	else
+		ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE_HOST}" "$@"
+	fi
+}
+
+# cluster-tool command prefix. Its server half (connect, pull, boot, list,
+# destroy) needs root for libvirt, haproxy, and the dnsmasq entries: remote
+# hosts get that from ssh root@, so only the local branch escalates. sudo
+# resets PATH, hence the resolved binary path, and cluster-tool chowns the
+# state it writes under sudo back to the invoking user. An array, so `run` in
+# teardown.sh can print it verbatim in a dry run.
+# shellcheck disable=SC2034 # consumed by cluster.sh and teardown.sh
+if remote_is_local; then
+	CLUSTER_TOOL_CMD=(sudo "$(command -v "${CLUSTER_TOOL}" 2>/dev/null || true)")
+else
+	CLUSTER_TOOL_CMD=("${CLUSTER_TOOL}")
+fi
 
 kubectl_bin() {
 	local bin
@@ -222,7 +270,7 @@ ensure_remote_zone_routed() {
 		return 0
 	fi
 	log "adding ${want} to ${conf} on ${REMOTE_HOST}"
-	ssh_remote bash -s <<EOF
+	ssh_remote_root bash -s <<EOF
 set -euo pipefail
 want=$(printf '%q' "${want}")
 conf=$(printf '%q' "${conf}")
