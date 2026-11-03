@@ -194,6 +194,11 @@ deploy:
           # for workers. The caas-ci profile sets the same flag for CI hubs
           # (values/caas-ci/instance.yaml).
           operator.ignition.trustIngressCA: "true"
+          # The dev hub has no Route 53 zone (no AWS); its DNS is the dev-env
+          # dnsmasq zone routing from `make osac-dev-setup`. The noop DNS
+          # driver makes the cluster-fulfillment AAP jobs skip external DNS
+          # record management instead of failing against Route 53.
+          aap.instanceGroups.clusterFulfillment.config.DNS_CLASS: "dns.noop.dns"
           aap.bootstrap.backoffLimit: "2"
           # Where the config-as-code project reads the Ansible content the job
           # templates name. Both are empty unless the caller exports them: an
