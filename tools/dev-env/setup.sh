@@ -18,7 +18,8 @@
 # --force (or FORCE=1 through the Makefile) re-runs the client setup even when it
 # is already configured.
 #
-# Needs sudo; run it as your normal user.
+# Needs sudo unless already root; run it as your normal user or as
+# root directly.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -40,7 +41,7 @@ make osac-dev runs this script and then dns.sh.
 --force re-runs the client setup even when it is already configured
 (shortcut: make osac-dev-setup FORCE=1).
 
-Needs sudo; run it as your normal user.
+Needs sudo unless already root; run it as your normal user or as root
 EOF
 }
 
@@ -74,7 +75,7 @@ main() {
 		shift
 	done
 
-	require_non_root
+	require_user_context
 
 	ensure_client_setup
 }

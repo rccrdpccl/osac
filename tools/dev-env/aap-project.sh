@@ -318,7 +318,7 @@ main() {
 		soft=1
 	fi
 
-	require_non_root
+	require_user_context
 	kubectl=$(kubectl_bin)
 	[ -n "${kubectl}" ] || die "neither kubectl nor oc found in PATH"
 	kubeconfig=$(hub_kubeconfig)

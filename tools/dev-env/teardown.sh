@@ -262,7 +262,7 @@ step_all() {
 
 main() {
 	local step
-	require_non_root
+	require_user_context
 
 	while [ $# -gt 0 ]; do
 		case $1 in
