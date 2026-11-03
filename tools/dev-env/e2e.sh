@@ -34,8 +34,14 @@
 #   -- ARGS...         appended verbatim after the selectors, e.g.
 #                      `-- -x -vv --junitxml=/tmp/e2e.xml`   (make E2E_ARGS=)
 #
+# Running another worktree's tests:
+#   E2E_REPO=~/worktrees/osac/my-feature
+# pytest runs from that worktree, so a test that is not merged yet is collected
+# from there while the hub, the CLI and the preflight still come from this one.
+#
 # Every option also reads an environment variable, which is how the make target
-# passes them: E2E_SUITE, E2E_FILTER, E2E_MARKER, E2E_ARGS, OSAC_CLI_PATH.
+# passes them: E2E_SUITE, E2E_FILTER, E2E_MARKER, E2E_ARGS, E2E_REPO,
+# OSAC_CLI_PATH.
 #
 # Inputs (defaults in common.sh): OSAC_DEV_HUB_KUBECONFIG, CLUSTER_NAME, NS,
 # PULL_SECRET_FILE, ARTIFACTS_FILE, REPO_ROOT.
@@ -48,6 +54,9 @@ source "${script_dir}/common.sh"
 : "${E2E_FILTER:=}"
 : "${E2E_MARKER:=}"
 : "${E2E_ARGS:=}"
+# Worktree whose tests to run, defaulting to this one. Point it at a feature
+# worktree to run a test that is not merged yet against the same hub.
+: "${E2E_REPO:=}"
 : "${OSAC_CLI_PATH:=}"
 
 suite=${E2E_SUITE}
@@ -301,6 +310,13 @@ main() {
 		warn "no SSH public key in ~/.ssh; set OSAC_SSH_PUBLIC_KEY_PATH to one"
 	fi
 
+	local repo=${REPO_ROOT}
+	if [ -n "${E2E_REPO}" ]; then
+		repo=$(expand_path "${E2E_REPO}")
+		[ -d "${repo}/tests/e2e" ] ||
+			die "E2E_REPO=${E2E_REPO} has no tests/e2e directory"
+	fi
+
 	local -a args=(pytest "${suite}")
 	[ -z "${filter_expr}" ] || args+=(-k "${filter_expr}")
 	[ -z "${marker_expr}" ] || args+=(-m "${marker_expr}")
@@ -312,6 +328,7 @@ main() {
 	fi
 
 	log "suite ${suite} on ${kubeconfig}"
+	[ "${repo}" = "${REPO_ROOT}" ] || log "tests from ${repo}"
 	log "cli ${OSAC_CLI_PATH}"
 	[ -z "${OSAC_PULL_SECRET_PATH:-}" ] || log "pull secret ${OSAC_PULL_SECRET_PATH}"
 	[ -z "${OSAC_SSH_PUBLIC_KEY_PATH:-}" ] || log "ssh key ${OSAC_SSH_PUBLIC_KEY_PATH}"
@@ -323,7 +340,7 @@ main() {
 		return 0
 	fi
 
-	cd "${REPO_ROOT}"
+	cd "${repo}"
 	exec uv run "${args[@]}"
 }
 

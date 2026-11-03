@@ -146,6 +146,7 @@ E2E_SUITE               ?=
 E2E_FILTER              ?=
 E2E_MARKER              ?=
 E2E_ARGS                ?=
+E2E_REPO                ?=
 OSAC_CLI_PATH           ?=
 SKAFFOLD_ARGS           ?=
 
@@ -159,6 +160,7 @@ export E2E_SUITE := $(E2E_SUITE)
 export E2E_FILTER := $(E2E_FILTER)
 export E2E_MARKER := $(E2E_MARKER)
 export E2E_ARGS := $(E2E_ARGS)
+export E2E_REPO := $(E2E_REPO)
 export OSAC_CLI_PATH := $(OSAC_CLI_PATH)
 # Teardown answers and extras; the scripts read the TEARDOWN_* names.
 export TEARDOWN_YES := $(YES)
