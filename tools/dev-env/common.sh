@@ -26,6 +26,14 @@ set -euo pipefail
 # whatever it is; 150G keeps kubelet's imagefs.available=15% threshold away.
 : "${DISK_SIZE:=150G}"
 
+# cluster-tool records where each server lives, which is the ssh target the
+# scripts need. Deriving it means REMOTE_HOST survives a new shell.
+if [ -z "${REMOTE_HOST}" ] && [ -f "${CLUSTER_TOOL_SERVERS}" ] &&
+	command -v jq >/dev/null 2>&1; then
+	REMOTE_HOST=$(jq -r --arg name "${SERVER_NAME}" '.servers[$name].host // empty' \
+		"${CLUSTER_TOOL_SERVERS}" 2>/dev/null || true)
+fi
+
 # Existing hub to reuse instead of booting a cluster.
 : "${OSAC_DEV_HUB_KUBECONFIG:=}"
 : "${CLUSTER_DOMAIN:=}"
