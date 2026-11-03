@@ -62,7 +62,16 @@ COPY osac-ui/apps/app-frontend/package.json ./apps/app-frontend/
 # (pointed at the prefetched pnpm store) when present -- i.e. a hermetic
 # Konflux build. Absent entirely for local/non-hermetic builds, where pnpm
 # installs from the real registry as before.
-RUN [ -f /cachi2/cachi2.env ] && . /cachi2/cachi2.env; pnpm install --frozen-lockfile
+#
+# --fetch-retries=8: pnpm's default 2 retries (10s, then 60s backoff) can be
+# outlived by a transient network stall. Lab and VPN paths that reap idle
+# keep-alive connections kill a whole batch of in-flight tarball fetches at
+# once (bursts of ERR_SOCKET_TIMEOUT, reproducibly hitting whatever sits at
+# that point in the lockfile's deterministic download order), and both
+# default retries land inside the same stall window. Eight retries span ~7
+# minutes worst case, and each retry gets a fresh connection -- which is what
+# actually recovers. Inert in hermetic builds, where nothing is fetched.
+RUN [ -f /cachi2/cachi2.env ] && . /cachi2/cachi2.env; pnpm install --frozen-lockfile --fetch-retries=8
 
 # ── Stage 2: build SPA ────────────────────────────────────────────────────
 FROM deps AS spa-builder
