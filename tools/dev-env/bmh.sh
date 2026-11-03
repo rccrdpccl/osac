@@ -206,7 +206,7 @@ main() {
 		shift
 	done
 
-	require_non_root
+	require_user_context
 	[ -n "${REMOTE_HOST}" ] ||
 		die "REMOTE_HOST is required (user@host, or 'local' when the hub runs here)"
 	[ -f "${LIB}" ] || die "${LIB} not found"

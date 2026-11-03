@@ -294,7 +294,7 @@ main() {
 	*) die "unknown command: ${command} (try --help)" ;;
 	esac
 
-	require_non_root
+	require_user_context
 	command -v "${SKAFFOLD}" >/dev/null 2>&1 ||
 		die "${SKAFFOLD} not found in PATH (install skaffold v2)"
 	command -v "${HELM}" >/dev/null 2>&1 || die "${HELM} not found in PATH"

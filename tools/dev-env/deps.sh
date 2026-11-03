@@ -125,7 +125,7 @@ main() {
 		shift
 	done
 
-	require_non_root
+	require_user_context
 
 	local installer kubeconfig zone
 	installer=$(installer_dir)

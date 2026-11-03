@@ -21,7 +21,8 @@
 # second half usually only confirms it.
 #
 # The zone comes from OSAC_DEV_HUB_KUBECONFIG (or CLUSTER_DOMAIN when set).
-# Needs sudo locally; run it as your normal user.
+# Needs sudo locally unless already root; run it as your normal user or as
+# root directly.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -48,7 +49,7 @@ The zone comes from OSAC_DEV_HUB_KUBECONFIG, or CLUSTER_DOMAIN when set.
 --force rewrites both entries even when the hub name already resolves
 (shortcut: make osac-dev-dns FORCE=1).
 
-Needs sudo locally; run it as your normal user.
+Needs sudo locally unless already root; run it as your normal user or as root
 EOF
 }
 
@@ -65,7 +66,7 @@ main() {
 		shift
 	done
 
-	require_non_root
+	require_user_context
 
 	local kubeconfig zone
 	kubeconfig=$(hub_kubeconfig)
