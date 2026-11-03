@@ -35,6 +35,8 @@
 #                             and watch mode refreshes it on every rebuild)
 #   make osac-dev-watch       `skaffold dev`: prep's initial build, then
 #                             rebuild and redeploy on every source change
+#   make osac-dev-e2e E2E_SUITE=vmaas/sanity
+#                             run an E2E suite against the deployed hub
 #   make osac-dev-delete      uninstall the release
 #
 # Teardown is a menu too, so a run that half finished can be dismantled one
@@ -50,6 +52,15 @@
 # The steps are destructive and ask before each one; YES=1 answers every prompt
 # and DRY_RUN=1 only prints the commands. TEARDOWN_CLIENT=1 also reverts
 # cluster-tool's client setup, TEARDOWN_FLAVOR=1 also deletes the flavor.
+#
+# `make osac-dev-e2e` runs the pytest suites in tests/e2e against whatever is
+# deployed. The suite is required, because the prerequisites differ by orders of
+# magnitude: tests/e2e/projects only needs the API, vmaas/sanity needs a VM
+# template and storage, caas/sanity provisions a cluster on the virtual BMHs.
+# Narrow a run with E2E_FILTER (pytest -k), E2E_MARKER (pytest -m, e.g.
+# 'sanity and not requires_caas'), or E2E_ARGS for anything else. The target
+# wires the dev hub's kubeconfig, NS, and an osac CLI built from this worktree;
+# the tests derive the cluster domain and the route hostnames themselves.
 #
 # Images go to IMAGE_PREFIX (quay.io/rh_ee_rpiccoli by default) instead of an
 # in-cluster registry, so `podman login quay.io` once. The deploy needs an AAP
@@ -118,6 +129,14 @@ IMAGE_PREFIX            ?= quay.io/rh_ee_rpiccoli
 AAP_LICENSE_FILE        ?=
 # Image tags recorded by osac-dev-prep and replayed by osac-dev-deploy.
 ARTIFACTS_FILE          ?= $(HOME)/.cache/osac-dev/builds.json
+# E2E runner (tools/dev-env/e2e.sh): the suite is required, the selectors and
+# the extra arguments are optional, and OSAC_CLI_PATH overrides the CLI that the
+# runner builds from this worktree into the ARTIFACTS_FILE directory.
+E2E_SUITE               ?=
+E2E_FILTER              ?=
+E2E_MARKER              ?=
+E2E_ARGS                ?=
+OSAC_CLI_PATH           ?=
 SKAFFOLD_ARGS           ?=
 
 export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
@@ -126,6 +145,11 @@ export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
 	BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT BMC_USERNAME BMC_PASSWORD \
 	BMH_LABELS SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
 export OSAC_DEV_FORCE := $(FORCE)
+export E2E_SUITE := $(E2E_SUITE)
+export E2E_FILTER := $(E2E_FILTER)
+export E2E_MARKER := $(E2E_MARKER)
+export E2E_ARGS := $(E2E_ARGS)
+export OSAC_CLI_PATH := $(OSAC_CLI_PATH)
 # Teardown answers and extras; the scripts read the TEARDOWN_* names.
 export TEARDOWN_YES := $(YES)
 export TEARDOWN_DRY_RUN := $(DRY_RUN)
@@ -142,12 +166,13 @@ export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI := $(OSAC_DEV_AAP_PROJECT_ARCHIVE_URI)
 
 .PHONY: osac-dev osac-dev-cluster osac-dev-setup osac-dev-deps osac-dev-bmh \
 	osac-dev-dns osac-dev-prep osac-dev-deploy osac-dev-aap-project \
-	osac-dev-watch osac-dev-delete osac-dev-teardown osac-dev-teardown-bmh \
+	osac-dev-watch osac-dev-delete osac-dev-e2e osac-dev-teardown \
+	osac-dev-teardown-bmh \
 	osac-dev-teardown-osac osac-dev-teardown-cluster osac-dev-teardown-dns \
 	osac-dev-teardown-local help
 
 help: ## Show available targets
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
 
 osac-dev: ## Boot the dev cluster (or reuse the hub), install prerequisites, add virtual BMHs, deploy OSAC
 	@$(OSAC_DEV_ENV)/cluster.sh
@@ -184,6 +209,9 @@ osac-dev-aap-project: ## Serve this worktree as the config-as-code project, prin
 
 osac-dev-watch: ## Rebuild and redeploy OSAC on every change (skaffold dev)
 	@$(OSAC_DEV_ENV)/osac.sh dev $(SKAFFOLD_ARGS)
+
+osac-dev-e2e: ## Run an E2E suite against the hub (E2E_SUITE=, E2E_FILTER=, E2E_MARKER=)
+	@$(OSAC_DEV_ENV)/e2e.sh $(if $(DRY_RUN),--dry-run,)
 
 osac-dev-delete: ## Uninstall the osac Helm release (keeps osac-deps/osac-infra)
 	@$(OSAC_DEV_ENV)/osac.sh delete $(SKAFFOLD_ARGS)
