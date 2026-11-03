@@ -234,7 +234,7 @@ resolve_ssh_key() {
 
 main() {
 	local kubeconfig cli pull_secret ssh_key kubectl
-	require_non_root
+	require_user_context
 
 	while [ $# -gt 0 ]; do
 		case $1 in

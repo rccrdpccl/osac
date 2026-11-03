@@ -82,11 +82,21 @@ die() {
 	exit 1
 }
 
-# The scripts escalate with sudo themselves. As root, HOME and PATH change and
-# the hub kubeconfig and kubectl cannot be found.
-require_non_root() {
-	[ "$(id -u)" -ne 0 ] ||
-		die "run this as your normal user, not via sudo (the script escalates by itself)"
+# The scripts escalate with sudo themselves, and the local state — the hub
+# kubeconfig, the image-tag cache, cluster-tool's client files — is keyed to
+# $HOME. Native root is self-consistent: everything lands in /root, and
+# cluster-tool (which keys its writes on SUDO_USER) agrees. Running through
+# sudo from a normal user is not: sudo points $HOME at /root while
+# cluster-tool writes the kubeconfig into the invoking user's home, and the
+# scripts would read the wrong one. So every context is allowed except that
+# one.
+require_user_context() {
+	if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] &&
+		[ "${SUDO_USER}" != "root" ]; then
+		die "run this as your normal user, or as root directly, not through sudo;
+       \$HOME would point at /root while cluster-tool writes the hub kubeconfig
+       into the invoking user's home"
+	fi
 }
 
 # Expand a leading ~/ so file tests work on a quoted path.

@@ -349,7 +349,7 @@ main() {
 		shift
 	done
 
-	require_non_root
+	require_user_context
 	local target kubectl kubeconfig node
 	target=$(to_bytes "${DISK_SIZE}")
 	kubectl=$(kubectl_bin)

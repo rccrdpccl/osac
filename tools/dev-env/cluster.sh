@@ -131,6 +131,7 @@ boot_cluster() {
 }
 
 main() {
+	require_user_context
 	while [ $# -gt 0 ]; do
 		case $1 in
 		-f | --force) CLUSTER_TOOL_FORCE=1 ;;
