@@ -5,9 +5,10 @@
 #
 # Usage: tools/dev-env/cluster.sh [--force]
 #
-# Prepares cluster-tool on REMOTE_HOST (user@host), makes sure the FLAVOR is
-# present there, then boots CLUSTER_NAME from it. Every step is skipped when the
-# desired state already exists, so re-running is cheap.
+# Prepares cluster-tool on REMOTE_HOST (root@host, or `local` to run the hub on
+# this machine), makes sure the FLAVOR is present there, then boots CLUSTER_NAME
+# from it. Every step is skipped when the desired state already exists, so
+# re-running is cheap.
 #
 # Fast path: when OSAC_DEV_HUB_KUBECONFIG points at a valid kubeconfig whose API
 # server is reachable, cluster-tool is not used at all and the existing hub is
@@ -15,6 +16,7 @@
 #
 # Required unless OSAC_DEV_HUB_KUBECONFIG is usable:
 #   REMOTE_HOST=root@host        SSH target for the cluster-tool server
+#   REMOTE_HOST=local            run the hub on this machine instead
 #   PULL_SECRET_FILE=~/ps.json   local pull secret injected into the cluster
 #
 # Other inputs (defaults in common.sh):
@@ -22,6 +24,10 @@
 #   FLAVOR=sno-4-22                       flavor to boot (pulled if missing)
 #   CLUSTER_NAME=osac-dev                 clone name, also the cluster's zone
 #   SERVER_NAME=osac-dev                  cluster-tool server alias locally
+#
+# With REMOTE_HOST=local the cluster-tool server operations run under sudo
+# (libvirt, haproxy, and the dnsmasq entries need root); cluster-tool chowns
+# the state and kubeconfig it writes back to the invoking user.
 #
 # One-time client-side prerequisite (DNS for *.apps on your laptop), run by hand
 # once: sudo cluster-tool setup client
@@ -42,6 +48,7 @@ reused and cluster-tool is not used at all.
 
 Required unless OSAC_DEV_HUB_KUBECONFIG is usable:
   REMOTE_HOST=root@host        SSH target for the cluster-tool server
+  REMOTE_HOST=local            run the hub on this machine instead
   PULL_SECRET_FILE=~/ps.json   local pull secret injected into the cluster
 
 Other inputs (defaults in common.sh):
@@ -49,6 +56,10 @@ Other inputs (defaults in common.sh):
   FLAVOR=sno-4-22                       flavor to boot (pulled if missing)
   CLUSTER_NAME=osac-dev                 clone name, also the cluster's zone
   SERVER_NAME=osac-dev                  cluster-tool server alias locally
+
+With REMOTE_HOST=local the server operations run under sudo (libvirt, haproxy,
+and the dnsmasq entries need root); cluster-tool chowns the state and
+kubeconfig it writes back to the invoking user.
 
 --force re-runs the cluster-tool server setup (CLUSTER_TOOL_FORCE=1).
 
@@ -58,10 +69,13 @@ EOF
 }
 
 # cluster-tool would pull a second copy of the flavor into another data dir.
+# The server config lives in root's home when the server is local (connect
+# runs under sudo), hence ssh_remote_root; for a real host it is the same ssh
+# as ssh_remote, just run as the ssh user.
 check_data_dir() {
 	[ "${CLUSTER_TOOL_FORCE}" != "1" ] || return 0
 	local remote_data
-	remote_data=$(ssh_remote \
+	remote_data=$(ssh_remote_root \
 		'sed -n "s/^CLUSTER_TOOL_DATA=//p" ~/.config/cluster-tool/config' 2>/dev/null) ||
 		remote_data=""
 	if [ -n "${remote_data}" ] && [ "${remote_data}" != "${CLUSTER_TOOL_DATA}" ]; then
@@ -74,19 +88,19 @@ check_data_dir() {
 setup_server() {
 	if [ "${CLUSTER_TOOL_FORCE}" != "1" ] &&
 		grep -qF "\"${SERVER_NAME}\"" "${CLUSTER_TOOL_SERVERS}" 2>/dev/null &&
-		ssh_remote 'test -f ~/.config/cluster-tool/config'; then
+		ssh_remote_root 'test -f ~/.config/cluster-tool/config'; then
 		log "${SERVER_NAME} already set up on ${REMOTE_HOST}, skipping (--force to redo)"
 		return 0
 	fi
 	log "cluster-tool server setup on ${REMOTE_HOST}"
-	"${CLUSTER_TOOL}" connect "${SERVER_NAME}" --host "${REMOTE_HOST}" \
+	"${CLUSTER_TOOL_CMD[@]}" connect "${SERVER_NAME}" --host "${REMOTE_HOST}" \
 		--data-path "${CLUSTER_TOOL_DATA}"
 }
 
 # First column of `cluster-tool flavors`/`list` table rows, header and rule
 # skipped.
 remote_names() {
-	"${CLUSTER_TOOL}" "$1" --server "${SERVER_NAME}" | awk 'NR > 2 { print $1 }'
+	"${CLUSTER_TOOL_CMD[@]}" "$1" --server "${SERVER_NAME}" | awk 'NR > 2 { print $1 }'
 }
 
 # True when the table for `flavors`/`list` contains the given name. Reads all
@@ -103,7 +117,7 @@ ensure_flavor() {
 		return 0
 	fi
 	log "pulling ${FLAVOR_IMAGE} (takes 10-15 min)"
-	"${CLUSTER_TOOL}" pull "${FLAVOR_IMAGE}" --server "${SERVER_NAME}"
+	"${CLUSTER_TOOL_CMD[@]}" pull "${FLAVOR_IMAGE}" --server "${SERVER_NAME}"
 }
 
 boot_cluster() {
@@ -112,7 +126,7 @@ boot_cluster() {
 		return 0
 	fi
 	log "booting ${CLUSTER_NAME} from ${FLAVOR} on ${REMOTE_HOST}"
-	"${CLUSTER_TOOL}" boot --server "${SERVER_NAME}" --flavor "${FLAVOR}" \
+	"${CLUSTER_TOOL_CMD[@]}" boot --server "${SERVER_NAME}" --flavor "${FLAVOR}" \
 		--name "${CLUSTER_NAME}" --pull-secret "${PULL_SECRET_FILE}"
 }
 
@@ -138,7 +152,8 @@ main() {
 	fi
 
 	[ -n "${REMOTE_HOST}" ] ||
-		die "REMOTE_HOST is required, e.g. REMOTE_HOST=root@host (or set OSAC_DEV_HUB_KUBECONFIG)"
+		die "REMOTE_HOST is required, e.g. REMOTE_HOST=root@host or REMOTE_HOST=local
+       (or set OSAC_DEV_HUB_KUBECONFIG)"
 	[ -n "${PULL_SECRET_FILE}" ] ||
 		die "PULL_SECRET_FILE is required, e.g. PULL_SECRET_FILE=~/pull-secret.json"
 	PULL_SECRET_FILE=$(expand_path "${PULL_SECRET_FILE}")
