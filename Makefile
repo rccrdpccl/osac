@@ -26,6 +26,15 @@
 #   make osac-dev-setup FORCE=1        client setup + DNS, forced
 #   make osac-dev-cluster FORCE=1      cluster-tool server setup, forced
 #
+# REMOTE_HOST selects where the hub runs: root@host for a remote hypervisor,
+# or `local` to run it on this machine (cluster-tool's own spelling). The local
+# mode runs the same steps in the same order; the hub-host work the remote flow
+# did over `ssh root@` (cluster-tool server operations, virsh, /etc, systemctl)
+# escalates through sudo instead, and cluster-tool chowns the kubeconfig and
+# state it writes back to the invoking user. The machine needs libvirt, enough
+# RAM for the hub plus the BMH_COUNT virtual BMHs, and a CLUSTER_TOOL_DATA
+# directory with room for the flavor and clones.
+#
 # `make osac-dev` ends with a deployed, ready OSAC: after the cluster steps it
 # prepares (osac-dev-prep) and deploys (osac-dev-deploy). Both halves are
 # targets of their own, so an iterate loop is
@@ -76,7 +85,8 @@
 # prerequisites are installed on the existing hub.
 #
 # Inputs, exported to the scripts (defaults live in tools/dev-env/common.sh):
-#   REMOTE_HOST=root@host        SSH target for the cluster-tool server
+#   REMOTE_HOST=root@host        SSH target for the cluster-tool server, or
+#                               `local` to run the hub on this machine
 #   PULL_SECRET_FILE=~/ps.json   local pull secret injected into the cluster
 #   OSAC_DEV_HUB_KUBECONFIG=...  existing hub to reuse (fast path)
 #   FLAVOR=sno-4-22              flavor to boot (pulled when missing)

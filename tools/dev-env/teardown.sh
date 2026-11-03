@@ -16,6 +16,11 @@
 #   dns      remove the hub zone routing on this machine and on REMOTE_HOST
 #   local    remove the image-tag cache that the prep step wrote
 #
+# REMOTE_HOST may be `local`: the hub-host steps then run on this machine,
+# through sudo for the parts the remote flow did as root (virsh, /etc, the
+# cluster-tool server operations). The sushy state and VM disks the BMH setup
+# created as root are found again, because teardown uses the same context.
+#
 # `all` runs the steps in that order, which is the only order that works: the
 # BMHs finalize through controllers that the osac release provides, so they go
 # first; the DNS drop-in is how this machine reaches the hub, so it goes last.
@@ -108,7 +113,7 @@ step_bmh_remote() {
 	ssh_remote true ||
 		die "cannot ssh to ${REMOTE_HOST} without a password (check your ssh agent)"
 	log "tearing down the BMH emulation on ${REMOTE_HOST}"
-	ssh_remote env "CLONE=${CLUSTER_NAME}" "COUNT=${BMH_COUNT}" bash -s <<'REMOTE'
+	ssh_remote_root env "CLONE=${CLUSTER_NAME}" "COUNT=${BMH_COUNT}" bash -s <<'REMOTE'
 set -uo pipefail
 prefix="virtual-bmh-${CLONE}"
 pid_file="${HOME}/sushy-${CLONE}/sushy.pid"
@@ -152,7 +157,7 @@ step_osac() {
 # server lists it.
 clone_exists() {
 	local names
-	names=$("${CLUSTER_TOOL}" list --server "${SERVER_NAME}" 2>/dev/null |
+	names=$("${CLUSTER_TOOL_CMD[@]}" list --server "${SERVER_NAME}" 2>/dev/null |
 		awk 'NR > 2 { print $1 }') || names=""
 	awk -v want="${CLUSTER_NAME}" '$1 == want { found = 1 } END { exit !found }' \
 		<<<"${names}"
@@ -162,7 +167,7 @@ step_cluster() {
 	local kubeconfig
 	if clone_exists; then
 		confirm "destroy the cluster-tool clone ${CLUSTER_NAME} on ${SERVER_NAME}"
-		run "${CLUSTER_TOOL}" destroy "${CLUSTER_NAME}" --server "${SERVER_NAME}"
+		run "${CLUSTER_TOOL_CMD[@]}" destroy "${CLUSTER_NAME}" --server "${SERVER_NAME}"
 	else
 		log "${CLUSTER_NAME} does not exist on ${SERVER_NAME}, nothing to destroy"
 	fi
@@ -177,7 +182,7 @@ step_cluster() {
 
 	if [ "${TEARDOWN_FLAVOR}" = "1" ]; then
 		confirm "delete the ${FLAVOR} flavor; pulling it again takes 10-15 minutes"
-		run "${CLUSTER_TOOL}" flavors --delete "${FLAVOR}" --server "${SERVER_NAME}"
+		run "${CLUSTER_TOOL_CMD[@]}" flavors --delete "${FLAVOR}" --server "${SERVER_NAME}"
 	fi
 }
 
@@ -208,7 +213,7 @@ step_dns() {
 		confirm "remove ${remote_conf} on ${REMOTE_HOST}"
 		ssh_remote true ||
 			die "cannot ssh to ${REMOTE_HOST} without a password (check your ssh agent)"
-		ssh_remote env "CONF=${remote_conf}" bash -s <<'REMOTE'
+		ssh_remote_root env "CONF=${remote_conf}" bash -s <<'REMOTE'
 set -uo pipefail
 if [ -f "${CONF}" ]; then
 	rm -f "${CONF}"

@@ -23,6 +23,10 @@
 # is only resized when it is smaller than the target, and the guest steps report
 # NOCHANGE once the root filesystem fills the disk.
 #
+# The block-device layer runs as root on the hub's host (ssh root@ for a real
+# REMOTE_HOST, sudo when it is `local`): virsh and the root-owned overlay under
+# CLUSTER_TOOL_DATA are not readable otherwise.
+#
 # The guest steps run in a privileged hostPID pod pinned to the node, entering
 # the host mount and pid namespaces with nsenter. The pod tolerates every taint
 # and is system-node-critical, because the interesting case is a hub that is
@@ -30,7 +34,8 @@
 #
 # Inputs (defaults in common.sh):
 #   DISK_SIZE=150G          target size of the hub's root disk
-#   REMOTE_HOST=root@host   where the clone runs; empty skips the whole resize
+#   REMOTE_HOST=root@host   where the clone runs; `local` grows it here;
+#                           empty skips the whole resize
 #   CLUSTER_NAME=osac-dev   clone name, also the VM name's prefix
 #   RESIZE_VM=...           VM to grow, default test-infra-cluster-<name>-master-0
 #   RESIZE_NODE=            node to grow, default the first one
@@ -60,11 +65,13 @@ Usage: tools/dev-env/resize.sh [--size 150G] [--node NAME] [--dry-run]
 
 Grow the hub's root disk to DISK_SIZE: virsh blockresize on REMOTE_HOST, then
 growpart and xfs_growfs in the guest. Both steps are skipped when the disk is
-already that big, so re-running is free.
+already that big, so re-running is free. The block-device layer runs as root
+on the hub's host (sudo when REMOTE_HOST=local).
 
 Inputs (defaults in common.sh):
   DISK_SIZE=150G          target size of the hub's root disk
-  REMOTE_HOST=root@host   where the clone runs; empty skips the whole resize
+  REMOTE_HOST=root@host   where the clone runs; `local` grows it here;
+                          empty skips the whole resize
   CLUSTER_NAME=osac-dev   clone name, also the VM name's prefix
   RESIZE_VM=...           VM to grow, default test-infra-cluster-<name>-master-0
   RESIZE_NODE=            node to grow, default the first one
@@ -129,7 +136,7 @@ resolve_node() {
 
 # Prints "<path> <virtual-size>" for the clone's first disk on REMOTE_HOST.
 remote_root_disk() {
-	ssh_remote bash -s <<EOF
+	ssh_remote_root bash -s <<EOF
 set -euo pipefail
 export LIBVIRT_DEFAULT_URI=qemu:///system
 # No early exit in awk: under pipefail virsh would die of SIGPIPE.
@@ -175,7 +182,7 @@ grow_block_device() {
 	fi
 	log "growing ${disk} to ${target} bytes"
 	# The trailing B is load bearing: virsh reads a bare number as KiB.
-	ssh_remote bash -s <<EOF
+	ssh_remote_root bash -s <<EOF
 set -euo pipefail
 export LIBVIRT_DEFAULT_URI=qemu:///system
 virsh blockresize --domain $(printf '%q' "${RESIZE_VM}") \

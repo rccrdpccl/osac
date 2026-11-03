@@ -12,11 +12,19 @@
 # pipes the library to a remote bash, and passes the inputs through env. A CI
 # job can call the same library directly.
 #
+# The library runs as root on that machine (ssh root@ for a real REMOTE_HOST,
+# sudo when it is `local`), because defining VMs, the storage pool, and the
+# emulator needs libvirt and the VMs' disks live where root put them. Locally
+# the kubeconfig is not pushed (it is already here) and the library gets its
+# KUBECONFIG and KUBECTL as absolute paths, since sudo resets HOME and PATH.
+#
 # REMOTE_HOST is the hypervisor running the cluster: the hub API address is
 # local to it and haproxy there routes by SNI, so oc needs the hub name to
 # resolve. That entry belongs to the DNS concern and is written by dns.sh; it is
 # re-applied here only when the hub API turns out to be unreachable, so the
-# target works even when dns.sh was never run for this host.
+# target works even when dns.sh was never run for this host. With
+# REMOTE_HOST=local that machine is this one, and the entry cluster-tool's boot
+# wrote here already covers it.
 #
 # Skipped only when the setup is verifiably current: for each of the
 # BMH_COUNT VMs it expects, the VM exists on REMOTE_HOST with its NIC MAC and
@@ -27,7 +35,7 @@
 # reconciled by the library.
 #
 # Inputs (defaults in common.sh / the Makefile):
-#   REMOTE_HOST      ssh target that hosts the cluster-tool cluster
+#   REMOTE_HOST      ssh target that hosts the cluster-tool cluster, or `local`
 #   OSAC_DEV_HUB_KUBECONFIG  kubeconfig of the hub, else ~/.kube/<CLUSTER_NAME>
 #   CLUSTER_NAME     cluster-tool clone name, used for network/VM names
 #   BMH_NAMESPACE=host-inventory BMH_COUNT=2 BMH_DISK_SIZE=150G SUSHY_PORT=8000
@@ -53,7 +61,8 @@ repaired in place: stopped VMs are started, a dead emulator restarted, missing
 or stale BMHs (re-)applied.
 
 Inputs (defaults in common.sh / the Makefile):
-  REMOTE_HOST              ssh target hosting the cluster (user@host)
+  REMOTE_HOST              ssh target hosting the cluster (user@host), or
+                           `local` to run the hub on this machine
   OSAC_DEV_HUB_KUBECONFIG  kubeconfig of the hub, else ~/.kube/<CLUSTER_NAME>
   CLUSTER_NAME=osac-dev    cluster-tool clone name (network and VM names)
   BMH_NAMESPACE=host-inventory  BMH_COUNT=2  BMH_DISK_SIZE=150G
@@ -66,9 +75,11 @@ EOF
 
 # Per-VM identity and power state on REMOTE_HOST, one line each:
 #   <vm name> <nic mac> <domain uuid> <domain state>
-# "none" stands in for anything virsh cannot report (VM absent).
+# "none" stands in for anything virsh cannot report (VM absent). Runs as root
+# on the hub's host: the VMs are defined by the root context the library runs
+# in, and virsh on qemu:///system is not a user operation there.
 remote_vm_state() {
-	ssh_remote "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") BMH_COUNT=$(printf '%q' "${BMH_COUNT}") bash -s" <<'REMOTE'
+	ssh_remote_root "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") BMH_COUNT=$(printf '%q' "${BMH_COUNT}") bash -s" <<'REMOTE'
 set -euo pipefail
 for index in $(seq 1 "${BMH_COUNT}"); do
 	vm="virtual-bmh-${CLONE_NAME}-${index}"
@@ -114,6 +125,10 @@ bmh_setup_is_current() {
 push_kubeconfig() {
 	local remote_kubeconfig='$HOME/.kube/'"${CLUSTER_NAME}"'.kubeconfig'
 	local local_sum remote_sum
+	if remote_is_local; then
+		log "hub kubeconfig is already on this machine, nothing to push"
+		return 0
+	fi
 	local_sum=$(md5sum "${HUB_KUBECONFIG}" | cut -d' ' -f1)
 	remote_sum=$(ssh_remote "md5sum ${remote_kubeconfig} 2>/dev/null | cut -d' ' -f1" || true)
 	if [ "${local_sum}" = "${remote_sum}" ]; then
@@ -144,12 +159,27 @@ ensure_remote_hub_access() {
 	log "hub API reachable from ${REMOTE_HOST}"
 }
 
+# The KUBECONFIG and KUBECTL lines for the library's environment. On a real
+# REMOTE_HOST the kubeconfig was pushed to the ssh user's home and that user's
+# PATH holds oc. Locally the library runs as root through ssh_remote_root, so
+# $HOME would point at /root and sudo's PATH may miss a user-local oc: pass
+# both as the absolute values this script already resolved. An empty kubectl
+# binary keeps the library's own `oc` default.
+remote_kubeconfig_env() {
+	if remote_is_local; then
+		printf 'KUBECONFIG=%q\nKUBECTL=%q\n' \
+			"${HUB_KUBECONFIG}" "$(kubectl_bin)"
+	else
+		printf 'KUBECONFIG=$HOME/.kube/%s.kubeconfig\n' "${CLUSTER_NAME}"
+	fi
+}
+
 run_remote_setup() {
 	local remote_env
 	remote_env=$(
 		cat <<EOF
 CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}")
-KUBECONFIG=\$HOME/.kube/${CLUSTER_NAME}.kubeconfig
+$(remote_kubeconfig_env)
 BMH_NAMESPACE=$(printf '%q' "${BMH_NAMESPACE}")
 BMH_COUNT=$(printf '%q' "${BMH_COUNT}")
 BMH_DISK_SIZE=$(printf '%q' "${BMH_DISK_SIZE}")
@@ -160,7 +190,7 @@ BMC_PASSWORD=$(printf '%q' "${BMC_PASSWORD}")
 EOF
 	)
 	log "running tools/shared/virtual-bmh.sh on ${REMOTE_HOST}"
-	ssh_remote "env ${remote_env//$'\n'/ } bash -s" <"${LIB}"
+	ssh_remote_root "env ${remote_env//$'\n'/ } bash -s" <"${LIB}"
 }
 
 main() {
@@ -177,7 +207,8 @@ main() {
 	done
 
 	require_non_root
-	[ -n "${REMOTE_HOST}" ] || die "REMOTE_HOST is required (user@host)"
+	[ -n "${REMOTE_HOST}" ] ||
+		die "REMOTE_HOST is required (user@host, or 'local' when the hub runs here)"
 	[ -f "${LIB}" ] || die "${LIB} not found"
 	HUB_KUBECONFIG=$(hub_kubeconfig)
 	[ -f "${HUB_KUBECONFIG}" ] ||
