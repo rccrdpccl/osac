@@ -245,10 +245,19 @@ check_image_pullability() {
 # which Helm copies into charts/. Rebuild them on every deploy: editing a
 # subchart template (osac-operator/charts/..., bare-metal-fulfillment-operator/
 # charts/...) only reaches the cluster when the copy is refreshed first.
+#
+# Chart.lock is a gitignored, per-checkout artifact, and `dependency build`
+# refuses to run when it no longer matches Chart.yaml — a checkout that last
+# ran an older tree keeps a stale one, and pulling cannot refresh an ignored
+# file. Regenerate it in that case; the local subcharts are the source of
+# truth here anyway, so nothing is lost by re-resolving them.
 ensure_chart_dependencies() {
 	local chart=$1
 	log "rebuilding chart dependencies in ${chart}/charts from the local subcharts"
-	"${HELM}" --repository-config /dev/null dependency build "${chart}" >/dev/null
+	if ! "${HELM}" --repository-config /dev/null dependency build "${chart}" >/dev/null 2>&1; then
+		log "Chart.lock does not match Chart.yaml, regenerating it (helm dependency update)"
+		"${HELM}" --repository-config /dev/null dependency update "${chart}" >/dev/null
+	fi
 }
 
 # The same values `install-osac` derives from the live cluster; skaffold.yaml
