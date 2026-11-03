@@ -21,6 +21,10 @@ set -euo pipefail
 : "${FLAVOR:=sno-4-22}"
 : "${FLAVOR_IMAGE:=quay.io/rh-ee-ovishlit/cluster-flavors:${FLAVOR}}"
 : "${CLUSTER_NAME:=osac-dev}"
+# Root disk size the hub is grown to after boot (tools/dev-env/resize.sh). The
+# flavors are post-install images, so a clone inherits the image's disk size
+# whatever it is; 150G keeps kubelet's imagefs.available=15% threshold away.
+: "${DISK_SIZE:=150G}"
 
 # Existing hub to reuse instead of booting a cluster.
 : "${OSAC_DEV_HUB_KUBECONFIG:=}"

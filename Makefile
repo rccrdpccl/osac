@@ -7,6 +7,10 @@
 #   tools/dev-env/cluster.sh   cluster-tool server setup, flavor pull, boot
 #   tools/dev-env/setup.sh     client setup (dnsmasq, NetworkManager)
 #   tools/dev-env/dns.sh       hub zone DNS routing here and on REMOTE_HOST
+#   tools/dev-env/resize.sh    grow the hub's root disk to DISK_SIZE
+#                              (the flavors are post-install images, so a
+#                              clone starts at the image's 93 GiB and kubelet
+#                              evicts under disk pressure minutes later)
 #   tools/dev-env/deps.sh      osac-deps + osac-infra via osac-installer,
 #                              skipped when the releases already match the
 #                              in-tree chart version
@@ -97,6 +101,12 @@ CLUSTER_TOOL_DATA       ?= /data/cluster-tool
 FLAVOR                  ?= sno-4-22
 FLAVOR_IMAGE            ?= quay.io/rh-ee-ovishlit/cluster-flavors:$(FLAVOR)
 CLUSTER_NAME            ?= osac-dev
+# Root disk size the hub is grown to after boot. This is not cosmetic: the
+# cluster-tool flavors are post-install images whose partition table is fixed at
+# build time, cluster-tool clones without a size, and 15% of 93 GiB (kubelet's
+# imagefs.available eviction threshold) is less than the OSAC images need. Raise
+# it when a flavor ships bigger; the resize is skipped when the disk is bigger.
+DISK_SIZE               ?= 150G
 CLUSTER_TOOL_FORCE      ?=
 # Derived from the hub kubeconfig when empty.
 CLUSTER_DOMAIN          ?=
@@ -141,9 +151,9 @@ SKAFFOLD_ARGS           ?=
 
 export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
 	OSAC_DEV_HUB_KUBECONFIG CLUSTER_TOOL_DATA FLAVOR FLAVOR_IMAGE CLUSTER_NAME \
-	CLUSTER_TOOL_FORCE CLUSTER_DOMAIN OSAC_INSTALLER PLATFORM PROFILE NS HELM \
-	BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT BMC_USERNAME BMC_PASSWORD \
-	BMH_LABELS SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
+	DISK_SIZE CLUSTER_TOOL_FORCE CLUSTER_DOMAIN OSAC_INSTALLER PLATFORM PROFILE \
+	NS HELM BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT BMC_USERNAME \
+	BMC_PASSWORD BMH_LABELS SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
 export OSAC_DEV_FORCE := $(FORCE)
 export E2E_SUITE := $(E2E_SUITE)
 export E2E_FILTER := $(E2E_FILTER)
@@ -165,7 +175,8 @@ export OSAC_DEV_AAP_PROJECT_GIT_BRANCH := $(OSAC_DEV_AAP_PROJECT_GIT_BRANCH)
 export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI := $(OSAC_DEV_AAP_PROJECT_ARCHIVE_URI)
 
 .PHONY: osac-dev osac-dev-cluster osac-dev-setup osac-dev-deps osac-dev-bmh \
-	osac-dev-dns osac-dev-prep osac-dev-deploy osac-dev-aap-project \
+	osac-dev-dns osac-dev-resize osac-dev-prep osac-dev-deploy \
+	osac-dev-aap-project \
 	osac-dev-watch osac-dev-delete osac-dev-e2e osac-dev-teardown \
 	osac-dev-teardown-bmh \
 	osac-dev-teardown-osac osac-dev-teardown-cluster osac-dev-teardown-dns \
@@ -178,6 +189,7 @@ osac-dev: ## Boot the dev cluster (or reuse the hub), install prerequisites, add
 	@$(OSAC_DEV_ENV)/cluster.sh
 	@$(OSAC_DEV_ENV)/setup.sh
 	@$(OSAC_DEV_ENV)/dns.sh
+	@$(OSAC_DEV_ENV)/resize.sh
 	@$(OSAC_DEV_ENV)/deps.sh
 	@$(OSAC_DEV_ENV)/bmh.sh
 	@$(OSAC_DEV_ENV)/osac.sh prep $(SKAFFOLD_ARGS)
@@ -197,6 +209,9 @@ osac-dev-bmh: ## Create virtual BareMetalHosts on REMOTE_HOST (needs REMOTE_HOST
 
 osac-dev-dns: ## Route hub names to dnsmasq here and on REMOTE_HOST
 	@$(OSAC_DEV_ENV)/dns.sh
+
+osac-dev-resize: ## Grow the hub's root disk to DISK_SIZE (osac-dev does this after dns)
+	@$(OSAC_DEV_ENV)/resize.sh --size $(DISK_SIZE) $(if $(DRY_RUN),--dry-run,)
 
 osac-dev-prep: ## Build and push every image, upload the AAP license, rebuild chart dependencies
 	@$(OSAC_DEV_ENV)/osac.sh prep $(SKAFFOLD_ARGS)
