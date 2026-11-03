@@ -150,7 +150,7 @@ step_osac() {
 
 # Mirror of cluster.sh's boot check: the clone is only ours to destroy when the
 # server lists it.
-clone_is_booted() {
+clone_exists() {
 	local names
 	names=$("${CLUSTER_TOOL}" list --server "${SERVER_NAME}" 2>/dev/null |
 		awk 'NR > 2 { print $1 }') || names=""
@@ -160,11 +160,11 @@ clone_is_booted() {
 
 step_cluster() {
 	local kubeconfig
-	if clone_is_booted; then
+	if clone_exists; then
 		confirm "destroy the cluster-tool clone ${CLUSTER_NAME} on ${SERVER_NAME}"
 		run "${CLUSTER_TOOL}" destroy "${CLUSTER_NAME}" --server "${SERVER_NAME}"
 	else
-		log "${CLUSTER_NAME} is not booted on ${SERVER_NAME}, nothing to destroy"
+		log "${CLUSTER_NAME} does not exist on ${SERVER_NAME}, nothing to destroy"
 	fi
 
 	kubeconfig=$(hub_kubeconfig)
