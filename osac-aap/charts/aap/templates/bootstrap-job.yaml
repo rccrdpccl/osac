@@ -117,10 +117,13 @@ spec:
       containers:
       - name: bootstrap
         image: {{ .Values.bootstrap.image }}
-        command:
-          - /bin/bash
-          - -c
+        # Do not override `command`: it would bypass the execution environment's
+        # entrypoint, which is what guarantees a writable HOME (/runner). With
+        # HOME empty Ansible resolves its temp dir to /.ansible and the run dies
+        # with PermissionError before the playbook starts.
         args:
+          - bash
+          - -c
           - |
             {{- include "osac-aap.bootstrapRunScript" . | nindent 12 }}
         envFrom:
