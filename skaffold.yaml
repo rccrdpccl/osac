@@ -186,6 +186,14 @@ deploy:
           # attempts keep a transient AAP hiccup recoverable while a real
           # misconfiguration fails in ~3m, where a rerun of make osac-dev-deploy
           # retries immediately instead of waiting out a backoff.
+          # The dev hub serves Assisted Service's discovery ignition through
+          # the OpenShift ingress Route, whose certificate chains to the
+          # cluster-internal CA. Without this the bare-metal worker's fetch
+          # fails TLS verification, InfraEnvReady stays IgnitionPending, no
+          # BareMetalInstance is created, and the CaaS suite times out waiting
+          # for workers. The caas-ci profile sets the same flag for CI hubs
+          # (values/caas-ci/instance.yaml).
+          operator.ignition.trustIngressCA: "true"
           aap.bootstrap.backoffLimit: "2"
           # Where the config-as-code project reads the Ansible content the job
           # templates name. Both are empty unless the caller exports them: an
