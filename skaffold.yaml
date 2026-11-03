@@ -199,6 +199,20 @@ deploy:
           # driver makes the cluster-fulfillment AAP jobs skip external DNS
           # record management instead of failing against Route 53.
           aap.instanceGroups.clusterFulfillment.config.DNS_CLASS: "dns.noop.dns"
+          # The virtual-BMH CaaS flow needs a fabric manager. The fulfillment
+          # service rejects BareMetalInstance creation for any subnet whose
+          # NetworkClass has no fabric_manager ("bare metal instances require a
+          # fabric manager"), so WorkersFailed/BMICreateRejected repeats until
+          # the CaaS suite times out. cudn_net is the CaaS overlay profile that
+          # values/caas-ci/instance.yaml uses for the same virtual-BMH setup.
+          # NETWORK_CLASS must be set explicitly too: full-ci sets
+          # expertOverrides.aap, which disables the chart's facade derivation of
+          # NETWORK_CLASS/NETWORK_STEPS_COLLECTION from global.networking.
+          # k8sManager is left alone: full-ci sets cudn_evpn, which the chart
+          # now requires whenever VMaaS is enabled (k8s_only is not a valid
+          # Kubernetes Manager for this profile).
+          global.networking.fabricManager: "cudn_net"
+          aap.instanceGroups.clusterFulfillment.config.NETWORK_CLASS: "ci"
           aap.bootstrap.backoffLimit: "2"
           # Where the config-as-code project reads the Ansible content the job
           # templates name. Both are empty unless the caller exports them: an
