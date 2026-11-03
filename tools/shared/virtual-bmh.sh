@@ -235,10 +235,13 @@ sushy_responds() {
 }
 
 # PID listening on the emulator address, empty when nothing is bound there.
+# Nothing listening is the normal case before the emulator starts, and pipefail
+# turns the empty grep into a failure that set -e acts on in the caller, which
+# would end the script with no message at all.
 port_listener_pid() {
 	ss -ltnp 2>/dev/null |
 		awk -v addr="${GW_IP}:${SUSHY_PORT}" '$4 == addr { print; exit }' |
-		grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+		grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2 || true
 }
 
 # Clone that owns a sushy-emulator process, taken from its --config path.
