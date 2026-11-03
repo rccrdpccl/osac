@@ -17,7 +17,12 @@
 #                           ~/.kube/<CLUSTER_NAME>)
 #   OSAC_NAMESPACE          NS (osac); the tests default to osac-devel
 #   OSAC_CLI_PATH           the osac CLI, built from the worktree when missing
-#   OSAC_PULL_SECRET_PATH   PULL_SECRET_FILE, when it is a file
+#   OSAC_PULL_SECRET_PATH   PULL_SECRET_FILE, else the hub's own pull secret
+#   OSAC_SSH_PUBLIC_KEY_PATH  ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub
+#
+# It also refuses to stay silent about the one hub problem the suites cannot
+# see: a node under disk pressure, where the kubelet evicts AWX task pods and
+# every AAP-driven provisioning step dies with a controller 500.
 #
 # Everything else keeps the tests' defaults, which already resolve from the
 # cluster: the cluster domain, the fulfillment and Keycloak routes, the service
@@ -140,15 +145,86 @@ require_tools() {
 # rather than inside a session fixture several minutes in.
 check_hub() {
 	local kubeconfig=$1 kubectl
-	kubectl=$(kubectl_bin) || kubectl=kubectl
+	kubectl=$(kubectl_bin)
+	[ -n "${kubectl}" ] || die "neither kubectl nor oc is on PATH"
 	[ -f "${kubeconfig}" ] ||
 		die "no kubeconfig at ${kubeconfig}; boot the hub first (make osac-dev-cluster)"
 	KUBECONFIG="${kubeconfig}" "${kubectl}" version --request-timeout=10s >/dev/null 2>&1 ||
 		die "cannot reach the hub API with ${kubeconfig}"
 }
 
+# Under disk pressure the kubelet evicts the AWX task pods, so every AAP-driven
+# provisioning step (default subnets, clusters, instances) fails with a 500 from
+# the controller API and the test dies on a poll timeout that says nothing about
+# the cause. Name the cause instead; the suites cannot see the node.
+check_node_pressure() {
+	local kubeconfig=$1 kubectl=$2 pressure
+	pressure=$(KUBECONFIG="${kubeconfig}" "${kubectl}" get nodes \
+		-o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="DiskPressure")].status}{"\n"}{end}' \
+		2>/dev/null)
+	case ${pressure} in
+	*True*)
+		warn "a hub node reports DiskPressure=True: the kubelet evicts AWX task pods,"
+		warn "so every AAP-driven provisioning step fails with a controller 500 and"
+		warn "the suite dies on a poll timeout. Free space first, e.g."
+		warn "  oc debug node/<node> -- chroot /host crictl rmi --prune"
+		;;
+	esac
+}
+
+# CaaS and BMaaS hand an OCP pull secret to Assisted Installer. PULL_SECRET_FILE
+# is optional in the dev flow, but the hub always has the one its own install
+# used, so fall back to that rather than failing on a missing environment
+# variable.
+resolve_pull_secret() {
+	local kubeconfig=$1 kubectl=$2 path
+	if [ -n "${OSAC_PULL_SECRET_PATH:-}" ]; then
+		printf '%s\n' "${OSAC_PULL_SECRET_PATH}"
+		return 0
+	fi
+	if [ -n "${PULL_SECRET_FILE}" ] && [ -f "$(expand_path "${PULL_SECRET_FILE}")" ]; then
+		# Keep it absolute: the tests run from REPO_ROOT, but a caller may not.
+		path=$(expand_path "${PULL_SECRET_FILE}")
+		case ${path} in
+		/*) ;;
+		*) path="${REPO_ROOT}/${path}" ;;
+		esac
+		printf '%s\n' "${path}"
+		return 0
+	fi
+	path="$(dirname "$(expand_path "${ARTIFACTS_FILE}")")/pull-secret.json"
+	if [ ! -s "${path}" ]; then
+		mkdir -p "$(dirname "${path}")"
+		KUBECONFIG="${kubeconfig}" "${kubectl}" -n openshift-config \
+			get secret pull-secret -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null |
+			base64 -d >"${path}" || {
+			rm -f "${path}"
+			return 1
+		}
+	fi
+	[ -s "${path}" ] || return 1
+	printf '%s\n' "${path}"
+}
+
+# Only suites that install a cluster need this, and the fixture default is the
+# RSA key that modern machines no longer generate.
+resolve_ssh_key() {
+	if [ -n "${OSAC_SSH_PUBLIC_KEY_PATH:-}" ]; then
+		printf '%s\n' "${OSAC_SSH_PUBLIC_KEY_PATH}"
+		return 0
+	fi
+	local candidate
+	for candidate in "${HOME}/.ssh/id_ed25519.pub" "${HOME}/.ssh/id_rsa.pub"; do
+		if [ -f "${candidate}" ]; then
+			printf '%s\n' "${candidate}"
+			return 0
+		fi
+	done
+	return 1
+}
+
 main() {
-	local kubeconfig cli pull_secret
+	local kubeconfig cli pull_secret ssh_key kubectl
 	require_non_root
 
 	while [ $# -gt 0 ]; do
@@ -204,19 +280,25 @@ main() {
 
 	kubeconfig=$(hub_kubeconfig)
 	check_hub "${kubeconfig}"
+	kubectl=$(kubectl_bin)
+	[ -n "${kubectl}" ] || die "neither kubectl nor oc is on PATH"
+	check_node_pressure "${kubeconfig}" "${kubectl}"
 	cli=$(resolve_cli)
 
 	export KUBECONFIG="${kubeconfig}"
 	export OSAC_NAMESPACE="${NS}"
 	export OSAC_CLI_PATH="${cli}"
-	if [ -n "${PULL_SECRET_FILE}" ] && [ -f "$(expand_path "${PULL_SECRET_FILE}")" ]; then
-		# Keep it absolute: the tests run from REPO_ROOT, but a caller may not.
-		pull_secret=$(expand_path "${PULL_SECRET_FILE}")
-		case ${pull_secret} in
-		/*) ;;
-		*) pull_secret="${REPO_ROOT}/${pull_secret}" ;;
-		esac
+	if pull_secret=$(resolve_pull_secret "${kubeconfig}" "${kubectl}"); then
 		export OSAC_PULL_SECRET_PATH="${pull_secret}"
+	else
+		warn "no pull secret found (PULL_SECRET_FILE, OSAC_PULL_SECRET_PATH, or"
+		warn "the hub's openshift-config/pull-secret); suites that install a"
+		warn "cluster will fail"
+	fi
+	if ssh_key=$(resolve_ssh_key); then
+		export OSAC_SSH_PUBLIC_KEY_PATH="${ssh_key}"
+	else
+		warn "no SSH public key in ~/.ssh; set OSAC_SSH_PUBLIC_KEY_PATH to one"
 	fi
 
 	local -a args=(pytest "${suite}")
@@ -231,6 +313,8 @@ main() {
 
 	log "suite ${suite} on ${kubeconfig}"
 	log "cli ${OSAC_CLI_PATH}"
+	[ -z "${OSAC_PULL_SECRET_PATH:-}" ] || log "pull secret ${OSAC_PULL_SECRET_PATH}"
+	[ -z "${OSAC_SSH_PUBLIC_KEY_PATH:-}" ] || log "ssh key ${OSAC_SSH_PUBLIC_KEY_PATH}"
 	[ -z "${filter_expr}" ] || log "filter -k ${filter_expr}"
 	[ -z "${marker_expr}" ] || log "marker -m ${marker_expr}"
 
