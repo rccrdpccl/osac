@@ -34,6 +34,9 @@ set -euo pipefail
 : "${NS:=osac}"
 : "${HELM:=helm}"
 
+# Image tags recorded by `osac.sh prep` and replayed by `osac.sh deploy`.
+: "${ARTIFACTS_FILE:=${HOME}/.cache/osac-dev/builds.json}"
+
 # Virtual BMH emulation (tools/shared/virtual-bmh.sh via tools/dev-env/bmh.sh).
 : "${BMH_NAMESPACE:=host-inventory}"
 : "${BMH_COUNT:=2}"

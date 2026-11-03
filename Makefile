@@ -37,6 +37,20 @@
 #                             rebuild and redeploy on every source change
 #   make osac-dev-delete      uninstall the release
 #
+# Teardown is a menu too, so a run that half finished can be dismantled one
+# concern at a time (osac-dev-delete stays as the release-only shortcut):
+#
+#   make osac-dev-teardown-bmh      BMHs, Redfish emulator, VMs, VM network
+#   make osac-dev-teardown-osac     the release and the AAP project server
+#   make osac-dev-teardown-cluster  the cluster-tool clone and its kubeconfig
+#   make osac-dev-teardown-dns      the hub zone routing here and on the host
+#   make osac-dev-teardown-local    the image-tag cache this flow wrote
+#   make osac-dev-teardown YES=1    all of the above, in that order
+#
+# The steps are destructive and ask before each one; YES=1 answers every prompt
+# and DRY_RUN=1 only prints the commands. TEARDOWN_CLIENT=1 also reverts
+# cluster-tool's client setup, TEARDOWN_FLAVOR=1 also deletes the flavor.
+#
 # Images go to IMAGE_PREFIX (quay.io/rh_ee_rpiccoli by default) instead of an
 # in-cluster registry, so `podman login quay.io` once. The deploy needs an AAP
 # subscription manifest: AAP_LICENSE_FILE=/path/to/license.zip, else
@@ -77,6 +91,13 @@ CLUSTER_TOOL_FORCE      ?=
 CLUSTER_DOMAIN          ?=
 # Shortcut for re-running the setup steps: make osac-dev FORCE=1
 FORCE                   ?=
+# Teardown: YES=1 skips its confirmations, DRY_RUN=1 prints instead of running.
+YES                     ?=
+DRY_RUN                 ?=
+# Teardown extras: also revert cluster-tool's client setup (CLIENT), also
+# delete the snapshot flavor (TEARDOWN_FLAVOR; pulling it again takes 10-15m).
+TEARDOWN_CLIENT         ?=
+TEARDOWN_FLAVOR         ?=
 OSAC_INSTALLER          ?= osac-installer
 HELM                    ?= helm
 # Virtual BMH emulation; tools/shared/virtual-bmh.sh holds the shared logic.
@@ -105,6 +126,11 @@ export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
 	BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT BMC_USERNAME BMC_PASSWORD \
 	BMH_LABELS SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
 export OSAC_DEV_FORCE := $(FORCE)
+# Teardown answers and extras; the scripts read the TEARDOWN_* names.
+export TEARDOWN_YES := $(YES)
+export TEARDOWN_DRY_RUN := $(DRY_RUN)
+export TEARDOWN_CLIENT := $(TEARDOWN_CLIENT)
+export TEARDOWN_FLAVOR := $(TEARDOWN_FLAVOR)
 
 # Skaffold turns an environment variable it cannot find into the literal string
 # `<no value>`, and skaffold.yaml feeds these two into the config-as-code project
@@ -116,10 +142,12 @@ export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI := $(OSAC_DEV_AAP_PROJECT_ARCHIVE_URI)
 
 .PHONY: osac-dev osac-dev-cluster osac-dev-setup osac-dev-deps osac-dev-bmh \
 	osac-dev-dns osac-dev-prep osac-dev-deploy osac-dev-aap-project \
-	osac-dev-watch osac-dev-delete help
+	osac-dev-watch osac-dev-delete osac-dev-teardown osac-dev-teardown-bmh \
+	osac-dev-teardown-osac osac-dev-teardown-cluster osac-dev-teardown-dns \
+	osac-dev-teardown-local help
 
 help: ## Show available targets
-	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-28s\033[0m %s\n", $$1, $$2}'
 
 osac-dev: ## Boot the dev cluster (or reuse the hub), install prerequisites, add virtual BMHs, deploy OSAC
 	@$(OSAC_DEV_ENV)/cluster.sh
@@ -159,3 +187,21 @@ osac-dev-watch: ## Rebuild and redeploy OSAC on every change (skaffold dev)
 
 osac-dev-delete: ## Uninstall the osac Helm release (keeps osac-deps/osac-infra)
 	@$(OSAC_DEV_ENV)/osac.sh delete $(SKAFFOLD_ARGS)
+
+osac-dev-teardown: ## Destroy everything the dev flow created (YES=1, DRY_RUN=1)
+	@$(OSAC_DEV_ENV)/teardown.sh all
+
+osac-dev-teardown-bmh: ## Delete the virtual BMHs, emulator, VMs and VM network
+	@$(OSAC_DEV_ENV)/teardown.sh bmh
+
+osac-dev-teardown-osac: ## Uninstall the release and the AAP project archive server
+	@$(OSAC_DEV_ENV)/teardown.sh osac
+
+osac-dev-teardown-cluster: ## Destroy the cluster-tool clone and its kubeconfig
+	@$(OSAC_DEV_ENV)/teardown.sh cluster
+
+osac-dev-teardown-dns: ## Remove the hub zone routing here and on REMOTE_HOST
+	@$(OSAC_DEV_ENV)/teardown.sh dns
+
+osac-dev-teardown-local: ## Remove the local image-tag cache the prep step wrote
+	@$(OSAC_DEV_ENV)/teardown.sh local
