@@ -14,13 +14,13 @@
 # <baseDomain> is hosted.<hub zone>, which the AAP hosted_cluster role sets on
 # the HostedCluster (spec.dns.baseDomain). On a real installation HyperShift's
 # external-dns integration creates these records. The dev environment has no DNS
-# provider: the hub dnsmasq only carries the catch-all
-# address=/<hub zone>/<server ip> that cluster-tool writes, and that catch-all
-# sends the hosted API name to the hub haproxy (no rule matches it) and the guest
-# apps domain to the hub router (which answers with the hub wildcard
-# certificate). A cluster that is otherwise healthy then never finishes:
-# capi-provider cannot resolve the API name to set the worker's providerID, and
-# the guest console-operator fails its route health check.
+# provider: the hub dnsmasq answers the hub's own names and nothing else (see
+# zone_records in common.sh), so a hosted API name that nobody publishes is
+# NXDOMAIN and capi-provider cannot resolve it to set the worker's providerID,
+# while an apps name caught by a looser rule lands on the hub router, which
+# answers with the hub wildcard certificate and fails the guest
+# console-operator's route health check. Either way a cluster that is otherwise
+# healthy never finishes.
 #
 # So this publishes, per order, one NetworkManager dnsmasq drop-in on the hub's
 # host: the API name to the hosted kube-apiserver LoadBalancer address, and the

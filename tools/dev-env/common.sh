@@ -259,10 +259,32 @@ ensure_zone_routed() {
 	log "${zone} resolves to $(zone_ip "${zone}")"
 }
 
-# The same rule on REMOTE_HOST. It is the hypervisor that runs the hub: haproxy
-# there listens on the VM address and routes by SNI, so oc and the BMH library
-# need the hub name to resolve on that machine too. cluster-tool writes this
-# entry only on the machine that ran the CLI.
+# The dnsmasq rules that make the hub zone resolve without a wildcard. The hub
+# answers for the API names and the apps subdomain; every other name in the zone
+# is NXDOMAIN, because the zone is lab-local and does not exist upstream. That
+# last part is the point: pods append the DHCP search domain and try a public
+# name with the suffix before the absolute name, so a wildcard answers
+# console.redhat.com.<zone> with the hub and their TLS client talks to the hub's
+# haproxy instead of Red Hat.
+zone_records() {
+	local zone=$1 ip=$2
+	printf 'local=/%s/\n' "${zone}"
+	printf 'address=/api.%s/%s\n' "${zone}" "${ip}"
+	printf 'address=/api-int.%s/%s\n' "${zone}" "${ip}"
+	printf 'address=/.apps.%s/%s\n' "${zone}" "${ip}"
+}
+
+# The same names on REMOTE_HOST. It is the hypervisor that runs the hub: haproxy
+# there listens on the host address and routes by SNI, so oc and the BMH library
+# need the hub names to resolve on that machine too. libvirt's dnsmasq for the
+# test-infra network forwards what it does not know to this one, which puts the
+# guest clusters' pods at the end of the same chain.
+#
+# cluster-tool writes one zone-wide wildcard (address=/<zone>/<ip>) on the
+# machine that ran the CLI. Overwrite it with zone_records: a wildcard answers
+# names that belong to somebody else — most visibly the ones guest pods build
+# from their search domain — and then the pod cannot reach the internet at all
+# while the host it lands on resets the connection.
 ensure_remote_zone_routed() {
 	local zone=$1 ip conf want
 	if [ -z "${REMOTE_HOST}" ]; then
@@ -273,30 +295,37 @@ ensure_remote_zone_routed() {
 	[ -n "${ip}" ] ||
 		die "cannot resolve api.${zone} on this machine; run: make osac-dev-dns"
 	conf="/etc/NetworkManager/dnsmasq.d/cluster-${CLUSTER_NAME}.conf"
-	want="address=/${zone}/${ip}"
+	want=$(zone_records "${zone}" "${ip}")
 	if [ "${OSAC_DEV_FORCE}" != "1" ] &&
-		ssh_remote "grep -qxF $(printf '%q' "${want}") $(printf '%q' "${conf}")" 2>/dev/null; then
-		log "${zone} -> ${ip} already in ${conf} on ${REMOTE_HOST}, skipping remote DNS patch"
+		[ "$(ssh_remote "cat $(printf '%q' "${conf}")" 2>/dev/null)" = "${want}" ]; then
+		log "${zone} already answers only the hub names in ${conf} on ${REMOTE_HOST}, skipping remote DNS patch"
 		return 0
 	fi
-	log "adding ${want} to ${conf} on ${REMOTE_HOST}"
+	log "writing the hub names for ${zone} to ${conf} on ${REMOTE_HOST}"
 	ssh_remote_root bash -s <<EOF
 set -euo pipefail
 want=$(printf '%q' "${want}")
 conf=$(printf '%q' "${conf}")
+zone=$(printf '%q' "${zone}")
 mkdir -p "\$(dirname "\${conf}")"
 printf '%s\n' "\${want}" >"\${conf}"
 systemctl reload NetworkManager || systemctl restart NetworkManager
+# Two things have to hold: the hub names answer, and a name in the zone that is
+# not one of ours does not. The second half is what keeps public names from
+# being answered with the hub.
 for attempt in 1 2 3 4 5; do
-	if [ -n "\$(dig +short $(printf '%q' "api.${zone}") @127.0.0.1 | head -1)" ]; then
+	if [ -n "\$(dig +short "api.\${zone}" @127.0.0.1 | head -1)" ] &&
+		[ -z "\$(dig +short "console.redhat.com.\${zone}" @127.0.0.1 | head -1)" ]; then
 		exit 0
 	fi
 	sleep 2
 done
-echo "api.${zone} still does not resolve via 127.0.0.1 on this host" >&2
+echo "dnsmasq on this host does not answer only the hub names for \${zone}" >&2
+dig +short "api.\${zone}" @127.0.0.1 >&2 || true
+dig +short "console.redhat.com.\${zone}" @127.0.0.1 >&2 || true
 exit 1
 EOF
-	log "${zone} -> ${ip} on ${REMOTE_HOST}"
+	log "${zone} answers api, api-int and *.apps on ${REMOTE_HOST}"
 }
 
 # Address the hub host answers DNS on: libvirt gives the network's gateway to

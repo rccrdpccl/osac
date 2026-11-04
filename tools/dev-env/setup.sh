@@ -9,7 +9,8 @@
 # dns=dnsmasq and writes one wildcard rule per clone
 # (address=/test-infra-cluster-<name>.redhat.com/<ip>). Skipped when
 # /etc/NetworkManager/conf.d/cluster-tool-dns.conf already has dns=dnsmasq and
-# dnsmasq is running, so `make osac-dev` can call it every time.
+# dnsmasq is running, so `make osac-dev` can call it every time. dns.sh narrows
+# that wildcard to the names the hub owns, so run it after this one.
 #
 # Routing that zone through dnsmasq is dns.sh's job: when systemd-resolved owns
 # /etc/resolv.conf the 127.0.0.1 dnsmasq is never queried. `make osac-dev` runs

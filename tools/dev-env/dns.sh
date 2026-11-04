@@ -7,18 +7,18 @@
 #
 # cluster-tool writes one wildcard rule per clone into
 # /etc/NetworkManager/dnsmasq.d/cluster-<name>.conf
-# (address=/test-infra-cluster-<name>.redhat.com/<server-ip>), which covers api,
-# *.apps, and keycloak. When systemd-resolved owns /etc/resolv.conf that dnsmasq
-# (127.0.0.1) is never queried, so the hub looks unreachable.
+# (address=/test-infra-cluster-<name>.redhat.com/<server-ip>). When
+# systemd-resolved owns /etc/resolv.conf that dnsmasq (127.0.0.1) is never
+# queried, so the hub looks unreachable.
 #
 # This writes a systemd-resolved drop-in that routes only the hub zone to
 # 127.0.0.1, leaving per-link servers (LAN, corp split DNS) untouched, then
 # restarts systemd-resolved and verifies the API name resolves. Skipped when the
-# hub name already resolves. The same dnsmasq entry is then added on REMOTE_HOST,
-# which runs the hub and therefore has to resolve its own API name; both halves
-# are skipped when the entry is already in place. With REMOTE_HOST=local that
-# host is this machine and cluster-tool's boot already wrote the entry, so the
-# second half usually only confirms it.
+# hub name already resolves. The same zone is then set up on REMOTE_HOST, which
+# runs the hub and therefore has to resolve its own API name; that half replaces
+# cluster-tool's wildcard with the hub names alone, see
+# ensure_remote_zone_routed. With REMOTE_HOST=local that host is this machine
+# and cluster-tool's boot already wrote the entry, so the second half narrows it.
 #
 # The hub's CoreDNS then forwards the hosted-cluster zone to that dnsmasq,
 # because the corp resolver answers NXDOMAIN for the hosted-cluster names
@@ -41,15 +41,18 @@ Usage: tools/dev-env/dns.sh [--force]
 
 Route the hub zone (test-infra-cluster-<name>.redhat.com) to NetworkManager's
 dnsmasq through a systemd-resolved drop-in, then restart systemd-resolved and
-verify that the API name resolves. With REMOTE_HOST set, the same dnsmasq entry
-is added there as well: REMOTE_HOST runs the hub, so its own oc and the virtual
-BMH step need the API name to resolve on that machine.
+verify that the API name resolves. With REMOTE_HOST set, the zone is answered
+there as well: REMOTE_HOST runs the hub, so its own oc and the virtual BMH step
+need the API name to resolve on that machine.
 
 cluster-tool writes one wildcard rule per clone into
-/etc/NetworkManager/dnsmasq.d/cluster-<name>.conf covering api, *.apps, and
-keycloak. When systemd-resolved owns /etc/resolv.conf that dnsmasq (127.0.0.1)
-is never queried, so the hub looks unreachable. Only the hub zone is routed
-here; per-link servers (LAN, corp split DNS) stay untouched.
+/etc/NetworkManager/dnsmasq.d/cluster-<name>.conf. On REMOTE_HOST that wildcard
+is replaced by the names the hub actually owns (api, api-int, *.apps), with the
+rest of the zone answered NXDOMAIN: a wildcard there also answers public names
+that guest pods ask for with their search domain appended
+(console.redhat.com.<zone>), and those pods then reach the hub instead of the
+internet. Only the hub zone is routed here; per-link servers (LAN, corp split
+DNS) stay untouched.
 
 The zone comes from OSAC_DEV_HUB_KUBECONFIG, or CLUSTER_DOMAIN when set.
 
