@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 from collections.abc import Callable
 from unittest.mock import Mock, call
@@ -759,3 +760,98 @@ def test_wait_for_worker_aggregates_reports_the_order_phase(
         "CaaS phase: workers joined",
         "CaaS: 2 worker(s) joined and ready",
     ]
+
+
+def test_workload_cluster_unhealthy_names_why_the_operator_is_not_met() -> None:
+    operators = [
+        {
+            "metadata": {"name": "ingress"},
+            "status": {
+                "conditions": [
+                    {"type": "Available", "status": "True"},
+                    {"type": "Progressing", "status": "False"},
+                    {
+                        "type": "Degraded",
+                        "status": "True",
+                        "reason": "CanaryChecksSucceeding",
+                        "message": (
+                            "The canary route check failed:\n"
+                            '  Get "http://canary-openshift-ingress-canary.apps.order-a.hosted.example/"\n  503'
+                        ),
+                    },
+                ]
+            },
+        }
+    ]
+
+    problems = helpers.workload_cluster_unhealthy(
+        nodes=[_node(name="worker-0")], operators=operators, expected_workers=1
+    )
+
+    # The status names the operator; the reason and message say what is wrong with it.
+    assert problems == [
+        "ClusterOperator ingress: Degraded=True (CanaryChecksSucceeding: The canary route check failed: "
+        'Get "http://canary-openshift-ingress-canary.apps.order-a.hosted.example/" 503)'
+    ]
+
+
+def test_wait_for_workload_cluster_health_keeps_the_guest_state_it_gave_up_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    router_pod = {
+        "metadata": {"name": "router-default-abc"},
+        "spec": {"nodeName": "worker-1"},
+        "status": {"hostIP": "10.0.0.2", "podIP": "10.128.0.5", "phase": "Running"},
+    }
+
+    def read(*, resource: str, namespace: str | None = None, **_kwargs: object) -> dict[str, object]:
+        if resource == "nodes":
+            return {"items": [_node(name="worker-0")]}
+        if resource == "pods":
+            return {"items": [router_pod]}
+        if resource == "clusteroperators.config.openshift.io":
+            return {
+                "items": [
+                    {
+                        "metadata": {"name": "ingress"},
+                        "status": {
+                            "conditions": [
+                                {"type": "Degraded", "status": "True", "reason": "CanaryFailed", "message": "503"}
+                            ]
+                        },
+                    }
+                ]
+            }
+        raise RuntimeError(f"no answer for {resource} in {namespace}")
+
+    k8s = Mock()
+    k8s.list_json.side_effect = read
+    k8s.get_json.side_effect = read
+    monkeypatch.setattr(helpers, "_GUEST_HEALTH_SNAPSHOT_DIR", tmp_path)
+    monkeypatch.setattr(helpers, "wait_for_workload_node_provider_ids", lambda **_kwargs: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(AssertionError) as failure:
+        helpers.wait_for_workload_cluster_health(k8s=k8s, expected_workers=1, order_name="order-a")
+
+    snapshot = tmp_path / "order-a-guest-health.json"
+    # The cluster is deleted seconds later, so the failure has to point at the copy.
+    assert f"guest state kept in {snapshot}" in str(failure.value)
+    kept = json.loads(snapshot.read_text())
+    assert kept["nodes"] == [{"name": "worker-0", "ready": "True", "internalIP": ""}]
+    assert kept["routerPods"] == [
+        {
+            "name": "router-default-abc",
+            "node": "worker-1",
+            "hostIP": "10.0.0.2",
+            "podIP": "10.128.0.5",
+            "phase": "Running",
+        }
+    ]
+    assert kept["clusterOperators"]["ingress"]["Degraded"] == {
+        "status": "True",
+        "reason": "CanaryFailed",
+        "message": "503",
+    }
+    # A resource the guest cannot answer for is recorded, not raised.
+    assert kept["ingressController"].startswith("unreadable: RuntimeError")

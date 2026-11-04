@@ -928,8 +928,12 @@ carry. A fresh cluster reports its install as failing and progressing first,
 so that check polls a bounded budget and reports the last observed conditions
 when it times out. Each wait logs the description it was given, and the health
 checks log the provider IDs they found, each change in the unhealthy
-ClusterOperators, and a closing summary line, so the run shows which checks ran
-and what each one saw. The stages before those checks are narrated as
+ClusterOperators with the `reason` and `message` of the failing condition, and a
+closing summary line, so the run shows which checks ran and what each one saw.
+A timeout also writes `/tmp/test-output/<order>-guest-health.json` holding the
+guest's Nodes, ClusterOperator conditions, ingress controller, apps domain, DNS
+operator, and router pods and services, because teardown deletes the only other
+copy. The stages before those checks are narrated as
 `CaaS phase: <step>` markers with the evidence that advanced them — hosts
 binding, Agents registering, the Agent install state, stage and percentage,
 the ClusterOrder's own `Progressing` reason with worker counts while they join,

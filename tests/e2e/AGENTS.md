@@ -77,6 +77,16 @@ satisfied after Ns`), and the health checks report what they found: the worker
 provider IDs, each change in the set of unhealthy ClusterOperators, and a final
 `guest cluster healthy: N worker node(s) and M ClusterOperators` line. Without
 that a run could satisfy the checks and leave no trace that it had.
+A ClusterOperator that is not healthy is reported with the `reason` and
+`message` of the condition it failed, not only its status: the status names the
+holdout, and the reason is the diagnosis (an `ingress` that is Available but
+`Degraded` on `CanaryChecksSucceeding` is usually a route that apps DNS does not
+reach). When the wait gives up it also writes
+`/tmp/test-output/<order>-guest-health.json` — Nodes with their internal IPs,
+every ClusterOperator's conditions, `IngressController/default`, the `Ingress`
+apps domain, the DNS operator, and the router pods and services with their
+nodes and load-balancer addresses. Teardown deletes the cluster seconds later,
+so that file is the only surviving evidence of why it was unhealthy.
 Bring-up is narrated as named phases, because the steps between registering
 worker hosts and a healthy guest are long and otherwise indistinguishable in the
 log. Each phase prints a `CaaS phase: <step>` marker and the evidence that
