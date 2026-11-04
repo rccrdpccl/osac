@@ -31,7 +31,7 @@ effects, and follow the instructions for every affected component.
 | Netris BMaaS connectivity | Numbered regression E2E for same-subnet and cross-subnet BMI networking plus cross-tenant isolation; selected only by `bmaas-netris` | `uv run pytest -n 0 -m 'requires_netris and requires_netris_bmaas' tests/e2e/networking/bmaas` | Requires the Netris BMaaS profile, available BMH SSH endpoints, the configured `OSAC_BMI_NETWORK_INTERFACE`, and fabric networking. The PR job excludes the slower cross-tenant class; run it separately with `-k TestCrossTenantBmaasNetworking`. |
 | Stretched BM/ComputeInstance connectivity | Backend-agnostic regression E2E for address uniqueness and bidirectional ARP/ICMP on one OSAC Subnet; selected by the generic `stretched_networking` suite and the Netris infrastructure job `/test stretched-netris` | `uv run pytest -n 0 -m requires_stretched_networking tests/e2e/networking/stretched` | The Netris runner uses the `full-ci` profile, BMaaS SSH access, `OSAC_BMI_NETWORK_INTERFACE`, a VM template, and the OCP CUDN EVPN VTEP/underlay. The test itself checks OSAC networking behavior and creates/cleans its VirtualNetwork, Subnet, SecurityGroup, BMI, and ComputeInstance. |
 | CaaS deletion helpers and focused teardown ordering | [DEV] Unit regressions for exact NotFound, parent-before-dependent ordering, polling budgets, safe diagnostics, and no mutation | From the repository root: `uv run pytest -n 0 tests/unit/test_caas_teardown_order.py tests/unit/test_cluster_deletion_polling.py tests/unit/test_caas_deletion_diagnostics.py tests/unit/test_caas_worker_bmi_visibility.py tests/unit/test_caas_two_node_sets.py tests/unit/test_caas_selector_contracts.py` | Kubernetes, fulfillment responses, and time are mocked; selector regressions cover NodeSet identity with shared BMITs and shared-only BMIT reference expectations. Does not prove deployed reconciliation. |
-| Focused bare-metal CaaS natural teardown | [QE] E2E for catalog-item-authored cluster creation, worker BMI removal, natural ClusterOrder removal, independent InfraEnv GC, fulfillment removal, and deleted metering | From the repository root: `uv run pytest -n 0 tests/e2e/caas/sanity/test_cluster_create.py::test_cluster_create --junitxml=/tmp/test-output/caas-bm-teardown-junit.xml` | Requires compatible source-pinned OSAC/operator/installer/AAP images and project source, hub access/auth, cluster template/release/disk images, pull-secret/SSH-key inputs, available virtual BMHs, and healthy Kafka/metering. No teardown completion is mocked. |
+| Focused bare-metal CaaS natural teardown | [QE] E2E for catalog-item-authored cluster creation, guest-cluster health (worker `agent://` provider IDs, then Nodes and ClusterOperators, then the HostedCluster's bubbled-up CVO conditions), worker BMI removal, natural ClusterOrder removal, independent InfraEnv GC, fulfillment removal, and deleted metering | From the repository root: `uv run pytest -n 0 tests/e2e/caas/sanity/test_cluster_create.py::test_cluster_create --junitxml=/tmp/test-output/caas-bm-teardown-junit.xml` | Requires compatible source-pinned OSAC/operator/installer/AAP images and project source, hub access/auth, cluster template/release/disk images, pull-secret/SSH-key inputs, available virtual BMHs, and healthy Kafka/metering. No teardown completion is mocked. |
 
 The `test_cluster_create` and `test_cluster_create_with_two_node_sets` scenarios
 share natural teardown assertions without the legacy helper's forced cleanup.
@@ -47,6 +47,22 @@ feedback test; the lifecycle verifies deployed version resolution through the
 ClusterOrder and HostedCluster release image. Two-node-set isolation belongs in
 CaaS regression; invalid-version API validation and ClusterVersion deletion
 protection belong in the Fulfillment integration suite.
+Both scenarios check the guest cluster's health before deleting it, in the order
+that makes a failure diagnosable. Every worker Node must first report a
+non-empty `agent://` `spec.providerID`, because a Node can be `Ready` while
+never bound through the machine API, which is the state a later scale-down or
+teardown has nothing to look up. Then the guest Nodes and all ClusterOperators
+must be ready, available, and neither progressing nor degraded. Finally the
+HostedCluster's bubbled-up CVO conditions must settle to
+`ClusterVersionSucceeding`/`ClusterVersionAvailable` true with
+`ClusterVersionFailing`/`ClusterVersionProgressing` false; a fresh cluster
+reports its install as failing and progressing first, so that last check polls a
+bounded budget and reports the conditions it last observed when it times out.
+The provider-ID and ClusterOperator checks live in
+`tests/e2e/core/helpers.py` (`wait_for_workload_cluster_health` runs the
+provider-ID wait first) and the CVO check is
+`wait_for_hosted_cluster_version_health`; the two-node-set scenario reaches them
+through `wait_for_guest_cluster_health`.
 Other CaaS scenarios still using `wait_for_cluster_deletion` do not establish
 that boundary. Both scenarios verify the API worker BMI's tenant, cluster-order
 label and owner-reference annotation, and the Kubernetes CR's tenant annotation

@@ -861,7 +861,7 @@ Touched-area requirements: [component guide](../tests/e2e/AGENTS.md#touched-area
 | E2E (Netris BMaaS connectivity) | Manual bmaas-netris suite; locally: `uv run pytest -n 0 -m 'requires_netris and requires_netris_bmaas' tests/e2e/networking/bmaas` | Numbered BMI networking lifecycle, including same-subnet ARP/ICMP, cross-subnet routing/isolation, and cross-tenant cases | Requires Netris BMaaS services, BMH SSH endpoints, and `OSAC_BMI_NETWORK_INTERFACE`. The PR job excludes the slower cross-tenant class. |
 | E2E (stretched BMI/ComputeInstance connectivity) | Backend-agnostic test: `uv run pytest -n 0 -m requires_stretched_networking tests/e2e/networking/stretched`; test-infra standalone selector: `SUITE=stretched_networking` | Creates a BMI and ComputeInstance on one OSAC Subnet and verifies unique addresses plus bidirectional ARP/ICMP | The Netris `/test stretched-netris` workflow provisions `full-ci`, BMaaS SSH access, `OSAC_BMI_NETWORK_INTERFACE`, the VM template, and CUDN EVPN VTEP/underlay. `SUITE=full` also includes this test. It is not part of standard VMaaS or BMaaS runs. |
 | Unit ([DEV], CaaS teardown) | From the repository root: `uv run pytest -n 0 tests/unit/test_caas_teardown_order.py tests/unit/test_cluster_deletion_polling.py tests/unit/test_caas_deletion_diagnostics.py tests/unit/test_caas_worker_bmi_visibility.py tests/unit/test_caas_two_node_sets.py tests/unit/test_caas_selector_contracts.py` | Read-only wait logic, exact-resource NotFound, ordered worker/parent/dependent waits, shared single/two-node-set budgets, stage-specific safe failures, snapshot throttling and sanitization, worker ownership checks, NodeSet selectors with shared BMITs, and shared-only BMIT reference expectations | API/client responses and time are mocked. No deployed controllers, fulfillment, AAP, provider, or metering is exercised. |
-| E2E ([QE], focused bare-metal CaaS lifecycle) | From the repository root: `uv run pytest -n 0 tests/e2e/caas/sanity/test_cluster_create.py::test_cluster_create --junitxml=/tmp/test-output/caas-bm-teardown-junit.xml` | CLI/API/database, Kubernetes, OSAC operators, AAP, HyperShift/CAPI/CAP-Agent, Assisted Service, provider-backed virtual BMHs, and Kafka/metering; catalog-item-authored creation (published ClusterCatalogItem locking version, node sets, and SSH key), guest readiness, scale events, natural worker/parent teardown, independent InfraEnv GC, fulfillment removal, and deleted events | Requires the compatible deployed CaaS profile; no mocked completion or workaround-enabled deletion wait. Virtual BMHs do not prove physical-hardware coverage. Guest LVMS device readiness, PVC/CSI mount, and application I/O are not established by this lifecycle test. |
+| E2E ([QE], focused bare-metal CaaS lifecycle) | From the repository root: `uv run pytest -n 0 tests/e2e/caas/sanity/test_cluster_create.py::test_cluster_create --junitxml=/tmp/test-output/caas-bm-teardown-junit.xml` | CLI/API/database, Kubernetes, OSAC operators, AAP, HyperShift/CAPI/CAP-Agent, Assisted Service, provider-backed virtual BMHs, and Kafka/metering; catalog-item-authored creation (published ClusterCatalogItem locking version, node sets, and SSH key), guest readiness (worker `agent://` provider IDs, then Nodes and ClusterOperators, then the HostedCluster's bubbled-up CVO conditions), scale events, natural worker/parent teardown, independent InfraEnv GC, fulfillment removal, and deleted events | Requires the compatible deployed CaaS profile; no mocked completion or workaround-enabled deletion wait. Virtual BMHs do not prove physical-hardware coverage. Guest LVMS device readiness, PVC/CSI mount, and application I/O are not established by this lifecycle test. |
 
 Resize lifecycle tests expect `RestartRequired`. Multi-node live hot-plug
 coverage is tracked under
@@ -907,6 +907,20 @@ scenario. Run that [QE] E2E with
 `uv run pytest -n 0 tests/e2e/caas/regression/test_cluster_node_sets.py::test_cluster_create_with_two_node_sets`;
 it requires the same source-pinned environment described below and enough
 available BMHs for both worker sets.
+
+Both scenarios also require the guest cluster to be healthy before deleting it,
+and check the facts in the order that makes a failure diagnosable. Every worker
+Node must first report a non-empty `agent://` `spec.providerID`: a Node can be
+`Ready` while never bound through the machine API, and that unbound state is
+what a later scale-down or teardown has nothing to look up, so it is asserted
+before the rest. Then the guest Nodes and every
+`clusteroperators.config.openshift.io` operator must be ready, available, and
+neither progressing nor degraded. Finally the HostedCluster's bubbled-up CVO
+conditions must settle to `ClusterVersionSucceeding` and
+`ClusterVersionAvailable` true with `ClusterVersionFailing` and
+`ClusterVersionProgressing` false; a fresh cluster reports that install as
+failing and progressing first, so that check polls a bounded budget and
+reports the last observed conditions when it times out.
 
 The deletion request triggers the test-owned worker BMI wait (480 attempts at
 five-second intervals). Worker ownership is verified through the fulfillment
