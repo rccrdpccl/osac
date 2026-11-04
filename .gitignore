@@ -252,3 +252,7 @@ m360-local.yaml
 
 # Task coverage runs of the osac-aap make targets
 osac-aap/tests/coverage/.runs/
+
+# CaaS coverage run output (OSAC-6117): generated merged profiles, HTML
+# reports and Go covdata, reproduced by tools/caas-coverage/run-*-coverage.sh
+docs/plans/coverage-*/
