@@ -52,8 +52,10 @@ that makes a failure diagnosable. Every worker Node must first report a
 non-empty `agent://` `spec.providerID`, because a Node can be `Ready` while
 never bound through the machine API, which is the state a later scale-down or
 teardown has nothing to look up. Then the guest Nodes and all ClusterOperators
-must be ready, available, and neither progressing nor degraded. Finally the
-bubbled-up CVO conditions must settle: the HostedCluster's
+must be ready, available, and neither progressing nor degraded; that wait gets
+fifteen minutes and a timeout names the Nodes and ClusterOperators that were
+not ready, so the failure is attributed instead of only reported as a timeout.
+Finally the bubbled-up CVO conditions must settle: the HostedCluster's
 `ClusterVersionSucceeding`/`ClusterVersionAvailable` true with
 `ClusterVersionProgressing` false, plus the HostedControlPlane's
 `ClusterVersionFailing` false. HyperShift splits those two sets — it never
