@@ -6,10 +6,16 @@
 # Usage: tools/dev-env/hosted-dns.sh [--dry-run] [--watch [SECONDS]]
 #                                   [--no-prune]
 #
-# Every ClusterOrder that owns a HostedCluster publishes two names:
+# Every ClusterOrder that owns a HostedCluster publishes three names:
 #
 #   api.<order>.<baseDomain>       the hosted kube-apiserver
+#   api-int.<order>.<baseDomain>   the same endpoint, as Assisted Service wants
 #   *.apps.<order>.<baseDomain>    the guest ingress routers
+#
+# api-int matters even though nothing in the guest dials it: the Assisted Service
+# host validation asks the install host to resolve it and parks the Agent in
+# `insufficient` when it cannot, so a cluster whose API name resolves still never
+# installs. Both API names point at the kube-apiserver LoadBalancer address.
 #
 # <baseDomain> is hosted.<hub zone>, which the AAP hosted_cluster role sets on
 # the HostedCluster (spec.dns.baseDomain). On a real installation HyperShift's
@@ -59,6 +65,7 @@ Publish DNS records for every ClusterOrder that owns a hosted cluster, on the
 hub's host (REMOTE_HOST), where NetworkManager's dnsmasq reads them:
 
   address=/api.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
+  address=/api-int.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
   address=/.apps.<order>.<baseDomain>/<worker node address>   (one per worker)
 
 <baseDomain> comes from the HostedCluster (spec.dns.baseDomain, hosted.<hub
@@ -120,6 +127,7 @@ order_records() {
 		-o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null) || kas=""
 	if [ -n "${kas}" ]; then
 		printf 'address=/api.%s.%s/%s\n' "${hc}" "${base}" "${kas}"
+		printf 'address=/api-int.%s.%s/%s\n' "${hc}" "${base}" "${kas}"
 	fi
 	node_ips=$(kube get agentmachine -n "${hcp_ns}" \
 		-o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' \
@@ -211,13 +219,15 @@ publish_once() {
 		remote_write "${conf}" "${desired}" ||
 			die "could not write ${conf} on ${REMOTE_HOST}"
 		changed=1
-		api=$(printf '%s\n' "${records}" | grep '^address=/api\.' || true)
-		if [ -n "${api}" ]; then
+		# Both API names (api and api-int) are checked; the apps record is a
+		# wildcard, so it is only exercised by the guest routers using it.
+		while read -r api; do
+			[ -n "${api}" ] || continue
 			domain=${api#address=/}
 			domain=${domain%%/*}
 			addr=${api##*/}
 			published+=("${domain} ${addr}")
-		fi
+		done < <(printf '%s\n' "${records}" | grep '^address=/api' || true)
 	done <<<"${orders}"
 	if [ "${prune}" = "1" ]; then
 		prune_stale "${dry_run}" "${kept}"
