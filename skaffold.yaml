@@ -199,6 +199,18 @@ deploy:
           # driver makes the cluster-fulfillment AAP jobs skip external DNS
           # record management instead of failing against Route 53.
           aap.instanceGroups.clusterFulfillment.config.DNS_CLASS: "dns.noop.dns"
+          # The CUDN fabric manager selected above must also be REGISTERED
+          # with the operator, or the NetworkClass never reconciles and the
+          # chart fails validation: global.networking picks the facade,
+          # operator.networkManagers supplies its backend (values/caas-ci).
+          operator.networkManagers.enabled: "true"
+          operator.networkManagers.fabricManagers.cudn_net.enabled: "true"
+          # The fulfillment-side BMI controller (BMaaS projection) is off by
+          # default; the CaaS suites exercise it.
+          operator.controllers.bareMetalInstance: "true"
+          # The ClusterOrder provisions a hub-access ServiceAccount in each
+          # hosted cluster; the CaaS feedback path expects it.
+          operator.hubAccess.enabled: "true"
           # The virtual-BMH CaaS flow needs a fabric manager. The fulfillment
           # service rejects BareMetalInstance creation for any subnet whose
           # NetworkClass has no fabric_manager ("bare metal instances require a
