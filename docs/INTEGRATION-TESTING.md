@@ -929,7 +929,12 @@ so that check polls a bounded budget and reports the last observed conditions
 when it times out. Each wait logs the description it was given, and the health
 checks log the provider IDs they found, each change in the unhealthy
 ClusterOperators, and a closing summary line, so the run shows which checks ran
-and what each one saw.
+and what each one saw. The stages before those checks are narrated as
+`CaaS phase: <step>` markers with the evidence that advanced them — hosts
+binding, Agents registering, the Agent install state, stage and percentage,
+the ClusterOrder's own `Progressing` reason with worker counts while they join,
+then the provider-ID, guest-health, ClusterOperator and control-plane version
+checks — so a long run reads as phases instead of undifferentiated polling.
 
 The deletion request triggers the test-owned worker BMI wait (480 attempts at
 five-second intervals). Worker ownership is verified through the fulfillment

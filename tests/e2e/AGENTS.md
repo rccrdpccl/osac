@@ -77,6 +77,20 @@ satisfied after Ns`), and the health checks report what they found: the worker
 provider IDs, each change in the set of unhealthy ClusterOperators, and a final
 `guest cluster healthy: N worker node(s) and M ClusterOperators` line. Without
 that a run could satisfy the checks and leave no trace that it had.
+Bring-up is narrated as named phases, because the steps between registering
+worker hosts and a healthy guest are long and otherwise indistinguishable in the
+log. Each phase prints a `CaaS phase: <step>` marker and the evidence that
+advanced it: `BareMetalInstances binding`, `Agents binding` (with a running
+registered count), `starting install` (Agent state, install stage and
+percentage, filtered to known values so nothing sensitive is echoed) then
+`install done`, `waiting for workers to join` (the ClusterOrder's own
+`Progressing` reason, so the wording is the operator's, with
+`desired/current/ready` worker counts), `waiting for worker provider IDs`,
+`waiting for a healthy guest cluster`, `all ClusterOperators healthy`, and
+`control plane version healthy`. Both flows call the same three waiting helpers
+(`wait_for_worker_agents`, `wait_for_worker_installation`,
+`wait_for_worker_aggregates`) in the same order, so neither can narrate a step
+the other skips.
 Other CaaS scenarios still using `wait_for_cluster_deletion` do not establish
 that boundary. Both scenarios verify the API worker BMI's tenant, cluster-order
 label and owner-reference annotation, and the Kubernetes CR's tenant annotation

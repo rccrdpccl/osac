@@ -662,7 +662,100 @@ def test_workload_cluster_health_reports_what_it_found(
     helpers.wait_for_workload_cluster_health(k8s=k8s, expected_workers=1)
 
     messages = [record.getMessage() for record in caplog.records]
-    assert f"worker provider IDs: worker-0={_AGENT_PROVIDER_ID}" in messages
+    assert "CaaS phase: waiting for worker provider IDs" in messages
+    assert "CaaS phase: provider IDs assigned" in messages
+    assert f"CaaS: worker provider IDs: worker-0={_AGENT_PROVIDER_ID}" in messages
+    assert "CaaS phase: waiting for a healthy guest cluster" in messages
     assert "guest cluster not healthy yet: ClusterOperator insights: Available=False, Degraded=True" in messages
-    healthy = "guest cluster healthy: 1 worker node(s) and 1 ClusterOperators available"
+    assert "CaaS phase: all ClusterOperators healthy" in messages
+    healthy = "CaaS: guest cluster healthy: 1 worker node(s) and 1 ClusterOperators available"
     assert any(message.startswith(healthy) and message.endswith("(3 check(s))") for message in messages)
+
+
+def _agent(*, name: str, state: str = "installing-in-progress", installed: bool = False, **progress: object) -> dict:
+    return {
+        "metadata": {
+            "name": name,
+            "namespace": "osac",
+            "labels": {"infraenvs.agent-install.openshift.io": "order-a-infraenv"},
+        },
+        "status": {
+            "debugInfo": {"state": state},
+            "progress": progress,
+            "conditions": [{"type": "Installed", "status": "True" if installed else "False"}],
+        },
+    }
+
+
+def test_wait_for_worker_agents_reports_each_registration(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    registrations = iter([[], [_agent(name="agent-0")], [_agent(name="agent-0"), _agent(name="agent-1")]])
+    k8s = Mock()
+    k8s.list_json.side_effect = lambda **_kwargs: {"items": next(registrations)}
+    monkeypatch.setattr(runner.time, "sleep", lambda _delay: None)
+    caplog.set_level("INFO", logger="tests.e2e.core.helpers")
+
+    agents = helpers.wait_for_worker_agents(k8s=k8s, co_name="order-a", namespace="osac", expected_agents=2)
+
+    assert len(agents) == 2
+    messages = [record.getMessage() for record in caplog.records if record.name == helpers.logger.name]
+    assert messages == [
+        "CaaS phase: Agents binding",
+        "CaaS: 1 of 2 worker Agent(s) registered",
+        "CaaS: 2 of 2 worker Agent(s) registered",
+        "CaaS: Agents bound: 2 worker Agent(s) registered",
+    ]
+
+
+def test_wait_for_worker_installation_reports_the_install_stage(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    installing = _agent(name="agent-0", currentStage="Rebooting", installationPercentage=55)
+    finished = _agent(name="agent-0", state="installed", installed=True)
+    observations = iter([[installing], [installing], [finished]])
+    k8s = Mock()
+    k8s.list_json.side_effect = lambda **_kwargs: {"items": next(observations)}
+    monkeypatch.setattr(runner.time, "sleep", lambda _delay: None)
+    caplog.set_level("INFO", logger="tests.e2e.core.helpers")
+
+    helpers.wait_for_worker_installation(k8s=k8s, co_name="order-a", namespace="osac", expected_agents=1)
+
+    messages = [record.getMessage() for record in caplog.records if record.name == helpers.logger.name]
+    assert messages == [
+        "CaaS phase: starting install",
+        "CaaS: installing, 0 of 1 done (installing-in-progress, Rebooting, 55%)",
+        "CaaS phase: install done",
+        "CaaS: installation finished on 1 worker Agent(s)",
+    ]
+
+
+def test_wait_for_worker_aggregates_reports_the_order_phase(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def _order(*, ready: int, reason: str) -> dict:
+        return {
+            "status": {
+                "desiredWorkers": 2,
+                "currentWorkers": 2,
+                "readyWorkers": ready,
+                "conditions": [{"type": "Progressing", "status": "True", "reason": reason}],
+            }
+        }
+
+    observations = iter([_order(ready=0, reason="PreparingInfrastructure"), _order(ready=2, reason="WorkersJoining")])
+    k8s = Mock()
+    k8s.get_json.side_effect = lambda **_kwargs: next(observations)
+    monkeypatch.setattr(runner.time, "sleep", lambda _delay: None)
+    caplog.set_level("INFO", logger="tests.e2e.core.helpers")
+
+    helpers.wait_for_worker_aggregates(k8s=k8s, co_name="order-a", expected_workers=2)
+
+    messages = [record.getMessage() for record in caplog.records if record.name == helpers.logger.name]
+    assert messages == [
+        "CaaS phase: waiting for workers to join",
+        "CaaS: workers desired 2, current 2, ready 0 (PreparingInfrastructure)",
+        "CaaS: workers desired 2, current 2, ready 2 (WorkersJoining)",
+        "CaaS phase: workers joined",
+        "CaaS: 2 worker(s) joined and ready",
+    ]
