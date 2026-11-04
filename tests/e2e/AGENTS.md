@@ -67,14 +67,16 @@ when it times out.
 The provider-ID and ClusterOperator checks live in
 `tests/e2e/core/helpers.py` (`wait_for_workload_cluster_health` runs the
 provider-ID wait first) and the CVO check is
-`wait_for_hosted_cluster_version_health`; both scenarios reach them through
-`wait_for_guest_cluster_health`, called from `assert_cluster_available` (sanity)
-and `assert_cluster_with_two_node_sets_available` (regression). A check that only
-one flow reaches leaves the other passing on a cluster it never looked at, which
-is what the docs claimed before the sanity flow called the gate.
+`wait_for_hosted_cluster_version_health`. Sanity reaches them through
+`_assert_guest_workers_ready` -> `wait_for_cluster_guest_readiness` (which
+already holds a workload kubeconfig), and regression through
+`wait_for_guest_cluster_health` (which fetches one); both end at the same
+`wait_for_workload_cluster_health`.
 Every wait names itself in the log (`Waiting for <description>`, `<description>
-satisfied after Ns`), so a run shows whether these checks ran, not just that some
-condition was met.
+satisfied after Ns`), and the health checks report what they found: the worker
+provider IDs, each change in the set of unhealthy ClusterOperators, and a final
+`guest cluster healthy: N worker node(s) and M ClusterOperators` line. Without
+that a run could satisfy the checks and leave no trace that it had.
 Other CaaS scenarios still using `wait_for_cluster_deletion` do not establish
 that boundary. Both scenarios verify the API worker BMI's tenant, cluster-order
 label and owner-reference annotation, and the Kubernetes CR's tenant annotation
