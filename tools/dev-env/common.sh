@@ -298,3 +298,101 @@ exit 1
 EOF
 	log "${zone} -> ${ip} on ${REMOTE_HOST}"
 }
+
+# Address the hub host answers DNS on: libvirt gives the network's gateway to
+# the bridge, and that dnsmasq is what holds the hosted-cluster records
+# hosted-dns.sh publishes. Prints nothing when it cannot tell.
+host_dnsmasq_ip() {
+	local xml
+	xml=$(ssh_remote_root "virsh net-dumpxml test-infra-net-${CLUSTER_NAME}" 2>/dev/null) || return 0
+	printf '%s\n' "${xml}" |
+		sed -n "s/.*<ip [^>]*address='\([0-9.]*\)'.*/\1/p" | awk 'NR == 1'
+}
+
+# Zone the hosted clusters are published under: AAP's hosted_cluster role sets
+# HOSTED_CLUSTER_BASE_DOMAIN to hosted.<hub zone>, where <hub zone> is the hub's
+# ingress domain without its apps. prefix. Prints nothing when it cannot tell.
+hosted_dns_zone() {
+	local kubeconfig kubectl domain
+	kubeconfig=$(hub_kubeconfig)
+	kubectl=$(kubectl_bin)
+	[ -f "${kubeconfig}" ] && [ -n "${kubectl}" ] || return 0
+	domain=$(KUBECONFIG="${kubeconfig}" "${kubectl}" get ingress.config.openshift.io cluster \
+		-o jsonpath='{.spec.domain}' 2>/dev/null) || domain=""
+	[ -n "${domain}" ] || return 0
+	printf 'hosted.%s\n' "${domain#apps.}"
+}
+
+# The hub-side half of hosted-cluster name resolution.
+#
+# Hub pods have to resolve api.<order>.<baseDomain> and *.apps.<order>.<baseDomain>.
+# Those records exist only in the hub host's dnsmasq (hosted-dns.sh publishes
+# them), and the corp resolver behind SystemResolvConf answers NXDOMAIN for them,
+# so HyperShift and capi-provider cannot reach the hosted API and the order never
+# leaves "Workers Joining". Delegate just the hosted zone(s) to that dnsmasq via
+# spec.servers, which is zone scoped.
+#
+# Do not point upstreamResolvers (the global list) at the dnsmasq instead. That
+# makes CoreDNS answer the search-suffix names pods try before the absolute one
+# (ndots 5: postgres.<ns>.svc.cluster.local -> ...svc.cluster.local.<zone>), the
+# dnsmasq wildcard cluster-tool writes for the hub zone matches those, and every
+# in-cluster service name then resolves to the hypervisor instead of its
+# ClusterIP: the hub loses its database and reports DeadlineExceeded.
+ensure_hub_dns_zone_forward() {
+	local dnsmasq_ip kubeconfig kubectl zones zone name entry entries
+	local cur_count cur_zones cur_ups
+	dnsmasq_ip=$(host_dnsmasq_ip) || dnsmasq_ip=""
+	if [ -z "${dnsmasq_ip}" ]; then
+		warn "cannot tell the hub host's dnsmasq address; left CoreDNS servers alone"
+		return 0
+	fi
+	kubeconfig=$(hub_kubeconfig)
+	kubectl=$(kubectl_bin)
+	if [ ! -f "${kubeconfig}" ] || [ -z "${kubectl}" ]; then
+		warn "no hub kubeconfig or kubectl; left CoreDNS servers alone"
+		return 0
+	fi
+	zones=$(printf '%s\n' "$@" "$(hosted_dns_zone)" | sed '/^$/d' | sort -u)
+	if [ -z "${zones}" ]; then
+		warn "cannot tell which zone hosted clusters use; left CoreDNS servers alone"
+		return 0
+	fi
+	cur_count=$(KUBECONFIG="${kubeconfig}" "${kubectl}" get dns.operator/default \
+		-o jsonpath='{range .spec.servers[*]}{.name}{"\n"}{end}' 2>/dev/null | grep -c .) || cur_count=0
+	cur_zones=$(KUBECONFIG="${kubeconfig}" "${kubectl}" get dns.operator/default \
+		-o jsonpath='{.spec.servers[*].zones[*]}' 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u) ||
+		cur_zones=""
+	cur_ups=$(KUBECONFIG="${kubeconfig}" "${kubectl}" get dns.operator/default \
+		-o jsonpath='{.spec.servers[*].forwardPlugin.upstreams[*]}' 2>/dev/null |
+		tr ' ' '\n' | sed '/^$/d' | sort -u) || cur_ups=""
+	if [ "${cur_count}" = "$(printf '%s\n' "${zones}" | grep -c .)" ] &&
+		[ "${cur_zones}" = "${zones}" ] && [ "${cur_ups}" = "${dnsmasq_ip}" ]; then
+		log "hub CoreDNS already forwards $(printf '%s\n' "${zones}" | tr '\n' ' ')to ${dnsmasq_ip}"
+		return 0
+	fi
+	log "letting hub CoreDNS forward $(printf '%s\n' "${zones}" | tr '\n' ' ')to ${dnsmasq_ip}"
+	entries=""
+	for zone in ${zones}; do
+		name="hosted-$(printf '%s' "${zone}" | tr '.' '-')"
+		name=$(printf '%s' "${name}" | cut -c1-63 | sed 's/-$//')
+		entry=$(printf '{"name":"%s","zones":["%s"],"forwardPlugin":{"policy":"Sequential","upstreams":["%s"]}}' \
+			"${name}" "${zone}" "${dnsmasq_ip}")
+		entries="${entries:+${entries},}${entry}"
+	done
+	# spec.servers is this function's alone, so replace it wholesale. Appending
+	# would let a half-applied earlier run leave two server blocks for one zone,
+	# and CoreDNS then refuses to load the Corefile at all.
+	KUBECONFIG="${kubeconfig}" "${kubectl}" patch dns.operator/default --type=merge \
+		-p "$(printf '{"spec":{"servers":[%s]}}' "${entries}")" >/dev/null || {
+		warn "could not patch dns.operator/default; hub pods keep the old Corefile"
+		return 0
+	}
+	# The operator rewrites the dns-default Corefile, but a running CoreDNS keeps
+	# serving the ConfigMap it read at startup, so recycle the DaemonSet pods.
+	KUBECONFIG="${kubeconfig}" "${kubectl}" rollout restart ds/dns-default \
+		-n openshift-dns >/dev/null 2>&1 ||
+		warn "could not restart dns-default; its pods keep the old Corefile"
+	KUBECONFIG="${kubeconfig}" "${kubectl}" rollout status ds/dns-default \
+		-n openshift-dns --timeout=180s >/dev/null 2>&1 ||
+		warn "dns-default did not roll out cleanly; check openshift-dns"
+}

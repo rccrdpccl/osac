@@ -24,6 +24,12 @@
 # see: a node under disk pressure, where the kubelet evicts AWX task pods and
 # every AAP-driven provisioning step dies with a controller 500.
 #
+# A CaaS suite provisions a hosted cluster, whose control plane and ingress are
+# published on names only the hub host's dnsmasq can answer (hosted-dns.sh). For
+# those suites this starts that publisher in --watch mode before pytest and stops
+# it afterwards, because the order it has to publish for does not exist yet; its
+# output goes to <ARTIFACTS_FILE dir>/hosted-dns.log.
+#
 # Everything else keeps the tests' defaults, which already resolve from the
 # cluster: the cluster domain, the fulfillment and Keycloak routes, the service
 # account, the tenant users, and the VMaaS storage tier.
@@ -45,7 +51,6 @@
 #
 # Inputs (defaults in common.sh): OSAC_DEV_HUB_KUBECONFIG, CLUSTER_NAME, NS,
 # PULL_SECRET_FILE, ARTIFACTS_FILE, REPO_ROOT.
-
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "${script_dir}/common.sh"
@@ -232,6 +237,31 @@ resolve_ssh_key() {
 	return 1
 }
 
+# CaaS suites create the order a couple of minutes in, so publish for as long as
+# pytest runs instead of once up front. Kept out of the suites' way: the publisher
+# only touches the hub host's dnsmasq and the hub's CoreDNS upstreams.
+hosted_dns_pid=""
+
+start_hosted_dns() {
+	local suite_path=$1 log_path
+	case ${suite_path} in
+	tests/e2e/caas/*) ;;
+	*) return 0 ;;
+	esac
+	log_path="$(dirname "$(expand_path "${ARTIFACTS_FILE}")")/hosted-dns.log"
+	mkdir -p "$(dirname "${log_path}")"
+	"${script_dir}/hosted-dns.sh" --watch >"${log_path}" 2>&1 &
+	hosted_dns_pid=$!
+	log "hosted-cluster DNS kept current by pid ${hosted_dns_pid} (${log_path})"
+}
+
+stop_hosted_dns() {
+	[ -n "${hosted_dns_pid}" ] || return 0
+	kill "${hosted_dns_pid}" 2>/dev/null || true
+	wait "${hosted_dns_pid}" 2>/dev/null || true
+	hosted_dns_pid=""
+}
+
 main() {
 	local kubeconfig cli pull_secret ssh_key kubectl
 	require_user_context
@@ -341,7 +371,9 @@ main() {
 	fi
 
 	cd "${repo}"
-	exec uv run "${args[@]}"
+	trap stop_hosted_dns EXIT INT TERM
+	start_hosted_dns "${suite}"
+	uv run "${args[@]}"
 }
 
 main "$@"

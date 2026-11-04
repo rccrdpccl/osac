@@ -49,7 +49,10 @@
 #   make osac-dev-watch       `skaffold dev`: prep's initial build, then
 #                             rebuild and redeploy on every source change
 #   make osac-dev-e2e E2E_SUITE=vmaas/sanity
-#                             run an E2E suite against the deployed hub
+#                             run an E2E suite against the deployed hub (CaaS
+#                             suites also keep the hosted cluster's DNS records
+#                             current, see hosted-dns.sh)
+#   make osac-dev-hosted-dns  publish the hosted-cluster DNS records once
 #   make osac-dev-delete      uninstall the release
 #
 # Teardown is a menu too, so a run that half finished can be dismantled one
@@ -187,7 +190,8 @@ export OSAC_DEV_AAP_PROJECT_GIT_BRANCH := $(OSAC_DEV_AAP_PROJECT_GIT_BRANCH)
 export OSAC_DEV_AAP_PROJECT_ARCHIVE_URI := $(OSAC_DEV_AAP_PROJECT_ARCHIVE_URI)
 
 .PHONY: osac-dev osac-dev-cluster osac-dev-setup osac-dev-deps osac-dev-bmh \
-	osac-dev-dns osac-dev-resize osac-dev-prep osac-dev-deploy \
+	osac-dev-dns osac-dev-hosted-dns osac-dev-resize osac-dev-prep \
+	osac-dev-deploy \
 	osac-dev-aap-project \
 	osac-dev-watch osac-dev-delete osac-dev-e2e osac-dev-teardown \
 	osac-dev-teardown-bmh \
@@ -221,6 +225,9 @@ osac-dev-bmh: ## Create virtual BareMetalHosts on REMOTE_HOST (needs REMOTE_HOST
 
 osac-dev-dns: ## Route hub names to dnsmasq here and on REMOTE_HOST
 	@$(OSAC_DEV_ENV)/dns.sh
+
+osac-dev-hosted-dns: ## Publish DNS for hosted CaaS orders (once; e2e does it too)
+	@$(OSAC_DEV_ENV)/hosted-dns.sh $(if $(DRY_RUN),--dry-run,)
 
 osac-dev-resize: ## Grow the hub's root disk to DISK_SIZE (osac-dev does this after dns)
 	@$(OSAC_DEV_ENV)/resize.sh --size $(DISK_SIZE) $(if $(DRY_RUN),--dry-run,)
