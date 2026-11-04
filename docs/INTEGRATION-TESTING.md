@@ -915,12 +915,15 @@ Node must first report a non-empty `agent://` `spec.providerID`: a Node can be
 what a later scale-down or teardown has nothing to look up, so it is asserted
 before the rest. Then the guest Nodes and every
 `clusteroperators.config.openshift.io` operator must be ready, available, and
-neither progressing nor degraded. Finally the HostedCluster's bubbled-up CVO
-conditions must settle to `ClusterVersionSucceeding` and
-`ClusterVersionAvailable` true with `ClusterVersionFailing` and
-`ClusterVersionProgressing` false; a fresh cluster reports that install as
-failing and progressing first, so that check polls a bounded budget and
-reports the last observed conditions when it times out.
+neither progressing nor degraded. Finally the bubbled-up CVO conditions must
+settle: the HostedCluster's `ClusterVersionSucceeding` and
+`ClusterVersionAvailable` true with `ClusterVersionProgressing` false, and the
+HostedControlPlane's `ClusterVersionFailing` false. HyperShift splits those
+two sets (it never copies `Failing` onto the HostedCluster), so a check that
+reads only one resource waits forever on a condition that resource does not
+carry. A fresh cluster reports its install as failing and progressing first,
+so that check polls a bounded budget and reports the last observed conditions
+when it times out.
 
 The deletion request triggers the test-owned worker BMI wait (480 attempts at
 five-second intervals). Worker ownership is verified through the fulfillment

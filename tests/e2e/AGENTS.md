@@ -53,11 +53,15 @@ non-empty `agent://` `spec.providerID`, because a Node can be `Ready` while
 never bound through the machine API, which is the state a later scale-down or
 teardown has nothing to look up. Then the guest Nodes and all ClusterOperators
 must be ready, available, and neither progressing nor degraded. Finally the
-HostedCluster's bubbled-up CVO conditions must settle to
+bubbled-up CVO conditions must settle: the HostedCluster's
 `ClusterVersionSucceeding`/`ClusterVersionAvailable` true with
-`ClusterVersionFailing`/`ClusterVersionProgressing` false; a fresh cluster
-reports its install as failing and progressing first, so that last check polls a
-bounded budget and reports the conditions it last observed when it times out.
+`ClusterVersionProgressing` false, plus the HostedControlPlane's
+`ClusterVersionFailing` false. HyperShift splits those two sets — it never
+copies `Failing` onto the HostedCluster — so the check reads both resources;
+waiting on one alone means waiting forever for a condition it does not carry.
+A fresh cluster reports its install as failing and progressing first, so that
+last check polls a bounded budget and reports the conditions it last observed
+when it times out.
 The provider-ID and ClusterOperator checks live in
 `tests/e2e/core/helpers.py` (`wait_for_workload_cluster_health` runs the
 provider-ID wait first) and the CVO check is
