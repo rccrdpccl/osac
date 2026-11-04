@@ -20,6 +20,13 @@
 # host is this machine and cluster-tool's boot already wrote the entry, so the
 # second half usually only confirms it.
 #
+# The hub's CoreDNS then forwards the hosted-cluster zone to that dnsmasq,
+# because the corp resolver answers NXDOMAIN for the hosted-cluster names
+# (api.<order>.hosted.<zone>) that live only on the hub host. That forwarding is
+# zone scoped: the global upstreams stay on SystemResolvConf, see
+# ensure_hub_dns_zone_forward. The records themselves are hosted-dns.sh's job;
+# this script only makes the hub ask the right server.
+#
 # The zone comes from OSAC_DEV_HUB_KUBECONFIG (or CLUSTER_DOMAIN when set).
 # Needs sudo locally unless already root; run it as your normal user or as
 # root directly.
@@ -45,6 +52,10 @@ is never queried, so the hub looks unreachable. Only the hub zone is routed
 here; per-link servers (LAN, corp split DNS) stay untouched.
 
 The zone comes from OSAC_DEV_HUB_KUBECONFIG, or CLUSTER_DOMAIN when set.
+
+Hub CoreDNS forwards the hosted-cluster zone (hosted.<hub zone>) to that
+dnsmasq, so hub pods resolve hosted-cluster names (api.<order>.hosted.<zone>);
+the records themselves come from hosted-dns.sh (make osac-dev-hosted-dns).
 
 --force rewrites both entries even when the hub name already resolves
 (shortcut: make osac-dev-dns FORCE=1).
@@ -78,6 +89,7 @@ main() {
 
 	ensure_zone_routed "${zone}"
 	ensure_remote_zone_routed "${zone}"
+	ensure_hub_dns_zone_forward
 }
 
 main "$@"
