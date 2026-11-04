@@ -67,8 +67,14 @@ when it times out.
 The provider-ID and ClusterOperator checks live in
 `tests/e2e/core/helpers.py` (`wait_for_workload_cluster_health` runs the
 provider-ID wait first) and the CVO check is
-`wait_for_hosted_cluster_version_health`; the two-node-set scenario reaches them
-through `wait_for_guest_cluster_health`.
+`wait_for_hosted_cluster_version_health`; both scenarios reach them through
+`wait_for_guest_cluster_health`, called from `assert_cluster_available` (sanity)
+and `assert_cluster_with_two_node_sets_available` (regression). A check that only
+one flow reaches leaves the other passing on a cluster it never looked at, which
+is what the docs claimed before the sanity flow called the gate.
+Every wait names itself in the log (`Waiting for <description>`, `<description>
+satisfied after Ns`), so a run shows whether these checks ran, not just that some
+condition was met.
 Other CaaS scenarios still using `wait_for_cluster_deletion` do not establish
 that boundary. Both scenarios verify the API worker BMI's tenant, cluster-order
 label and owner-reference annotation, and the Kubernetes CR's tenant annotation

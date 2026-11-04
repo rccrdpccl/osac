@@ -909,7 +909,10 @@ it requires the same source-pinned environment described below and enough
 available BMHs for both worker sets.
 
 Both scenarios also require the guest cluster to be healthy before deleting it,
-and check the facts in the order that makes a failure diagnosable. Every worker
+and check the facts in the order that makes a failure diagnosable. Sanity reaches
+the check through `assert_cluster_available` and regression through
+`assert_cluster_with_two_node_sets_available`; a gate only one flow reaches
+leaves the other reporting a healthy cluster it never inspected. Every worker
 Node must first report a non-empty `agent://` `spec.providerID`: a Node can be
 `Ready` while never bound through the machine API, and that unbound state is
 what a later scale-down or teardown has nothing to look up, so it is asserted
@@ -923,7 +926,8 @@ two sets (it never copies `Failing` onto the HostedCluster), so a check that
 reads only one resource waits forever on a condition that resource does not
 carry. A fresh cluster reports its install as failing and progressing first,
 so that check polls a bounded budget and reports the last observed conditions
-when it times out.
+when it times out. Each wait logs the description it was given, so the run shows
+which of these checks ran and how long each took.
 
 The deletion request triggers the test-owned worker BMI wait (480 attempts at
 five-second intervals). Worker ownership is verified through the fulfillment

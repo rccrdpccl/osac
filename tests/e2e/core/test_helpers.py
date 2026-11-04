@@ -586,3 +586,38 @@ def test_k8s_client_supports_explicit_namespaces_and_cluster_scoped_lists(monkey
         ("kubectl", "get", "nodes", "-o", "json"),
         ("kubectl", "get", "nodepools", "-n", "hcp", "-o", "json"),
     ]
+
+
+def test_poll_until_names_what_it_waits_for(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    # A run is unreadable when every wait logs the same sentence: "Waiting for
+    # resource condition..." does not say whether the wait for provider IDs, for
+    # ClusterOperator health, or for a ClusterVersion condition ever ran.
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    attempts = iter([0, 0, 1])
+
+    caplog.set_level("INFO", logger="tests.e2e.core.runner")
+    value = runner.poll_until(
+        fn=lambda: next(attempts),
+        until=lambda current: current == 1,
+        retries=3,
+        delay=0,
+        description="workload cluster worker provider IDs",
+    )
+
+    assert value == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert "Waiting for workload cluster worker provider IDs" in messages
+    assert any(message.startswith("workload cluster worker provider IDs satisfied after") for message in messages)
+
+
+def test_poll_until_names_the_wait_it_timed_out_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(TimeoutError, match="timed out after 2s: workload cluster worker and ClusterOperator health"):
+        runner.poll_until(
+            fn=lambda: False,
+            until=bool,
+            retries=3,
+            delay=1,
+            description="workload cluster worker and ClusterOperator health",
+        )

@@ -57,8 +57,13 @@ def poll_until(
     last_error: subprocess.CalledProcessError | None = None
     start = time.monotonic()
     last_logged = start
-    # Descriptions and polled values may contain API responses or credentials.
-    logger.info("Waiting for resource condition...")
+    # Polled values may contain API responses or credentials, so they stay out of
+    # the log. Descriptions do not: they are the caller's static label for what is
+    # being waited on, and a run is unreadable without them -- a burst of
+    # "Waiting for resource condition..." says nothing about whether the wait for
+    # worker provider IDs, ClusterOperator health, or a ClusterVersion condition
+    # actually ran.
+    logger.info("Waiting for %s", description)
     for attempt in range(retries):
         # retry_on_error is opt-in: most callers' fn() raising CalledProcessError
         # indicates a real bug (bad namespace, typo'd resource, auth
@@ -75,25 +80,27 @@ def poll_until(
             else:
                 last_error = None
                 if until(value):
-                    logger.info("Resource condition met after %.0fs", time.monotonic() - start)
+                    logger.info("%s satisfied after %.0fs", description, time.monotonic() - start)
                     return value
         else:
             value = fn()
             if until(value):
-                logger.info("Resource condition met after %.0fs", time.monotonic() - start)
+                logger.info("%s satisfied after %.0fs", description, time.monotonic() - start)
                 return value
         now = time.monotonic()
         if now - last_logged >= _PROGRESS_LOG_INTERVAL_S:
-            logger.info("Still waiting (attempt %d/%d, %.0fs elapsed)", attempt + 1, retries, now - start)
+            logger.info(
+                "Still waiting for %s (attempt %d/%d, %.0fs elapsed)", description, attempt + 1, retries, now - start
+            )
             last_logged = now
         if attempt + 1 < retries:
             time.sleep(delay)
     if last_error is not None:
         # Suppress the subprocess exception: its command and output may contain secrets.
         raise TimeoutError(
-            f"Resource condition timed out after {max(retries - 1, 0) * delay}s (last call failed)"
+            f"Resource condition timed out after {max(retries - 1, 0) * delay}s: {description} (last call failed)"
         ) from None
-    raise TimeoutError(f"Resource condition timed out after {max(retries - 1, 0) * delay}s")
+    raise TimeoutError(f"Resource condition timed out after {max(retries - 1, 0) * delay}s: {description}")
 
 
 def env(name: str, default: str | None = None) -> str:
