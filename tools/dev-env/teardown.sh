@@ -213,6 +213,9 @@ step_dns() {
 		confirm "remove ${remote_conf} on ${REMOTE_HOST}"
 		ssh_remote true ||
 			die "cannot ssh to ${REMOTE_HOST} without a password (check your ssh agent)"
+		# The hosted-cluster records (hosted-dns.sh) are per order and would be
+		# reused by name on a later boot, so they go too - but only the files
+		# carrying our marker, never one someone wrote by hand.
 		ssh_remote_root env "CONF=${remote_conf}" bash -s <<'REMOTE'
 set -uo pipefail
 if [ -f "${CONF}" ]; then
@@ -222,6 +225,13 @@ if [ -f "${CONF}" ]; then
 else
 	printf '%s is already gone\n' "${CONF}"
 fi
+for hosted in /etc/NetworkManager/dnsmasq.d/hosted-*.conf; do
+	[ -e "${hosted}" ] || continue
+	head -1 "${hosted}" | grep -qxF '# managed by tools/dev-env/hosted-dns.sh' || continue
+	rm -f "${hosted}"
+	systemctl reload NetworkManager || systemctl restart NetworkManager
+	printf 'removed %s\n' "${hosted}"
+done
 REMOTE
 	fi
 
