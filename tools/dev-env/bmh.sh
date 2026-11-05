@@ -5,12 +5,15 @@
 #
 # Usage: tools/dev-env/bmh.sh [--force]
 #
-# The emulation itself lives in tools/shared/virtual-bmh.sh, which knows nothing
-# about REMOTE_HOST, sudo, or this repository: it expects to run on the machine
-# that hosts the libvirt VMs and takes its configuration from the environment.
-# This script supplies that transport — it copies the hub kubeconfig over,
-# pipes the library to a remote bash, and passes the inputs through env. A CI
-# job can call the same library directly.
+# The emulation is osac-test-infra's: tools/shared/virtual-bmh.sh is a thin
+# orchestrator over its activate-ironic.sh, setup-sushy-tools.sh,
+# manage-virtual-bmh-vms.py and reconcile-bmhs.py, so this environment and CI
+# run the same code. That library knows nothing about REMOTE_HOST, sudo, or this
+# repository: it expects to run on the machine that hosts the libvirt VMs, needs
+# an osac-test-infra checkout there (TEST_INFRA_DIR), and takes its configuration
+# from the environment. This script supplies both the transport — it copies the
+# hub kubeconfig over, clones or updates the checkout, pipes the library to a
+# remote bash, and passes the inputs through env — and the checkout itself.
 #
 # The library runs as root on that machine (ssh root@ for a real REMOTE_HOST,
 # sudo when it is `local`), because defining VMs, the storage pool, and the
@@ -39,6 +42,7 @@
 #   OSAC_DEV_HUB_KUBECONFIG  kubeconfig of the hub, else ~/.kube/<CLUSTER_NAME>
 #   CLUSTER_NAME     cluster-tool clone name, used for network/VM names
 #   BMH_NAMESPACE=host-inventory BMH_COUNT=2 BMH_DISK_SIZE=150G SUSHY_PORT=8000
+#   TEST_INFRA_DIR=~/osac-test-infra  TEST_INFRA_REF=main  TEST_INFRA_UPDATE=
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -57,8 +61,8 @@ that Ironic inspects until they are available.
 Skipped only when the expected VMs exist on REMOTE_HOST, are running, and each
 has an available BMH still pointing at that VM's MAC and UUID; --force runs the
 setup regardless (shortcut: make osac-dev-bmh FORCE=1). Partial state is
-repaired in place: stopped VMs are started, a dead emulator restarted, missing
-or stale BMHs (re-)applied.
+repaired in place: stopped VMs are started, a VM whose domain is gone is
+replaced, a dead emulator restarted, missing or stale BMHs (re-)applied.
 
 Inputs (defaults in common.sh / the Makefile):
   REMOTE_HOST              ssh target hosting the cluster (user@host), or
@@ -68,28 +72,87 @@ Inputs (defaults in common.sh / the Makefile):
   BMH_NAMESPACE=host-inventory  BMH_COUNT=2  BMH_DISK_SIZE=150G
   SUSHY_PORT=8000          BMC_USERNAME=admin  BMC_PASSWORD=password
   BMH_LABELS="osac.openshift.io/host-type=default"
+  TEST_INFRA_DIR=${HOME}/osac-test-infra on REMOTE_HOST (default),
+  TEST_INFRA_REF=main, TEST_INFRA_UPDATE=1 to move an existing checkout
 
-The library doing the work is tools/shared/virtual-bmh.sh, shared with CI.
+The library doing the work is tools/shared/virtual-bmh.sh, a thin orchestrator
+over the osac-test-infra BMaaS tools; the checkout it runs from is cloned or
+updated here.
 EOF
 }
 
-# Per-VM identity and power state on REMOTE_HOST, one line each:
-#   <vm name> <nic mac> <domain uuid> <domain state>
-# "none" stands in for anything virsh cannot report (VM absent). Runs as root
-# on the hub's host: the VMs are defined by the root context the library runs
-# in, and virsh on qemu:///system is not a user operation there.
+# Per-host identity on REMOTE_HOST, one line each: <vm name> <mac> <uuid>.
+# The raw inventory that osac-test-infra's tools maintain is the source of truth:
+# host names carry a generated token, so they are not derivable from the clone,
+# and the inventory is what maps a BMH back to the domain that backs it. Fails
+# when there is no inventory or any listed domain is not running. Runs as root
+# on the hub's host, which is the context the library created them in.
 remote_vm_state() {
-	ssh_remote_root "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") BMH_COUNT=$(printf '%q' "${BMH_COUNT}") bash -s" <<'REMOTE'
+	ssh_remote_root "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") bash -s" <<'REMOTE'
 set -euo pipefail
-for index in $(seq 1 "${BMH_COUNT}"); do
-	vm="virtual-bmh-${CLONE_NAME}-${index}"
-	uuid=$(virsh -c qemu:///system domuuid "${vm}" 2>/dev/null) || uuid=none
-	mac=$(virsh -c qemu:///system domiflist "${vm}" 2>/dev/null |
-		awk 'NR > 2 && !found { found = 1; print $5 }' || true)
-	state=$(virsh -c qemu:///system domstate "${vm}" 2>/dev/null) || state=none
-	printf '%s %s %s %s\n' "${vm}" "${mac:-none}" "${uuid}" "${state:-none}"
-	done
+inventory="${HOME}/virtual-bmh-inventory-${CLONE_NAME}.json"
+[ -f "${inventory}" ] || exit 1
+python3 - "${inventory}" <<'PY'
+import json, subprocess, sys
+
+with open(sys.argv[1]) as inventory_file:
+    inventory = json.load(inventory_file)
+for host in inventory["hosts"]:
+    state = subprocess.run(
+        ["virsh", "-c", "qemu:///system", "domstate", host["name"]],
+        capture_output=True,
+        text=True,
+    )
+    if state.returncode != 0 or state.stdout.strip() != "running":
+        sys.exit(1)
+    print(host["name"], host["boot_mac"], host["uuid"])
+PY
 REMOTE
+}
+
+# Absolute path of the osac-test-infra checkout on REMOTE_HOST. It is root that
+# executes the tools there, so a relative value has no directory to resolve
+# against.
+remote_test_infra_dir() {
+	if [ -n "${TEST_INFRA_DIR}" ]; then
+		case ${TEST_INFRA_DIR} in
+		/*) printf '%s\n' "${TEST_INFRA_DIR}" ;;
+		*) die "TEST_INFRA_DIR must be an absolute path (got '${TEST_INFRA_DIR}')" ;;
+		esac
+		return 0
+	fi
+	ssh_remote 'printf "%s/osac-test-infra\n" "$HOME"'
+}
+
+# The emulation runs CI's own tools, so REMOTE_HOST gets an osac-test-infra
+# checkout instead of a copy of them: cloned on first use, and moved to
+# TEST_INFRA_REF only when TEST_INFRA_UPDATE=1, so an ordinary run does not
+# depend on reaching GitHub.
+ensure_remote_test_infra() {
+	local dir=$1 head
+	if ssh_remote "[ -d $(printf '%q' "${dir}")/.git ]"; then
+		if [ "${TEST_INFRA_UPDATE}" = "1" ]; then
+			log "updating ${dir} on ${REMOTE_HOST} to ${TEST_INFRA_REPO} ${TEST_INFRA_REF}"
+			ssh_remote "cd $(printf '%q' "${dir}") &&
+				git fetch --quiet $(printf '%q' "${TEST_INFRA_REPO}") $(printf '%q' "${TEST_INFRA_REF}") &&
+				git checkout --quiet FETCH_HEAD" ||
+				die "could not update ${dir} on ${REMOTE_HOST}"
+		else
+			head=$(ssh_remote "git -C $(printf '%q' "${dir}") rev-parse --short HEAD") ||
+				die "could not read the revision of ${dir} on ${REMOTE_HOST}"
+			log "using ${dir} on ${REMOTE_HOST} at ${head} (TEST_INFRA_UPDATE=1 to move it)"
+		fi
+	else
+		log "cloning ${TEST_INFRA_REPO} (${TEST_INFRA_REF}) into ${dir} on ${REMOTE_HOST}"
+		ssh_remote "mkdir -p $(printf '%q' "$(dirname "${dir}")") &&
+			git clone --quiet --branch $(printf '%q' "${TEST_INFRA_REF}") $(printf '%q' "${TEST_INFRA_REPO}") $(printf '%q' "${dir}")" ||
+			die "could not clone ${TEST_INFRA_REPO} on ${REMOTE_HOST}"
+	fi
+	ssh_remote "for script in activate-ironic.sh setup-sushy-tools.sh manage-virtual-bmh-vms.py \
+		reconcile-bmhs.py raw_inventory.py; do
+		test -f $(printf '%q' "${dir}")/.github/scripts/\$script || exit 1
+	done" ||
+		die "${dir} on ${REMOTE_HOST} is not an osac-test-infra checkout (incomplete .github/scripts)"
 }
 
 # True when every virtual BMH this setup owns is available on the hub *and* still
@@ -98,17 +161,20 @@ REMOTE
 # UUID and MAC, and a powered-off VM stops being usable while its BMH still
 # reads available for a while.
 bmh_setup_is_current() {
-	local kubectl hub_dump vm_dump name mac uuid state line jsonpath
+	local kubectl hub_dump vm_dump name mac uuid line jsonpath
 	kubectl=$(kubectl_bin)
 	[ -n "${kubectl}" ] || return 1
 	vm_dump=$(remote_vm_state) || return 1
+	[ -n "${vm_dump}" ] || return 1
+	# Fewer hosts than the profile asks for is not current, however healthy they
+	# are: an earlier run may have stopped after creating the first one.
+	[ "$(grep -c . <<<"${vm_dump}")" -ge "${BMH_COUNT}" ] || return 1
 	jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.provisioning.state}{" "}'
 	jsonpath=$jsonpath'{.spec.bootMACAddress}{" "}{.spec.bmc.address}{"\n"}{end}'
 	hub_dump=$("${kubectl}" --kubeconfig "${HUB_KUBECONFIG}" get bmh \
 		-n "${BMH_NAMESPACE}" -o jsonpath="${jsonpath}" 2>/dev/null) || return 1
-	while read -r name mac uuid state; do
-		[ "${mac}" != "none" ] && [ "${uuid}" != "none" ] || return 1
-		[ "${state}" = "running" ] || return 1
+	while read -r name mac uuid; do
+		[ -n "${name}" ] || return 1
 		line=$(awk -v want="${name}" '$1 == want { print; exit }' <<<"${hub_dump}")
 		[ -n "${line}" ] || return 1
 		[ "$(awk '{ print $2 }' <<<"${line}")" = "available" ] || return 1
@@ -179,11 +245,13 @@ run_remote_setup() {
 	remote_env=$(
 		cat <<EOF
 CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}")
+TEST_INFRA_DIR=$(printf '%q' "${REMOTE_TEST_INFRA_DIR}")
 $(remote_kubeconfig_env)
 BMH_NAMESPACE=$(printf '%q' "${BMH_NAMESPACE}")
 BMH_COUNT=$(printf '%q' "${BMH_COUNT}")
 BMH_DISK_SIZE=$(printf '%q' "${BMH_DISK_SIZE}")
 SUSHY_PORT=$(printf '%q' "${SUSHY_PORT}")
+SUSHY_CACHE_PORT=$(printf '%q' "${SUSHY_CACHE_PORT}")
 BMH_LABELS=$(printf '%q' "${BMH_LABELS}")
 BMC_USERNAME=$(printf '%q' "${BMC_USERNAME}")
 BMC_PASSWORD=$(printf '%q' "${BMC_PASSWORD}")
@@ -229,6 +297,9 @@ main() {
 
 	push_kubeconfig
 	ensure_remote_hub_access
+	REMOTE_TEST_INFRA_DIR=$(remote_test_infra_dir) ||
+		die "could not determine the osac-test-infra checkout path on ${REMOTE_HOST}"
+	ensure_remote_test_infra "${REMOTE_TEST_INFRA_DIR}"
 	run_remote_setup
 }
 

@@ -76,23 +76,62 @@ usage() {
 		"${BASH_SOURCE[0]}"
 }
 
+# Names of the virtual BMHs this environment owns. osac-test-infra names each
+# host with a generated token recorded in the raw inventory on REMOTE_HOST, so
+# they cannot be derived here; the index names of the tool it replaced are added
+# because a host that predates it still carries them.
+remote_bmh_names() {
+	ssh_remote_root "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") bash -s" <<'REMOTE'
+set -uo pipefail
+prefix="virtual-bmh-${CLONE_NAME}"
+inventory="${HOME}/virtual-bmh-inventory-${CLONE_NAME}.json"
+if [ -f "${inventory}" ]; then
+	python3 - "${inventory}" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as inventory_file:
+    inventory = json.load(inventory_file)
+for host in inventory["hosts"]:
+    print(host["name"])
+PY
+fi
+virsh -c qemu:///system list --all --name |
+	awk -v p="${prefix}-" 'index($0, p) == 1 && substr($0, length(p) + 1) ~ /^[0-9]+$/'
+REMOTE
+}
+
+bmh_names() {
+	local index
+	if [ -n "${REMOTE_HOST}" ] && remote_bmh_names; then
+		return 0
+	fi
+	# Without the host there is no inventory to read: name the index hosts of the
+	# tool this replaced, which is the most that can be known.
+	warn "cannot read the raw inventory on ${REMOTE_HOST:-an unset REMOTE_HOST}; only the index-named BMHs are known"
+	for ((index = 1; index <= BMH_COUNT; index++)); do
+		printf 'virtual-bmh-%s-%s\n' "${CLUSTER_NAME}" "${index}"
+	done
+}
+
 # The BMHs are resources of the hub: their finalizers are removed by the
 # controllers of the osac release, which is why this runs before `osac`.
 step_bmh() {
-	local kubeconfig kubectl index
+	local kubeconfig kubectl name names
 	kubeconfig=$(hub_kubeconfig)
 	kubectl=$(kubectl_bin)
+	names=$(bmh_names)
 	if [ -z "${kubectl}" ] || [ ! -f "${kubeconfig}" ]; then
 		log "no kubeconfig at ${kubeconfig}, skipping the BMH resources"
 	else
-		confirm "delete the ${BMH_COUNT} virtual BMH(s) in ${BMH_NAMESPACE}"
-		for ((index = 1; index <= BMH_COUNT; index++)); do
+		confirm "delete the virtual BMH(s) in ${BMH_NAMESPACE}"
+		while read -r name; do
+			[ -n "${name}" ] || continue
 			run "${kubectl}" --kubeconfig "${kubeconfig}" -n "${BMH_NAMESPACE}" \
-				delete bmh "virtual-bmh-${CLUSTER_NAME}-${index}" \
+				delete bmh "${name}" \
 				--ignore-not-found --wait=true --timeout=15m ||
-				warn "BMH virtual-bmh-${CLUSTER_NAME}-${index} was not deleted;
+				warn "BMH ${name} was not deleted;
        a finalizer may be waiting for a controller that is already gone"
-		done
+		done <<<"${names}"
 	fi
 
 	if [ -z "${REMOTE_HOST}" ]; then
@@ -107,30 +146,59 @@ step_bmh() {
 step_bmh_remote() {
 	confirm "stop the emulator and undefine the VMs on ${REMOTE_HOST}"
 	if [ "${TEARDOWN_DRY_RUN}" = "1" ]; then
-		log "would stop the Redfish emulator, undefine virtual-bmh-${CLUSTER_NAME}-1..${BMH_COUNT} with their disks, and drop the test-infra-net-${CLUSTER_NAME} network on ${REMOTE_HOST}"
+		log "would stop the Redfish emulator and its virtual-media cache, undefine the VMs the raw inventory lists (plus the index-named VMs of the tool it replaced) with their disks, drop the ${SUSHY_STORAGE_POOL} storage pool and the test-infra-net-${CLUSTER_NAME} network on ${REMOTE_HOST}"
 		return 0
 	fi
 	ssh_remote true ||
 		die "cannot ssh to ${REMOTE_HOST} without a password (check your ssh agent)"
 	log "tearing down the BMH emulation on ${REMOTE_HOST}"
-	ssh_remote_root env "CLONE=${CLUSTER_NAME}" "COUNT=${BMH_COUNT}" bash -s <<'REMOTE'
+	ssh_remote_root env "CLONE=${CLUSTER_NAME}" \
+		"CACHE_NAME=${SUSHY_CACHE_NAME}" "POOL=${SUSHY_STORAGE_POOL}" bash -s <<'REMOTE'
 set -uo pipefail
 prefix="virtual-bmh-${CLONE}"
+inventory="${HOME}/virtual-bmh-inventory-${CLONE}.json"
+# setup-sushy-tools.sh records the emulator's pid and start time; the pattern
+# fallback catches one whose config directory was already removed.
 pid_file="${HOME}/sushy-${CLONE}/sushy.pid"
 if [ -f "${pid_file}" ]; then
 	pid=$(cat "${pid_file}")
 	kill "${pid}" 2>/dev/null || true
 	printf 'stopped the Redfish emulator (pid %s)\n' "${pid}"
 fi
-pkill -f "sushy-emulator.*${CLONE}" 2>/dev/null || true
-for ((i = 1; i <= COUNT; i++)); do
-	virsh -c qemu:///system destroy "${prefix}-${i}" 2>/dev/null || true
-	virsh -c qemu:///system undefine "${prefix}-${i}" \
+pkill -f "sushy-emulator.*sushy-${CLONE}/" 2>/dev/null || true
+if command -v podman >/dev/null 2>&1; then
+	podman rm --force "${CACHE_NAME}" >/dev/null 2>&1 || true
+	podman volume rm --force "${CACHE_NAME}" >/dev/null 2>&1 || true
+fi
+# The raw inventory names carry generated tokens; the index names belong to the
+# tool this replaced and are removed too so a host upgraded in place is clean.
+{
+	if [ -f "${inventory}" ]; then
+		python3 - "${inventory}" <<'PY'
+import json, sys
+
+with open(sys.argv[1]) as inventory_file:
+    inventory = json.load(inventory_file)
+for host in inventory["hosts"]:
+    print(host["name"])
+PY
+	fi
+	virsh -c qemu:///system list --all --name |
+		awk -v p="${prefix}-" 'index($0, p) == 1 && substr($0, length(p) + 1) ~ /^[0-9]+$/'
+} | while IFS= read -r name; do
+	[ -n "${name}" ] || continue
+	virsh -c qemu:///system destroy "${name}" 2>/dev/null || true
+	if virsh -c qemu:///system undefine "${name}" \
 		--nvram --remove-all-storage >/dev/null 2>&1 ||
-		virsh -c qemu:///system undefine "${prefix}-${i}" >/dev/null 2>&1 || true
-	printf 'undefined %s-%s\n' "${prefix}" "${i}"
+		virsh -c qemu:///system undefine "${name}" >/dev/null 2>&1; then
+		printf 'undefined %s\n' "${name}"
+	fi
 done
-rm -rf "${HOME}/sushy-${CLONE}" "${HOME}/sushy-vmedia-tmp-${CLONE}"
+rm -f "${inventory}"
+rm -rf "${HOME}/sushy-${CLONE}" "${HOME}/sushy-vmedia-tmp-${CLONE}" \
+	"/tmp/virtual-bmh-disks-${CLONE}"
+virsh -c qemu:///system pool-destroy "${POOL}" 2>/dev/null || true
+virsh -c qemu:///system pool-undefine "${POOL}" 2>/dev/null || true
 virsh -c qemu:///system net-destroy "test-infra-net-${CLONE}" 2>/dev/null || true
 virsh -c qemu:///system net-undefine "test-infra-net-${CLONE}" 2>/dev/null || true
 REMOTE

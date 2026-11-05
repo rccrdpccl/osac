@@ -15,7 +15,8 @@
 #                              skipped when the releases already match the
 #                              in-tree chart version
 #   tools/dev-env/bmh.sh       virtual BareMetalHosts on REMOTE_HOST, running
-#                              tools/shared/virtual-bmh.sh there over ssh
+#                              tools/shared/virtual-bmh.sh there over ssh on
+#                              top of an osac-test-infra checkout
 #   tools/dev-env/osac.sh      prepare and deploy OSAC itself (Helm release
 #                              `osac`) through the repository-root skaffold.yaml
 #
@@ -134,11 +135,21 @@ TEARDOWN_CLIENT         ?=
 TEARDOWN_FLAVOR         ?=
 OSAC_INSTALLER          ?= osac-installer
 HELM                    ?= helm
-# Virtual BMH emulation; tools/shared/virtual-bmh.sh holds the shared logic.
+# Virtual BMH emulation; tools/shared/virtual-bmh.sh orchestrates the
+# osac-test-infra BMaaS tools (activate-ironic.sh, setup-sushy-tools.sh,
+# manage-virtual-bmh-vms.py, reconcile-bmhs.py) from a checkout on REMOTE_HOST.
 BMH_NAMESPACE           ?= host-inventory
 BMH_COUNT               ?= 2
 BMH_DISK_SIZE           ?= 150G
 SUSHY_PORT              ?= 8000
+SUSHY_CACHE_PORT        ?= 8080
+# osac-test-infra checkout the emulation runs from; empty means
+# $HOME/osac-test-infra on REMOTE_HOST. UPDATE=1 moves an existing checkout to
+# REF, otherwise it is used as it is (so a run needs no network access).
+TEST_INFRA_DIR          ?=
+TEST_INFRA_REF          ?= main
+TEST_INFRA_REPO         ?= https://github.com/osac-project/osac-test-infra.git
+TEST_INFRA_UPDATE       ?=
 BMC_USERNAME            ?= admin
 BMC_PASSWORD            ?= password
 BMH_LABELS              ?= osac.openshift.io/host-type=default
@@ -166,8 +177,9 @@ SKAFFOLD_ARGS           ?=
 export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
 	OSAC_DEV_HUB_KUBECONFIG CLUSTER_TOOL_DATA FLAVOR FLAVOR_IMAGE CLUSTER_NAME \
 	DISK_SIZE CLUSTER_TOOL_FORCE CLUSTER_DOMAIN OSAC_INSTALLER PLATFORM PROFILE \
-	NS HELM BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT BMC_USERNAME \
-	BMC_PASSWORD BMH_LABELS SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
+	NS HELM BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT SUSHY_CACHE_PORT \
+	BMH_LABELS TEST_INFRA_DIR TEST_INFRA_REF TEST_INFRA_REPO TEST_INFRA_UPDATE \
+	BMC_USERNAME BMC_PASSWORD SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
 export OSAC_DEV_FORCE := $(FORCE)
 export E2E_SUITE := $(E2E_SUITE)
 export E2E_FILTER := $(E2E_FILTER)
