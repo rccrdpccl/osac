@@ -54,14 +54,25 @@ fi
 # Image tags recorded by `osac.sh prep` and replayed by `osac.sh deploy`.
 : "${ARTIFACTS_FILE:=${HOME}/.cache/osac-dev/builds.json}"
 
-# Virtual BMH emulation (tools/shared/virtual-bmh.sh via tools/dev-env/bmh.sh).
+# Virtual BMH emulation: tools/dev-env/bmh.sh drives tools/shared/virtual-bmh.sh,
+# which orchestrates the osac-test-infra BMaaS tools from this checkout on
+# REMOTE_HOST (empty means $HOME/osac-test-infra there).
+: "${TEST_INFRA_DIR:=}"
+: "${TEST_INFRA_REF:=main}"
+: "${TEST_INFRA_REPO:=https://github.com/osac-project/osac-test-infra.git}"
+: "${TEST_INFRA_UPDATE:=}"
 : "${BMH_NAMESPACE:=host-inventory}"
 : "${BMH_COUNT:=2}"
 : "${BMH_DISK_SIZE:=150G}"
 : "${SUSHY_PORT:=8000}"
+: "${SUSHY_CACHE_PORT:=8080}"
 : "${BMC_USERNAME:=admin}"
 : "${BMC_PASSWORD:=password}"
 : "${BMH_LABELS:=osac.openshift.io/host-type=default}"
+# Derived from the clone, exactly as the emulation builds them; teardown reads
+# them to drop the storage pool and the virtual-media cache container.
+export SUSHY_STORAGE_POOL="bmh-${CLUSTER_NAME}"
+export SUSHY_CACHE_NAME="sushy-cache-${CLUSTER_NAME}"
 
 DEV_ENV_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${DEV_ENV_DIR}/../.." && pwd)
