@@ -124,6 +124,35 @@ remote_test_infra_dir() {
 	ssh_remote 'printf "%s/osac-test-infra\n" "$HOME"'
 }
 
+# The emulation needs the tools that replaced setup-virtual-bmh.sh, and a
+# checkout that predates that refactor still has a .github/scripts directory, so
+# from outside it looks like the wrong path rather than an old revision. Name
+# the missing tools and the two ways out; "not a checkout" sends people looking
+# for the wrong problem.
+require_remote_test_infra_tools() {
+	local dir=$1 missing head branch dirty
+	missing=$(ssh_remote "cd $(printf '%q' "${dir}") &&
+		for tool in activate-ironic.sh setup-sushy-tools.sh \
+			manage-virtual-bmh-vms.py reconcile-bmhs.py raw_inventory.py; do
+			test -f \".github/scripts/\${tool}\" || printf '%s ' \"\${tool}\"
+		done" 2>/dev/null) || missing=""
+	if [ -z "${missing}" ]; then
+		return 0
+	fi
+	head=$(ssh_remote "git -C $(printf '%q' "${dir}") log -1 --format='%h %s'" 2>/dev/null) ||
+		head="an unknown revision"
+	branch=$(ssh_remote "git -C $(printf '%q' "${dir}") rev-parse --abbrev-ref HEAD" 2>/dev/null) ||
+		branch="an unknown branch"
+	dirty=$(ssh_remote "git -C $(printf '%q' "${dir}") status --porcelain" 2>/dev/null) || dirty=""
+	warn "${dir} on ${REMOTE_HOST} has no .github/scripts/{${missing% }}"
+	warn "its HEAD is ${head} on ${branch}, which predates those tools."
+	if [ -n "${dirty}" ]; then
+		warn "it also has uncommitted changes, and an update replaces them."
+		die "commit or stash them there and rerun with TEST_INFRA_UPDATE=1, or point TEST_INFRA_DIR at a checkout of ${TEST_INFRA_REF}"
+	fi
+	die "rerun with TEST_INFRA_UPDATE=1 to move it to ${TEST_INFRA_REF}, or point TEST_INFRA_DIR at a checkout of it"
+}
+
 # The emulation runs CI's own tools, so REMOTE_HOST gets an osac-test-infra
 # checkout instead of a copy of them: cloned on first use, and moved to
 # TEST_INFRA_REF only when TEST_INFRA_UPDATE=1, so an ordinary run does not
@@ -132,6 +161,11 @@ ensure_remote_test_infra() {
 	local dir=$1 head
 	if ssh_remote "[ -d $(printf '%q' "${dir}")/.git ]"; then
 		if [ "${TEST_INFRA_UPDATE}" = "1" ]; then
+			# Someone's working checkout is exactly the one likely to
+			# be dirty, and losing it to a move is not recoverable.
+			if [ -n "$(ssh_remote "git -C $(printf '%q' "${dir}") status --porcelain" 2>/dev/null)" ]; then
+				die "${dir} on ${REMOTE_HOST} has uncommitted changes; commit or stash them, or point TEST_INFRA_DIR at another checkout"
+			fi
 			log "updating ${dir} on ${REMOTE_HOST} to ${TEST_INFRA_REPO} ${TEST_INFRA_REF}"
 			ssh_remote "cd $(printf '%q' "${dir}") &&
 				git fetch --quiet $(printf '%q' "${TEST_INFRA_REPO}") $(printf '%q' "${TEST_INFRA_REF}") &&
@@ -148,11 +182,7 @@ ensure_remote_test_infra() {
 			git clone --quiet --branch $(printf '%q' "${TEST_INFRA_REF}") $(printf '%q' "${TEST_INFRA_REPO}") $(printf '%q' "${dir}")" ||
 			die "could not clone ${TEST_INFRA_REPO} on ${REMOTE_HOST}"
 	fi
-	ssh_remote "for script in activate-ironic.sh setup-sushy-tools.sh manage-virtual-bmh-vms.py \
-		reconcile-bmhs.py raw_inventory.py; do
-		test -f $(printf '%q' "${dir}")/.github/scripts/\$script || exit 1
-	done" ||
-		die "${dir} on ${REMOTE_HOST} is not an osac-test-infra checkout (incomplete .github/scripts)"
+	require_remote_test_infra_tools "${dir}"
 }
 
 # True when every virtual BMH this setup owns is available on the hub *and* still
