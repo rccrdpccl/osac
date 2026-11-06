@@ -40,6 +40,10 @@ from tests.e2e.core.helpers import (
     wait_for_vmi_ip,
 )
 from tests.e2e.core.k8s_client import K8sClient
+
+# Re-exported: the suite and its unit tests read both through this module.
+from tests.e2e.core.keep import KEEP_RESOURCES_ENV as KEEP_RESOURCES_ENV
+from tests.e2e.core.keep import keep_resources as keep_resources
 from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import poll_until
 from tests.e2e.core.wait_kinds import WaitResourceKind
@@ -48,9 +52,6 @@ from tests.e2e.networking.teardown import teardown_sg, teardown_subnets, teardow
 from tests.e2e.networking.vmaas import guest_ssh
 
 T = TypeVar("T")
-
-# Local debugging only: set it to true to keep what the suite created after the run. No job sets it.
-KEEP_RESOURCES_ENV = "OSAC_E2E_KEEP_RESOURCES"
 
 EXTERNAL_PATH_HINT = (
     "Check on the Netris lab: the VPC VRF and the VNIs exist on the SoftGates and leaves (Netris deploys them "
@@ -79,11 +80,6 @@ def require_host_tools() -> None:
             f"The pytest host lacks {', '.join(missing)} on PATH, and the suite cannot run without it. "
             "Install kubectl (or oc) and the OpenSSH client."
         )
-
-
-def keep_resources() -> bool:
-    """True when a person debugging on a live lab wants the suite's resources left in place."""
-    return os.environ.get(KEEP_RESOURCES_ENV, "").strip().lower() == "true"
 
 
 def run_parallel(calls: Sequence[Callable[[], T]]) -> list[T]:

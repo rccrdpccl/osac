@@ -8,7 +8,7 @@ import pytest
 
 from tests.e2e.caas.regression import test_cluster_node_sets as regression
 from tests.e2e.caas.sanity import test_cluster_create as scenario
-from tests.e2e.core import helpers, runner
+from tests.e2e.core import helpers, keep, runner
 from tests.e2e.core.k8s_client import K8sClient
 from tests.e2e.core.metering import MeteringCollector
 
@@ -176,3 +176,31 @@ def test_two_node_set_scenario_rejects_foreign_worker_before_teardown(two_node_s
     scenario.wait_for_cluster_deleting.assert_not_called()
     helpers.wait_for_cluster_deletion.assert_not_called()
     two_node_set_clients["k8s_hub_client"].is_absent.assert_not_called()
+
+
+def test_two_node_set_scenario_keeps_the_cluster_when_asked(
+    monkeypatch: pytest.MonkeyPatch, two_node_set_clients: dict[str, Mock], caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv(keep.KEEP_RESOURCES_ENV, "true")
+
+    _run_scenario(two_node_set_clients)
+
+    # Nothing is deleted and nothing is asserted gone: the cluster the person
+    # asked for is the evidence.
+    two_node_set_clients["cli"].delete_cluster.assert_not_called()
+    scenario.wait_for_cluster_grpc_removal.assert_not_called()
+    two_node_set_clients["k8s_hub_client"].is_absent.assert_not_called()
+    # A kept run says what stays and how to remove it.
+    assert keep.KEEP_RESOURCES_ENV in caplog.text
+    assert "osac delete cluster cluster-id" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["", "false", "1"])
+def test_two_node_set_scenario_deletes_unless_the_flag_says_true(
+    monkeypatch: pytest.MonkeyPatch, two_node_set_clients: dict[str, Mock], value: str
+) -> None:
+    monkeypatch.setenv(keep.KEEP_RESOURCES_ENV, value)
+
+    _run_scenario(two_node_set_clients)
+
+    two_node_set_clients["cli"].delete_cluster.assert_has_calls([call(uuid="cluster-id"), call(uuid="cluster-id")])

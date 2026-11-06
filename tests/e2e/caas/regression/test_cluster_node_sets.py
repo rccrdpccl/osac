@@ -16,6 +16,7 @@ from tests.e2e.core.fulfillment_trust import assert_cluster_trust, assert_manage
 from tests.e2e.core.grpc_client import GRPCClient
 from tests.e2e.core.helpers import unique_name
 from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.keep import keep_resources, note_kept_resources
 from tests.e2e.core.metering import MeteringCollector
 from tests.e2e.core.osac_cli import OsacCLI
 
@@ -63,8 +64,15 @@ def test_cluster_create_with_two_node_sets(
         if os.environ.get("OSAC_FULFILLMENT_TRUST_E2E") == "true":
             assert_management_tls(k8s_hub_client, require_metering=True)
             assert_cluster_trust(k8s_hub_client, cluster.co_name)
+        if keep_resources():
+            note_kept_resources(
+                f"cluster {name} ({uuid}), its two node sets and their workers",
+                remove_with=f"osac delete cluster {uuid}",
+            )
+            return
         cli.delete_cluster(uuid=uuid)
         _assert_cluster_deleted(grpc=grpc, k8s=k8s_hub_client, metering=metering, uuid=uuid, cluster=cluster)
     finally:
-        with contextlib.suppress(subprocess.SubprocessError):
-            cli.delete_cluster(uuid=uuid)
+        if not keep_resources():
+            with contextlib.suppress(subprocess.SubprocessError):
+                cli.delete_cluster(uuid=uuid)
