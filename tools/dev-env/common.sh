@@ -165,6 +165,42 @@ else
 	CLUSTER_TOOL_CMD=("${CLUSTER_TOOL}")
 fi
 
+# Absolute path of the osac-test-infra checkout on REMOTE_HOST. It is root that
+# executes the tools there, so a relative value has no directory to resolve
+# against.
+remote_test_infra_dir() {
+	if [ -n "${TEST_INFRA_DIR}" ]; then
+		case ${TEST_INFRA_DIR} in
+		/*) printf '%s\n' "${TEST_INFRA_DIR}" ;;
+		*) die "TEST_INFRA_DIR must be an absolute path (got '${TEST_INFRA_DIR}')" ;;
+		esac
+		return 0
+	fi
+	ssh_remote 'printf "%s/osac-test-infra\n" "$HOME"'
+}
+
+# The IPv4 range the CaaS guest ingress VIPs come from, derived from the
+# clone's libvirt network the way the CI workflows derive it: the same
+# osac-test-infra script, on the host that owns the network, picking a free
+# block below the DHCP pool and away from the pinned addresses. The AAP role
+# takes the range as an input (CI_GUEST_INGRESS_IP_RANGE) and never guesses
+# one, so a dev environment without this step cannot run a CaaS suite.
+#
+# Prints the range on stdout and the script's reasoning on stderr.
+guest_ingress_vip_range() {
+	local dir script
+	dir=$(remote_test_infra_dir) || return 1
+	script="${dir}/.github/scripts/guest_ingress_vip_range.py"
+	if ! ssh_remote "test -f $(printf '%q' "${script}")"; then
+		die "${dir} on ${REMOTE_HOST} has no .github/scripts/guest_ingress_vip_range.py;
+       clone or update an osac-test-infra checkout that has it, via TEST_INFRA_DIR,
+       or TEST_INFRA_REF=<branch> TEST_INFRA_UPDATE=1 (as the BMH setup does)"
+	fi
+	# As root: virsh talks to qemu:///system.
+	ssh_remote_root "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") \
+		python3 $(printf '%q' "${script}") --explain"
+}
+
 kubectl_bin() {
 	local bin
 	if bin=$(command -v kubectl 2>/dev/null); then

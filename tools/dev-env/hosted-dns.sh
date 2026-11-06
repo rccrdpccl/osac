@@ -30,12 +30,17 @@
 #
 # So this publishes, per order, one NetworkManager dnsmasq drop-in on the hub's
 # host: the API name to the hosted kube-apiserver LoadBalancer address, and the
-# apps domain to each worker's node address, which is where the guest routers
-# listen (the guest IngressController publishes on the host network). Both values
-# come from the hub, so the records follow the orders a suite creates and are
-# dropped when an order is deleted. The hub CoreDNS half — delegating this
-# dnsmasq the hosted zone, because the corp resolver answers NXDOMAIN for it — is
-# ensure_hub_dns_zone_forward in common.sh.
+# apps domain to the guest ingress VIP the ClusterOrder published
+# (osac.openshift.io/ingress-endpoint), which is where the guest routers listen
+# once the ingress controller is bound to the MetalLB Service the AAP role
+# configures. Worker addresses are the fallback only for an order that has not
+# published an endpoint yet: the guest IngressController does listen on the host
+# network there, but with more than one worker the name then resolves to a set of
+# addresses only one of which a given router answers on, and a two-node guest
+# flakes. Both values come from the hub, so the records follow the orders a suite
+# creates and are dropped when an order is deleted. The hub CoreDNS half —
+# delegating this dnsmasq the hosted zone, because the corp resolver answers
+# NXDOMAIN for it — is ensure_hub_dns_zone_forward in common.sh.
 #
 # Skipped, with a message, while no order has a hosted cluster yet: a suite
 # creates one minutes into the run, which is what --watch is for.
@@ -92,9 +97,11 @@ kube() {
 	KUBECONFIG="${kubeconfig}" "${kubectl}" "$@"
 }
 
-# order<TAB>hosted cluster<TAB>hosted cluster namespace, one per line.
+# order<TAB>order namespace<TAB>hosted cluster<TAB>hosted cluster namespace,
+# one per line. The ClusterOrder's own namespace is where the ingress endpoint
+# annotation is read from.
 hosted_orders() {
-	kube get clusterorder --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.clusterReference.hostedClusterName}{"\t"}{.status.clusterReference.namespace}{"\n"}{end}' 2>/dev/null ||
+	kube get clusterorder --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.namespace}{"\t"}{.status.clusterReference.hostedClusterName}{"\t"}{.status.clusterReference.namespace}{"\n"}{end}' 2>/dev/null ||
 		true
 }
 
@@ -104,7 +111,7 @@ hosted_zones() {
 	local _order hc hc_ns base
 	{
 		hosted_dns_zone
-		while IFS=$'\t' read -r _order hc hc_ns; do
+		while IFS=$'\t' read -r _order _order_ns hc hc_ns; do
 			[ -n "${hc}" ] || continue
 			base=$(kube get hostedcluster "${hc}" -n "${hc_ns}" \
 				-o jsonpath='{.spec.dns.baseDomain}' 2>/dev/null) || base=""
@@ -113,13 +120,22 @@ hosted_zones() {
 	} | sort -u
 }
 
+# The guest ingress VIP the ClusterOrder published, empty until the AAP role has
+# reserved and configured it.
+ingress_endpoint() {
+	local order_ns=$1 order=$2
+	kube get clusterorder "${order}" -n "${order_ns}" \
+		-o jsonpath='{.metadata.annotations.osac\.openshift\.io/ingress-endpoint}' 2>/dev/null ||
+		true
+}
+
 # The dnsmasq records one hosted cluster needs, one address= line each. Silent
 # while the control plane has no LoadBalancer address yet or no worker has
 # registered: there is nothing truthful to publish then, and the next pass picks
 # it up.
 order_records() {
-	local hc=$1 hc_ns=$2
-	local hcp_ns="${hc_ns}-${hc}" base kas node_ips ip
+	local order_ns=$1 order=$2 hc=$3 hc_ns=$4
+	local hcp_ns="${hc_ns}-${hc}" base kas vip node_ips ip
 	base=$(kube get hostedcluster "${hc}" -n "${hc_ns}" \
 		-o jsonpath='{.spec.dns.baseDomain}' 2>/dev/null) || base=""
 	[ -n "${base}" ] || return 0
@@ -129,6 +145,12 @@ order_records() {
 		printf 'address=/api.%s.%s/%s\n' "${hc}" "${base}" "${kas}"
 		printf 'address=/api-int.%s.%s/%s\n' "${hc}" "${base}" "${kas}"
 	fi
+	vip=$(ingress_endpoint "${order_ns}" "${order}")
+	if [ -n "${vip}" ]; then
+		printf 'address=/.apps.%s.%s/%s\n' "${hc}" "${base}" "${vip}"
+		return 0
+	fi
+	warn "${order}: no ingress endpoint yet; answering *.apps.${hc}.${base} with the worker addresses"
 	node_ips=$(kube get agentmachine -n "${hcp_ns}" \
 		-o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' \
 		2>/dev/null) || node_ips=""
@@ -189,17 +211,17 @@ prune_stale() {
 
 # One pass: publish every hosted order's records, then prune what died.
 publish_once() {
-	local dry_run=$1 prune=$2 orders order hc hc_ns records conf current
-	local desired changed="" kept="" api domain addr
+	local dry_run=$1 prune=$2 orders order order_ns hc hc_ns records conf current
+	local desired changed="" kept="" api apps domain addr
 	local -a published=()
 	orders=$(hosted_orders)
 	if [ -z "${orders}" ]; then
 		log "no ClusterOrder owns a hosted cluster yet"
 	fi
-	while IFS=$'\t' read -r order hc hc_ns; do
+	while IFS=$'\t' read -r order order_ns hc hc_ns; do
 		[ -n "${hc:-}" ] || continue
 		kept="${kept} ${hc}"
-		records=$(order_records "${hc}" "${hc_ns}") || records=""
+		records=$(order_records "${order_ns}" "${order}" "${hc}" "${hc_ns}") || records=""
 		if [ -z "${records}" ]; then
 			log "${hc}: no API address or worker yet, nothing to publish"
 			continue
@@ -219,8 +241,10 @@ publish_once() {
 		remote_write "${conf}" "${desired}" ||
 			die "could not write ${conf} on ${REMOTE_HOST}"
 		changed=1
-		# Both API names (api and api-int) are checked; the apps record is a
-		# wildcard, so it is only exercised by the guest routers using it.
+		# Both API names are single addresses dnsmasq has to answer with exactly,
+		# so they are checked. The apps name is too, but only once the order
+		# published an ingress endpoint: a worker-based apps record is a set of
+		# addresses, one per router, that no single-address check can carry.
 		while read -r api; do
 			[ -n "${api}" ] || continue
 			domain=${api#address=/}
@@ -228,6 +252,15 @@ publish_once() {
 			addr=${api##*/}
 			published+=("${domain} ${addr}")
 		done < <(printf '%s\n' "${records}" | grep '^address=/api' || true)
+		apps=$(printf '%s\n' "${records}" | grep -c '^address=/.apps' || true)
+		if [ "${apps}" = "1" ]; then
+			api=$(printf '%s\n' "${records}" | grep '^address=/.apps')
+			domain=${api#address=/}
+			domain=${domain%%/*}
+			addr=${api##*/}
+			# The wildcard is probed through a name it has to answer.
+			published+=("default-router${domain} ${addr}")
+		fi
 	done <<<"${orders}"
 	if [ "${prune}" = "1" ]; then
 		prune_stale "${dry_run}" "${kept}"

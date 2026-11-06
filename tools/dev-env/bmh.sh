@@ -110,20 +110,6 @@ PY
 REMOTE
 }
 
-# Absolute path of the osac-test-infra checkout on REMOTE_HOST. It is root that
-# executes the tools there, so a relative value has no directory to resolve
-# against.
-remote_test_infra_dir() {
-	if [ -n "${TEST_INFRA_DIR}" ]; then
-		case ${TEST_INFRA_DIR} in
-		/*) printf '%s\n' "${TEST_INFRA_DIR}" ;;
-		*) die "TEST_INFRA_DIR must be an absolute path (got '${TEST_INFRA_DIR}')" ;;
-		esac
-		return 0
-	fi
-	ssh_remote 'printf "%s/osac-test-infra\n" "$HOME"'
-}
-
 # The emulation needs the tools that replaced setup-virtual-bmh.sh, and a
 # checkout that predates that refactor still has a .github/scripts directory, so
 # from outside it looks like the wrong path rather than an old revision. Name

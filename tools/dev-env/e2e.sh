@@ -28,7 +28,9 @@
 # published on names only the hub host's dnsmasq can answer (hosted-dns.sh). For
 # those suites this starts that publisher in --watch mode before pytest and stops
 # it afterwards, because the order it has to publish for does not exist yet; its
-# output goes to <ARTIFACTS_FILE dir>/hosted-dns.log.
+# output goes to <ARTIFACTS_FILE dir>/hosted-dns.log. It also hands the AAP role
+# the guest ingress VIP range the CI workflows hand it: derived from the clone's
+# libvirt network and patched into cluster-fulfillment-ig just before the run.
 #
 # Everything else keeps the tests' defaults, which already resolve from the
 # cluster: the cluster domain, the fulfillment and Keycloak routes, the service
@@ -62,7 +64,9 @@
 # E2E_KEEP, OSAC_CLI_PATH.
 #
 # Inputs (defaults in common.sh): OSAC_DEV_HUB_KUBECONFIG, CLUSTER_NAME, NS,
-# PULL_SECRET_FILE, ARTIFACTS_FILE, REPO_ROOT.
+# PULL_SECRET_FILE, ARTIFACTS_FILE, REPO_ROOT. A CaaS suite also reads the
+# osac-test-infra checkout bmh.sh manages: TEST_INFRA_DIR (else
+# $HOME/osac-test-infra on REMOTE_HOST).
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "${script_dir}/common.sh"
@@ -258,6 +262,42 @@ resolve_ssh_key() {
 	return 1
 }
 
+# The CI workflows hand the AAP cluster-fulfillment instance group a
+# provider-reserved guest ingress VIP range before the CaaS suite runs: they
+# derive it from the clone's libvirt network (osac-test-infra's
+# guest_ingress_vip_range.py) and merge CI_GUEST_INGRESS_IP_RANGE into the
+# cluster-fulfillment-ig ConfigMap. That ConfigMap is the container group's env,
+# read when a job pod starts, so a merge patch here reaches the next cluster the
+# suite orders without touching the chart. Do it the same way, from the same
+# script against this clone's network, so the dev hub never has to guess a range
+# and a CaaS run exercises the flow CI runs.
+#
+# Patched here rather than in osac.sh because it has to follow a redeploy: a
+# chart upgrade re-renders the ConfigMap from values/full-ci straight back to
+# no range at all.
+publish_guest_ingress_range() {
+	local kubeconfig=$1 kubectl=$2 range payload
+	case ${suite} in
+	tests/e2e/caas/*) ;;
+	*) return 0 ;;
+	esac
+	range=$(guest_ingress_vip_range) ||
+		die "could not derive the guest ingress VIP range for cluster ${CLUSTER_NAME}"
+	[ -n "${range}" ] ||
+		die "the guest ingress VIP range derivation printed nothing for cluster ${CLUSTER_NAME}"
+	# The script prints `first-last`, so the only JSON metacharacter it can carry
+	# is the dash between the two addresses.
+	payload="{\"data\":{\"CI_GUEST_INGRESS_IP_RANGE\":\"${range}\"}}"
+	if [ "${dry_run}" = "1" ]; then
+		log "would patch cluster-fulfillment-ig in ${NS} with CI_GUEST_INGRESS_IP_RANGE=${range}"
+		return 0
+	fi
+	KUBECONFIG="${kubeconfig}" "${kubectl}" -n "${NS}" patch configmap cluster-fulfillment-ig \
+		--type=merge -p "${payload}" >/dev/null ||
+		die "could not patch cluster-fulfillment-ig in ${NS} with CI_GUEST_INGRESS_IP_RANGE=${range}"
+	log "guest ingress VIP range ${range} (cluster-fulfillment-ig in ${NS})"
+}
+
 # CaaS suites create the order a couple of minutes in, so publish for as long as
 # pytest runs instead of once up front. Kept out of the suites' way: the publisher
 # only touches the hub host's dnsmasq and the hub's CoreDNS upstreams.
@@ -409,10 +449,12 @@ main() {
 	fi
 
 	if [ "${dry_run}" = "1" ]; then
+		publish_guest_ingress_range "${kubeconfig}" "${kubectl}"
 		log "would run: uv run ${args[*]}"
 		return 0
 	fi
 
+	publish_guest_ingress_range "${kubeconfig}" "${kubectl}"
 	cd "${repo}"
 	trap on_exit EXIT INT TERM
 	start_hosted_dns "${suite}"

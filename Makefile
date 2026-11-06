@@ -79,6 +79,16 @@
 # 'sanity and not requires_caas'), or E2E_ARGS for anything else. The target
 # wires the dev hub's kubeconfig, NS, and an osac CLI built from this worktree;
 # the tests derive the cluster domain and the route hostnames themselves.
+#
+# A CaaS suite gets the same guest ingress VIP range the CI workflows give it:
+# e2e.sh runs osac-test-infra's guest_ingress_vip_range.py against this clone's
+# libvirt network and merges the answer into cluster-fulfillment-ig as
+# CI_GUEST_INGRESS_IP_RANGE, which is the input the AAP external_access role
+# reserves the VIP from. So a run needs that script on REMOTE_HOST: the
+# checkout bmh.sh manages (TEST_INFRA_DIR, else $HOME/osac-test-infra), on a
+# revision that has it. Nothing has to be set by hand, and no range is assumed
+# for this clone.
+#
 # E2E_KEEP=1 exports OSAC_E2E_KEEP_RESOURCES=true, which the suites that offer
 # the escape hatch read: they delete nothing, log what stays, and the hosted
 # cluster's DNS publisher keeps running so the kept cluster stays reachable.
