@@ -46,6 +46,7 @@ from tests.e2e.core.helpers import (
     wait_for_worker_installation,
 )
 from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.keep import keep_resources, note_kept_resources
 from tests.e2e.core.metering import HEARTBEAT_TYPE, MeteringCollector
 from tests.e2e.core.osac_cli import OsacCLI
 from tests.e2e.core.runner import env, poll_until, run
@@ -774,18 +775,25 @@ def test_cluster_create(
         # Scale back before deletion.
         cli.scale_cluster(uuid=uuid, node_set=cluster.worker_node_set, size=cluster.original_size)
         capture_snapshot(request.config, request.node.nodeid)
+        if keep_resources():
+            note_kept_resources(
+                f"cluster {name} ({uuid}), its worker and ClusterCatalogItem {catalog_item_id}",
+                remove_with=f"osac delete cluster {uuid}",
+            )
+            return
         cli.delete_cluster(uuid=uuid)
         _assert_cluster_deleted(grpc=grpc, k8s=k8s_hub_client, metering=metering, uuid=uuid, cluster=cluster)
     except (Exception, pytest.fail.Exception) as exc:
         capture_failure(request.config, exc, request.node.nodeid)
         raise
     finally:
-        if uuid:
-            with contextlib.suppress(subprocess.SubprocessError):
-                cli.delete_cluster(uuid=uuid)
-        if catalog_item_id:
-            with contextlib.suppress(subprocess.SubprocessError):
-                private_grpc.delete_cluster_catalog_item(catalog_item_id=catalog_item_id, api=PRIVATE_API)
+        if not keep_resources():
+            if uuid:
+                with contextlib.suppress(subprocess.SubprocessError):
+                    cli.delete_cluster(uuid=uuid)
+            if catalog_item_id:
+                with contextlib.suppress(subprocess.SubprocessError):
+                    private_grpc.delete_cluster_catalog_item(catalog_item_id=catalog_item_id, api=PRIVATE_API)
         _restore_operator_publication(private_grpc, publication_states)
 
 

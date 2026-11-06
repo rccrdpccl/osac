@@ -40,6 +40,14 @@
 #   -- ARGS...         appended verbatim after the selectors, e.g.
 #                      `-- -x -vv --junitxml=/tmp/e2e.xml`   (make E2E_ARGS=)
 #
+# Keeping resources:
+#   --keep / E2E_KEEP=1  export OSAC_E2E_KEEP_RESOURCES=true, which the suites
+#                      that offer the escape hatch honor by deleting nothing
+#                      and logging what stays (the CaaS cluster lifecycles and
+#                      the VMaaS Netris suite). The hosted-cluster DNS
+#                      publisher stays up too, because the cluster it publishes
+#                      for is still there; its pid is printed on exit.
+#
 # Running another worktree's tests:
 #   E2E_REPO=~/worktrees/osac/my-feature
 # pytest runs from that worktree, so a test that is not merged yet is collected
@@ -47,7 +55,7 @@
 #
 # Every option also reads an environment variable, which is how the make target
 # passes them: E2E_SUITE, E2E_FILTER, E2E_MARKER, E2E_ARGS, E2E_REPO,
-# OSAC_CLI_PATH.
+# E2E_KEEP, OSAC_CLI_PATH.
 #
 # Inputs (defaults in common.sh): OSAC_DEV_HUB_KUBECONFIG, CLUSTER_NAME, NS,
 # PULL_SECRET_FILE, ARTIFACTS_FILE, REPO_ROOT.
@@ -59,6 +67,9 @@ source "${script_dir}/common.sh"
 : "${E2E_FILTER:=}"
 : "${E2E_MARKER:=}"
 : "${E2E_ARGS:=}"
+# Leave what the suite creates in place for inspection. Only suites that offer
+# the escape hatch honour it, so a suite that does not keeps cleaning up.
+: "${E2E_KEEP:=}"
 # Worktree whose tests to run, defaulting to this one. Point it at a feature
 # worktree to run a test that is not merged yet against the same hub.
 : "${E2E_REPO:=}"
@@ -69,6 +80,12 @@ filter_expr=${E2E_FILTER}
 marker_expr=${E2E_MARKER}
 rebuild=0
 dry_run=0
+keep=0
+case ${E2E_KEEP} in
+"" | 0 | [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo]) ;;
+1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss]) keep=1 ;;
+*) die "E2E_KEEP=${E2E_KEEP} is not a value this script understands (1/true/yes or 0/false/no)" ;;
+esac
 declare -a extra_args=()
 
 usage() {
@@ -262,6 +279,19 @@ stop_hosted_dns() {
 	hosted_dns_pid=""
 }
 
+# A kept run leaves the publisher alone: the cluster it publishes for is still
+# there, and the names it answers are what the person inspecting it dials.
+on_exit() {
+	local status=$?
+	if [ "${keep}" = "1" ] && [ -n "${hosted_dns_pid}" ]; then
+		log "kept resources: hosted DNS still publishing for them (pid ${hosted_dns_pid})"
+		log "  stop it with: kill ${hosted_dns_pid}"
+	else
+		stop_hosted_dns
+	fi
+	exit "${status}"
+}
+
 main() {
 	local kubeconfig cli pull_secret ssh_key kubectl
 	require_user_context
@@ -293,6 +323,7 @@ main() {
 			shift
 			;;
 		--rebuild) rebuild=1 ;;
+		--keep) keep=1 ;;
 		--dry-run) dry_run=1 ;;
 		--)
 			shift
@@ -364,6 +395,10 @@ main() {
 	[ -z "${OSAC_SSH_PUBLIC_KEY_PATH:-}" ] || log "ssh key ${OSAC_SSH_PUBLIC_KEY_PATH}"
 	[ -z "${filter_expr}" ] || log "filter -k ${filter_expr}"
 	[ -z "${marker_expr}" ] || log "marker -m ${marker_expr}"
+	if [ "${keep}" = "1" ]; then
+		export OSAC_E2E_KEEP_RESOURCES=true
+		log "keeping what the suite creates (OSAC_E2E_KEEP_RESOURCES=true)"
+	fi
 
 	if [ "${dry_run}" = "1" ]; then
 		log "would run: uv run ${args[*]}"
@@ -371,7 +406,7 @@ main() {
 	fi
 
 	cd "${repo}"
-	trap stop_hosted_dns EXIT INT TERM
+	trap on_exit EXIT INT TERM
 	start_hosted_dns "${suite}"
 	uv run "${args[@]}"
 }

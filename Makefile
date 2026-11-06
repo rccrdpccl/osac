@@ -52,7 +52,8 @@
 #   make osac-dev-e2e E2E_SUITE=vmaas/sanity
 #                             run an E2E suite against the deployed hub (CaaS
 #                             suites also keep the hosted cluster's DNS records
-#                             current, see hosted-dns.sh)
+#                             current, see hosted-dns.sh); E2E_KEEP=1 leaves
+#                             what the suite creates in place to inspect
 #   make osac-dev-hosted-dns  publish the hosted-cluster DNS records once
 #   make osac-dev-delete      uninstall the release
 #
@@ -78,6 +79,10 @@
 # 'sanity and not requires_caas'), or E2E_ARGS for anything else. The target
 # wires the dev hub's kubeconfig, NS, and an osac CLI built from this worktree;
 # the tests derive the cluster domain and the route hostnames themselves.
+# E2E_KEEP=1 exports OSAC_E2E_KEEP_RESOURCES=true, which the suites that offer
+# the escape hatch read: they delete nothing, log what stays, and the hosted
+# cluster's DNS publisher keeps running so the kept cluster stays reachable.
+# Nothing else is kept, so delete the cluster before the next run.
 #
 # Images go to IMAGE_PREFIX (quay.io/rh_ee_rpiccoli by default) instead of an
 # in-cluster registry, so `podman login quay.io` once. The deploy needs an AAP
@@ -256,7 +261,7 @@ osac-dev-aap-project: ## Serve this worktree as the config-as-code project, prin
 osac-dev-watch: ## Rebuild and redeploy OSAC on every change (skaffold dev)
 	@$(OSAC_DEV_ENV)/osac.sh dev $(SKAFFOLD_ARGS)
 
-osac-dev-e2e: ## Run an E2E suite against the hub (E2E_SUITE=, E2E_FILTER=, E2E_MARKER=)
+osac-dev-e2e: ## Run an E2E suite against the hub (E2E_SUITE=, E2E_FILTER=, E2E_MARKER=, E2E_KEEP=1)
 	@$(OSAC_DEV_ENV)/e2e.sh $(if $(DRY_RUN),--dry-run,)
 
 osac-dev-delete: ## Uninstall the osac Helm release (keeps osac-deps/osac-infra)

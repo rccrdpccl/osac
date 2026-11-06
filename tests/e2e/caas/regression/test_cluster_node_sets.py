@@ -22,6 +22,7 @@ from tests.e2e.core.fulfillment_trust import assert_cluster_trust, assert_manage
 from tests.e2e.core.grpc_client import GRPCClient
 from tests.e2e.core.helpers import unique_name
 from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.keep import keep_resources, note_kept_resources
 from tests.e2e.core.metering import MeteringCollector
 from tests.e2e.core.osac_cli import OsacCLI
 
@@ -94,13 +95,19 @@ def test_cluster_create_with_two_node_sets(
             hosted_cluster_reference=(cluster.hosted_cluster_name, cluster.hosted_cluster_namespace),
         )
         capture_snapshot(request.config, request.node.nodeid)
+        if keep_resources():
+            note_kept_resources(
+                f"cluster {name} ({uuid}), its two node sets and their workers",
+                remove_with=f"osac delete cluster {uuid}",
+            )
+            return
         cli.delete_cluster(uuid=uuid)
         _assert_cluster_deleted(grpc=grpc, k8s=k8s_hub_client, metering=metering, uuid=uuid, cluster=cluster)
     except (Exception, pytest.fail.Exception) as exc:
         capture_failure(request.config, exc, request.node.nodeid)
         raise
     finally:
-        with contextlib.suppress(subprocess.SubprocessError):
-            if uuid:
+        if uuid and not keep_resources():
+            with contextlib.suppress(subprocess.SubprocessError):
                 cli.delete_cluster(uuid=uuid)
         _restore_operator_publication(private_grpc, publication_states)

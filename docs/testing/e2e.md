@@ -95,6 +95,11 @@ removed; legacy cleanup-enabled waits do not prove natural teardown. Retry
 sleep budgets are not production SLAs. Preserve JUnit, lifecycle and cleanup
 evidence before teardown.
 
+For a local debug run, set `OSAC_E2E_KEEP_RESOURCES=true` or run
+`make osac-dev-e2e E2E_KEEP=1`. The two CaaS lifecycle scenarios keep the
+clusters and skip deletion assertions. Delete the retained resources by hand
+before retrying on the same hub. Do not set this flag when validating teardown.
+
 `tests/e2e/conftest.py` fixtures supply hub, API, CLI, image/template,
 pull-secret/SSH, virtual BMH and Kafka/metering inputs. Pin compatible
 OSAC/operator/installer/AAP revisions and image digests; AAP must resolve the
