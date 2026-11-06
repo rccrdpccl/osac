@@ -29,8 +29,9 @@
 # those suites this starts that publisher in --watch mode before pytest and stops
 # it afterwards, because the order it has to publish for does not exist yet; its
 # output goes to <ARTIFACTS_FILE dir>/hosted-dns.log. It also hands the AAP role
-# the guest ingress VIP range the CI workflows hand it: derived from the clone's
-# libvirt network and patched into cluster-fulfillment-ig just before the run.
+# the inputs the CI workflows hand it: the guest ingress VIP range, derived from
+# the clone's libvirt network, and the base domain the guest names live under,
+# both patched into cluster-fulfillment-ig just before the run.
 #
 # Everything else keeps the tests' defaults, which already resolve from the
 # cluster: the cluster domain, the fulfillment and Keycloak routes, the service
@@ -272,11 +273,19 @@ resolve_ssh_key() {
 # script against this clone's network, so the dev hub never has to guess a range
 # and a CaaS run exercises the flow CI runs.
 #
+# The base domain comes with it. The CI values set EXTERNAL_ACCESS_BASE_DOMAIN
+# and HOSTED_CLUSTER_BASE_DOMAIN to the same value, so the names the AAP role
+# publishes and waits for are the names the guest HostedCluster carries. A dev
+# hub renders only HOSTED_CLUSTER_BASE_DOMAIN (from the hub's ingress domain) and
+# leaves the external-access one to the role default, so the two disagree: the
+# role publishes under a domain nothing answers and its wait never sees the
+# record. Read the rendered value back and pin both to it.
+#
 # Patched here rather than in osac.sh because it has to follow a redeploy: a
 # chart upgrade re-renders the ConfigMap from values/full-ci straight back to
-# no range at all.
-publish_guest_ingress_range() {
-	local kubeconfig=$1 kubectl=$2 range payload
+# no range and no base domain at all.
+publish_caas_inputs() {
+	local kubeconfig=$1 kubectl=$2 range base data payload
 	case ${suite} in
 	tests/e2e/caas/*) ;;
 	*) return 0 ;;
@@ -285,9 +294,20 @@ publish_guest_ingress_range() {
 		die "could not derive the guest ingress VIP range for cluster ${CLUSTER_NAME}"
 	[ -n "${range}" ] ||
 		die "the guest ingress VIP range derivation printed nothing for cluster ${CLUSTER_NAME}"
-	# The script prints `first-last`, so the only JSON metacharacter it can carry
-	# is the dash between the two addresses.
-	payload="{\"data\":{\"CI_GUEST_INGRESS_IP_RANGE\":\"${range}\"}}"
+	base=$(caas_base_domain "${kubeconfig}" "${kubectl}")
+	# The script prints `first-last`, so the only JSON metacharacter the range can
+	# carry is the dash between the two addresses; the base domain is a name.
+	data="\"CI_GUEST_INGRESS_IP_RANGE\":\"${range}\""
+	if [ -n "${base}" ]; then
+		data="${data},\"EXTERNAL_ACCESS_BASE_DOMAIN\":\"${base}\""
+		data="${data},\"EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS\":\"${base}\""
+		log "guest base domain ${base}"
+	else
+		# No rendered base domain: hosted_cluster falls back to the same default
+		# the role does, so the two already agree and there is nothing to pin.
+		log "cluster-fulfillment-ig has no HOSTED_CLUSTER_BASE_DOMAIN; guest base domain stays on the role default"
+	fi
+	payload="{\"data\":{${data}}}"
 	if [ "${dry_run}" = "1" ]; then
 		log "would patch cluster-fulfillment-ig in ${NS} with CI_GUEST_INGRESS_IP_RANGE=${range}"
 		return 0
@@ -296,6 +316,19 @@ publish_guest_ingress_range() {
 		--type=merge -p "${payload}" >/dev/null ||
 		die "could not patch cluster-fulfillment-ig in ${NS} with CI_GUEST_INGRESS_IP_RANGE=${range}"
 	log "guest ingress VIP range ${range} (cluster-fulfillment-ig in ${NS})"
+}
+
+# The base domain the guest clusters are published under: hosted_cluster derives
+# it from the hub's ingress domain and the chart renders it into the same
+# ConfigMap the range goes to, so read it back instead of repeating that rule
+# here. Empty while the chart had no ingress domain to derive it from, in which
+# case both sides keep the role default.
+caas_base_domain() {
+	local kubeconfig=$1 kubectl=$2 base
+	base=$(KUBECONFIG="${kubeconfig}" "${kubectl}" -n "${NS}" get configmap \
+		cluster-fulfillment-ig -o jsonpath='{.data.HOSTED_CLUSTER_BASE_DOMAIN}' 2>/dev/null) ||
+		base=""
+	printf '%s\n' "${base}"
 }
 
 # CaaS suites create the order a couple of minutes in, so publish for as long as
@@ -449,12 +482,12 @@ main() {
 	fi
 
 	if [ "${dry_run}" = "1" ]; then
-		publish_guest_ingress_range "${kubeconfig}" "${kubectl}"
+		publish_caas_inputs "${kubeconfig}" "${kubectl}"
 		log "would run: uv run ${args[*]}"
 		return 0
 	fi
 
-	publish_guest_ingress_range "${kubeconfig}" "${kubectl}"
+	publish_caas_inputs "${kubeconfig}" "${kubectl}"
 	cd "${repo}"
 	trap on_exit EXIT INT TERM
 	start_hosted_dns "${suite}"

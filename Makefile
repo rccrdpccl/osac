@@ -87,7 +87,9 @@
 # reserves the VIP from. So a run needs that script on REMOTE_HOST: the
 # checkout bmh.sh manages (TEST_INFRA_DIR, else $HOME/osac-test-infra), on a
 # revision that has it. Nothing has to be set by hand, and no range is assumed
-# for this clone.
+# for this clone. The same patch pins EXTERNAL_ACCESS_BASE_DOMAIN to the
+# HOSTED_CLUSTER_BASE_DOMAIN the chart rendered, because the role publishes and
+# waits on names under it and the CI values set both to one value already.
 #
 # E2E_KEEP=1 exports OSAC_E2E_KEEP_RESOURCES=true, which the suites that offer
 # the escape hatch read: they delete nothing, log what stays, and the hosted
