@@ -53,10 +53,12 @@ source-pinned environment prerequisites as the focused lifecycle. Run it with
 To inspect what either lifecycle created, set `OSAC_E2E_KEEP_RESOURCES=true`
 (`make osac-dev-e2e E2E_KEEP=1` for the dev environment): both skip their
 deletion, their deleted-assertions and their best-effort cleanup, and log the
-cluster UUID with the `osac delete cluster` command that removes it. The kept
-cluster is the caller's to delete before the next run on the same hub; no job
-sets the variable. The CaaS deletion-feedback tests ignore it, because deletion
-is what they verify.
+cluster UUID with the `osac delete cluster` command that removes it. The tenant
+pull Secret the cluster was created with stays too, because the cluster still
+references it; deleting it would only turn the kept run's teardown into an
+error. The kept cluster is the caller's to delete before the next run on the
+same hub, and no job sets the variable. The CaaS deletion-feedback tests ignore
+it, because deletion is what they verify.
 CaaS sanity contains the single-nodepool lifecycle and the fast deletion
 feedback test; the lifecycle verifies deployed version resolution through the
 ClusterOrder and HostedCluster release image. Two-node-set isolation belongs in
