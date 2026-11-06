@@ -163,12 +163,34 @@ pack_archive() {
 }
 
 # The pod currently serving the archive, if any.
+#
+# A rollout leaves the outgoing pod in phase Running until it is gone, so a
+# pod that already has a deletion timestamp must not be chosen: a new osac-aap
+# tag triggers exactly the rollout that replaces the pod, and uploading the
+# archive into the pod on its way out loses it, leaving the project update to
+# fail on a 404 minutes later. Take the newest pod that is ready and not
+# terminating, which is the one the current ReplicaSet serves.
 server_pod() {
 	local kubectl=$1
 	"${kubectl}" -n "${NS}" get pod \
 		-l "app.kubernetes.io/name=${SRV_NAME}" \
-		--field-selector status.phase=Running \
-		-o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+		--field-selector status.phase=Running -o json 2>/dev/null |
+		python3 -c '
+import json, sys
+
+data = sys.stdin.read()
+pods = [
+    pod
+    for pod in (json.loads(data) if data.strip() else {}).get("items") or []
+    if not pod["metadata"].get("deletionTimestamp")
+    and all(
+        status.get("ready")
+        for status in (pod.get("status") or {}).get("containerStatuses") or []
+    )
+]
+pods.sort(key=lambda pod: pod["metadata"]["creationTimestamp"])
+print(pods[-1]["metadata"]["name"] if pods else "")
+' 2>/dev/null || true
 }
 
 ensure_server() {
