@@ -46,7 +46,11 @@
 #                      and logging what stays (the CaaS cluster lifecycles and
 #                      the VMaaS Netris suite). The hosted-cluster DNS
 #                      publisher stays up too, because the cluster it publishes
-#                      for is still there; its pid is printed on exit.
+#                      for is still there; its pid is printed on exit. It is
+#                      started with nohup so that it outlives the session: in
+#                      a `tmux new -d` run the pane still goes away with the
+#                      command, so add `; exec bash` (or set remain-on-exit) to
+#                      keep the output on screen.
 #
 # Running another worktree's tests:
 #   E2E_REPO=~/worktrees/osac/my-feature
@@ -267,7 +271,11 @@ start_hosted_dns() {
 	esac
 	log_path="$(dirname "$(expand_path "${ARTIFACTS_FILE}")")/hosted-dns.log"
 	mkdir -p "$(dirname "${log_path}")"
-	"${script_dir}/hosted-dns.sh" --watch >"${log_path}" 2>&1 &
+	# nohup, because a kept run's publisher has to outlive the session that
+	# started it: tmux new -d dies with its command and hangs up the children,
+	# which is the opposite of what --keep asked for. The publisher's own TERM
+	# trap still stops it on request, so this only removes SIGHUP from the list.
+	nohup "${script_dir}/hosted-dns.sh" --watch >"${log_path}" 2>&1 &
 	hosted_dns_pid=$!
 	log "hosted-cluster DNS kept current by pid ${hosted_dns_pid} (${log_path})"
 }
