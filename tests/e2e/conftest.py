@@ -21,6 +21,7 @@ from tests.e2e.core.helpers import (
     wait_for_tenant_default_networking_ready,
 )
 from tests.e2e.core.k8s_client import K8sClient
+from tests.e2e.core.keep import keep_resources, note_kept_resources
 from tests.e2e.core.keycloak import get_jwt
 from tests.e2e.core.keycloak_admin import (
     add_user_to_organization,
@@ -437,13 +438,18 @@ def cli(
 
 @pytest.fixture
 def pull_secret_name(cli: OsacCLI, pull_secret_path: str) -> Iterator[str]:
-    """Create a tenant-scoped pull Secret for a CaaS cluster, then remove it."""
+    """Create a tenant-scoped pull Secret for a CaaS cluster, then remove unless the run keeps it."""
     name = unique_name("e2e-pull-secret")
     cli.create_secret(name=name, from_files={".dockerconfigjson": pull_secret_path}, secret_type="pull-secret")
     try:
         yield name
     finally:
-        cli.delete_secret(name=name)
+        # The kept cluster still references the secret, so deleting it is refused;
+        # say so instead of failing the run's teardown with that refusal.
+        if keep_resources():
+            note_kept_resources(f"pull secret {name}", remove_with=f"osac delete secret {name}")
+        else:
+            cli.delete_secret(name=name)
 
 
 @pytest.fixture(scope="session")

@@ -97,7 +97,8 @@ evidence before teardown.
 
 For a local debug run, set `OSAC_E2E_KEEP_RESOURCES=true` or run
 `make osac-dev-e2e E2E_KEEP=1`. The two CaaS lifecycle scenarios keep the
-clusters and skip deletion assertions. Delete the retained resources by hand
+clusters and skip deletion assertions. The pull Secret stays because the
+retained cluster still references it. Delete the retained resources by hand
 before retrying on the same hub. Do not set this flag when validating teardown.
 
 `tests/e2e/conftest.py` fixtures supply hub, API, CLI, image/template,
