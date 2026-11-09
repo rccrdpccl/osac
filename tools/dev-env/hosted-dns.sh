@@ -220,6 +220,13 @@ order_records() {
 # role reserves VIPs from, which is the address it claims for the only order this
 # clone runs, and it moves to the published ingress endpoint once the ingress
 # binds.
+#
+# default-router.apps.<cluster domain> is published at that address too, before
+# the ClusterOrder carries an ingress endpoint, because the AAP role waits for it
+# before it publishes the endpoint: it creates that record itself through the dns
+# class, and in a dev environment that is the no-op backend, so without this the
+# role waits on a name nobody publishes while the endpoint that would make this
+# script publish it is exactly what it is waiting to publish.
 order_names() {
 	local order_ns=$1 order=$2 hc=$3 hc_ns=$4
 	local hcp_ns="${hc_ns}-${hc}" base kas vip
@@ -241,6 +248,7 @@ order_names() {
 	while read -r address; do
 		if [ -n "${address}" ]; then
 			printf '%s console-openshift-console.apps.%s.%s\n' "${address}" "${hc}" "${base}"
+			printf '%s default-router.apps.%s.%s\n' "${address}" "${hc}" "${base}"
 		fi
 	done < <(guest_ingress_first_address)
 	return 0
