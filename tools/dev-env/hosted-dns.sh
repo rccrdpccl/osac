@@ -42,6 +42,17 @@
 # delegating this dnsmasq the hosted zone, because the corp resolver answers
 # NXDOMAIN for it — is ensure_hub_dns_zone_forward in common.sh.
 #
+# Each record is published twice, because two different resolvers answer for the
+# hosted zone. The NetworkManager drop-in is what the hub host and the suites ask,
+# and it is the only one that can hold the *.apps wildcard. Hub pods never see it:
+# they ask CoreDNS, which forwards the hosted zone to the network's dnsmasq, and
+# libvirt writes local=/<hub zone>/ into that instance, so it answers only what
+# the network definition holds and forwards nothing else. sync_network_hosts
+# therefore also adds the exact names to the clone network with virsh net-update,
+# which is the only live way in: the guest admin kubeconfig points at
+# https://api.<order>.<baseDomain>:6443, so without it the AAP job that configures
+# the guest cannot reach the API it was handed.
+#
 # Skipped, with a message, while no order has a hosted cluster yet: a suite
 # creates one minutes into the run, which is what --watch is for.
 #
@@ -72,6 +83,11 @@ hub's host (REMOTE_HOST), where NetworkManager's dnsmasq reads them:
   address=/api.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
   address=/api-int.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
   address=/.apps.<order>.<baseDomain>/<worker node address>   (one per worker)
+
+and, because hub pods ask CoreDNS and CoreDNS forwards the hosted zone to the
+clone network's dnsmasq instead, the same API names in that network's addn-hosts
+entry (virsh net-update). The apps wildcard cannot live in addn-hosts, so pods
+get the concrete default-router.<order>.<baseDomain> name the AAP role waits on.
 
 <baseDomain> comes from the HostedCluster (spec.dns.baseDomain, hosted.<hub
 zone>); the addresses come from the hub's kube-apiserver Service and the
@@ -161,6 +177,29 @@ order_records() {
 	done <<<"${node_ips}"
 }
 
+# The names hub pods have to resolve, one "<address> <name>" pair per line: the
+# two API names and, once the ingress VIP is published, the concrete router name
+# that stands in for the apps wildcard. Silent until there is something truthful
+# to publish, exactly like order_records.
+order_names() {
+	local order_ns=$1 order=$2 hc=$3 hc_ns=$4
+	local hcp_ns="${hc_ns}-${hc}" base kas vip
+	base=$(kube get hostedcluster "${hc}" -n "${hc_ns}" \
+		-o jsonpath='{.spec.dns.baseDomain}' 2>/dev/null) || base=""
+	[ -n "${base}" ] || return 0
+	kas=$(kube get service kube-apiserver -n "${hcp_ns}" \
+		-o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null) || kas=""
+	if [ -n "${kas}" ]; then
+		printf '%s api.%s.%s\n' "${kas}" "${hc}" "${base}"
+		printf '%s api-int.%s.%s\n' "${kas}" "${hc}" "${base}"
+	fi
+	vip=$(ingress_endpoint "${order_ns}" "${order}") || vip=""
+	if [ -n "${vip}" ]; then
+		printf '%s default-router.apps.%s.%s\n' "${vip}" "${hc}" "${base}"
+	fi
+	return 0
+}
+
 remote_read() {
 	ssh_remote_root "cat $(printf '%q' "$1") 2>/dev/null" 2>/dev/null || true
 }
@@ -209,10 +248,129 @@ prune_stale() {
 	done
 }
 
+# Publish the same names into the clone network's dnsmasq.
+#
+# libvirt declares the hub zone as the network's DHCP domain, so it writes
+# local=/<hub zone>/ into that dnsmasq: the instance is authoritative for the zone
+# and forwards none of it. A name therefore only answers there if the network
+# definition holds it, and the NetworkManager drop-in above does not. virsh
+# net-update rewrites the network's addn-hosts file and reloads dnsmasq, which is
+# the only live way to add a name without restarting the network the hub runs on.
+# Entries under the hosted zones that nothing wants any more are removed; an entry
+# that also carries a name outside those zones is left alone, because libvirt can
+# only add and delete a whole host element.
+sync_network_hosts() {
+	local dry_run=$1 desired=$2 net="test-infra-net-${CLUSTER_NAME}"
+	local zones
+	zones=$(hosted_zones | tr '\n' ' ')
+	[ -n "${zones// /}" ] || return 0
+	ssh_remote_root "env DRY_RUN=$(printf '%q' "${dry_run}") NETWORK=$(printf '%q' "${net}") \
+ZONES=$(printf '%q' "${zones}") DESIRED=$(printf '%q' "${desired}") python3 -" <<'PY'
+import os
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+net = os.environ["NETWORK"]
+zones = os.environ.get("ZONES", "").split()
+dry = os.environ.get("DRY_RUN", "") == "1"
+desired = {}
+for line in os.environ.get("DESIRED", "").splitlines():
+    fields = line.split()
+    if len(fields) == 2:
+        desired[fields[1]] = fields[0]
+
+
+def owned(name):
+    return any(name == zone or name.endswith("." + zone) for zone in zones)
+
+
+def virsh(*args):
+    return subprocess.run(
+        ["virsh", "-c", "qemu:///system", *args], capture_output=True, text=True
+    )
+
+
+def host_element(names, address):
+    body = "".join("<hostname>%s</hostname>" % name for name in names)
+    return "<host ip='%s'>%s</host>" % (address, body)
+
+
+dump = virsh("net-dumpxml", net)
+if dump.returncode != 0:
+    sys.stderr.write(dump.stderr.strip() + "\n")
+    sys.exit(1)
+
+live = {}
+for host in ET.fromstring(dump.stdout).iter("host"):
+    address = host.get("ip") or ""
+    names = [(name.text or "").strip() for name in host.iter("hostname")]
+    if address:
+        live.setdefault(address, []).extend(names)
+
+want = {}
+for name, address in desired.items():
+    want.setdefault(address, []).append(name)
+for names in want.values():
+    names.sort()
+
+changed = 0
+
+
+def replace(address, live_names, want_names):
+    if live_names:
+        result = virsh(
+            "net-update", net, "delete", "dns-host", host_element(live_names, address), "--live"
+        )
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr.strip() + "\n")
+            return
+    if want_names:
+        result = virsh(
+            "net-update", net, "add", "dns-host", host_element(want_names, address), "--live"
+        )
+        if result.returncode != 0:
+            sys.stderr.write(result.stderr.strip() + "\n")
+            return
+    print(
+        "%s in %s: %s -> %s"
+        % (
+            "would set" if dry else "set",
+            net,
+            address,
+            " ".join(want_names) or "(none)",
+        )
+    )
+
+
+for address in sorted(set(live) | set(want)):
+    live_names = live.get(address, [])
+    want_names = want.get(address, [])
+    if not want_names and not live_names:
+        continue
+    if not want_names and len([n for n in live_names if owned(n)]) != len(live_names):
+        # libvirt adds and deletes a whole host element, so an entry that also
+        # carries a name outside the hosted zones is left alone.
+        continue
+    if sorted(live_names) == want_names:
+        continue
+    changed += 1
+    if dry:
+        print(
+            "would replace %s in %s: %s -> %s"
+            % (address, net, " ".join(live_names) or "(none)", " ".join(want_names) or "(none)")
+        )
+        continue
+    replace(address, live_names, want_names)
+
+sys.exit(0)
+PY
+}
+
 # One pass: publish every hosted order's records, then prune what died.
 publish_once() {
 	local dry_run=$1 prune=$2 orders order order_ns hc hc_ns records conf current
-	local desired changed="" kept="" api apps domain addr
+	local desired changed="" kept="" apps domain addr names net_names=""
 	local -a published=()
 	orders=$(hosted_orders)
 	if [ -z "${orders}" ]; then
@@ -221,6 +379,10 @@ publish_once() {
 	while IFS=$'\t' read -r order order_ns hc hc_ns; do
 		[ -n "${hc:-}" ] || continue
 		kept="${kept} ${hc}"
+		names=$(order_names "${order_ns}" "${order}" "${hc}" "${hc_ns}") || names=""
+		if [ -n "${names}" ]; then
+			net_names="${net_names}${names}"$'\n'
+		fi
 		records=$(order_records "${order_ns}" "${order}" "${hc}" "${hc_ns}") || records=""
 		if [ -z "${records}" ]; then
 			log "${hc}: no API address or worker yet, nothing to publish"
@@ -262,6 +424,8 @@ publish_once() {
 			published+=("default-router${domain} ${addr}")
 		fi
 	done <<<"${orders}"
+	sync_network_hosts "${dry_run}" "${net_names}" ||
+		warn "could not publish the hosted names in the clone network's dnsmasq"
 	if [ "${prune}" = "1" ]; then
 		prune_stale "${dry_run}" "${kept}"
 	fi
