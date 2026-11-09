@@ -17,6 +17,13 @@
 # `insufficient` when it cannot, so a cluster whose API name resolves still never
 # installs. Both API names point at the kube-apiserver LoadBalancer address.
 #
+# console-openshift-console.apps.<order>.<baseDomain> matters for the same reason
+# at a third name: the Assisted Service resolves that exact name on the install
+# host (its AppsSubDomainNameHostDNSValidation constant, printed in the failure
+# as *.apps) and parks the Agent in `insufficient` until it answers. It is a
+# concrete name and not a wildcard query, so an addn-hosts record satisfies it
+# and no wildcard rule is needed.
+#
 # <baseDomain> is hosted.<hub zone>, which the AAP hosted_cluster role sets on
 # the HostedCluster (spec.dns.baseDomain). On a real installation HyperShift's
 # external-dns integration creates these records. The dev environment has no DNS
@@ -51,7 +58,9 @@
 # therefore also adds the exact names to the clone network with virsh net-update,
 # which is the only live way in: the guest admin kubeconfig points at
 # https://api.<order>.<baseDomain>:6443, so without it the AAP job that configures
-# the guest cannot reach the API it was handed.
+# the guest cannot reach the API it was handed. The console name goes in there
+# too, because the Assisted Service resolves it from the install host before it
+# lets the guest install.
 #
 # Skipped, with a message, while no order has a hosted cluster yet: a suite
 # creates one minutes into the run, which is what --watch is for.
@@ -84,10 +93,12 @@ hub's host (REMOTE_HOST), where NetworkManager's dnsmasq reads them:
   address=/api-int.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
   address=/.apps.<order>.<baseDomain>/<worker node address>   (one per worker)
 
-and, because hub pods ask CoreDNS and CoreDNS forwards the hosted zone to the
-clone network's dnsmasq instead, the same API names in that network's addn-hosts
-entry (virsh net-update). The apps wildcard cannot live in addn-hosts, so pods
-get the concrete default-router.<order>.<baseDomain> name the AAP role waits on.
+and, because hub pods and the install host ask the clone network's dnsmasq while
+CoreDNS only forwards to it, the same names in that network's addn-hosts entry
+(virsh net-update), including console-openshift-console.apps.<order>.<baseDomain>
+- the name the Assisted Service resolves on the install host before it lets the
+host install - and the concrete default-router.<order>.<baseDomain> name the AAP
+role waits on.
 
 <baseDomain> comes from the HostedCluster (spec.dns.baseDomain, hosted.<hub
 zone>); the addresses come from the hub's kube-apiserver Service and the
@@ -145,13 +156,30 @@ ingress_endpoint() {
 		true
 }
 
+# The guest workers' addresses, empty until an AgentMachine reports one.
+worker_addresses() {
+	kube get agentmachine -n "$1" \
+		-o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' \
+		2>/dev/null || true
+}
+
+# The first address of the range the CaaS role reserves guest ingress VIPs from,
+# as e2e.sh publishes it for this clone, empty when it published none.
+guest_ingress_first_address() {
+	local range
+	range=$(kube -n "${NS}" get configmap cluster-fulfillment-ig \
+		-o jsonpath='{.data.CI_GUEST_INGRESS_IP_RANGE}' 2>/dev/null) || range=""
+	[ -n "${range}" ] || return 0
+	printf '%s\n' "${range%%-*}"
+}
+
 # The dnsmasq records one hosted cluster needs, one address= line each. Silent
 # while the control plane has no LoadBalancer address yet or no worker has
 # registered: there is nothing truthful to publish then, and the next pass picks
 # it up.
 order_records() {
 	local order_ns=$1 order=$2 hc=$3 hc_ns=$4
-	local hcp_ns="${hc_ns}-${hc}" base kas vip node_ips ip
+	local hcp_ns="${hc_ns}-${hc}" base kas vip ip
 	base=$(kube get hostedcluster "${hc}" -n "${hc_ns}" \
 		-o jsonpath='{.spec.dns.baseDomain}' 2>/dev/null) || base=""
 	[ -n "${base}" ] || return 0
@@ -167,20 +195,31 @@ order_records() {
 		return 0
 	fi
 	warn "${order}: no ingress endpoint yet; answering *.apps.${hc}.${base} with the worker addresses"
-	node_ips=$(kube get agentmachine -n "${hcp_ns}" \
-		-o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' \
-		2>/dev/null) || node_ips=""
-	while read -r ip; do
+	worker_addresses "${hcp_ns}" | while read -r ip; do
 		if [ -n "${ip}" ]; then
 			printf 'address=/.apps.%s.%s/%s\n' "${hc}" "${base}" "${ip}"
 		fi
-	done <<<"${node_ips}"
+	done
 }
 
-# The names hub pods have to resolve, one "<address> <name>" pair per line: the
-# two API names and, once the ingress VIP is published, the concrete router name
-# that stands in for the apps wildcard. Silent until there is something truthful
-# to publish, exactly like order_records.
+# The names hub pods and the Assisted Service have to resolve, one
+# "<address> <name>" pair per line: the two API names and the apps names. Silent
+# until there is something truthful to publish, exactly like order_records.
+#
+# console-openshift-console.apps.<cluster domain> is part of that: the Assisted
+# Service validates the apps domain by resolving that name on the install host
+# (assisted-service's AppsSubDomainNameHostDNSValidation, shown in the failure as
+# `*.apps.<cluster domain>`) before it lets the guest install, and parks the
+# Agent in insufficient when it cannot, so a guest whose API name resolves still
+# never installs. Publishing the literal `*` label does not help - nothing asks
+# for it, and dnsmasq matches no subdomain from an addn-hosts entry - but this is
+# a concrete name and an addn-hosts entry answers it. Its address has to sit
+# outside the DHCP pool: dnsmasq already holds every lease there, and a name
+# published at a leased address does not resolve (tried at a worker's own
+# address, and it did not). So it points at the first address of the range the
+# role reserves VIPs from, which is the address it claims for the only order this
+# clone runs, and it moves to the published ingress endpoint once the ingress
+# binds.
 order_names() {
 	local order_ns=$1 order=$2 hc=$3 hc_ns=$4
 	local hcp_ns="${hc_ns}-${hc}" base kas vip
@@ -196,7 +235,14 @@ order_names() {
 	vip=$(ingress_endpoint "${order_ns}" "${order}") || vip=""
 	if [ -n "${vip}" ]; then
 		printf '%s default-router.apps.%s.%s\n' "${vip}" "${hc}" "${base}"
+		printf '%s console-openshift-console.apps.%s.%s\n' "${vip}" "${hc}" "${base}"
+		return 0
 	fi
+	while read -r address; do
+		if [ -n "${address}" ]; then
+			printf '%s console-openshift-console.apps.%s.%s\n' "${address}" "${hc}" "${base}"
+		fi
+	done < <(guest_ingress_first_address)
 	return 0
 }
 
