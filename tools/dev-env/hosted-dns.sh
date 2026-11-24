@@ -35,7 +35,10 @@
 # come from the hub, so the records follow the orders a suite creates and are
 # dropped when an order is deleted. The hub CoreDNS half — delegating this
 # dnsmasq the hosted zone, because the corp resolver answers NXDOMAIN for it — is
-# ensure_hub_dns_zone_forward in common.sh.
+# ensure_hub_dns_zone_forward in common.sh. The worker VMs resolve through the
+# test-infra network's dnsmasq, which cluster-tool defines with
+# localOnly='yes'; flipping that is ensure_vm_net_forwards_hosted_zone in
+# common.sh, dns.sh's job.
 #
 # Skipped, with a message, while no order has a hosted cluster yet: a suite
 # creates one minutes into the run, which is what --watch is for.

@@ -27,6 +27,12 @@
 # ensure_hub_dns_zone_forward. The records themselves are hosted-dns.sh's job;
 # this script only makes the hub ask the right server.
 #
+# The VM network is the other consumer. cluster-tool defines it with
+# localOnly='yes', whose dnsmasq then answers the whole hub zone — the hosted
+# names included — itself instead of forwarding, and the worker VMs have no
+# other resolver: ensure_vm_net_forwards_hosted_zone flips that, so their
+# Assisted Service host validation can resolve the hosted names.
+#
 # The zone comes from OSAC_DEV_HUB_KUBECONFIG (or CLUSTER_DOMAIN when set).
 # Needs sudo locally unless already root; run it as your normal user or as
 # root directly.
@@ -58,6 +64,9 @@ The zone comes from OSAC_DEV_HUB_KUBECONFIG, or CLUSTER_DOMAIN when set.
 
 Hub CoreDNS forwards the hosted-cluster zone (hosted.<hub zone>) to that
 dnsmasq, so hub pods resolve hosted-cluster names (api.<order>.hosted.<zone>);
+the VM network's dnsmasq forwards the names it does not know to it too (its
+localOnly flag would otherwise answer the whole zone itself), so the worker
+VMs resolve them;
 the records themselves come from hosted-dns.sh (make osac-dev-hosted-dns).
 
 --force rewrites both entries even when the hub name already resolves
@@ -92,6 +101,7 @@ main() {
 
 	ensure_zone_routed "${zone}"
 	ensure_remote_zone_routed "${zone}"
+	ensure_vm_net_forwards_hosted_zone "${zone}"
 	ensure_hub_dns_zone_forward
 }
 

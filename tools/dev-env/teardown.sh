@@ -201,6 +201,9 @@ virsh -c qemu:///system pool-destroy "${POOL}" 2>/dev/null || true
 virsh -c qemu:///system pool-undefine "${POOL}" 2>/dev/null || true
 virsh -c qemu:///system net-destroy "test-infra-net-${CLONE}" 2>/dev/null || true
 virsh -c qemu:///system net-undefine "test-infra-net-${CLONE}" 2>/dev/null || true
+# dns.sh may have replaced the network's dnsmasq with one libvirt does not
+# track; net-destroy stops only its own.
+pkill -f "dnsmasq.*test-infra-net-${CLONE}.conf" 2>/dev/null || true
 REMOTE
 }
 

@@ -436,3 +436,100 @@ ensure_hub_dns_zone_forward() {
 		-n openshift-dns --timeout=180s >/dev/null 2>&1 ||
 		warn "dns-default did not roll out cleanly; check openshift-dns"
 }
+
+# The VM-side half of hosted-cluster name resolution.
+#
+# cluster-tool defines the test-infra libvirt network with
+# <domain localOnly='yes'> on the hub zone, so the network's own dnsmasq
+# answers the whole zone — hosted.<zone> included — itself: a name it has no
+# record for is NXDOMAIN, never forwarded. The worker VMs have no other
+# resolver (their only NIC is on that network, and its DHCP hands them that
+# dnsmasq), so the Assisted Service host validation cannot resolve the
+# api/api-int/*.apps names of a hosted cluster and parks the Agent in
+# `insufficient`: the order stalls at "Workers Joining" with the control plane
+# already available. Flip the flag and replace the running dnsmasq in place —
+# the bridge, the leases and the VMs stay up — so names the network does not
+# know forward to the host resolver, whose NetworkManager dnsmasq holds both
+# the hub names (ensure_remote_zone_routed) and the hosted records
+# hosted-dns.sh publishes. osac-test-infra's agentless-net scripts fix their
+# management network the same way.
+ensure_vm_net_forwards_hosted_zone() {
+	local zone=$1 net conf xml gw bridge
+	net="test-infra-net-${CLUSTER_NAME}"
+	conf="/var/lib/libvirt/dnsmasq/${net}.conf"
+	if [ -z "${REMOTE_HOST}" ]; then
+		log "REMOTE_HOST unset, leaving the ${net} dnsmasq alone"
+		return 0
+	fi
+	# The persistent definition is what both the check and net-define read: the
+	# running one keeps the old localOnly until the network itself restarts.
+	xml=$(ssh_remote_root "virsh net-dumpxml --inactive $(printf '%q' "${net}")" 2>/dev/null) || xml=""
+	if [ -z "${xml}" ]; then
+		warn "no libvirt network ${net} on ${REMOTE_HOST}; left its dnsmasq alone"
+		return 0
+	fi
+	gw=$(printf '%s\n' "${xml}" |
+		sed -n "s/.*<ip [^>]*address='\([0-9.]*\)'.*/\1/p" | awk 'NR == 1')
+	bridge=$(printf '%s\n' "${xml}" |
+		sed -n "s/.*<bridge name='\([^']*\)'.*/\1/p" | awk 'NR == 1')
+	[ -n "${gw}" ] && [ -n "${bridge}" ] ||
+		die "cannot tell the gateway or the bridge of ${net} from its definition"
+	if ! printf '%s\n' "${xml}" | grep -q "localOnly='yes'" &&
+		! ssh_remote_root "grep -q '^local=/' $(printf '%q' "${conf}")" 2>/dev/null; then
+		log "${net} already forwards the names it does not know, skipping the dnsmasq fix"
+		return 0
+	fi
+	log "letting ${net} forward the names it does not know"
+	ssh_remote_root bash -s <<EOF
+set -euo pipefail
+net=$(printf '%q' "${net}")
+conf=$(printf '%q' "${conf}")
+bridge=$(printf '%q' "${bridge}")
+zone=$(printf '%q' "${zone}")
+gw=$(printf '%q' "${gw}")
+# The persistent definition first, so a later net-start keeps the fix. The
+# network keeps running: net-define only rewrites what the next start reads.
+if virsh net-dumpxml --inactive "\${net}" | grep -q "localOnly='yes'"; then
+	tmp=\$(mktemp)
+	virsh net-dumpxml --inactive "\${net}" >"\${tmp}"
+	sed -i "s/localOnly='yes'/localOnly='no'/" "\${tmp}"
+	virsh net-define "\${tmp}"
+	rm -f "\${tmp}"
+fi
+# Then the running dnsmasq. net-destroy would take the bridge — and the hub
+# VM's NIC on it — down, so the process is replaced instead: its conf loses
+# the local=/ line and a new one starts with libvirt's own arguments. The
+# kill goes by conf file, not by libvirt's pid file, so an instance an
+# earlier run left behind dies too.
+sed -i '/^local=/d' "\${conf}"
+pids=\$(pgrep -f "dnsmasq.*\${net}.conf" || true)
+if [ -n "\${pids}" ]; then
+	printf '%s\n' "\${pids}" | xargs -r kill
+	for attempt in 1 2 3 4 5; do
+		pgrep -f "dnsmasq.*\${net}.conf" >/dev/null 2>&1 || break
+		sleep 1
+	done
+fi
+# Start a replacement only when none is running: libvirtd does not respawn a
+# network dnsmasq that died, but if it ever did, the instance it starts reads
+# the fixed definition, and two of them would split the queries between
+# configs.
+if ! pgrep -f "dnsmasq.*\${net}.conf" >/dev/null 2>&1; then
+	DNSMASQ_INTERFACE="\${bridge}" /usr/sbin/dnsmasq --conf-file="\${conf}" \\
+		--leasefile-ro --dhcp-script=/usr/libexec/libvirt_leaseshelper
+fi
+# The replacement must not cost the VMs their hub: the records the network
+# carries still answer, and the local=/ line is gone.
+for attempt in 1 2 3 4 5; do
+	if [ -n "\$(dig +short "api.\${zone}" "@\${gw}" | head -1)" ] &&
+		! grep -q '^local=/' "\${conf}"; then
+		exit 0
+	fi
+	sleep 2
+done
+echo "the dnsmasq for \${net} does not answer api.\${zone} after the restart" >&2
+dig +short "api.\${zone}" "@\${gw}" >&2 || true
+exit 1
+EOF
+	log "${net} forwards the names it does not know to the host resolver"
+}
