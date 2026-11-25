@@ -3,7 +3,7 @@
 #
 # aap-project.sh — serve this worktree as the AAP config-as-code project.
 #
-# Usage: tools/dev-env/aap-project.sh [--force] [--delete] [--from-skaffold]
+# Usage: tools/dev-env/aap-project.sh [--archive FILE] [--force] [--delete] [--from-skaffold]
 #
 # The bootstrap job creates job templates whose playbook paths have to exist in
 # the controller project. That project was a git clone of an upstream branch,
@@ -25,9 +25,9 @@
 # The served name is stable on purpose: the URL goes into the release, and
 # skaffold dev re-runs that deploy on every change. The content hash decides
 # whether an upload is needed, so an unchanged tree uploads nothing and a
-# changed one replaces the file the pod serves. The server runs the osac-aap
-# artifact from ARTIFACTS_FILE, which the node has already cached for the
-# bootstrap job, so this pulls nothing new.
+# changed one atomically replaces the file on the persistent volume. The server
+# runs the osac-aap artifact from ARTIFACTS_FILE, which the node has already
+# cached for the bootstrap job, so this pulls nothing new.
 #
 # skaffold runs this with --from-skaffold after it rebuilds the osac-aap
 # artifact (see the hook in skaffold.yaml), which is exactly the moment the
@@ -48,9 +48,10 @@
 #                         publish the archive; anything else makes --from-skaffold
 #                         a no-op
 #
-# --force re-applies the server and re-uploads the archive even when both look
-# current (shortcut: make osac-dev-aap-project FORCE=1). --delete removes the
-# server; osac-dev-delete does that for you.
+# --archive FILE republishes an existing archive instead of packing the worktree.
+# --force uploads even when the archive is current (make osac-dev-aap-project
+# FORCE=1). --delete removes the server and volume; osac-dev-delete does that
+# for you.
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -64,9 +65,9 @@ log() { printf '>> %s\n' "$*" >&2; }
 
 readonly SRV_NAME="osac-dev-aap-project"
 readonly SRV_PORT="8080"
-# /tmp is the one place any UID can write, which keeps this pod inside the
-# restricted-v2 SCC: an emptyDir would need fsGroup, and that SCC rejects it.
-readonly SRV_DIR="/tmp"
+# The default StorageClass provisions this volume. OpenShift's restricted SCC
+# supplies the pod's fsGroup, so no privileged init container is needed.
+readonly SRV_DIR="/archive"
 readonly ARCHIVE_NAME="osac-aap.tar.gz"
 
 archive_local=""
@@ -74,22 +75,24 @@ archive_sum=""
 
 usage() {
 	cat <<'EOF'
-Usage: tools/dev-env/aap-project.sh [--force] [--delete] [--from-skaffold]
+Usage: tools/dev-env/aap-project.sh [--archive FILE] [--force] [--delete] [--from-skaffold]
 
 Pack osac-aap/ from this worktree, serve it in the cluster, and print the URL to
 hand to aap.configAsCode.projectArchiveUri. The AAP config-as-code project then
 reads the tree the execution environment was built from instead of a branch,
 which is what keeps the bootstrap job's playbook paths resolvable.
 
-The server is a Deployment plus a Service named osac-dev-aap-project in NS; it
-runs the osac-aap image recorded in ARTIFACTS_FILE, so run osac-dev-prep first.
+The server is a Deployment, Service, and PVC named osac-dev-aap-project in NS.
+It requires a default StorageClass and runs the osac-aap image recorded in
+ARTIFACTS_FILE, so run osac-dev-prep first.
 
 --from-skaffold is for the build hook in skaffold.yaml: it adds nothing but
 OSAC_DEV_AAP_PROJECT_SERVE=1 to the run, skips the work when that is unset, and
 lets a missing image tag be a warning.
---force re-applies the Deployment and re-uploads the archive even when the tree
-has not changed (shortcut: make osac-dev-aap-project FORCE=1).
---delete removes the Deployment and the Service.
+--archive FILE publishes a previously built archive without packing the worktree.
+--force uploads even when the archive has not changed
+(shortcut: make osac-dev-aap-project FORCE=1).
+--delete removes the Deployment, Service, and PVC.
 EOF
 }
 
@@ -158,53 +161,53 @@ pack_archive() {
 		find . -mindepth 1 -maxdepth 1 -printf '%P\0' |
 		tar --null -T - -cf -) | gzip -n -9 >"${archive_local}"
 	rm -rf "${staging}"
-	archive_sum=$(sha256sum "${archive_local}" | cut -d' ' -f1)
 	log "packed $(du -h "${archive_local}" | cut -f1) of osac-aap/"
 }
 
-# The pod currently serving the archive, if any.
-#
-# A rollout leaves the outgoing pod in phase Running until it is gone, so a
-# pod that already has a deletion timestamp must not be chosen: a new osac-aap
-# tag triggers exactly the rollout that replaces the pod, and uploading the
-# archive into the pod on its way out loses it, leaving the project update to
-# fail on a 404 minutes later. Take the newest pod that is ready and not
-# terminating, which is the one the current ReplicaSet serves.
+# The pod cannot be Ready on first publication until it has an archive. Exclude
+# terminating pods, pods with the wrong image, and the legacy /tmp publisher.
 server_pod() {
-	local kubectl=$1
-	"${kubectl}" -n "${NS}" get pod \
+	local kubectl=$1 image=$2
+	"${kubectl}" -n "${NS}" get pod --request-timeout=10s \
 		-l "app.kubernetes.io/name=${SRV_NAME}" \
 		--field-selector status.phase=Running -o json 2>/dev/null |
 		python3 -c '
 import json, sys
 
-data = sys.stdin.read()
+image, claim = sys.argv[1:]
 pods = [
-    pod
-    for pod in (json.loads(data) if data.strip() else {}).get("items") or []
+    pod for pod in json.load(sys.stdin)["items"]
     if not pod["metadata"].get("deletionTimestamp")
-    and all(
-        status.get("ready")
-        for status in (pod.get("status") or {}).get("containerStatuses") or []
-    )
+    and any(container["name"] == "archive" and container["image"] == image
+            for container in pod["spec"]["containers"])
+    and any(volume.get("persistentVolumeClaim", {}).get("claimName") == claim
+            for volume in pod["spec"].get("volumes", []))
+    and any(status["name"] == "archive" and "running" in status.get("state", {})
+            for status in pod.get("status", {}).get("containerStatuses", []))
 ]
-pods.sort(key=lambda pod: pod["metadata"]["creationTimestamp"])
-print(pods[-1]["metadata"]["name"] if pods else "")
-' 2>/dev/null || true
+if pods:
+    print(max(pods, key=lambda pod: pod["metadata"]["creationTimestamp"])["metadata"]["name"])
+' "${image}" "${SRV_NAME}" 2>/dev/null || true
 }
 
 ensure_server() {
-	local kubectl=$1 image=$2 current
-	current=$("${kubectl}" -n "${NS}" get deployment "${SRV_NAME}" \
-		-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null) || current=""
-	if [ "${OSAC_DEV_FORCE}" != "1" ] && [ "${current}" = "${image}" ] &&
-		"${kubectl}" -n "${NS}" rollout status deployment/"${SRV_NAME}" \
-			--timeout=10s >/dev/null 2>&1; then
-		log "archive server ${NS}/${SRV_NAME} is already up with this image"
-		return 0
-	fi
+	local kubectl=$1 image=$2
 	log "applying archive server ${NS}/${SRV_NAME}"
 	"${kubectl}" apply -f - >&2 <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${SRV_NAME}
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/part-of: osac-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -215,6 +218,9 @@ metadata:
     app.kubernetes.io/part-of: osac-dev
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: ${SRV_NAME}
@@ -228,6 +234,10 @@ spec:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
+      volumes:
+        - name: project-archive
+          persistentVolumeClaim:
+            claimName: ${SRV_NAME}
       containers:
         - name: archive
           image: ${image}
@@ -241,11 +251,20 @@ spec:
           ports:
             - name: http
               containerPort: ${SRV_PORT}
+          volumeMounts:
+            - name: project-archive
+              mountPath: ${SRV_DIR}
           readinessProbe:
-            httpGet:
-              path: /
-              port: http
+            exec:
+              command:
+                - /usr/bin/python3
+                - -c
+                - >-
+                  import urllib.request;
+                  urllib.request.urlopen(urllib.request.Request(
+                  "http://127.0.0.1:${SRV_PORT}/${ARCHIVE_NAME}", method="HEAD"), timeout=2).close()
             periodSeconds: 5
+            timeoutSeconds: 3
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -273,33 +292,43 @@ spec:
       port: ${SRV_PORT}
       targetPort: http
 EOF
-	"${kubectl}" -n "${NS}" rollout status deployment/"${SRV_NAME}" \
-		--timeout=300s >&2
 }
 
-# Copy the archive into the pod and prove that it is served. The pod's copy is
-# compared by hash, so an unchanged tree skips the upload and a changed one
-# replaces what the pod serves -- which is what keeps a watch session honest,
-# since its URL never changes.
+# Compare by hash and only replace the served name after the full archive has
+# been written to the same volume and verified. A failed upload leaves the
+# preceding archive available to AAP.
 upload_archive() {
-	local kubectl=$1 pod served url
-	pod=$(server_pod "${kubectl}")
-	[ -n "${pod}" ] || die "no running ${SRV_NAME} pod in ${NS}"
+	local kubectl=$1 image=$2 pod served url deadline
+	deadline=$((SECONDS + 300))
+	while :; do
+		pod=$(server_pod "${kubectl}" "${image}")
+		[ -z "${pod}" ] || break
+		[ "${SECONDS}" -lt "${deadline}" ] || die "no running ${SRV_NAME} pod with its archive volume in ${NS}"
+		sleep 2
+	done
 	served=$("${kubectl}" -n "${NS}" exec "${pod}" -- \
 		sha256sum "${SRV_DIR}/${ARCHIVE_NAME}" 2>/dev/null | cut -d' ' -f1) || served=""
 	if [ "${OSAC_DEV_FORCE}" != "1" ] && [ "${served}" = "${archive_sum}" ]; then
-		log "${pod} already serves this tree"
+		log "${pod} already serves this archive"
 	else
 		log "uploading $(basename "${archive_local}") to ${NS}/${pod}"
-		"${kubectl}" -n "${NS}" exec -i "${pod}" -- \
-			sh -c 'cat > "${1}/${2}"' sh "${SRV_DIR}" "${ARCHIVE_NAME}" \
-			<"${archive_local}"
+		# The variables in the quoted script belong to the container's shell.
+		# shellcheck disable=SC2016
+		"${kubectl}" -n "${NS}" exec -i "${pod}" -- sh -eu -c '
+			tmp=$(mktemp "$1/.upload.XXXXXX")
+			trap '\''rm -f -- "$tmp"'\'' EXIT
+			cat >"$tmp"
+			printf "%s  %s\n" "$3" "$tmp" | sha256sum --check --status
+			mv -f -- "$tmp" "$1/$2"
+		' sh "${SRV_DIR}" "${ARCHIVE_NAME}" "${archive_sum}" <"${archive_local}" ||
+			die "failed to upload and verify the archive in ${NS}/${pod}"
 	fi
 	url="http://127.0.0.1:${SRV_PORT}/${ARCHIVE_NAME}"
 	"${kubectl}" -n "${NS}" exec "${pod}" -- python3 -c \
-		'import sys, urllib.request; print("serving", urllib.request.urlopen(sys.argv[1], timeout=10).status)' \
+		'import sys, urllib.request; print("serving", urllib.request.urlopen(urllib.request.Request(sys.argv[1], method="HEAD"), timeout=10).status)' \
 		"${url}" >&2 ||
 		die "the archive server does not answer ${url}"
+	"${kubectl}" -n "${NS}" rollout status deployment/"${SRV_NAME}" --timeout=300s >&2
 }
 
 remove_server() {
@@ -309,14 +338,21 @@ remove_server() {
 		--ignore-not-found >/dev/null
 	"${kubectl}" -n "${NS}" delete service "${SRV_NAME}" \
 		--ignore-not-found >/dev/null
+	"${kubectl}" -n "${NS}" delete persistentvolumeclaim "${SRV_NAME}" \
+		--ignore-not-found --timeout=120s >/dev/null
 }
 
 main() {
-	local delete=0 from_skaffold=0 soft="" kubectl kubeconfig image
+	local delete=0 from_skaffold=0 soft="" kubectl kubeconfig image prebuilt=""
 
 	while [ $# -gt 0 ]; do
 		case $1 in
 		-f | --force) OSAC_DEV_FORCE=1 ;;
+		--archive)
+			[ "$#" -ge 2 ] && [ -n "$2" ] || die '--archive requires a file path'
+			prebuilt=$2
+			shift
+			;;
 		--delete) delete=1 ;;
 		--from-skaffold) from_skaffold=1 ;;
 		-h | --help)
@@ -361,9 +397,16 @@ main() {
 		log "no osac-aap image tag yet; the deploy publishes the archive"
 		return 0
 	fi
-	pack_archive
+	if [ -n "${prebuilt}" ]; then
+		archive_local=$(expand_path "${prebuilt}")
+		[ -f "${archive_local}" ] && [ -s "${archive_local}" ] ||
+			die "missing or empty archive: ${archive_local}"
+	else
+		pack_archive
+	fi
+	archive_sum=$(sha256sum -- "${archive_local}" | cut -d' ' -f1)
 	ensure_server "${kubectl}" "${image}"
-	upload_archive "${kubectl}"
+	upload_archive "${kubectl}" "${image}"
 	printf 'http://%s.%s.svc:%s/%s\n' \
 		"${SRV_NAME}" "${NS}" "${SRV_PORT}" "${ARCHIVE_NAME}"
 }
