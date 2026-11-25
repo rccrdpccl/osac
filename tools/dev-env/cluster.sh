@@ -3,12 +3,15 @@
 #
 # cluster.sh — provision the OSAC dev cluster with cluster-tool.
 #
-# Usage: tools/dev-env/cluster.sh [--force]
+# Usage: tools/dev-env/cluster.sh [--force | --repair-gateway]
 #
 # Prepares cluster-tool on REMOTE_HOST (root@host, or `local` to run the hub on
 # this machine), makes sure the FLAVOR is present there, then boots CLUSTER_NAME
 # from it. Every step is skipped when the desired state already exists, so
-# re-running is cheap.
+# re-running is cheap. The clone's OVN external bridge (br-ex) must use its
+# primary libvirt network for hosted API traffic. Fix it on newly booted
+# clones if necessary; use --repair-gateway to reboot an existing clone only
+# if its gateway needs repair.
 #
 # Fast path: when OSAC_DEV_HUB_KUBECONFIG points at a valid kubeconfig whose API
 # server is reachable, cluster-tool is not used at all and the existing hub is
@@ -38,7 +41,7 @@ source "${script_dir}/common.sh"
 
 usage() {
 	cat <<'EOF'
-Usage: tools/dev-env/cluster.sh [--force]
+Usage: tools/dev-env/cluster.sh [--force | --repair-gateway]
 
 Prepare cluster-tool on REMOTE_HOST, pull FLAVOR if missing, and boot
 CLUSTER_NAME. Steps are skipped when the desired state already exists.
@@ -62,6 +65,9 @@ and the dnsmasq entries need root); cluster-tool chowns the state and
 kubeconfig it writes back to the invoking user.
 
 --force re-runs the cluster-tool server setup (CLUSTER_TOOL_FORCE=1).
+--repair-gateway only checks/repairs br-ex on the named existing clone, with
+  a hub reboot if needed. It uses REMOTE_HOST, CLUSTER_NAME, FLAVOR, and
+  CLUSTER_TOOL_DATA. No pull secret is needed; unset OSAC_DEV_HUB_KUBECONFIG.
 
 One-time client-side prerequisite (DNS for *.apps on your laptop):
   sudo cluster-tool setup client
@@ -86,8 +92,16 @@ check_data_dir() {
 
 # The remote config file is the last thing cluster-tool's server setup writes.
 setup_server() {
-	if [ "${CLUSTER_TOOL_FORCE}" != "1" ] &&
-		grep -qF "\"${SERVER_NAME}\"" "${CLUSTER_TOOL_SERVERS}" 2>/dev/null &&
+	local registered_host=
+	if [ -f "${CLUSTER_TOOL_SERVERS}" ]; then
+		registered_host=$(jq -r --arg name "${SERVER_NAME}" '.servers[$name].host // empty' "${CLUSTER_TOOL_SERVERS}") ||
+			die "cannot read ${CLUSTER_TOOL_SERVERS}"
+	fi
+	if [ -n "${registered_host}" ] && [ "${registered_host}" != "${REMOTE_HOST}" ]; then
+		die "${SERVER_NAME} points to ${registered_host}, not ${REMOTE_HOST}; choose a different SERVER_NAME"
+	fi
+	check_data_dir
+	if [ "${CLUSTER_TOOL_FORCE}" != "1" ] && [ -n "${registered_host}" ] &&
 		ssh_remote_root 'test -f ~/.config/cluster-tool/config'; then
 		log "${SERVER_NAME} already set up on ${REMOTE_HOST}, skipping (--force to redo)"
 		return 0
@@ -120,21 +134,34 @@ ensure_flavor() {
 	"${CLUSTER_TOOL_CMD[@]}" pull "${FLAVOR_IMAGE}" --server "${SERVER_NAME}"
 }
 
+# Run before client DNS setup; reach the guest via its primary libvirt lease.
+ensure_hub_gateway() {
+	local command
+	printf -v command 'bash -s -- %q %q %q %q' "$1" \
+		"test-infra-cluster-${CLUSTER_NAME}-master-0" "test-infra-net-${CLUSTER_NAME}" \
+		"${CLUSTER_TOOL_DATA}/flavors/${FLAVOR}/crypto/cluster-tool.key"
+	ssh_remote_root "${command}" <"${script_dir}/hub-gateway.sh"
+}
+
 boot_cluster() {
 	if remote_has list "${CLUSTER_NAME}"; then
 		log "${CLUSTER_NAME} is already booted on ${REMOTE_HOST}, skipping boot"
-		return 0
+		ensure_hub_gateway check
+		return
 	fi
 	log "booting ${CLUSTER_NAME} from ${FLAVOR} on ${REMOTE_HOST}"
 	"${CLUSTER_TOOL_CMD[@]}" boot --server "${SERVER_NAME}" --flavor "${FLAVOR}" \
 		--name "${CLUSTER_NAME}" --pull-secret "${PULL_SECRET_FILE}"
+	ensure_hub_gateway repair
 }
 
 main() {
+	local repair_gateway=0 kubeconfig
 	require_user_context
 	while [ $# -gt 0 ]; do
 		case $1 in
 		-f | --force) CLUSTER_TOOL_FORCE=1 ;;
+		--repair-gateway) repair_gateway=1 ;;
 		-h | --help)
 			usage
 			return 0
@@ -144,8 +171,14 @@ main() {
 		shift
 	done
 
-	local kubeconfig
 	if [ "${OSAC_DEV_FORCE}" = "1" ]; then CLUSTER_TOOL_FORCE=1; fi
+	if [ "${repair_gateway}" = "1" ]; then
+		[ -z "${OSAC_DEV_HUB_KUBECONFIG}" ] || die '--repair-gateway is only for cluster-tool clones; unset OSAC_DEV_HUB_KUBECONFIG'
+		[ -n "${REMOTE_HOST}" ] || die '--repair-gateway requires REMOTE_HOST or a configured SERVER_NAME'
+		check_data_dir
+		ensure_hub_gateway repair
+		return
+	fi
 	kubeconfig=$(hub_kubeconfig)
 	if hub_ready; then
 		log "OSAC_DEV_HUB_KUBECONFIG=${kubeconfig} is valid and reachable, reusing that hub"
@@ -162,7 +195,6 @@ main() {
 	command -v "${CLUSTER_TOOL}" >/dev/null 2>&1 ||
 		die "${CLUSTER_TOOL} not found in PATH"
 
-	check_data_dir
 	setup_server
 	ensure_flavor
 	boot_cluster
