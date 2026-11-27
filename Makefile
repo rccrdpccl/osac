@@ -13,7 +13,8 @@
 #                              evicts under disk pressure minutes later)
 #   tools/dev-env/deps.sh      osac-deps + osac-infra via osac-installer,
 #                              skipped when the releases already match the
-#                              in-tree chart version
+#                              in-tree chart version. Full-regression CI's
+#                              /dev/sdb LVMS disk is used on full-ci clones.
 #   tools/dev-env/bmh.sh       virtual BareMetalHosts on REMOTE_HOST, running
 #                              tools/shared/virtual-bmh.sh there over ssh on
 #                              top of an osac-test-infra checkout
@@ -26,6 +27,10 @@
 #   make osac-dev FORCE=1              every step, forced
 #   make osac-dev-setup FORCE=1        client setup + DNS, forced
 #   make osac-dev-cluster FORCE=1      cluster-tool server setup, forced
+#
+# A failed clone still pointing LVMS at /dev/vdb can initialize the verified
+# spare /dev/sdb and retry prerequisites with:
+#   make osac-dev-deps REPAIR_LVMS=1   with the same clone/server settings
 #
 # REMOTE_HOST selects where the hub runs: root@host for a remote hypervisor,
 # or `local` to run it on this machine (cluster-tool's own spelling). The local
@@ -234,8 +239,8 @@ osac-dev-cluster: ## cluster-tool server setup, flavor pull, and boot only
 osac-dev-setup: ## Client setup only (dnsmasq, NetworkManager)
 	@$(OSAC_DEV_ENV)/setup.sh
 
-osac-dev-deps: ## Install OSAC prerequisites (osac-deps + osac-infra) on the hub
-	@$(OSAC_DEV_ENV)/deps.sh
+osac-dev-deps: ## Install OSAC prerequisites (REPAIR_LVMS=1 opts into repairing a failed clone)
+	@$(OSAC_DEV_ENV)/deps.sh $(if $(filter 1,$(REPAIR_LVMS)),--repair-lvms)
 
 osac-dev-bmh: ## Create virtual BareMetalHosts on REMOTE_HOST (needs REMOTE_HOST)
 	@$(OSAC_DEV_ENV)/bmh.sh
