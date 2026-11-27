@@ -53,13 +53,6 @@ AAP EDA hostname
 {{- end }}
 
 {{/*
-AAP controller hostname
-*/}}
-{{- define "osac-aap.controllerHostname" -}}
-{{- printf "%s-controller-service" (include "osac-aap.instanceName" .) }}
-{{- end }}
-
-{{/*
 Shared wait-for-aap readiness script (bootstrap-job.yaml, create-api-token.yaml).
 Wall-clock-bounded (1500s epoch deadline, not iteration count) since each
 iteration can take up to ~65s worst case -- keep activeDeadlineSeconds above this.
@@ -94,8 +87,10 @@ READINESS_DEADLINE=$(( $(date +%s) + 1500 ))
 i=0
 while [ "$(date +%s)" -lt "${READINESS_DEADLINE}" ]; do
   i=$((i + 1))
+  # Use the same gateway route as the license module. The direct Controller
+  # Service can answer before the gateway has a healthy Controller upstream.
   curl -sf --connect-timeout 5 --max-time 15 \
-    "http://${AAP_CONTROLLER_GATEWAY_HOSTNAME}/api/v2/ping/" \
+    "http://${AAP_GATEWAY_HOSTNAME}/api/controller/v2/ping/" \
     | grep -q 'version'
   controller_ping="${?}"
 
@@ -204,8 +199,6 @@ env:
   value: /tmp
 - name: AAP_GATEWAY_HOSTNAME
   value: {{ include "osac-aap.gatewayHostname" . | quote }}
-- name: AAP_CONTROLLER_GATEWAY_HOSTNAME
-  value: {{ include "osac-aap.controllerHostname" . | quote }}
 - name: AAP_PASSWORD
   valueFrom:
     secretKeyRef:

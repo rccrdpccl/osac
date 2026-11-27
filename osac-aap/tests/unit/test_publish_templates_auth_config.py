@@ -148,6 +148,40 @@ def _render_aap_chart(*set_strings):
     )
 
 
+def test_aap_hooks_wait_for_the_controller_route_through_the_gateway() -> None:
+    chart = Path(__file__).resolve().parents[2] / "charts/aap"
+    result = subprocess.run(
+        [
+            "helm", "template", "aap-test", str(chart),
+            "--set", "bootstrap.enabled=true,apiToken.create=true,aap.instance.name=example-aap",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    jobs = {
+        doc["metadata"]["name"]: doc
+        for doc in yaml.safe_load_all(result.stdout)
+        if doc and doc["kind"] == "Job"
+    }
+    readiness_checks = [
+        next(
+            init for init in job["spec"]["template"]["spec"]["initContainers"]
+            if init["name"] == "wait-for-aap"
+        )
+        for name, job in jobs.items()
+        if name.endswith(("-bootstrap", "-create-token"))
+    ]
+    assert len(readiness_checks) == 2
+    for init in readiness_checks:
+        env = {item["name"]: item.get("value") for item in init["env"]}
+        assert env["AAP_GATEWAY_HOSTNAME"] == "example-aap"
+        script = init["command"][-1]
+        assert "http://${AAP_GATEWAY_HOSTNAME}/api/controller/v2/ping/" in script
+        assert "http://${AAP_GATEWAY_HOSTNAME}/api/gateway/v1/tokens/" in script
+
+
 @pytest.mark.parametrize("value", ["", "flase", "no", "yes", "0", " true"])
 def test_config_as_code_secret_rejects_a_non_boolean_netris_validate_certs(value):
     result = _render_aap_chart(f"instanceGroups.networkFulfillment.config.NETRIS_VALIDATE_CERTS={value}")
