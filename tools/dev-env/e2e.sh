@@ -133,7 +133,7 @@ cli_is_stale() {
 build_cli() {
 	local cli=$1
 	mkdir -p "$(dirname "${cli}")"
-	log "building the osac CLI -> ${cli}"
+	log "building the osac CLI -> ${cli}" >&2
 	(cd "${REPO_ROOT}/fulfillment-service" && go build -o "${cli}" ./cmd/osac) ||
 		die "could not build the osac CLI; set OSAC_CLI_PATH to a working binary"
 }
