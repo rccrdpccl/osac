@@ -111,18 +111,27 @@ spec:
               nodeRequests:
                 description: |-
                   NodeRequests defines the types of nodes and number of each type of node that will be used
-                  to build the cluster. Each request selects a BareMetalInstanceType.
+                  to build the cluster. All requests must select the same worker backend.
                 items:
                   properties:
                     bareMetal:
-                      description: |-
-                        BareMetal holds bare-metal-specific configuration for this node set.
-                        This node request targets bare-metal workers.
+                      description: BareMetal holds bare-metal-specific configuration
+                        for this node set.
                       properties:
                         instanceType:
                           description: |-
                             InstanceType names the BareMetalInstanceType (hardware profile) for the
                             nodes in this request.
+                          minLength: 1
+                          type: string
+                      required:
+                      - instanceType
+                      type: object
+                    computeInstance:
+                      description: ComputeInstance selects VM workers sized by a fulfillment
+                        InstanceType.
+                      properties:
+                        instanceType:
                           minLength: 1
                           type: string
                       required:
@@ -153,11 +162,16 @@ spec:
                       pattern: ^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*|\[[A-Fa-f0-9:]+\])(?::[0-9]+)?(?:/[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*)+(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}(?:@sha256:[A-Fa-f0-9]{64})?|@sha256:[A-Fa-f0-9]{64})$
                       type: string
                   required:
-                  - bareMetal
                   - nodeSet
                   - numberOfNodes
                   type: object
+                  x-kubernetes-validations:
+                  - message: select exactly one worker backend
+                    rule: has(self.bareMetal) != has(self.computeInstance)
                 type: array
+                x-kubernetes-validations:
+                - message: cannot mix compute and bare metal node sets
+                  rule: self.all(n, has(n.computeInstance)) || self.all(n, has(n.bareMetal))
               pullSecret:
                 description: |-
                   PullSecret contains credentials for authenticating to container image repositories.
@@ -573,6 +587,16 @@ spec:
                       required:
                       - instanceType
                       type: object
+                    computeInstance:
+                      description: ComputeNodeSpec names the VM instance type of a
+                        compute node set.
+                      properties:
+                        instanceType:
+                          minLength: 1
+                          type: string
+                      required:
+                      - instanceType
+                      type: object
                     fabricInterface:
                       type: string
                     nodeSet:
@@ -626,7 +650,6 @@ spec:
                       - attemptID
                       type: object
                   required:
-                  - bareMetal
                   - nodeSet
                   - numberOfNodes
                   type: object
@@ -792,8 +815,8 @@ spec:
                       format: date-time
                       type: string
                     bareMetalInstance:
-                      description: BareMetalInstance records the reserved name and
-                        fulfillment ID of the backing BMI.
+                      description: 'BareMetalInstance is the existing worker journal
+                        slot: kind selects the API owning this name and ID.'
                       properties:
                         id:
                           type: string

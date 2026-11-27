@@ -513,6 +513,53 @@ var _ = Describe("BareMetalWorkerReconciler direct shared worker template", Labe
 		Expect(setWorkerIgnitionURL(ctx, name+"-infraenv", testNamespace, ign.URL())).To(Succeed())
 	}
 
+	It("creates and removes a compute worker without using BMI services", func() {
+		vm := &computeWorkerStub{}
+		r.SetComputeClient(vm)
+		co := newBareMetalClusterOrder("vm-worker-lifecycle")
+		nr := &co.Spec.NodeRequests[0]
+		nr.BareMetal = nil
+		nr.ComputeInstance = &osacv1alpha1.ComputeNodeSpec{InstanceType: "vm-small"}
+		create(co)
+		cluster, err := fc.GetCluster(ctx, "ci-cluster")
+		Expect(err).NotTo(HaveOccurred())
+		ref := privatev1.InstanceTypeReference_builder{Id: "vm-small", Name: "vm-small", Tenant: "shared"}.Build()
+		cluster.GetSpec().SetNodeSets(map[string]*privatev1.ClusterNodeSet{nr.NodeSet: privatev1.ClusterNodeSet_builder{ComputeInstanceType: ref}.Build()})
+		fc.AddCluster(cluster)
+		makeInfraEnvReady(co.Name)
+
+		for range 2 {
+			_, err := runReconcile(co.Name)
+			Expect(err).NotTo(HaveOccurred())
+		}
+		Expect(vm.creates).To(Equal(1))
+		Expect(vm.vm.GetSpec().GetInstanceType().GetId()).To(Equal("vm-small"))
+		Expect(vm.vm.GetSpec().GetDiskImage().GetId()).To(Equal("ci-disk-image"))
+		Expect(vm.vm.GetSpec().GetUserDataSource().GetInline()).NotTo(BeEmpty())
+		Expect(vm.vm.GetMetadata().GetTenant()).To(Equal("tenant1"))
+		Expect(vm.vm.GetStatus().GetCluster().GetId()).To(Equal("ci-cluster"))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), co)).To(Succeed())
+		Expect(co.Status.Workers).To(HaveLen(1))
+		Expect(co.Status.Workers[0].Kind).To(Equal("ComputeInstance"))
+		Expect(co.Status.Workers[0].BareMetalInstance.ID).To(Equal(vm.vm.GetId()))
+		Expect(co.Status.Workers[0].Phase).To(Equal("WaitingForAgent"))
+		Expect(k8sClient.Delete(ctx, co)).To(Succeed())
+		for range 8 {
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(co)})
+			Expect(err).NotTo(HaveOccurred())
+			if apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), co)) {
+				break
+			}
+		}
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(co), co))).To(BeTrue())
+		Expect(vm.vm).To(BeNil())
+		Expect(fc.CreateCalls()).To(BeEmpty())
+		Expect(fc.GetInstanceTypeCalls()).To(BeEmpty())
+		Expect(fc.ListCalls()).To(BeEmpty())
+		Expect(fc.GetCalls()).To(BeEmpty())
+		Expect(fc.DeleteCalls()).To(BeEmpty())
+	})
+
 	It("creates a worker directly from the shared template without a system catalog item", func() {
 		co := newBareMetalClusterOrder("bmw-ci-create")
 		create(co)

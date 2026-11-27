@@ -73,6 +73,7 @@ type PrivateClustersServer struct {
 	generic                   *GenericServer[*privatev1.Cluster]
 	secretStore               vault.SecretStore
 	lifecycle                 *externalIPLifecycle
+	instanceTypesDao          *dao.GenericDAO[*privatev1.InstanceType]
 	bareMetalInstanceTypesDao *dao.GenericDAO[*privatev1.BareMetalInstanceType]
 	tenantsDao                *dao.GenericDAO[*privatev1.Tenant]
 	settings                  NetworkingSettings
@@ -197,6 +198,15 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		return
 	}
 
+	instanceTypesDao, err := dao.NewGenericDAO[*privatev1.InstanceType]().
+		SetLogger(b.logger).
+		SetTenancyLogic(b.tenancyLogic).
+		SetMetricsRegisterer(b.metricsRegisterer).
+		Build()
+	if err != nil {
+		return
+	}
+
 	// Create the cluster versions DAO:
 	clusterVersionsDao, err := dao.NewGenericDAO[*privatev1.ClusterVersion]().
 		SetLogger(b.logger).
@@ -302,6 +312,7 @@ func (b *PrivateClustersServerBuilder) Build() (result *PrivateClustersServer, e
 		templatesDao:              templatesDao,
 		catalogItemsDao:           catalogItemsDao,
 		bareMetalInstanceTypesDao: bareMetalInstanceTypesDao,
+		instanceTypesDao:          instanceTypesDao,
 		tenantsDao:                tenantsDao,
 		settings:                  resolveNetworkingSettings(b.networkingSettings),
 		clusterVersionsDao:        clusterVersionsDao,
@@ -663,11 +674,31 @@ func (s *PrivateClustersServer) prepareUpdatedClusterNodeSets(
 	if !s.updateAffectsNodeSets(mask) {
 		return nil
 	}
+	previous := current.GetSpec().GetNodeSets()
+	if mask == nil && len(candidate.GetSpec().GetNodeSets()) == 0 {
+		// A legacy full-object or finalizer update may omit node sets entirely.
+		if len(previous) > 0 {
+			candidate.GetSpec().SetNodeSets(proto.CloneOf(current.GetSpec()).GetNodeSets())
+		}
+		return nil
+	}
+	var compute bool
+	for _, set := range previous {
+		compute = set.HasComputeInstanceType()
+		break
+	}
 	for name, nodeSet := range candidate.GetSpec().GetNodeSets() {
-		existing := current.GetSpec().GetNodeSets()[name]
+		existing := previous[name]
 		if err := s.prepareUpdatedNodeSetHardware(ctx, name, existing, nodeSet, mask, sizeOnlyNodeSets); err != nil {
 			return err
 		}
+		// Even replacing every set at once cannot switch the backend of workers still being retired.
+		if len(previous) > 0 && nodeSet.HasComputeInstanceType() != compute {
+			return grpcstatus.Error(grpccodes.InvalidArgument, "cluster worker backend is immutable")
+		}
+	}
+	if err := validateClusterNodeSetMap(candidate.GetSpec().GetNodeSets()); err != nil {
+		return grpcstatus.Errorf(grpccodes.InvalidArgument, "node_sets: %s", err)
 	}
 	return nil
 }
@@ -968,6 +999,7 @@ func validateClusterNodeSetMap(nodeSets map[string]*privatev1.ClusterNodeSet) er
 	if len(nodeSets) == 0 {
 		return fmt.Errorf("must contain at least one node set")
 	}
+	var bare, compute bool
 	for name, nodeSet := range nodeSets {
 		if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
 			return fmt.Errorf("node set name '%s' is not a valid DNS label: %s", name, strings.Join(errs, ", "))
@@ -981,8 +1013,19 @@ func validateClusterNodeSetMap(nodeSets map[string]*privatev1.ClusterNodeSet) er
 		if nodeSet.GetSize() <= 0 {
 			return fmt.Errorf("size for node set '%s' should be greater than zero, but it is %d", name, nodeSet.GetSize())
 		}
-		if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
-			return fmt.Errorf("bare metal instance type for node set '%s' is required", name)
+		if vm := nodeSet.GetComputeInstanceType(); vm != nil {
+			if refKey(vm) == "" || nodeSet.HasBaremetalInstanceType() {
+				return fmt.Errorf("node set %q must select exactly one instance type", name)
+			}
+			compute = true
+		} else {
+			if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
+				return fmt.Errorf("bare metal instance type for node set '%s' is required", name)
+			}
+			bare = true
+		}
+		if compute && bare {
+			return fmt.Errorf("cannot mix compute and bare metal node sets")
 		}
 	}
 	return nil
@@ -1474,6 +1517,9 @@ func (s *PrivateClustersServer) validateAutoExternalIPImmutability(ctx context.C
 // loading its BareMetalInstanceType by the already-resolved ID and selecting the first interface with role "fabric".
 func (s *PrivateClustersServer) resolveFabricInterfaces(ctx context.Context, cluster *privatev1.Cluster) error {
 	for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+		if nodeSet.HasComputeInstanceType() {
+			continue
+		}
 		if refKey(nodeSet.GetBaremetalInstanceType()) == "" {
 			continue
 		}
@@ -1641,6 +1687,12 @@ func (s *PrivateClustersServer) resolveClusterNodeSets(ctx context.Context, clus
 		return grpcstatus.Errorf(grpccodes.InvalidArgument, "node_sets: %s", err)
 	}
 	for name, nodeSet := range cluster.GetSpec().GetNodeSets() {
+		if ref := nodeSet.GetComputeInstanceType(); ref != nil {
+			if err := s.validateComputeNodeType(ctx, name, ref); err != nil {
+				return err
+			}
+			continue
+		}
 		ref := nodeSet.GetBaremetalInstanceType()
 		kind := "node_sets." + name + ".baremetal_instance_type"
 		resolved, err := getReferenceResource(ctx, s.bareMetalInstanceTypesDao, ref.GetId())

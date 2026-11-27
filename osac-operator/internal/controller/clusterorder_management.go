@@ -642,7 +642,7 @@ func (r *ClusterOrderReconciler) infraEnvDiscoveryIgnitionURL(
 }
 
 func clusterOrderRequestsBareMetalWorkers(instance *v1alpha1.ClusterOrder) bool {
-	return instance != nil && instance.HasBareMetalNodeSet()
+	return instance != nil && instance.HasWorkerNodeSet()
 }
 
 func (r *ClusterOrderReconciler) probeManagementEndpoint(

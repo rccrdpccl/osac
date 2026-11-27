@@ -74,57 +74,124 @@ const (
 	on e.dimension = p.dimension
 	`
 	clusterStatement = `
-	select p.project as project, p.dimension as dimension, greatest(p.amount -
-	coalesce(e.amount, 0), 0)::bigint as amount from ( select r.id as id, r.tenant as tenant,
-	r.project::text as project, u.dimension as dimension, sum(u.amount)::bigint as amount from
-	clusters r cross join lateral ( select 'caas.control_planes' as dimension, 1 as amount union
-	all select 'network.external_ips' as dimension, 2 as amount where (r.data #>>
+	select p.project as project, p.dimension as dimension, greatest(p.amount - coalesce(e.amount,
+	0), 0)::bigint as amount from ( select r.id as id, r.tenant as tenant, r.project::text as
+	project, u.dimension as dimension, sum(u.amount)::bigint as amount from clusters r cross join
+	lateral ( select 'caas.control_planes' as dimension, 1 as amount union all select
+	'network.external_ips' as dimension, 2 as amount where (r.data #>>
 	'{spec,auto_external_ip_attachment}') = 'true' union all select 'quota.type.missing:' ||
 	coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''), nullif((i2.val #>>
-	'{baremetal_instance_type,name}'), '')) as dimension, 1 as amount from
-	jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as i2(k, val) left join
-	lateral ( select t.name as name, t.data as data from bare_metal_instance_types t where
-	(t.name = coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''), nullif((i2.val
-	#>> '{baremetal_instance_type,name}'), '')) or t.id = coalesce(nullif((i2.val #>>
-	'{baremetal_instance_type,id}'), ''), nullif((i2.val #>> '{baremetal_instance_type,name}'),
-	''))) and case when (i2.val #>> '{baremetal_instance_type,tenant}') is not null and (i2.val
-	#>> '{baremetal_instance_type,tenant}') <> '' then t.tenant = (i2.val #>>
-	'{baremetal_instance_type,tenant}') and t.project::text = coalesce((i2.val #>>
-	'{baremetal_instance_type,project}'), '') else t.tenant = r.tenant or t.tenant = 'shared'
-	end order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t3 on true where
-	coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''), nullif((i2.val #>>
-	'{baremetal_instance_type,name}'), '')) is not null and t3.name is null union all select
-	'bare_metal.instances.' || t3.name as dimension, coalesce(((i2.val #>> '{size}'))::bigint,
-	0) * 1 as amount from jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as
-	i2(k, val) left join lateral ( select t.name as name, t.data as data from
+	'{baremetal_instance_type,name}'), '')) as dimension, 1 as amount from (select * from
+	jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as entry(k,val) where val ?
+	'baremetal_instance_type') as i2 left join lateral ( select t.name as name, t.data as data from
 	bare_metal_instance_types t where (t.name = coalesce(nullif((i2.val #>>
 	'{baremetal_instance_type,id}'), ''), nullif((i2.val #>> '{baremetal_instance_type,name}'),
-	'')) or t.id = coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''),
-	nullif((i2.val #>> '{baremetal_instance_type,name}'), ''))) and case when (i2.val #>>
+	'')) or t.id = coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''), nullif((i2.val
+	#>> '{baremetal_instance_type,name}'), ''))) and case when (i2.val #>>
 	'{baremetal_instance_type,tenant}') is not null and (i2.val #>>
 	'{baremetal_instance_type,tenant}') <> '' then t.tenant = (i2.val #>>
 	'{baremetal_instance_type,tenant}') and t.project::text = coalesce((i2.val #>>
-	'{baremetal_instance_type,project}'), '') else t.tenant = r.tenant or t.tenant = 'shared'
-	end order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t3 on true ) u where
-	r.tenant = $1 and u.dimension is not null and u.dimension <> '' group by r.id, r.tenant,
-	r.project, u.dimension ) p left join lateral ( select ex.dimension as dimension,
-	sum(ex.amount)::bigint as amount from ( select d.dimension as dimension, d.amount as amount
-	from external_ips v1 cross join lateral ( select 'network.external_ips' as dimension, 1 as
-	amount ) d where v1.tenant = p.tenant and v1.creator = 'system' and v1.labels @>
+	'{baremetal_instance_type,project}'), '') else t.tenant = r.tenant or t.tenant = 'shared' end
+	order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t3 on true where
+	coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''), nullif((i2.val #>>
+	'{baremetal_instance_type,name}'), '')) is not null and t3.name is null union all select
+	'bare_metal.instances.' || t3.name as dimension, coalesce(((i2.val #>> '{size}'))::bigint, 0) *
+	1 as amount from (select * from jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb))
+	as entry(k,val) where val ? 'baremetal_instance_type') as i2 left join lateral ( select t.name
+	as name, t.data as data from bare_metal_instance_types t where (t.name =
+	coalesce(nullif((i2.val #>> '{baremetal_instance_type,id}'), ''), nullif((i2.val #>>
+	'{baremetal_instance_type,name}'), '')) or t.id = coalesce(nullif((i2.val #>>
+	'{baremetal_instance_type,id}'), ''), nullif((i2.val #>> '{baremetal_instance_type,name}'),
+	''))) and case when (i2.val #>> '{baremetal_instance_type,tenant}') is not null and (i2.val #>>
+	'{baremetal_instance_type,tenant}') <> '' then t.tenant = (i2.val #>>
+	'{baremetal_instance_type,tenant}') and t.project::text = coalesce((i2.val #>>
+	'{baremetal_instance_type,project}'), '') else t.tenant = r.tenant or t.tenant = 'shared' end
+	order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t3 on true union all select
+	'quota.type.missing:' || coalesce(nullif((i6.val #>> '{compute_instance_type,id}'), ''),
+	nullif((i6.val #>> '{compute_instance_type,name}'), '')) as dimension, 1 as amount from (select
+	* from jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as entry(k,val) where
+	val ? 'compute_instance_type') as i6 left join lateral ( select t.name as name, t.data as data
+	from instance_types t where (t.name = coalesce(nullif((i6.val #>>
+	'{compute_instance_type,id}'), ''), nullif((i6.val #>> '{compute_instance_type,name}'), '')) or
+	t.id = coalesce(nullif((i6.val #>> '{compute_instance_type,id}'), ''), nullif((i6.val #>>
+	'{compute_instance_type,name}'), ''))) and case when (i6.val #>>
+	'{compute_instance_type,tenant}') is not null and (i6.val #>> '{compute_instance_type,tenant}')
+	<> '' then t.tenant = (i6.val #>> '{compute_instance_type,tenant}') and t.project::text =
+	coalesce((i6.val #>> '{compute_instance_type,project}'), '') else t.tenant = r.tenant or
+	t.tenant = 'shared' end order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t7 on
+	true where coalesce(nullif((i6.val #>> '{compute_instance_type,id}'), ''), nullif((i6.val #>>
+	'{compute_instance_type,name}'), '')) is not null and t7.name is null union all select
+	'compute.gpu.' || (t7.data #>> '{spec,gpu,resource_name}') as dimension, coalesce(((i6.val #>>
+	'{size}'))::bigint, 0) * coalesce(((t7.data #>> '{spec,gpu,count}'))::bigint, 0) as amount from
+	(select * from jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as entry(k,val)
+	where val ? 'compute_instance_type') as i6 left join lateral ( select t.name as name, t.data as
+	data from instance_types t where (t.name = coalesce(nullif((i6.val #>>
+	'{compute_instance_type,id}'), ''), nullif((i6.val #>> '{compute_instance_type,name}'), '')) or
+	t.id = coalesce(nullif((i6.val #>> '{compute_instance_type,id}'), ''), nullif((i6.val #>>
+	'{compute_instance_type,name}'), ''))) and case when (i6.val #>>
+	'{compute_instance_type,tenant}') is not null and (i6.val #>> '{compute_instance_type,tenant}')
+	<> '' then t.tenant = (i6.val #>> '{compute_instance_type,tenant}') and t.project::text =
+	coalesce((i6.val #>> '{compute_instance_type,project}'), '') else t.tenant = r.tenant or
+	t.tenant = 'shared' end order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t7 on
+	true union all select 'compute.memory_gib' as dimension, coalesce(((i6.val #>>
+	'{size}'))::bigint, 0) * coalesce(((t7.data #>> '{spec,memory_gib}'))::bigint, 0) as amount
+	from (select * from jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as
+	entry(k,val) where val ? 'compute_instance_type') as i6 left join lateral ( select t.name as
+	name, t.data as data from instance_types t where (t.name = coalesce(nullif((i6.val #>>
+	'{compute_instance_type,id}'), ''), nullif((i6.val #>> '{compute_instance_type,name}'), '')) or
+	t.id = coalesce(nullif((i6.val #>> '{compute_instance_type,id}'), ''), nullif((i6.val #>>
+	'{compute_instance_type,name}'), ''))) and case when (i6.val #>>
+	'{compute_instance_type,tenant}') is not null and (i6.val #>> '{compute_instance_type,tenant}')
+	<> '' then t.tenant = (i6.val #>> '{compute_instance_type,tenant}') and t.project::text =
+	coalesce((i6.val #>> '{compute_instance_type,project}'), '') else t.tenant = r.tenant or
+	t.tenant = 'shared' end order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t7 on
+	true union all select 'compute.vcpus' as dimension, coalesce(((i6.val #>> '{size}'))::bigint,
+	0) * coalesce(((t7.data #>> '{spec,vcpus}'))::bigint, 0) as amount from (select * from
+	jsonb_each(coalesce(r.data #> '{spec,node_sets}', '{}'::jsonb)) as entry(k,val) where val ?
+	'compute_instance_type') as i6 left join lateral ( select t.name as name, t.data as data from
+	instance_types t where (t.name = coalesce(nullif((i6.val #>> '{compute_instance_type,id}'),
+	''), nullif((i6.val #>> '{compute_instance_type,name}'), '')) or t.id = coalesce(nullif((i6.val
+	#>> '{compute_instance_type,id}'), ''), nullif((i6.val #>> '{compute_instance_type,name}'),
+	''))) and case when (i6.val #>> '{compute_instance_type,tenant}') is not null and (i6.val #>>
+	'{compute_instance_type,tenant}') <> '' then t.tenant = (i6.val #>>
+	'{compute_instance_type,tenant}') and t.project::text = coalesce((i6.val #>>
+	'{compute_instance_type,project}'), '') else t.tenant = r.tenant or t.tenant = 'shared' end
+	order by (t.tenant = r.tenant) desc, t.project::text limit 1 ) t7 on true ) u where r.tenant =
+	$1 and u.dimension is not null and u.dimension <> '' group by r.id, r.tenant, r.project,
+	u.dimension ) p left join lateral ( select ex.dimension as dimension, sum(ex.amount)::bigint as
+	amount from ( select d.dimension as dimension, d.amount as amount from external_ips v1 cross
+	join lateral ( select 'network.external_ips' as dimension, 1 as amount ) d where v1.tenant =
+	p.tenant and v1.creator = 'system' and v1.labels @>
 	jsonb_build_object('osac.openshift.io/auto-created-for', p.id,
 	'osac.openshift.io/auto-created-kind', 'cluster') union all select d.dimension as dimension,
 	d.amount as amount from bare_metal_instances v4 left join lateral ( select t.name as name,
 	t.data as data from bare_metal_instance_types t where (t.name = coalesce(nullif((v4.data #>>
-	'{spec,instance_type,id}'), ''), nullif((v4.data #>> '{spec,instance_type,name}'), '')) or
-	t.id = coalesce(nullif((v4.data #>> '{spec,instance_type,id}'), ''), nullif((v4.data #>>
-	'{spec,instance_type,name}'), ''))) and case when (v4.data #>>
-	'{spec,instance_type,tenant}') is not null and (v4.data #>> '{spec,instance_type,tenant}')
-	<> '' then t.tenant = (v4.data #>> '{spec,instance_type,tenant}') and t.project::text =
-	coalesce((v4.data #>> '{spec,instance_type,project}'), '') else t.tenant = v4.tenant or
-	t.tenant = 'shared' end order by (t.tenant = v4.tenant) desc, t.project::text limit 1 ) t5
-	on true cross join lateral ( select 'bare_metal.instances.' || t5.name as dimension, 1 as
-	amount ) d where v4.tenant = p.tenant and v4.creator = 'system' and v4.data #>>
-	'{status,cluster,id}' = p.id ) ex group by ex.dimension ) e on e.dimension = p.dimension
+	'{spec,instance_type,id}'), ''), nullif((v4.data #>> '{spec,instance_type,name}'), '')) or t.id
+	= coalesce(nullif((v4.data #>> '{spec,instance_type,id}'), ''), nullif((v4.data #>>
+	'{spec,instance_type,name}'), ''))) and case when (v4.data #>> '{spec,instance_type,tenant}')
+	is not null and (v4.data #>> '{spec,instance_type,tenant}') <> '' then t.tenant = (v4.data #>>
+	'{spec,instance_type,tenant}') and t.project::text = coalesce((v4.data #>>
+	'{spec,instance_type,project}'), '') else t.tenant = v4.tenant or t.tenant = 'shared' end order
+	by (t.tenant = v4.tenant) desc, t.project::text limit 1 ) t5 on true cross join lateral (
+	select 'bare_metal.instances.' || t5.name as dimension, 1 as amount ) d where v4.tenant =
+	p.tenant and v4.creator = 'system' and v4.data #>> '{status,cluster,id}' = p.id union all
+	select d.dimension as dimension, d.amount as amount from compute_instances v8 left join lateral
+	( select t.name as name, t.data as data from instance_types t where (t.name =
+	coalesce(nullif((v8.data #>> '{spec,instance_type,id}'), ''), nullif((v8.data #>>
+	'{spec,instance_type,name}'), '')) or t.id = coalesce(nullif((v8.data #>>
+	'{spec,instance_type,id}'), ''), nullif((v8.data #>> '{spec,instance_type,name}'), ''))) and
+	case when (v8.data #>> '{spec,instance_type,tenant}') is not null and (v8.data #>>
+	'{spec,instance_type,tenant}') <> '' then t.tenant = (v8.data #>>
+	'{spec,instance_type,tenant}') and t.project::text = coalesce((v8.data #>>
+	'{spec,instance_type,project}'), '') else t.tenant = v8.tenant or t.tenant = 'shared' end order
+	by (t.tenant = v8.tenant) desc, t.project::text limit 1 ) t9 on true cross join lateral (
+	select 'compute.gpu.' || (t9.data #>> '{spec,gpu,resource_name}') as dimension,
+	coalesce(((t9.data #>> '{spec,gpu,count}'))::bigint, 0) as amount union all select
+	'compute.memory_gib' as dimension, coalesce(((t9.data #>> '{spec,memory_gib}'))::bigint, 0) as
+	amount union all select 'compute.vcpus' as dimension, coalesce(((t9.data #>>
+	'{spec,vcpus}'))::bigint, 0) as amount ) d where v8.tenant = p.tenant and v8.creator = 'system'
+	and v8.data #>> '{status,cluster,id}' = p.id ) ex group by ex.dimension ) e on e.dimension =
+	p.dimension
 	`
 	computeInstanceStatement = `
 	select p.project as project, p.dimension as dimension, greatest(p.amount -
@@ -281,7 +348,7 @@ var _ = Describe("Counter statements", func() {
 				"select 'quota.type.missing:' || coalesce(nullif((i2.val #>>" +
 					" '{baremetal_instance_type,id}'), '')," +
 					" nullif((i2.val #>> '{baremetal_instance_type,name}'), '')) as dimension," +
-					" 1 as amount from jsonb_each"))
+					" 1 as amount from (select * from jsonb_each"))
 		})
 
 		It("drops a parent's ask for a kind the installation never creates", func() {

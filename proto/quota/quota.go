@@ -133,6 +133,9 @@ type Field struct {
 
 // Creates says what OSAC creates for an annotated field's value.
 type Creates struct {
+	// WhenPresent selects entries of an annotated map by message-field presence.
+	WhenPresent string
+
 	// Kind is the kind of resource created, such as "Volume".
 	Kind string
 
@@ -510,8 +513,19 @@ func newKind(
 			return nil, err
 		}
 		kind.Fields = append(kind.Fields, *field)
+		options := proto.GetExtension(annotated.descriptor.Options(), privatev1.E_Quota).(*privatev1.QuotaFieldOptions)
+		for _, extra := range options.GetAdditionalCreates() {
+			if field.Creates == nil || field.Creates.WhenPresent == "" || extra.GetWhenPresent() == "" {
+				return nil, fmt.Errorf("%s: alternative creates require map selectors", where)
+			}
+			creates, err := newCreates(message, annotated, extra, universe)
+			if err != nil {
+				return nil, err
+			}
+			kind.Fields = append(kind.Fields, Field{Path: field.Path, Creates: creates})
+		}
 	}
-	sort.Slice(kind.Fields, func(i, j int) bool { return kind.Fields[i].Path < kind.Fields[j].Path })
+	sort.SliceStable(kind.Fields, func(i, j int) bool { return kind.Fields[i].Path < kind.Fields[j].Path })
 	return kind, nil
 }
 
@@ -666,11 +680,12 @@ func newCreates(
 	}
 
 	creates := &Creates{
-		Kind:       options.GetKind(),
-		Each:       options.GetEach(),
-		Count:      options.GetCount(),
-		CountField: options.GetCountField(),
-		Set:        options.GetSet(),
+		Kind:        options.GetKind(),
+		WhenPresent: options.GetWhenPresent(),
+		Each:        options.GetEach(),
+		Count:       options.GetCount(),
+		CountField:  options.GetCountField(),
+		Set:         options.GetSet(),
 	}
 	if creates.Count < 0 {
 		return nil, fmt.Errorf("%s sets a negative count", where)
@@ -723,6 +738,11 @@ func newCreates(
 		return nil, fmt.Errorf("%s creates resources but is neither a bool, message, list nor map", where)
 	}
 
+	if creates.WhenPresent != "" {
+		if !field.IsMap() || item == nil || item.Fields().ByName(protoreflect.Name(creates.WhenPresent)) == nil {
+			return nil, fmt.Errorf("%s: when_present must name a map entry field", where)
+		}
+	}
 	if item == nil {
 		if creates.CountField != "" || len(creates.Set) > 0 {
 			return nil, fmt.Errorf(

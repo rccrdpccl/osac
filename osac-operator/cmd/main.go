@@ -523,6 +523,7 @@ func setupClusterControllers(
 		os.Getenv(envClusterOrderNamespace),
 	)
 	if grpcConn != nil {
+		baremetalworkerReconciler.SetComputeClient(privatev1.NewComputeInstancesClient(grpcConn))
 		baremetalworkerReconciler.SetSecretsClient(privatev1.NewSecretsClient(grpcConn))
 	}
 	if err := baremetalworkerReconciler.SetupWithManager(mgr); err != nil {

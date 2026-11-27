@@ -86,6 +86,7 @@ func (r *Reconciler) rejectWorkerIdentity(co *v1alpha1.ClusterOrder, reason stri
 
 func checkWorkerBMI(co *v1alpha1.ClusterOrder, tenant, name string, bmi *privatev1.BareMetalInstance) error {
 	if bmi == nil || bmi.GetId() == "" || bmi.GetMetadata().GetTenant() != tenant ||
+		(co.UsesComputeWorkers() && bmi.GetStatus().GetCluster().GetId() != co.Labels[clusterOrderIDLabel]) ||
 		bmi.GetMetadata().GetName() != name ||
 		bmi.GetMetadata().GetAnnotations()["osac.openshift.io/owner-reference"] != "ClusterOrder/"+co.Name ||
 		bmi.GetMetadata().GetLabels()[clusterOrderLabel] != co.Name {
@@ -98,7 +99,7 @@ func checkWorkerBMI(co *v1alpha1.ClusterOrder, tenant, name string, bmi *private
 // Worker names identify status slots and are not a source of external identity.
 func validateWorkerBMIReferences(co *v1alpha1.ClusterOrder) error {
 	for _, w := range co.Status.Workers {
-		if w.Kind == workerKindBMI && w.BareMetalInstance.Name == "" {
+		if isWorkerKind(w.Kind) && w.BareMetalInstance.Name == "" {
 			return fmt.Errorf("worker %q: bareMetalInstance.name is required", w.Name)
 		}
 	}

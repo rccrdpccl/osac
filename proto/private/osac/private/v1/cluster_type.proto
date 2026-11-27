@@ -22,6 +22,7 @@ import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "osac/private/v1/add_on_operator_type.proto";
 import "osac/private/v1/baremetal_instance_type_type.proto";
+import "osac/private/v1/instance_type_type.proto";
 import "osac/private/v1/cluster_catalog_item_type.proto";
 import "osac/private/v1/cluster_common_type.proto";
 import "osac/private/v1/cluster_template_type.proto";
@@ -165,6 +166,13 @@ message ClusterSpec {
       kind: "BareMetalInstance"
       count_field: "size"
       set: {key: "spec.instance_type" value: "baremetal_instance_type"}
+      when_present: "baremetal_instance_type"
+    }
+    additional_creates: {
+      kind: "ComputeInstance"
+      count_field: "size"
+      set: {key: "spec.instance_type" value: "compute_instance_type"}
+      when_present: "compute_instance_type"
     }
   }];
 
@@ -580,6 +588,9 @@ message ClusterNodeSet {
   // Immutable after creation.
   BareMetalInstanceTypeReference baremetal_instance_type = 4 [(google.api.field_behavior) = IMMUTABLE];
 
+  // VM sizing profile. Mutually exclusive with baremetal_instance_type; all node sets use the same worker backend.
+  InstanceTypeReference compute_instance_type = 6 [(google.api.field_behavior) = IMMUTABLE];
+
   // Reserved field number and name for the removed node-set version field.
   // The selected reference now lives in ClusterNodeSetStatus.version.
   reserved 5;
@@ -596,6 +607,9 @@ message ClusterNodeSetStatus {
 
   // BareMetalInstanceType most recently observed for this set.
   BareMetalInstanceTypeReference baremetal_instance_type = 4;
+
+  // InstanceType most recently observed for a VM-backed set.
+  InstanceTypeReference compute_instance_type = 7;
 
   // OpenShift version observed on this node set.
   string observed_version = 6 [(google.api.field_behavior) = OUTPUT_ONLY];

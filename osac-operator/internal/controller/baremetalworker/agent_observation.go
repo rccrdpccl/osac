@@ -83,7 +83,7 @@ func projectAgentWorkerPhases(
 }
 
 func eligibleForAgentObservation(w v1alpha1.WorkerStatus) bool {
-	return w.Kind == workerKindBMI && w.BareMetalInstance.ID != "" &&
+	return isWorkerKind(w.Kind) && w.BareMetalInstance.ID != "" &&
 		w.Phase != workerPhaseFailed && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting
 }
 

@@ -52,7 +52,11 @@ func (r *Reconciler) reconcileObservedAgents(
 ) ([]v1alpha1.WorkerStatus, ctrl.Result, error) {
 	workers = append([]v1alpha1.WorkerStatus(nil), workers...)
 	if o.agents != nil {
-		if _, err := r.matchAndBindAgents(ctx, co, o.agents, workers, r.workerMACResolver(o)); err != nil {
+		resolve := r.workerMACResolver(o)
+		if co.UsesComputeWorkers() && r.macResolver == nil {
+			resolve = computeWorkerMACs
+		}
+		if _, err := r.matchAndBindAgents(ctx, co, o.agents, workers, resolve); err != nil {
 			return nil, ctrl.Result{}, err
 		}
 	}

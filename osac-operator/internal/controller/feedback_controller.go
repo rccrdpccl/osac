@@ -1020,11 +1020,10 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 	log := ctrllog.FromContext(ctx)
 	for i := range len(clusterOrder.Status.NodeRequests) {
 		nodeRequest := &clusterOrder.Status.NodeRequests[i]
-		if nodeRequest.BareMetal == nil || nodeRequest.BareMetal.InstanceType == "" {
-			log.Error(nil, "Node request missing bareMetal.instanceType")
+		instanceTypeName := (ckv1alpha1.NodeRequest{BareMetal: nodeRequest.BareMetal, ComputeInstance: nodeRequest.ComputeInstance}).WorkerInstanceType()
+		if instanceTypeName == "" {
 			continue
 		}
-		instanceTypeName := nodeRequest.BareMetal.InstanceType
 
 		nodeSetID := nodeRequest.NodeSet
 		requestedNodeSet, found := remote.GetSpec().GetNodeSets()[nodeSetID]
@@ -1033,7 +1032,11 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 			continue
 		}
 		instanceType := requestedNodeSet.GetBaremetalInstanceType()
-		if instanceType.GetName() != instanceTypeName {
+		observedType := instanceType.GetName()
+		if nodeRequest.ComputeInstance != nil {
+			observedType = requestedNodeSet.GetComputeInstanceType().GetName()
+		}
+		if observedType != instanceTypeName {
 			log.Error(nil, "Node set instance type does not match", "node_set", nodeSetID, "instance_type", instanceTypeName)
 			continue
 		}
@@ -1048,7 +1051,11 @@ func syncClusterOrderNodeRequests(ctx context.Context, clusterOrder *ckv1alpha1.
 			nodeSet = privatev1.ClusterNodeSetStatus_builder{}.Build()
 			nodeSets[nodeSetID] = nodeSet
 		}
-		nodeSet.SetBaremetalInstanceType(proto.Clone(instanceType).(*privatev1.BareMetalInstanceTypeReference))
+		if nodeRequest.ComputeInstance != nil {
+			nodeSet.SetComputeInstanceType(proto.CloneOf(requestedNodeSet.GetComputeInstanceType()))
+		} else {
+			nodeSet.SetBaremetalInstanceType(proto.CloneOf(instanceType))
+		}
 
 		oldValue := nodeSet.GetSize()
 		newValue := int32(nodeRequest.NumberOfNodes)

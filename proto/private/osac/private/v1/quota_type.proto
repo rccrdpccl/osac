@@ -98,6 +98,9 @@ message QuotaCreatesOptions {
   // Fields of each new resource. Each key is a field path of the new resource, and each
   // value is a path from the item, such as "spec.size_gib" from "size_gib".
   map<string, string> set = 5;
+
+  // For a map of messages, only price entries containing this field.
+  string when_present = 6;
 }
 
 // Options of a field that quota reads. Exactly one of `dimension`, `through`, `creates` and
@@ -118,6 +121,9 @@ message QuotaFieldOptions {
 
   // Resources OSAC will create for this field's value.
   QuotaCreatesOptions creates = 4;
+
+  // Other resource kinds created by entries in the same map.
+  repeated QuotaCreatesOptions additional_creates = 6;
 
   // Link to the parent this resource was created for, when the field itself holds the
   // link, such as a host's `status.cluster`.

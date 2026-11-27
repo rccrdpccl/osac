@@ -24,6 +24,7 @@ import "osac/private/v1/compute_instance_catalog_item_type.proto";
 import "osac/private/v1/compute_instance_common_type.proto";
 import "osac/private/v1/compute_instance_template_type.proto";
 import "osac/private/v1/condition_status_type.proto";
+import "osac/private/v1/cluster_type.proto";
 import "osac/private/v1/disk_image_type.proto";
 import "osac/private/v1/metadata_type.proto";
 import "osac/private/v1/instance_type_type.proto";
@@ -215,6 +216,9 @@ message ComputeInstanceSpec {
 
 // The status contains the details of the compute instance provided by the system.
 message ComputeInstanceStatus {
+  // Parent cluster for a system-provisioned VM worker.
+  ClusterLocalReference cluster = 14 [(cleanapi.field).private = true, (osac.private.v1.quota) = {created_for: {parent: "Cluster"}}];
+
   // Indicates the overall state of the compute instance.
   ComputeInstanceState state = 1 [(osac.private.v1.metering) = {kind: METERING_FIELD_KIND_VARIES transition_time: "status.state_transition_time"}];
 

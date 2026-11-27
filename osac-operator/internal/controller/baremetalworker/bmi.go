@@ -24,6 +24,7 @@ type bmiState struct {
 }
 
 const (
+	sharedTenant        = "shared"
 	systemBMITemplateID = "osac.templates.bm_host_provisioning"
 )
 
@@ -62,11 +63,7 @@ func (r *Reconciler) ensureBMI(
 	workerName string, image *privatev1.DiskImageReference, ignitionRaw, filter string,
 ) (*privatev1.BareMetalInstance, ctrl.Result, error) {
 	// The worker lives in its cluster's project and records its cluster in status.cluster.
-	req, err := r.buildBMICreateRequest(co, cluster.GetMetadata().GetTenant(), cluster, nodeSet, workerName, image, ignitionRaw)
-	if err != nil {
-		return nil, ctrl.Result{}, err
-	}
-	created, err := r.fulfillment.CreateBareMetalInstance(ctx, req)
+	created, err := r.instances(co).create(ctx, co, cluster, nodeSet, workerName, image, ignitionRaw)
 	if err == nil {
 		return created, ctrl.Result{}, nil
 	}
@@ -89,7 +86,7 @@ func (r *Reconciler) ensureBMI(
 // findBMIByName re-lists BMIs and returns the one matching the given name.
 func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrder, tenant, filter, name string) (*privatev1.BareMetalInstance, error) {
 	ctrllog.FromContext(ctx).Info("BMI create returned AlreadyExists, re-listing", "name", name)
-	refreshed, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
+	refreshed, err := r.instances(co).ListBareMetalInstances(ctx, filter)
 	if err != nil {
 		return nil, fmt.Errorf("re-listing BMIs after AlreadyExists: %w", err)
 	}
@@ -102,7 +99,7 @@ func (r *Reconciler) findBMIByName(ctx context.Context, co *v1alpha1.ClusterOrde
 		// AlreadyExists is a recovery hint, not permission to adopt a stale
 		// List snapshot. Verify this incarnation's current ownership/liveness.
 		id := bmi.GetId()
-		bmi, err = r.fulfillment.GetBareMetalInstance(ctx, id)
+		bmi, err = r.instances(co).GetBareMetalInstance(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("verifying recovered BMI %s: %w", name, err)
 		}
@@ -149,13 +146,13 @@ func (r *Reconciler) buildBMICreateRequest(
 	var instanceType *privatev1.BareMetalInstanceTypeReference
 	if nodeSet.BareMetal.InstanceType != "" {
 		instanceType = privatev1.BareMetalInstanceTypeReference_builder{
-			Name: nodeSet.BareMetal.InstanceType, Tenant: "shared", Shared: true,
+			Name: nodeSet.BareMetal.InstanceType, Tenant: sharedTenant, Shared: true,
 		}.Build()
 	}
 
 	specBuilder := privatev1.BareMetalInstanceSpec_builder{
 		Template: privatev1.BareMetalInstanceTemplateReference_builder{
-			Id: systemBMITemplateID, Tenant: "shared", Shared: true,
+			Id: systemBMITemplateID, Tenant: sharedTenant, Shared: true,
 		}.Build(),
 		DiskImage:          image,
 		UserDataSource:     privatev1.UserDataSource_builder{Inline: &ignitionRaw}.Build(),
@@ -230,7 +227,7 @@ func (r *Reconciler) verifyRecordedBMI(ctx context.Context, co *v1alpha1.Cluster
 		}
 		return bmiState{bmi: bmi}, nil
 	}
-	bmi, err := o.getBMI(ctx, r.fulfillment, w.BareMetalInstance.ID)
+	bmi, err := o.getBMI(ctx, r.instances(co), w.BareMetalInstance.ID)
 	if status.Code(err) == codes.NotFound {
 		return bmiState{absent: true}, nil
 	}
@@ -259,11 +256,11 @@ func reconcileBMI(w v1alpha1.WorkerStatus, state bmiState) *v1alpha1.WorkerStatu
 }
 
 func eligibleForBMIRecovery(w v1alpha1.WorkerStatus) bool {
-	return w.Kind == workerKindBMI && w.BareMetalInstance.ID == "" && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting && (w.Phase != workerPhaseFailed || w.NextRetryTime == nil)
+	return isWorkerKind(w.Kind) && w.BareMetalInstance.ID == "" && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting && (w.Phase != workerPhaseFailed || w.NextRetryTime == nil)
 }
 
 func eligibleForBMIAbsence(w v1alpha1.WorkerStatus) bool {
-	return w.Kind == workerKindBMI && w.BareMetalInstance.ID != "" && w.Phase != workerPhaseFailed && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting
+	return isWorkerKind(w.Kind) && w.BareMetalInstance.ID != "" && w.Phase != workerPhaseFailed && w.Phase != workerPhaseUnbinding && w.Phase != workerPhaseDeleting
 }
 
 func bmiDeleting(bmi *privatev1.BareMetalInstance) bool {
@@ -273,7 +270,7 @@ func bmiDeleting(bmi *privatev1.BareMetalInstance) bool {
 // Only a fresh Get NotFound proves recorded-incarnation absence. List omission,
 // deleting state, Delete success and lookup failures never release the identity.
 func (r *Reconciler) readCleanupBMI(ctx context.Context, co *v1alpha1.ClusterOrder, tenant string, w v1alpha1.WorkerStatus) (bmiState, error) {
-	bmi, err := r.fulfillment.GetBareMetalInstance(ctx, w.BareMetalInstance.ID)
+	bmi, err := r.instances(co).GetBareMetalInstance(ctx, w.BareMetalInstance.ID)
 	if status.Code(err) == codes.NotFound {
 		return bmiState{absent: true}, nil
 	}

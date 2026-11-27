@@ -48,7 +48,9 @@ func indexWorkerBMIs(bmis []*privatev1.BareMetalInstance) *workerObservation {
 	return o
 }
 
-func (o *workerObservation) getBMI(ctx context.Context, f FulfillmentClient, id string) (*privatev1.BareMetalInstance, error) {
+func (o *workerObservation) getBMI(ctx context.Context, f interface {
+	GetBareMetalInstance(context.Context, string) (*privatev1.BareMetalInstance, error)
+}, id string) (*privatev1.BareMetalInstance, error) {
 	if bmi, ok := o.byID[id]; ok {
 		return bmi, nil
 	}
@@ -77,7 +79,7 @@ func (o *workerObservation) exactOwnedName(co *v1alpha1.ClusterOrder, tenant, na
 
 func (r *Reconciler) observeWorkerResources(ctx context.Context, co *v1alpha1.ClusterOrder) (*workerObservation, ctrl.Result, error) {
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
-	bmis, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
+	bmis, err := r.instances(co).ListBareMetalInstances(ctx, filter)
 	if err != nil {
 		return nil, ctrl.Result{}, fmt.Errorf("observing worker BMIs: %w", err)
 	}
@@ -114,7 +116,7 @@ func (r *Reconciler) observeExistingWorkers(ctx context.Context, co *v1alpha1.Cl
 	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	for i := 0; i < len(workers); i++ {
 		w := workers[i]
-		if w.Kind != workerKindBMI {
+		if !isWorkerKind(w.Kind) {
 			continue
 		}
 		var state bmiState
@@ -183,7 +185,7 @@ func (r *Reconciler) observeDeletionWorkers(ctx context.Context, co *v1alpha1.Cl
 	}
 	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	for i := range workers {
-		if workers[i].Kind != workerKindBMI {
+		if !isWorkerKind(workers[i].Kind) {
 			continue
 		}
 		state, err := r.verifyRecordedBMI(ctx, co, tenant, workers[i], o)

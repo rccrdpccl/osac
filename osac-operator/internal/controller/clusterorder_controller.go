@@ -198,7 +198,7 @@ func (r *ClusterOrderReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
 		for i, request := range instance.Spec.NodeRequests {
-			if request.BareMetal == nil || request.BareMetal.InstanceType == "" {
+			if request.WorkerInstanceType() == "" {
 				return ctrl.Result{}, fmt.Errorf("spec.nodeRequests[%d].bareMetal.instanceType is required", i)
 			}
 		}
@@ -381,7 +381,7 @@ func (r *ClusterOrderReconciler) patchStatusWithRetry(ctx context.Context, key c
 		terminalPhase := latest.Status.Phase == v1alpha1.ClusterOrderPhaseFailed ||
 			latest.Status.Phase == v1alpha1.ClusterOrderPhaseDeleting || deleting
 		workerPending := !terminalPhase && computed.Phase == v1alpha1.ClusterOrderPhaseReady &&
-			latest.HasBareMetalNodeSet() && !bareMetalWorkersReady(latest)
+			latest.HasWorkerNodeSet() && !bareMetalWorkersReady(latest)
 		switch {
 		case deleting:
 			latest.Status.Phase = v1alpha1.ClusterOrderPhaseDeleting
@@ -785,7 +785,7 @@ func bareMetalWorkersReady(instance *v1alpha1.ClusterOrder) bool {
 	if instance == nil {
 		return false
 	}
-	if !instance.HasBareMetalNodeSet() {
+	if !instance.HasWorkerNodeSet() {
 		return true
 	}
 	if instance.Status.DesiredWorkers == nil ||
@@ -804,7 +804,7 @@ func bareMetalWorkersReady(instance *v1alpha1.ClusterOrder) bool {
 	}
 	requestedWorkers := int32(0)
 	for _, nodeRequest := range instance.Spec.NodeRequests {
-		if !nodeRequest.IsBareMetal() {
+		if !nodeRequest.HasWorkerBackend() {
 			continue
 		}
 		if nodeRequest.NumberOfNodes <= 0 {
@@ -851,7 +851,7 @@ func (r *ClusterOrderReconciler) reconcileClusterOrderReadiness(
 		return
 	}
 
-	if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
+	if instance.HasWorkerNodeSet() && !bareMetalWorkersReady(instance) {
 		setClusterOrderPhase(&instance.Status, v1alpha1.ClusterOrderPhaseProgressing)
 		instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
 			humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
@@ -984,10 +984,10 @@ func (thresholds ClusterOrderStallThresholds) workersJoiningThreshold(nodeReques
 	threshold := time.Duration(0)
 	for _, nodeRequest := range nodeRequests {
 		effectiveThreshold := baseThreshold
-		if nodeRequest.BareMetal == nil {
+		if nodeRequest.WorkerInstanceType() == "" {
 			continue
 		}
-		if override, found := thresholds.WorkersJoiningByInstanceType[nodeRequest.BareMetal.InstanceType]; found && override > 0 {
+		if override, found := thresholds.WorkersJoiningByInstanceType[nodeRequest.WorkerInstanceType()]; found && override > 0 {
 			effectiveThreshold = override
 		}
 		if effectiveThreshold > threshold {
@@ -1085,6 +1085,10 @@ func (r *ClusterOrderReconciler) handleNodePool(ctx context.Context, instance *v
 			},
 		)
 		nodeRequestStatus = &instance.Status.NodeRequests[len(instance.Status.NodeRequests)-1]
+		if instance.UsesComputeWorkers() {
+			nodeRequestStatus.BareMetal = nil
+			nodeRequestStatus.ComputeInstance = &v1alpha1.ComputeNodeSpec{InstanceType: instanceType}
+		}
 	}
 
 	// Update the selected `nodeRequests` item with the NodePool's
@@ -1160,7 +1164,7 @@ func nodePoolsMatchRequests(requests []v1alpha1.NodeRequest, nodePools []hypersh
 func nodeRequestsContainDuplicateNodeSets(requests []v1alpha1.NodeRequest) bool {
 	seen := sets.New[string]()
 	for _, request := range requests {
-		if request.NodeSet == "" || request.BareMetal == nil || request.BareMetal.InstanceType == "" || seen.Has(request.NodeSet) {
+		if request.NodeSet == "" || request.WorkerInstanceType() == "" || seen.Has(request.NodeSet) {
 			return true
 		}
 		seen.Insert(request.NodeSet)
@@ -1171,7 +1175,7 @@ func nodeRequestsContainDuplicateNodeSets(requests []v1alpha1.NodeRequest) bool 
 func expectedNodePoolReplicas(requests []v1alpha1.NodeRequest) map[string]int {
 	expected := make(map[string]int, len(requests))
 	for _, request := range requests {
-		if request.BareMetal != nil && request.BareMetal.InstanceType != "" {
+		if request.WorkerInstanceType() != "" {
 			expected[request.NodeSet] = request.NumberOfNodes
 		}
 	}
@@ -1458,7 +1462,7 @@ func (r *ClusterOrderReconciler) provisioningCallbacks(instance *v1alpha1.Cluste
 			if instance.Status.Phase != v1alpha1.ClusterOrderPhaseProgressing {
 				return
 			}
-			if instance.HasBareMetalNodeSet() && !bareMetalWorkersReady(instance) {
+			if instance.HasWorkerNodeSet() && !bareMetalWorkersReady(instance) {
 				instance.SetStatusCondition(v1alpha1.ConditionProgressing, metav1.ConditionTrue,
 					humanizeConditionName(v1alpha1.ReasonWorkersJoining), v1alpha1.ReasonWorkersJoining)
 				return

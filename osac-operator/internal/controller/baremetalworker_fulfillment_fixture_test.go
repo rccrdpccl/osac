@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -72,6 +73,43 @@ func newWorkerFulfillmentStub() *workerFulfillmentStub {
 		catalogItems:    map[string]*privatev1.BareMetalInstanceCatalogItem{},
 		instanceTypes:   map[string]*privatev1.BareMetalInstanceType{},
 	}
+}
+
+// VM RPCs for the worker envtest. Keep this separate from fc.bmis so looking
+// up a VM through the bare-metal service can never pass the lifecycle test.
+type computeWorkerStub struct {
+	privatev1.ComputeInstancesClient
+	vm      *privatev1.ComputeInstance
+	creates int
+}
+
+func (f *computeWorkerStub) Create(_ context.Context, req *privatev1.ComputeInstancesCreateRequest, _ ...grpc.CallOption) (*privatev1.ComputeInstancesCreateResponse, error) {
+	f.creates++
+	f.vm = proto.CloneOf(req.GetObject())
+	f.vm.SetId("vm-worker-id")
+	return privatev1.ComputeInstancesCreateResponse_builder{Object: f.vm}.Build(), nil
+}
+
+func (f *computeWorkerStub) List(context.Context, *privatev1.ComputeInstancesListRequest, ...grpc.CallOption) (*privatev1.ComputeInstancesListResponse, error) {
+	if f.vm == nil {
+		return &privatev1.ComputeInstancesListResponse{}, nil
+	}
+	return privatev1.ComputeInstancesListResponse_builder{Items: []*privatev1.ComputeInstance{f.vm}}.Build(), nil
+}
+
+func (f *computeWorkerStub) Get(_ context.Context, req *privatev1.ComputeInstancesGetRequest, _ ...grpc.CallOption) (*privatev1.ComputeInstancesGetResponse, error) {
+	if f.vm == nil || req.GetId() != f.vm.GetId() {
+		return nil, status.Error(codes.NotFound, "worker not found")
+	}
+	return privatev1.ComputeInstancesGetResponse_builder{Object: f.vm}.Build(), nil
+}
+
+func (f *computeWorkerStub) Delete(_ context.Context, req *privatev1.ComputeInstancesDeleteRequest, _ ...grpc.CallOption) (*privatev1.ComputeInstancesDeleteResponse, error) {
+	if f.vm == nil || req.GetId() != f.vm.GetId() {
+		return nil, status.Error(codes.NotFound, "worker not found")
+	}
+	f.vm = nil
+	return &privatev1.ComputeInstancesDeleteResponse{}, nil
 }
 
 func cloneBMI(b *privatev1.BareMetalInstance) *privatev1.BareMetalInstance {

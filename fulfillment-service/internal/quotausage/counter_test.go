@@ -186,6 +186,18 @@ var _ = Describe("Usage counter", func() {
 		db.insertObject("disk_images", "image-1", "acme", "", "user", "{}", `{}`)
 	})
 
+	It("counts VM workers once across reservation and creation", func() {
+		db.insertObject("clusters", "vm-cluster", "other", "", "user", "{}", `{"spec":{"node_sets":{"workers":{"size":2,"compute_instance_type":{"name":"it-small"}}}}}`)
+		before, err := counter.Count(db.ctx, "other")
+		Expect(err).NotTo(HaveOccurred())
+		// The existing standalone VM uses six CPUs; two reserved workers add four.
+		Expect(before[""]["compute.vcpus"]).To(Equal(int64(10)))
+		db.insertObject("compute_instances", "vm-worker", "other", "", "system", "{}", `{"spec":{"instance_type":{"name":"it-small"}},"status":{"cluster":{"id":"vm-cluster"}}}`)
+		after, err := counter.Count(db.ctx, "other")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(after).To(Equal(before))
+	})
+
 	It("counts each dimension per project, priced by the registry", func(ctx context.Context) {
 		usage, err := counter.Count(db.ctx, "acme")
 		Expect(err).ToNot(HaveOccurred())

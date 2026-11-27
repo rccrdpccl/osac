@@ -917,7 +917,7 @@ func parseClusterNodeSetFlag(s string) (string, *publicv1.ClusterNodeSet, error)
 			return "", nil, fmt.Errorf("invalid --node-set assignment %q: expected key=value", strings.TrimSpace(pair))
 		}
 		switch key {
-		case "name", "size", "baremetal-instance-type":
+		case "name", "size", "baremetal-instance-type", "compute-instance-type":
 			values[key] = value
 		default:
 			return "", nil, fmt.Errorf("unknown --node-set key %q", key)
@@ -944,12 +944,18 @@ func parseClusterNodeSetFlag(s string) (string, *publicv1.ClusterNodeSet, error)
 		}.Build()
 	}
 
+	if vm := values["compute-instance-type"]; vm != "" {
+		if builder.BaremetalInstanceType != nil {
+			return "", nil, fmt.Errorf("select only one worker instance type")
+		}
+		builder.ComputeInstanceType = publicv1.InstanceTypeReference_builder{Id: vm}.Build()
+	}
 	return name, builder.Build(), nil
 }
 
 const nodeSetFlagHelp = `
 _NODE_SET_ - Node set configuration for worker pools as comma-separated key=value pairs.
-Supported keys are {{ bt }}name{{ bt }}, {{ bt }}size{{ bt }}, and {{ bt }}baremetal-instance-type{{ bt }}.
+Supported keys are {{ bt }}name{{ bt }}, {{ bt }}size{{ bt }}, {{ bt }}baremetal-instance-type{{ bt }}, and {{ bt }}compute-instance-type{{ bt }}.
 The {{ bt }}name{{ bt }} key is required.
 Can be specified multiple times for multiple worker pools.
 Example:

@@ -29,6 +29,20 @@ func (s *PrivateClustersServer) prepareUpdatedNodeSetHardware(ctx context.Contex
 		return grpcstatus.Errorf(grpccodes.InvalidArgument,
 			"node_sets.%s.baremetal_instance_type is required when adding a node set with a size-only update", name)
 	}
+	if existing.HasComputeInstanceType() {
+		keepType := sizeOnlyNodeSets && !nodeSet.HasComputeInstanceType()
+		if nodeSet.HasBaremetalInstanceType() || (!keepType && refKey(nodeSet.GetComputeInstanceType()) != refKey(existing.GetComputeInstanceType())) {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "cannot change compute_instance_type for node set %q", name)
+		}
+		nodeSet.SetComputeInstanceType(cloneMessage(existing.GetComputeInstanceType()))
+		return nil
+	}
+	if ref := nodeSet.GetComputeInstanceType(); ref != nil {
+		if existing != nil {
+			return grpcstatus.Errorf(grpccodes.InvalidArgument, "cannot change backend of node set %q", name)
+		}
+		return s.validateComputeNodeType(ctx, name, ref)
+	}
 	if existing != nil {
 		existingKey := refKey(existing.GetBaremetalInstanceType())
 		updatedKey := refKey(nodeSet.GetBaremetalInstanceType())
@@ -59,4 +73,15 @@ func (s *PrivateClustersServer) prepareUpdatedNodeSetHardware(ctx context.Contex
 		return resourceLookupError(err, kind, ref.GetId(), "", grpccodes.InvalidArgument)
 	}
 	return validateResourceNotDeleted(kind, refKey(ref), "", resolved.GetMetadata())
+}
+
+func (s *PrivateClustersServer) validateComputeNodeType(ctx context.Context, name string, ref *privatev1.InstanceTypeReference) error {
+	source := " in node_sets." + name + ".compute_instance_type"
+	// Serialize admission with type deletion until the referencing cluster is stored.
+	resolved, err := getShareLockedReferenceResource(ctx, s.instanceTypesDao, ref.GetId())
+	if err != nil {
+		return resourceLookupError(err, "instance type", ref.GetId(), source, grpccodes.InvalidArgument)
+	}
+	_, err = validateResolvedInstanceType(resolved, ref.GetId(), source)
+	return err
 }

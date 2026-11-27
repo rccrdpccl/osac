@@ -30,11 +30,8 @@ const (
 	metricWorkerTypeLabel   = "worker_type"
 	metricInstanceTypeLabel = "instance_type"
 
-	// workerTypeBareMetal is the worker_type label value for workers this controller manages.
-	// The metric names (osac_caas_worker_*) are shared with future compute (VM) worker flows;
-	// worker_type is what disambiguates the two, so it is emitted even though every series in
-	// this controller is bare-metal.
 	workerTypeBareMetal = "bare_metal"
+	workerTypeCompute   = "compute"
 
 	// tenantAnnotationKey associates a ClusterOrder with its tenant. The canonical
 	// definition is osacTenantKey ("osac.openshift.io/tenant") in the parent controller
@@ -137,7 +134,7 @@ func updateWorkerGauges(orders []v1alpha1.ClusterOrder) {
 	workerDesired.Reset()
 	workerReady.Reset()
 
-	type key struct{ tenant, instanceType string }
+	type key struct{ tenant, workerType, instanceType string }
 	type counts struct{ desired, ready float64 }
 	agg := map[key]*counts{}
 	at := func(k key) *counts {
@@ -151,13 +148,17 @@ func updateWorkerGauges(orders []v1alpha1.ClusterOrder) {
 	for i := range orders {
 		co := &orders[i]
 		tenant := tenantOf(co)
+		workerType := workerTypeBareMetal
+		if co.UsesComputeWorkers() {
+			workerType = workerTypeCompute
+		}
 		// Desired is the requested intent, independent of the worker journal.
 		for j := range co.Spec.NodeRequests {
 			nr := &co.Spec.NodeRequests[j]
-			if !nr.IsBareMetal() || nr.NumberOfNodes <= 0 {
+			if !nr.HasWorkerBackend() || nr.NumberOfNodes <= 0 {
 				continue
 			}
-			at(key{tenant: tenant, instanceType: nr.BareMetal.InstanceType}).desired += float64(nr.NumberOfNodes)
+			at(key{tenant: tenant, workerType: workerType, instanceType: nr.WorkerInstanceType()}).desired += float64(nr.NumberOfNodes)
 		}
 		// Ready keeps the provisioned instance type of the retained worker, so a
 		// hardware change does not relabel existing capacity as the new profile.
@@ -167,14 +168,21 @@ func updateWorkerGauges(orders []v1alpha1.ClusterOrder) {
 			if w.Phase != workerPhaseReady || w.BareMetalInstance.ID == "" {
 				continue
 			}
-			at(key{tenant: tenant, instanceType: w.InstanceType}).ready++
+			at(key{tenant: tenant, workerType: workerType, instanceType: w.InstanceType}).ready++
 		}
 	}
 
 	for k, c := range agg {
-		workerDesired.WithLabelValues(k.tenant, workerTypeBareMetal, k.instanceType).Set(c.desired)
-		workerReady.WithLabelValues(k.tenant, workerTypeBareMetal, k.instanceType).Set(c.ready)
+		workerDesired.WithLabelValues(k.tenant, k.workerType, k.instanceType).Set(c.desired)
+		workerReady.WithLabelValues(k.tenant, k.workerType, k.instanceType).Set(c.ready)
 	}
+}
+
+func workerMetricType(w v1alpha1.WorkerStatus) string {
+	if w.Kind == workerKindCompute {
+		return workerTypeCompute
+	}
+	return workerTypeBareMetal
 }
 
 // tenantOf returns the tenant a ClusterOrder belongs to, read from its tenant annotation.
@@ -183,17 +191,17 @@ func tenantOf(co *v1alpha1.ClusterOrder) string {
 }
 
 func observeProvisioningDuration(tenant string, w v1alpha1.WorkerStatus) {
-	workerProvisioningDuration.WithLabelValues(tenant, workerTypeBareMetal, w.InstanceType).
+	workerProvisioningDuration.WithLabelValues(tenant, workerMetricType(w), w.InstanceType).
 		Observe(time.Since(w.CreationTimestamp.Time).Seconds())
 }
 
 func observeCorrelationDuration(tenant string, w v1alpha1.WorkerStatus) {
-	workerCorrelationDuration.WithLabelValues(tenant, workerTypeBareMetal, w.InstanceType).
+	workerCorrelationDuration.WithLabelValues(tenant, workerMetricType(w), w.InstanceType).
 		Observe(time.Since(w.CreationTimestamp.Time).Seconds())
 }
 
 // observeProvisioningFailure records one worker provisioning failure. Call it on each transition
 // into the Failed phase (each failed attempt counts once; retries that fail again count again).
 func observeProvisioningFailure(tenant string, w v1alpha1.WorkerStatus) {
-	workerProvisioningFailures.WithLabelValues(tenant, workerTypeBareMetal, w.InstanceType).Inc()
+	workerProvisioningFailures.WithLabelValues(tenant, workerMetricType(w), w.InstanceType).Inc()
 }

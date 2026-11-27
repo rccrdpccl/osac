@@ -247,6 +247,12 @@ func resolveClusterNodeSetReferencesForTest(ctx context.Context, request proto.M
 	if err != nil {
 		return err
 	}
+	vmTypes, err := dao.NewGenericDAO[*privatev1.InstanceType]().SetLogger(logger).SetTenancyLogic(tenancy).Build()
+	if err != nil {
+		return err
+	}
+	references.RegisterDAOLookup(validator, "osac.private.v1.InstanceTypeReference", vmTypes)
+	references.RegisterDAOLookup(validator, "osac.public.v1.InstanceTypeReference", vmTypes)
 	references.RegisterDAOLookup(validator, "osac.private.v1.BareMetalInstanceTypeReference", bmitDao)
 	references.RegisterDAOLookup(validator, "osac.public.v1.BareMetalInstanceTypeReference", bmitDao)
 	clusterVersionsDao, err := dao.NewGenericDAO[*privatev1.ClusterVersion]().
@@ -2148,6 +2154,34 @@ var _ = Describe("Private clusters server", func() {
 			Entry("fabric with a project", "fabric", true, "other"),
 		)
 
+		It("accepts multiple compute node sets but rejects mixing or switching worker backends", func() {
+			_, err := server.instanceTypesDao.Create().SetObject(privatev1.InstanceType_builder{
+				Id: "vm-small", Metadata: privatev1.Metadata_builder{Name: "vm-small", Tenant: "shared"}.Build(),
+				Spec: privatev1.InstanceTypeSpec_builder{Vcpus: 2, MemoryGib: 8}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			sets := map[string]*privatev1.ClusterNodeSet{"workers": privatev1.ClusterNodeSet_builder{
+				Size: proto.Int32(1), ComputeInstanceType: privatev1.InstanceTypeReference_builder{Id: "vm-small"}.Build(),
+			}.Build()}
+			sets["extra"] = proto.CloneOf(sets["workers"])
+			created, err := server.Create(ctx, newCaaSNodeSetCreateRequest("vm-cluster", sets, nil))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(created.GetObject().GetSpec().GetNodeSets()["workers"].GetComputeInstanceType().GetId()).To(Equal("vm-small"))
+			sets["metal"] = privatev1.ClusterNodeSet_builder{Size: proto.Int32(1), BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build()}.Build()
+			_, err = server.Create(ctx, newCaaSNodeSetCreateRequest("mixed-cluster", sets, nil))
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err.Error()).To(ContainSubstring("cannot mix"))
+			_, err = server.Update(ctx, privatev1.ClustersUpdateRequest_builder{
+				Object: privatev1.Cluster_builder{
+					Id:   created.GetObject().GetId(),
+					Spec: privatev1.ClusterSpec_builder{NodeSets: map[string]*privatev1.ClusterNodeSet{"metal": sets["metal"]}}.Build(),
+				}.Build(),
+				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"spec.node_sets"}},
+			}.Build())
+			Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
+			Expect(err.Error()).To(ContainSubstring("backend is immutable"))
+		})
+
 		It("resolves an explicitly shared name-only CaaS NodeSet reference without mutating the request", func() {
 			request := newCaaSNodeSetCreateRequest("shared-name-only", map[string]*privatev1.ClusterNodeSet{
 				"workers": privatev1.ClusterNodeSet_builder{
@@ -2412,7 +2446,7 @@ var _ = Describe("Private clusters server", func() {
 			Expect(err).To(MatchError(ContainSubstring("node_sets")))
 		})
 
-		It("refuses an incomplete node set through the quota check and accepts a complete one", func() {
+		It("refuses an incomplete node set and accepts a complete one", func() {
 			workers := privatev1.ClusterNodeSet_builder{
 				Size:                  proto.Int32(2),
 				BaremetalInstanceType: privatev1.BareMetalInstanceTypeReference_builder{Id: "acme-bmit-id", Shared: true}.Build(),
@@ -2435,7 +2469,7 @@ var _ = Describe("Private clusters server", func() {
 				}.Build())
 			}
 
-			// The quota check prices each node set's hosts from its size and hardware, so a
+			// Node-set validation now runs on the merged candidate before quota pricing; a
 			// node set that leaves one of them out is refused as an invalid request naming
 			// the missing value:
 			for _, testCase := range []struct {
@@ -2443,12 +2477,12 @@ var _ = Describe("Private clusters server", func() {
 				value string
 			}{
 				{privatev1.ClusterNodeSet_builder{}.Build(), "size"},
-				{privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(), "baremetal_instance_type"},
+				{privatev1.ClusterNodeSet_builder{Size: proto.Int32(1)}.Build(), "instance type"},
 			} {
 				_, err = updateNodeSets(testCase.gpu)
 				Expect(grpcstatus.Code(err)).To(Equal(grpccodes.InvalidArgument))
 				Expect(grpcstatus.Convert(err).Message()).To(
-					Equal("the request doesn't set '" + testCase.value + "'"))
+					ContainSubstring(testCase.value))
 			}
 
 			// Nothing was written: the stored cluster keeps its one complete node set:

@@ -365,6 +365,12 @@ func addCreates(
 
 	var planned []PlannedCreate
 	for i, item := range items {
+		if selector := creates.WhenPresent; selector != "" {
+			message := item.Message()
+			if !message.Has(message.Descriptor().Fields().ByName(protoreflect.Name(selector))) {
+				continue
+			}
+		}
 		count, err := createCount(creates, item)
 		if err != nil {
 			return nil, err

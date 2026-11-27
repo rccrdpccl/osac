@@ -96,6 +96,24 @@
           - nodepool_definitions[0].metadata.annotations['osac.openshift.io/upgrade-attempt-id'] == 'cluster-id'
           - nodepool_definitions[1].metadata.annotations['osac.openshift.io/upgrade-attempt-id'] == 'cluster-id'
 
+    - name: Build a NodePool for ComputeInstance workers
+      ansible.builtin.include_role:
+        name: osac.service.hosted_cluster
+        tasks_from: build_nodepools.yaml
+      vars:
+        hosted_cluster_node_requests:
+          - nodeSet: vm-workers
+            numberOfNodes: 1
+            releaseImage: example.test/compute:4.16
+            computeInstance:
+              instanceType: vm.large
+
+    - name: Verify VM workers use the same Agent platform
+      ansible.builtin.assert:
+        that:
+          - nodepool_definitions[-1].metadata.labels['osac.openshift.io/instance_type'] == 'vm.large'
+          - nodepool_definitions[-1].spec.platform.agent.agentLabelSelector.matchLabels['osac.openshift.io/node-set'] == 'vm-workers'
+
     - name: Verify a missing node release image is rejected
       block:
         - name: Reset definitions before rejecting a missing release image

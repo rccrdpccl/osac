@@ -60,10 +60,12 @@ func TestKinds(t *testing.T) {
 			Fields: []Field{
 				{Path: "spec.auto_external_ip_attachment", Creates: &Creates{Kind: "ExternalIP", Count: 2}},
 				{Path: "spec.node_sets", Creates: &Creates{
-					Kind:       "BareMetalInstance",
-					CountField: "size",
-					Set:        map[string]string{"spec.instance_type": "baremetal_instance_type"},
+					Kind:        "BareMetalInstance",
+					WhenPresent: "baremetal_instance_type",
+					CountField:  "size",
+					Set:         map[string]string{"spec.instance_type": "baremetal_instance_type"},
 				}},
+				{Path: "spec.node_sets", Creates: &Creates{Kind: "ComputeInstance", CountField: "size", WhenPresent: "compute_instance_type", Set: map[string]string{"spec.instance_type": "compute_instance_type"}}},
 			},
 		},
 		{
@@ -87,6 +89,7 @@ func TestKinds(t *testing.T) {
 					},
 				}},
 				{Path: "spec.instance_type", Through: "InstanceType", LargerOf: "status.instance_type"},
+				{Path: "status.cluster", CreatedFor: &CreatedFor{Parent: "Cluster"}},
 			},
 		},
 		{
@@ -318,6 +321,20 @@ func TestPriceComputeInstance(t *testing.T) {
 	assertSources(t, quote, "compute.vcpus", []string{"spec.instance_type"})
 	assertSources(t, quote, "storage.volumes", []string{"spec.additional_disks", "spec.boot_disk"})
 	assertSources(t, quote, "network.external_ips", []string{"spec.auto_external_ip_attachment"})
+}
+
+func TestPriceClusterComputeWorkers(t *testing.T) {
+	cluster := &privatev1.Cluster{Spec: &privatev1.ClusterSpec{NodeSets: map[string]*privatev1.ClusterNodeSet{
+		"workers": {Size: proto.Int32(2), ComputeInstanceType: &privatev1.InstanceTypeReference{Name: "vm-worker"}},
+	}}}
+	quote, err := Price(cluster.ProtoReflect(), instanceTypes(instanceType("vm-worker", 4, 16, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDimensions(t, quote, map[string]int64{"caas.control_planes": 1, "compute.vcpus": 8, "compute.memory_gib": 32})
+	if len(quote.Creates) != 1 || quote.Creates[0].Kind != "ComputeInstance" || quote.Creates[0].Count != 2 {
+		t.Fatalf("unexpected worker plans: %+v", quote.Creates)
+	}
 }
 
 // TestPriceCluster prices a cluster: one control plane, as many hosts of the node set's

@@ -52,7 +52,8 @@ type ClusterOrderSpec struct {
 	// +kubebuilder:validation:Optional
 	TemplateParameters string `json:"templateParameters,omitempty"`
 	// NodeRequests defines the types of nodes and number of each type of node that will be used
-	// to build the cluster. Each request selects a BareMetalInstanceType.
+	// to build the cluster. All requests must select the same worker backend.
+	// +kubebuilder:validation:XValidation:rule="self.all(n, has(n.computeInstance)) || self.all(n, has(n.bareMetal))",message="cannot mix compute and bare metal node sets"
 	// +kubebuilder:validation:Optional
 	NodeRequests []NodeRequest `json:"nodeRequests,omitempty"`
 	// AddOnOperators lists the stable names of operators requested for the cluster.
@@ -126,6 +127,7 @@ type ClusterNetworkAttachment struct {
 	SecurityGroupRefs []string `json:"securityGroupRefs,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="has(self.bareMetal) != has(self.computeInstance)",message="select exactly one worker backend"
 type NodeRequest struct {
 	// NodeSet is the logical group key from the Fulfillment Cluster's spec.node_sets.
 	// It is independent of the hardware profile selected by BareMetal.InstanceType.
@@ -137,9 +139,10 @@ type NodeRequest struct {
 	// +kubebuilder:validation:Minimum=1
 	NumberOfNodes int `json:"numberOfNodes"`
 	// BareMetal holds bare-metal-specific configuration for this node set.
-	// This node request targets bare-metal workers.
-	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Optional
 	BareMetal *BareMetalNodeSpec `json:"bareMetal,omitempty"`
+	// ComputeInstance selects VM workers sized by a fulfillment InstanceType.
+	ComputeInstance *ComputeNodeSpec `json:"computeInstance,omitempty"`
 	// FabricInterface is the host NIC name used for tenant network traffic.
 	// When set, IP discovery filters Agent inventory interfaces by this name,
 	// preventing the provisioning NIC address from being returned.
@@ -165,8 +168,9 @@ type NodeRequestStatus struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Minimum=0
 	NumberOfNodes int `json:"numberOfNodes"`
-	// +kubebuilder:validation:Required
-	BareMetal *BareMetalNodeSpec `json:"bareMetal,omitempty"`
+	// +kubebuilder:validation:Optional
+	BareMetal       *BareMetalNodeSpec `json:"bareMetal,omitempty"`
+	ComputeInstance *ComputeNodeSpec   `json:"computeInstance,omitempty"`
 	// +kubebuilder:validation:Optional
 	FabricInterface string `json:"fabricInterface,omitempty"`
 	// ObservedVersion is the OpenShift version reported by this node set's
@@ -216,6 +220,41 @@ type BareMetalNodeSpec struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	InstanceType string `json:"instanceType"`
+}
+
+// ComputeNodeSpec names the VM instance type of a compute node set.
+type ComputeNodeSpec struct {
+	// +kubebuilder:validation:MinLength=1
+	InstanceType string `json:"instanceType"`
+}
+
+// HasWorkerBackend reports whether the request selects a managed worker type.
+func (nr NodeRequest) HasWorkerBackend() bool {
+	return nr.BareMetal != nil || nr.ComputeInstance != nil
+}
+
+func (nr NodeRequest) WorkerInstanceType() string {
+	if nr.ComputeInstance != nil {
+		return nr.ComputeInstance.InstanceType
+	}
+	if nr.BareMetal != nil {
+		return nr.BareMetal.InstanceType
+	}
+	return ""
+}
+
+// UsesComputeWorkers assumes the validated, homogeneous node-set contract.
+func (co *ClusterOrder) UsesComputeWorkers() bool {
+	return len(co.Spec.NodeRequests) != 0 && co.Spec.NodeRequests[0].ComputeInstance != nil
+}
+
+func (co *ClusterOrder) HasWorkerNodeSet() bool {
+	for _, nr := range co.Spec.NodeRequests {
+		if nr.HasWorkerBackend() {
+			return true
+		}
+	}
+	return false
 }
 
 // IsBareMetal reports whether this node request targets bare-metal workers.
@@ -486,7 +525,7 @@ type WorkerStatus struct {
 	// +kubebuilder:validation:Required
 	Kind string `json:"kind"`
 
-	// BareMetalInstance records the reserved name and fulfillment ID of the backing BMI.
+	// BareMetalInstance is the existing worker journal slot: kind selects the API owning this name and ID.
 	// +kubebuilder:validation:Optional
 	BareMetalInstance BareMetalInstanceReference `json:"bareMetalInstance,omitempty"`
 

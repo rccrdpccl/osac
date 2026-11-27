@@ -583,6 +583,9 @@ func (t *task) prepareNodeRequests() []osacv1alpha1.NodeRequest {
 }
 
 func (t *task) prepareNodeRequest(key string, nodeSet *privatev1.ClusterNodeSet) osacv1alpha1.NodeRequest {
+	if vm := nodeSet.GetComputeInstanceType(); vm != nil {
+		return osacv1alpha1.NodeRequest{NodeSet: key, NumberOfNodes: int(nodeSet.GetSize()), ComputeInstance: &osacv1alpha1.ComputeNodeSpec{InstanceType: vm.GetName()}}
+	}
 	bmitName := nodeSet.GetBaremetalInstanceType().GetName()
 	return osacv1alpha1.NodeRequest{
 		NodeSet:         key,

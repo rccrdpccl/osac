@@ -253,7 +253,7 @@ func sumBareMetalNodeRequests(co *v1alpha1.ClusterOrder) (int32, error) {
 	total := 0
 	for i := range co.Spec.NodeRequests {
 		nr := &co.Spec.NodeRequests[i]
-		if !nr.IsBareMetal() || nr.NumberOfNodes <= 0 {
+		if !nr.HasWorkerBackend() || nr.NumberOfNodes <= 0 {
 			continue
 		}
 		if total > math.MaxInt32-nr.NumberOfNodes {

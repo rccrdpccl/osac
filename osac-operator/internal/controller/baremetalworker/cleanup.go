@@ -61,7 +61,7 @@ func (r *Reconciler) cleanupWorker(ctx context.Context, co *v1alpha1.ClusterOrde
 	if bmiDeleting(state.bmi) {
 		return false, nil
 	}
-	return false, r.fulfillment.DeleteBareMetalInstance(ctx, w.BareMetalInstance.ID)
+	return false, r.instances(co).DeleteBareMetalInstance(ctx, w.BareMetalInstance.ID)
 }
 
 // ID-less reservations may hide an accepted Create with a lost response. Even
@@ -72,7 +72,7 @@ func (r *Reconciler) recoverCleanupBMI(ctx context.Context, co *v1alpha1.Cluster
 		return fmt.Errorf("worker %s has no recorded BMI name", w.Name)
 	}
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
-	bmis, err := r.fulfillment.ListBareMetalInstances(ctx, filter)
+	bmis, err := r.instances(co).ListBareMetalInstances(ctx, filter)
 	if err != nil {
 		return err
 	}

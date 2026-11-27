@@ -246,7 +246,7 @@ func selectDueSlot(co *v1alpha1.ClusterOrder, now time.Time) (*v1alpha1.NodeRequ
 	plan := planWorkerSlots(co)
 	for i := range co.Spec.NodeRequests {
 		nr := &co.Spec.NodeRequests[i]
-		if !nr.IsBareMetal() {
+		if !nr.HasWorkerBackend() {
 			continue
 		}
 		for _, prev := range plan.selected {
@@ -269,11 +269,15 @@ func (r *Reconciler) createSelectedWorker(
 	nr *v1alpha1.NodeRequest, prev *v1alpha1.WorkerStatus,
 	inputs workerCreationInputs, observed *workerObservation,
 ) (ctrl.Result, error) {
-	_, res, err := r.resolveNodeSetInstanceType(ctx, co, nr.BareMetal.InstanceType)
-	if err != nil || !res.IsZero() {
-		return res, err
+	var res ctrl.Result
+	var err error
+	if nr.IsBareMetal() {
+		_, res, err = r.resolveNodeSetInstanceType(ctx, co, nr.WorkerInstanceType())
+		if err != nil || !res.IsZero() {
+			return res, err
+		}
 	}
-	if na := co.Spec.NetworkAttachment; na != nil && na.SubnetRef != "" && nr.FabricInterface == "" {
+	if na := co.Spec.NetworkAttachment; na != nil && na.SubnetRef != "" && nr.IsBareMetal() && nr.FabricInterface == "" {
 		return ctrl.Result{}, fmt.Errorf("node request %q has no stored fabric interface for network attachment", nr.NodeSet)
 	}
 	filter := fmt.Sprintf(`this.metadata.labels["%s"] == "%s"`, clusterOrderLabel, co.Name)
@@ -484,14 +488,17 @@ func allocateMissingWorkerSlots(co *v1alpha1.ClusterOrder) error {
 	}
 	plan := planWorkerSlots(co)
 	for _, nr := range co.Spec.NodeRequests {
-		if !nr.IsBareMetal() {
+		if !nr.HasWorkerBackend() {
 			continue
 		}
 		for range plan.missingByNodeSet[nr.NodeSet] {
 			name := uuid.NewString()
 			// newWorkerStatus seeds the attempt origin, so the reservation write
 			// records the registration clock before any external Create.
-			worker := newWorkerStatus(nr.NodeSet, nr.BareMetal.InstanceType, name, "", workerPhaseProvisioning)
+			worker := newWorkerStatus(nr.NodeSet, nr.WorkerInstanceType(), name, "", workerPhaseProvisioning)
+			if nr.ComputeInstance != nil {
+				worker.Kind = workerKindCompute
+			}
 			worker.BMICreateState = v1alpha1.WorkerBMICreateStateReserved
 			co.Status.Workers = append(co.Status.Workers, worker)
 		}
@@ -519,7 +526,7 @@ func (r *Reconciler) ensureWorkerBMI(
 			return v1alpha1.WorkerStatus{}, ctrl.Result{}, err
 		}
 		log.Info("worker BMI already exists, skipping create", "name", workerName)
-		return newWorkerStatus(nr.NodeSet, nr.BareMetal.InstanceType, workerName, bmi.GetId(), workerPhaseWaitingForAgent), ctrl.Result{}, nil
+		return newWorkerStatus(nr.NodeSet, nr.WorkerInstanceType(), workerName, bmi.GetId(), workerPhaseWaitingForAgent), ctrl.Result{}, nil
 	}
 	bmi, res, err := r.ensureBMI(ctx, co, cluster, *nr, workerName, image, ignitionRaw, filter)
 	if err != nil || !res.IsZero() {
@@ -528,16 +535,16 @@ func (r *Reconciler) ensureWorkerBMI(
 	log.Info("created BMI", "name", workerName, "id", bmi.GetId())
 	r.recorder.Eventf(co, nil, corev1.EventTypeNormal, eventReasonWorkerCreated, "CreateWorker",
 		"worker %s: BMI %s created", workerName, bmi.GetId())
-	return newWorkerStatus(nr.NodeSet, nr.BareMetal.InstanceType, workerName, bmi.GetId(), workerPhaseWaitingForAgent), ctrl.Result{}, nil
+	return newWorkerStatus(nr.NodeSet, nr.WorkerInstanceType(), workerName, bmi.GetId(), workerPhaseWaitingForAgent), ctrl.Result{}, nil
 }
 
 func validateBareMetalNodeSets(co *v1alpha1.ClusterOrder) error {
 	seen := make(map[string]bool)
 	for i, request := range co.Spec.NodeRequests {
-		if !request.IsBareMetal() {
+		if !request.HasWorkerBackend() {
 			continue
 		}
-		if request.BareMetal.InstanceType == "" {
+		if request.WorkerInstanceType() == "" {
 			return fmt.Errorf("spec.nodeRequests[%d].bareMetal.instanceType is required", i)
 		}
 		if request.NodeSet == "" || seen[request.NodeSet] {

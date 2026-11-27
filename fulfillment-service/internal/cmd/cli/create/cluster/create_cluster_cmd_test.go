@@ -107,6 +107,13 @@ var _ = Describe("Parse cluster node set flag", func() {
 		Expect(ns.GetBaremetalInstanceType().GetShared()).To(BeTrue())
 	})
 
+	It("accepts a compute-backed node set without a bare metal type", func() {
+		_, ns, err := parseClusterNodeSetFlag("name=workers,size=1,compute-instance-type=vm-worker")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ns.GetBaremetalInstanceType()).To(BeNil())
+		Expect(ns.GetComputeInstanceType().GetId()).To(Equal("vm-worker"))
+	})
+
 	It("should require an explicit node set name", func() {
 		_, _, err := parseClusterNodeSetFlag("size=2,baremetal-instance-type=ci-worker-bm")
 		Expect(err).To(MatchError("--node-set name is required"))

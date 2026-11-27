@@ -45,7 +45,7 @@ func (r *Reconciler) reconcileNodePoolReplicas(
 func requestedBareMetalWorkersByNodeSet(co *v1alpha1.ClusterOrder) map[string]int64 {
 	replicas := make(map[string]int64)
 	for _, request := range co.Spec.NodeRequests {
-		if request.IsBareMetal() {
+		if request.HasWorkerBackend() {
 			replicas[request.NodeSet] = int64(request.NumberOfNodes)
 		}
 	}

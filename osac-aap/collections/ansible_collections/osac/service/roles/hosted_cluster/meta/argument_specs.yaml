@@ -26,9 +26,14 @@ argument_specs:
           releaseImage:
             type: str
             required: true
+          computeInstance:
+            type: dict
+            options:
+              instanceType:
+                type: str
+                required: true
           bareMetal:
             type: dict
-            required: true
             options:
               instanceType:
                 type: str

@@ -59,6 +59,7 @@ type Reconciler struct {
 	ignition              IgnitionFetcher
 	recorder              events.EventRecorder
 	clusterOrderNamespace string
+	compute               privatev1.ComputeInstancesClient
 	macResolver           MACResolver
 	secrets               SecretsClient
 }
@@ -91,6 +92,8 @@ func NewReconciler(
 	return r
 }
 
+func (r *Reconciler) SetComputeClient(client privatev1.ComputeInstancesClient) { r.compute = client }
+
 // SetMACResolver overrides the function used to resolve a BMI's host NIC MACs for agent
 // correlation. The default reads status.hardware.nics (OSAC-4203) from the
 // reconcile-local BMI observation; tests can inject a stub resolver before use.
@@ -121,6 +124,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err := r.apiReader.Get(ctx, req.NamespacedName, co); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if co.DeletionTimestamp.IsZero() && co.Annotations[managementStateAnnotation] == managementStateUnmanaged {
+		return ctrl.Result{}, nil
+	}
+	// Never use NotFound from the wrong service as evidence a worker is gone.
+	for _, nr := range co.Spec.NodeRequests {
+		if nr.ComputeInstance != nil && nr.BareMetal != nil || (nr.ComputeInstance != nil) != co.UsesComputeWorkers() {
+			return ctrl.Result{}, fmt.Errorf("mixed worker backends are not supported")
+		}
+	}
+	for _, worker := range co.Status.Workers {
+		if isWorkerKind(worker.Kind) && (worker.Kind == workerKindCompute) != co.UsesComputeWorkers() {
+			return ctrl.Result{}, fmt.Errorf("worker %q backend differs from its order", worker.Name)
+		}
+	}
+	if co.UsesComputeWorkers() && r.compute == nil {
+		return ctrl.Result{}, fmt.Errorf("compute worker client unavailable")
+	}
 	if !co.DeletionTimestamp.IsZero() {
 		res, err := r.handleVerifiedClusterDeletion(ctx, co)
 		if err != nil {
@@ -128,10 +148,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return res, nil
 	}
-	if v, ok := co.Annotations[managementStateAnnotation]; ok && v == managementStateUnmanaged {
-		return ctrl.Result{}, nil
-	}
-	if !co.HasBareMetalNodeSet() {
+	if !co.HasWorkerNodeSet() {
 		return ctrl.Result{}, nil
 	}
 	if err := validateBareMetalNodeSets(co); err != nil {

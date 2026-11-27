@@ -49,7 +49,7 @@ func planWorkerSlots(co *v1alpha1.ClusterOrder) workerSlotPlan {
 func planWorkerSlotsFor(co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStatus) workerSlotPlan {
 	plan := workerSlotPlan{missingByNodeSet: make(map[string]int)}
 	for _, nr := range co.Spec.NodeRequests {
-		if nr.IsBareMetal() {
+		if nr.HasWorkerBackend() {
 			plan.missingByNodeSet[nr.NodeSet] = nr.NumberOfNodes
 		}
 	}
@@ -67,7 +67,7 @@ func planWorkerSlotsFor(co *v1alpha1.ClusterOrder, workers []v1alpha1.WorkerStat
 }
 
 func isExcessWorkerSlot(w v1alpha1.WorkerStatus, remainingSlots int) bool {
-	return w.Kind != workerKindBMI ||
+	return !isWorkerKind(w.Kind) ||
 		w.Phase == workerPhaseUnbinding ||
 		w.Phase == workerPhaseDeleting ||
 		remainingSlots == 0

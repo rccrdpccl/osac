@@ -62,7 +62,7 @@ func (r *Reconciler) handleClusterDeletion(ctx context.Context, co *v1alpha1.Clu
 	workers := append([]v1alpha1.WorkerStatus(nil), co.Status.Workers...)
 	changed := false
 	for i := range workers {
-		if workers[i].Kind != workerKindBMI || workers[i].Phase == workerPhaseUnbinding || workers[i].Phase == workerPhaseDeleting {
+		if !isWorkerKind(workers[i].Kind) || workers[i].Phase == workerPhaseUnbinding || workers[i].Phase == workerPhaseDeleting {
 			continue
 		}
 		workers[i].Phase = workerPhaseUnbinding

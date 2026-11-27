@@ -744,6 +744,9 @@ func (g *statementGenerator) itemsFrom(field quota.Field, descriptor protoreflec
 	data := fmt.Sprintf("r.data #> '{%s}'", strings.Join(segments, ","))
 	switch {
 	case descriptor.IsMap():
+		if selector := field.Creates.WhenPresent; selector != "" {
+			return fmt.Sprintf("from (select * from jsonb_each(coalesce(%s, '{}'::jsonb)) as entry(k,val) where val ? '%s') as %s", data, selector, g.item)
+		}
 		return fmt.Sprintf(
 			"from jsonb_each(coalesce(%s, '{}'::jsonb)) as %s(k, val)", data, g.item,
 		)
