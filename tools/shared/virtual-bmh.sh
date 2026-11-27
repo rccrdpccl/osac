@@ -49,6 +49,8 @@
 #   BMH_NAMESPACE   namespace for BMH resources        (host-inventory)
 #   BMH_COUNT       number of virtual hosts            (2)
 #   BMH_DISK_SIZE   qcow2 size for new disks           (150G)
+#   BMH_CPU         vCPUs per new virtual host        (4)
+#   BMH_MEMORY_MIB  memory per new virtual host       (8192)
 #   BMH_LABELS      space-separated labels for the BMHs
 #                   (osac.openshift.io/host-type=default)
 #   BMC_USERNAME / BMC_PASSWORD                        (admin / password)
@@ -68,6 +70,8 @@ TEST_INFRA_DIR="${TEST_INFRA_DIR:-}"
 BMH_NAMESPACE="${BMH_NAMESPACE:-host-inventory}"
 BMH_COUNT="${BMH_COUNT:-2}"
 BMH_DISK_SIZE="${BMH_DISK_SIZE:-150G}"
+BMH_CPU="${BMH_CPU:-4}"
+BMH_MEMORY_MIB="${BMH_MEMORY_MIB:-8192}"
 BMH_LABELS="${BMH_LABELS:-osac.openshift.io/host-type=default}"
 BMC_USERNAME="${BMC_USERNAME:-admin}"
 BMC_PASSWORD="${BMC_PASSWORD:-password}"
@@ -280,6 +284,8 @@ grow_vms() {
 		--redfish-host "${GW_IP}" \
 		--redfish-port "${SUSHY_PORT}" \
 		--count "${want}" \
+		--cpu "${BMH_CPU}" \
+		--memory-mib "${BMH_MEMORY_MIB}" \
 		--disk-size "${BMH_DISK_SIZE}"
 }
 

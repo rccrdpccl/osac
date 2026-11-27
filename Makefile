@@ -77,7 +77,9 @@
 # cluster-tool's client setup, TEARDOWN_FLAVOR=1 also deletes the flavor.
 #
 # `make osac-dev-e2e` runs the pytest suites in tests/e2e against whatever is
-# deployed. The suite is required, because the prerequisites differ by orders of
+# deployed. Remote CaaS clones use the CI Podman runner on REMOTE_HOST by
+# default so the guest API is reachable. E2E_RUNNER=local forces local pytest.
+# The suite is required, because the prerequisites differ by orders of
 # magnitude: tests/e2e/projects only needs the API, vmaas/sanity needs a VM
 # template and storage, caas/sanity provisions a cluster on the virtual BMHs.
 # Narrow a run with E2E_FILTER (pytest -k), E2E_MARKER (pytest -m, e.g.
@@ -151,6 +153,10 @@ HELM                    ?= helm
 BMH_NAMESPACE           ?= host-inventory
 BMH_COUNT               ?= 2
 BMH_DISK_SIZE           ?= 150G
+# Empty uses the dev BMH profile defaults (OpenShift full-ci: 8 / 12288).
+BMH_CPU                 ?=
+BMH_MEMORY_MIB          ?=
+REPAIR_BMH_SIZING       ?=
 SUSHY_PORT              ?= 8000
 SUSHY_CACHE_PORT        ?= 8080
 # osac-test-infra checkout the emulation runs from; empty means
@@ -174,8 +180,9 @@ AAP_LICENSE_FILE        ?=
 # Image tags recorded by osac-dev-prep and replayed by osac-dev-deploy.
 ARTIFACTS_FILE          ?= $(HOME)/.cache/osac-dev/builds.json
 # E2E runner (tools/dev-env/e2e.sh): the suite is required, the selectors and
-# the extra arguments are optional, and OSAC_CLI_PATH overrides the CLI that the
-# runner builds from this worktree into the ARTIFACTS_FILE directory.
+# the extra arguments are optional. OSAC_CLI_PATH overrides the CLI built from
+# this worktree (local) or copied from the deployed service (remote container).
+E2E_RUNNER              ?= auto
 E2E_SUITE               ?=
 E2E_FILTER              ?=
 E2E_MARKER              ?=
@@ -187,10 +194,11 @@ SKAFFOLD_ARGS           ?=
 export CLUSTER_TOOL SERVER_NAME REMOTE_HOST PULL_SECRET_FILE \
 	OSAC_DEV_HUB_KUBECONFIG CLUSTER_TOOL_DATA FLAVOR FLAVOR_IMAGE CLUSTER_NAME \
 	DISK_SIZE CLUSTER_TOOL_FORCE CLUSTER_DOMAIN OSAC_INSTALLER PLATFORM PROFILE \
-	NS HELM BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE SUSHY_PORT SUSHY_CACHE_PORT \
+	NS HELM BMH_NAMESPACE BMH_COUNT BMH_DISK_SIZE BMH_CPU BMH_MEMORY_MIB SUSHY_PORT SUSHY_CACHE_PORT \
 	BMH_LABELS TEST_INFRA_DIR TEST_INFRA_REF TEST_INFRA_REPO TEST_INFRA_UPDATE \
 	BMC_USERNAME BMC_PASSWORD SKAFFOLD IMAGE_PREFIX AAP_LICENSE_FILE ARTIFACTS_FILE
 export OSAC_DEV_FORCE := $(FORCE)
+export E2E_RUNNER := $(E2E_RUNNER)
 export E2E_SUITE := $(E2E_SUITE)
 export E2E_FILTER := $(E2E_FILTER)
 export E2E_MARKER := $(E2E_MARKER)
@@ -242,8 +250,8 @@ osac-dev-setup: ## Client setup only (dnsmasq, NetworkManager)
 osac-dev-deps: ## Install OSAC prerequisites (REPAIR_LVMS=1 opts into repairing a failed clone)
 	@$(OSAC_DEV_ENV)/deps.sh $(if $(filter 1,$(REPAIR_LVMS)),--repair-lvms)
 
-osac-dev-bmh: ## Create virtual BareMetalHosts on REMOTE_HOST (needs REMOTE_HOST)
-	@$(OSAC_DEV_ENV)/bmh.sh
+osac-dev-bmh: ## Create virtual BMHs, or refresh persistent sizing (REPAIR_BMH_SIZING=1)
+	@$(OSAC_DEV_ENV)/bmh.sh $(if $(filter 1,$(REPAIR_BMH_SIZING)),--repair-sizing) $(if $(DRY_RUN),--dry-run,)
 
 osac-dev-dns: ## Route hub names to dnsmasq here and on REMOTE_HOST
 	@$(OSAC_DEV_ENV)/dns.sh
@@ -266,7 +274,7 @@ osac-dev-aap-project: ## Serve this worktree as the config-as-code project, prin
 osac-dev-watch: ## Rebuild and redeploy OSAC on every change (skaffold dev)
 	@$(OSAC_DEV_ENV)/osac.sh dev $(SKAFFOLD_ARGS)
 
-osac-dev-e2e: ## Run an E2E suite against the hub (E2E_SUITE=, E2E_FILTER=, E2E_MARKER=, E2E_KEEP=1)
+osac-dev-e2e: ## Run E2E against the hub (E2E_SUITE=, E2E_RUNNER=auto, E2E_FILTER=, E2E_MARKER=, E2E_KEEP=1)
 	@$(OSAC_DEV_ENV)/e2e.sh $(if $(DRY_RUN),--dry-run,)
 
 osac-dev-delete: ## Uninstall the osac Helm release (keeps osac-deps/osac-infra)

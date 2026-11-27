@@ -3,7 +3,7 @@
 #
 # bmh.sh — run the virtual BMH setup on REMOTE_HOST against the hub.
 #
-# Usage: tools/dev-env/bmh.sh [--force]
+# Usage: tools/dev-env/bmh.sh [--force | --repair-sizing [--dry-run]]
 #
 # The emulation is osac-test-infra's: tools/shared/virtual-bmh.sh is a thin
 # orchestrator over its activate-ironic.sh, setup-sushy-tools.sh,
@@ -42,6 +42,7 @@
 #   OSAC_DEV_HUB_KUBECONFIG  kubeconfig of the hub, else ~/.kube/<CLUSTER_NAME>
 #   CLUSTER_NAME     cluster-tool clone name, used for network/VM names
 #   BMH_NAMESPACE=host-inventory BMH_COUNT=2 BMH_DISK_SIZE=150G SUSHY_PORT=8000
+#   BMH_CPU and BMH_MEMORY_MIB default to CI sizing (8 and 12288) for full-ci.
 #   TEST_INFRA_DIR=~/osac-test-infra  TEST_INFRA_REF=main  TEST_INFRA_UPDATE=
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -52,7 +53,7 @@ LIB="${REPO_ROOT}/tools/shared/virtual-bmh.sh"
 
 usage() {
 	cat <<'EOF'
-Usage: tools/dev-env/bmh.sh [--force]
+Usage: tools/dev-env/bmh.sh [--force | --repair-sizing [--dry-run]]
 
 Create virtual BareMetalHosts on REMOTE_HOST for the hub: libvirt VMs on the
 cluster-tool network plus a sushy-tools Redfish emulator, then BMH resources
@@ -70,6 +71,9 @@ Inputs (defaults in common.sh / the Makefile):
   OSAC_DEV_HUB_KUBECONFIG  kubeconfig of the hub, else ~/.kube/<CLUSTER_NAME>
   CLUSTER_NAME=osac-dev    cluster-tool clone name (network and VM names)
   BMH_NAMESPACE=host-inventory  BMH_COUNT=2  BMH_DISK_SIZE=150G
+  BMH_CPU and BMH_MEMORY_MIB default to 8 and 12288 for OpenShift full-ci.
+  --repair-sizing updates only persistent definitions of available, unclaimed
+  dev BMHs. It does not restart VMs. --dry-run previews this operation.
   SUSHY_PORT=8000          BMC_USERNAME=admin  BMC_PASSWORD=password
   BMH_LABELS="osac.openshift.io/host-type=default"
   TEST_INFRA_DIR=${HOME}/osac-test-infra on REMOTE_HOST (default),
@@ -85,14 +89,15 @@ EOF
 # The raw inventory that osac-test-infra's tools maintain is the source of truth:
 # host names carry a generated token, so they are not derivable from the clone,
 # and the inventory is what maps a BMH back to the domain that backs it. Fails
-# when there is no inventory or any listed domain is not running. Runs as root
-# on the hub's host, which is the context the library created them in.
+# when there is no inventory or any listed domain is not running (unless
+# checking persistent sizing, where shut-off domains are also safe). Runs as
+# root on the hub's host, which is the context the library created them in.
 remote_vm_state() {
-	ssh_remote_root "env CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") bash -s" <<'REMOTE'
+	ssh_remote_root "env LC_ALL=C CLONE_NAME=$(printf '%q' "${CLUSTER_NAME}") bash -s -- $(printf '%q' "${1:-running}")" <<'REMOTE'
 set -euo pipefail
 inventory="${HOME}/virtual-bmh-inventory-${CLONE_NAME}.json"
 [ -f "${inventory}" ] || exit 1
-python3 - "${inventory}" <<'PY'
+python3 - "${inventory}" "$1" <<'PY'
 import json, subprocess, sys
 
 with open(sys.argv[1]) as inventory_file:
@@ -103,7 +108,8 @@ for host in inventory["hosts"]:
         capture_output=True,
         text=True,
     )
-    if state.returncode != 0 or state.stdout.strip() != "running":
+    allowed = {"running", "shut off"} if sys.argv[2] == "defined" else {"running"}
+    if state.returncode != 0 or state.stdout.strip() not in allowed:
         sys.exit(1)
     print(host["name"], host["boot_mac"], host["uuid"])
 PY
@@ -280,6 +286,8 @@ $(remote_kubeconfig_env)
 BMH_NAMESPACE=$(printf '%q' "${BMH_NAMESPACE}")
 BMH_COUNT=$(printf '%q' "${BMH_COUNT}")
 BMH_DISK_SIZE=$(printf '%q' "${BMH_DISK_SIZE}")
+BMH_CPU=$(printf '%q' "${BMH_CPU}")
+BMH_MEMORY_MIB=$(printf '%q' "${BMH_MEMORY_MIB}")
 SUSHY_PORT=$(printf '%q' "${SUSHY_PORT}")
 SUSHY_CACHE_PORT=$(printf '%q' "${SUSHY_CACHE_PORT}")
 BMH_LABELS=$(printf '%q' "${BMH_LABELS}")
@@ -291,10 +299,37 @@ EOF
 	ssh_remote_root "env ${remote_env//$'\n'/ } bash -s" <"${LIB}"
 }
 
+repair_bmh_sizing() {
+	local mode=$1 kubectl hosts domains name mac uuid command
+	local -a targets=()
+	kubectl=$(kubectl_bin)
+	[[ -n ${kubectl} ]] || die 'kubectl or oc is required to check BareMetalHosts'
+	command -v jq >/dev/null || die 'jq is required to check BareMetalHost ownership'
+	domains=$(remote_vm_state defined) || die 'cannot read the clone virtual worker inventory'
+	[[ -n ${domains} ]] || die 'no existing virtual workers to resize'
+	hosts=$("${kubectl}" --kubeconfig "${HUB_KUBECONFIG}" -n "${BMH_NAMESPACE}" get bmh -o json) ||
+		die 'cannot inspect BareMetalHost allocations'
+	while read -r name mac uuid; do
+		[[ ${name} == "virtual-bmh-${CLUSTER_NAME}-"* ]] || die "${name}: not a worker of this clone"
+		jq -e --arg name "${name}" --arg mac "${mac}" --arg uuid "${uuid}" '
+			any(.items[]; .metadata.name == $name and .metadata.deletionTimestamp == null and
+			  .status.provisioning.state == "available" and .spec.consumerRef == null and
+			  (.spec.bootMACAddress | ascii_downcase) == ($mac | ascii_downcase) and
+			  (.spec.bmc.address | endswith("/" + $uuid)))' <<<"${hosts}" >/dev/null ||
+			die "${name}: expected an available, unclaimed BareMetalHost matching the VM inventory"
+		targets+=("${name}" "${uuid}" "${mac}")
+	done <<<"${domains}"
+	printf -v command '%q ' "${mode}" "test-infra-net-${CLUSTER_NAME}" "${BMH_CPU}" "${BMH_MEMORY_MIB}" "${targets[@]}"
+	ssh_remote_root "LC_ALL=C python3 - ${command}" <"${DEV_ENV_DIR}/bmh-definition.py"
+}
+
 main() {
+	local repair_sizing=0 dry_run=0
 	while [ $# -gt 0 ]; do
 		case $1 in
 		-f | --force) OSAC_DEV_FORCE=1 ;;
+		--repair-sizing) repair_sizing=1 ;;
+		--dry-run) dry_run=1 ;;
 		-h | --help)
 			usage
 			return 0
@@ -311,6 +346,23 @@ main() {
 	HUB_KUBECONFIG=$(hub_kubeconfig)
 	[ -f "${HUB_KUBECONFIG}" ] ||
 		die "hub kubeconfig ${HUB_KUBECONFIG} not found; set OSAC_DEV_HUB_KUBECONFIG"
+
+	if [[ ${PLATFORM} == openshift && ${PROFILE} == full-ci ]]; then
+		: "${BMH_CPU:=8}" "${BMH_MEMORY_MIB:=12288}"
+	else
+		: "${BMH_CPU:=4}" "${BMH_MEMORY_MIB:=8192}"
+	fi
+	[[ ${BMH_CPU} =~ ^[1-9][0-9]*$ && ${BMH_MEMORY_MIB} =~ ^[1-9][0-9]*$ ]] ||
+		die 'BMH_CPU and BMH_MEMORY_MIB must be positive integers'
+	if [[ ${repair_sizing} == 1 ]]; then
+		if [[ ${dry_run} == 1 ]]; then
+			repair_bmh_sizing preview
+		else
+			repair_bmh_sizing apply
+		fi
+		return
+	fi
+	[[ ${dry_run} == 0 ]] || die '--dry-run is supported with --repair-sizing only'
 
 	ssh_remote true ||
 		die "cannot ssh to ${REMOTE_HOST} without a password (check your ssh agent)"

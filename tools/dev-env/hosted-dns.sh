@@ -30,11 +30,12 @@
 #
 # So this publishes, per order, one NetworkManager dnsmasq drop-in on the hub's
 # host: the API name to the hosted kube-apiserver LoadBalancer address, and the
-# apps domain to each worker's node address, which is where the guest routers
-# listen (the guest IngressController publishes on the host network). Both values
-# come from the hub, so the records follow the orders a suite creates and are
-# dropped when an order is deleted. The hub CoreDNS half — delegating this
-# dnsmasq the hosted zone, because the corp resolver answers NXDOMAIN for it — is
+# apps domain to the order's reserved guest ingress VIP. Both values come from
+# the hub, so records follow the orders a suite creates and are dropped when an
+# order is deleted. Drop-ins are keyed by hub UID and order UID, so another
+# hub's records (including old, unscoped files) are never pruned. The hub CoreDNS
+# half — delegating this dnsmasq the hosted zone because the corp resolver answers
+# NXDOMAIN for it — is
 # ensure_hub_dns_zone_forward in common.sh. The worker VMs resolve through the
 # test-infra network's dnsmasq, which cluster-tool defines with
 # localOnly='yes'; flipping that is ensure_vm_net_forwards_hosted_zone in
@@ -69,11 +70,11 @@ hub's host (REMOTE_HOST), where NetworkManager's dnsmasq reads them:
 
   address=/api.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
   address=/api-int.<order>.<baseDomain>/<kube-apiserver LoadBalancer address>
-  address=/.apps.<order>.<baseDomain>/<worker node address>   (one per worker)
+  address=/.apps.<order>.<baseDomain>/<reserved guest ingress VIP>
 
 <baseDomain> comes from the HostedCluster (spec.dns.baseDomain, hosted.<hub
 zone>); the addresses come from the hub's kube-apiserver Service and the
-AgentMachines of the hosted control plane namespace. The hosted zone is
+CI guest ingress VIP claim registry. The hosted zone is
 delegated nowhere in a dev environment, and the catch-all cluster-tool writes for
 the hub zone answers these names with the hub's own address, which stalls a CaaS
 order at "Workers Joining" even though the cluster itself came up.
@@ -95,34 +96,37 @@ kube() {
 	KUBECONFIG="${kubeconfig}" "${kubectl}" "$@"
 }
 
-# order<TAB>hosted cluster<TAB>hosted cluster namespace, one per line.
+# UID, namespace, order, hosted cluster and hosted namespace. The operator
+# supplies the namespace before AAP needs DNS, but may not have observed the
+# HostedCluster name yet. The dev CI template creates it with the order name.
 hosted_orders() {
-	kube get clusterorder --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.clusterReference.hostedClusterName}{"\t"}{.status.clusterReference.namespace}{"\n"}{end}' 2>/dev/null ||
-		true
+	kube get clusterorder --all-namespaces -o json | jq -r '.items[] |
+		[.metadata.uid, .metadata.namespace, .metadata.name,
+		  ((.status.clusterReference.hostedClusterName | select(. != "")) // .metadata.name),
+		  (.status.clusterReference.namespace // "")] | @tsv'
 }
 
 # Every zone this run has to keep resolvable: the hosted zone from the hub's
 # ingress domain, plus the baseDomain each live HostedCluster actually set.
 hosted_zones() {
-	local _order hc hc_ns base
+	local orders _uid _namespace _order hc hc_ns base
+	orders=$(hosted_orders) || return 1
 	{
 		hosted_dns_zone
-		while IFS=$'\t' read -r _order hc hc_ns; do
-			[ -n "${hc}" ] || continue
+		while IFS=$'\t' read -r _uid _namespace _order hc hc_ns; do
+			[ -n "${hc_ns}" ] || continue
 			base=$(kube get hostedcluster "${hc}" -n "${hc_ns}" \
 				-o jsonpath='{.spec.dns.baseDomain}' 2>/dev/null) || base=""
 			[ -n "${base}" ] && printf '%s\n' "${base}"
-		done < <(hosted_orders)
+		done <<<"${orders}"
 	} | sort -u
 }
 
-# The dnsmasq records one hosted cluster needs, one address= line each. Silent
-# while the control plane has no LoadBalancer address yet or no worker has
-# registered: there is nothing truthful to publish then, and the next pass picks
-# it up.
+# Publish the API as soon as it has a LoadBalancer address, then publish the
+# ingress VIP as soon as AAP claims it, before AAP waits for DNS or workers.
 order_records() {
-	local hc=$1 hc_ns=$2
-	local hcp_ns="${hc_ns}-${hc}" base kas node_ips ip
+	local hc=$1 hc_ns=$2 vip=$3
+	local hcp_ns="${hc_ns}-${hc}" base kas
 	base=$(kube get hostedcluster "${hc}" -n "${hc_ns}" \
 		-o jsonpath='{.spec.dns.baseDomain}' 2>/dev/null) || base=""
 	[ -n "${base}" ] || return 0
@@ -132,14 +136,9 @@ order_records() {
 		printf 'address=/api.%s.%s/%s\n' "${hc}" "${base}" "${kas}"
 		printf 'address=/api-int.%s.%s/%s\n' "${hc}" "${base}" "${kas}"
 	fi
-	node_ips=$(kube get agentmachine -n "${hcp_ns}" \
-		-o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="ExternalIP")].address}{"\n"}{end}' \
-		2>/dev/null) || node_ips=""
-	while read -r ip; do
-		if [ -n "${ip}" ]; then
-			printf 'address=/.apps.%s.%s/%s\n' "${hc}" "${base}" "${ip}"
-		fi
-	done <<<"${node_ips}"
+	if [[ ${vip} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+		printf 'address=/.apps.%s.%s/%s\n' "${hc}" "${base}" "${vip}"
+	fi
 }
 
 remote_read() {
@@ -168,46 +167,57 @@ verify_name() {
 	fi
 }
 
-# Drop the drop-ins of hosted clusters that no longer exist. $* is the set of
-# clusters still published.
+# Drop only records of this hub's deleted orders. Legacy unscoped files are
+# intentionally left alone. Return success only if files were removed.
 prune_stale() {
-	local dry_run=$1 keep=" $* " files file hc
-	files=$(ssh_remote_root "ls -1 ${DNSMASQ_DIR}/hosted-*.conf" 2>/dev/null) || files=""
+	local dry_run=$1 keep=$2 files file uid removed=1
+	local prefix="${DNSMASQ_DIR}/hosted-${hub_uid}-"
+	files=$(ssh_remote_root "ls -1 ${prefix}*.conf" 2>/dev/null) || files=""
 	for file in ${files}; do
-		hc=${file##*/hosted-}
-		hc=${hc%.conf}
-		case ${keep} in
-		*" ${hc} "*) continue ;;
+		[[ ${file} == "${prefix}"*.conf ]] || continue
+		uid=${file#"${prefix}"}
+		uid=${uid%.conf}
+		case " ${keep} " in
+		*" ${uid} "*) continue ;;
 		esac
 		remote_read "${file}" | awk 'NR == 1' | grep -qxF "${MARKER}" || continue
 		if [ "${dry_run}" = "1" ]; then
-			log "would remove ${file} (no ClusterOrder for ${hc})"
+			log "would remove ${file} (no ClusterOrder with UID ${uid})"
 			continue
 		fi
-		log "removing ${file} (no ClusterOrder for ${hc})"
-		ssh_remote_root "rm -f $(printf '%q' "${file}")" ||
+		log "removing ${file} (no ClusterOrder with UID ${uid})"
+		if ssh_remote_root "rm -f $(printf '%q' "${file}")"; then
+			removed=0
+		else
 			warn "could not remove ${file}"
+		fi
 	done
+	return "${removed}"
 }
 
 # One pass: publish every hosted order's records, then prune what died.
 publish_once() {
-	local dry_run=$1 prune=$2 orders order hc hc_ns records conf current
+	local dry_run=$1 prune=$2 orders claims uid namespace order hc hc_ns vip records conf current
 	local desired changed="" kept="" api domain addr
 	local -a published=()
-	orders=$(hosted_orders)
+	orders=$(hosted_orders) || return 1
+	claims=$(kube get configmap osac-ci-guest-ingress-vip-claims -n "${NS}" --ignore-not-found -o json) || return 1
 	if [ -z "${orders}" ]; then
 		log "no ClusterOrder owns a hosted cluster yet"
 	fi
-	while IFS=$'\t' read -r order hc hc_ns; do
-		[ -n "${hc:-}" ] || continue
-		kept="${kept} ${hc}"
-		records=$(order_records "${hc}" "${hc_ns}") || records=""
+	while IFS=$'\t' read -r uid namespace order hc hc_ns; do
+		[[ ${uid} =~ ^[a-z0-9-]+$ ]] || continue
+		kept="${kept} ${uid}"
+		[ -n "${hc_ns}" ] || continue
+		vip=$(jq -r --arg uid "${uid}" --arg owner "${namespace}/${order}" '
+			(.data[$uid] // "" | split(" ")) | select(length == 2 and .[1] == $owner) | .[0]' \
+			<<<"${claims}") || return 1
+		records=$(order_records "${hc}" "${hc_ns}" "${vip}") || records=""
 		if [ -z "${records}" ]; then
-			log "${hc}: no API address or worker yet, nothing to publish"
+			log "${hc}: no hosted endpoint yet, nothing to publish"
 			continue
 		fi
-		conf="${DNSMASQ_DIR}/hosted-${hc}.conf"
+		conf="${DNSMASQ_DIR}/hosted-${hub_uid}-${uid}.conf"
 		desired=$(printf '%s\n%s' "${MARKER}" "${records}")
 		current=$(remote_read "${conf}")
 		if [ "${current}" = "${desired}" ]; then
@@ -232,8 +242,8 @@ publish_once() {
 			published+=("${domain} ${addr}")
 		done < <(printf '%s\n' "${records}" | grep '^address=/api' || true)
 	done <<<"${orders}"
-	if [ "${prune}" = "1" ]; then
-		prune_stale "${dry_run}" "${kept}"
+	if [ "${prune}" = "1" ] && prune_stale "${dry_run}" "${kept}"; then
+		changed=1
 	fi
 	[ -n "${changed}" ] || return 0
 	reload_dnsmasq
@@ -247,7 +257,7 @@ publish_once() {
 }
 
 main() {
-	local dry_run="" watch="" prune=1 interval=${HOSTED_DNS_INTERVAL}
+	local dry_run="" watch="" prune=1 interval=${HOSTED_DNS_INTERVAL} zones
 	require_user_context
 
 	while [ $# -gt 0 ]; do
@@ -275,11 +285,15 @@ main() {
 	[ -n "${kubectl}" ] || die "neither kubectl nor oc is on PATH"
 	[ -f "${kubeconfig}" ] ||
 		die "no kubeconfig at ${kubeconfig}; boot the hub first (make osac-dev-cluster)"
+	command -v jq >/dev/null || die 'jq is required to publish hosted DNS'
+	hub_uid=$(kube get namespace kube-system -o jsonpath='{.metadata.uid}') || die 'cannot identify DNS owner hub'
+	[[ ${hub_uid} =~ ^[a-z0-9-]+$ ]] || die 'unexpected hub UID; refusing to change DNS'
+	zones=$(hosted_zones) || die 'cannot read ClusterOrders on the hub'
 	if [ "${dry_run}" = "1" ]; then
-		log "would let hub CoreDNS forward $(hosted_zones | tr '\n' ' ')to the host dnsmasq"
+		log "would let hub CoreDNS forward $(tr '\n' ' ' <<<"${zones}")to the host dnsmasq"
 	else
-		# shellcheck disable=SC2046 # zone names never contain whitespace
-		ensure_hub_dns_zone_forward $(hosted_zones)
+		# shellcheck disable=SC2086 # zone names never contain whitespace
+		ensure_hub_dns_zone_forward ${zones}
 	fi
 
 	if [ "${watch}" = "1" ]; then

@@ -16,7 +16,8 @@
 #   KUBECONFIG              the dev hub (OSAC_DEV_HUB_KUBECONFIG, else
 #                           ~/.kube/<CLUSTER_NAME>)
 #   OSAC_NAMESPACE          NS (osac); the tests default to osac-devel
-#   OSAC_CLI_PATH           the osac CLI, built from the worktree when missing
+#   OSAC_CLI_PATH           override; defaults to a worktree build locally or
+#                           the deployed Fulfillment CLI in remote mode
 #   OSAC_PULL_SECRET_PATH   PULL_SECRET_FILE, else the hub's own pull secret
 #   OSAC_SSH_PUBLIC_KEY_PATH  ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub
 #
@@ -28,7 +29,12 @@
 # published on names only the hub host's dnsmasq can answer (hosted-dns.sh). For
 # those suites this starts that publisher in --watch mode before pytest and stops
 # it afterwards, because the order it has to publish for does not exist yet; its
-# output goes to <ARTIFACTS_FILE dir>/hosted-dns.log.
+# output goes to hosted-dns.log beside ARTIFACTS_FILE (local) or inside the
+# per-run artifacts directory (remote).
+#
+# CaaS on a remote clone defaults to Podman on REMOTE_HOST, where the hosted
+# records and guest subnet are reachable. Set E2E_RUNNER=local to use local
+# pytest instead, or E2E_RUNNER=remote-container to require Podman.
 #
 # Everything else keeps the tests' defaults, which already resolve from the
 # cluster: the cluster domain, the fulfillment and Keycloak routes, the service
@@ -66,7 +72,10 @@
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "${script_dir}/common.sh"
+# shellcheck source=e2e-remote.sh
+source "${script_dir}/e2e-remote.sh"
 
+: "${E2E_RUNNER:=auto}"
 : "${E2E_SUITE:=}"
 : "${E2E_FILTER:=}"
 : "${E2E_MARKER:=}"
@@ -230,9 +239,9 @@ resolve_pull_secret() {
 	path="$(dirname "$(expand_path "${ARTIFACTS_FILE}")")/pull-secret.json"
 	if [ ! -s "${path}" ]; then
 		mkdir -p "$(dirname "${path}")"
-		KUBECONFIG="${kubeconfig}" "${kubectl}" -n openshift-config \
+		(umask 077; KUBECONFIG="${kubeconfig}" "${kubectl}" -n openshift-config \
 			get secret pull-secret -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null |
-			base64 -d >"${path}" || {
+			base64 -d >"${path}") || {
 			rm -f "${path}"
 			return 1
 		}
@@ -263,13 +272,30 @@ resolve_ssh_key() {
 # only touches the hub host's dnsmasq and the hub's CoreDNS upstreams.
 hosted_dns_pid=""
 
+is_caas_suite() {
+	[[ $1 == tests/e2e/caas || $1 == tests/e2e/caas/* ]]
+}
+
+select_runner() {
+	case ${E2E_RUNNER} in
+	auto)
+		if is_caas_suite "$1" && [[ -n ${REMOTE_HOST} ]] && ! remote_is_local; then
+			printf '%s\n' remote-container
+		else
+			printf '%s\n' local
+		fi ;;
+	local) printf '%s\n' local ;;
+	remote-container)
+		[[ -n ${REMOTE_HOST} ]] && ! remote_is_local || die 'remote-container requires a remote REMOTE_HOST'
+		printf '%s\n' remote-container ;;
+	*) die 'E2E_RUNNER must be auto, local, or remote-container' ;;
+	esac
+}
+
 start_hosted_dns() {
 	local suite_path=$1 log_path
-	case ${suite_path} in
-	tests/e2e/caas/*) ;;
-	*) return 0 ;;
-	esac
-	log_path="$(dirname "$(expand_path "${ARTIFACTS_FILE}")")/hosted-dns.log"
+	is_caas_suite "${suite_path}" || return 0
+	log_path=${2:-"$(dirname "$(expand_path "${ARTIFACTS_FILE}")")/hosted-dns.log"}
 	mkdir -p "$(dirname "${log_path}")"
 	# nohup, because a kept run's publisher has to outlive the session that
 	# started it: tmux new -d dies with its command and hangs up the children,
@@ -277,6 +303,7 @@ start_hosted_dns() {
 	# trap still stops it on request, so this only removes SIGHUP from the list.
 	nohup "${script_dir}/hosted-dns.sh" --watch >"${log_path}" 2>&1 &
 	hosted_dns_pid=$!
+	hosted_dns_log=${log_path}
 	log "hosted-cluster DNS kept current by pid ${hosted_dns_pid} (${log_path})"
 }
 
@@ -291,17 +318,25 @@ stop_hosted_dns() {
 # there, and the names it answers are what the person inspecting it dials.
 on_exit() {
 	local status=$?
+	trap - EXIT INT TERM
+	cleanup_remote_e2e
 	if [ "${keep}" = "1" ] && [ -n "${hosted_dns_pid}" ]; then
 		log "kept resources: hosted DNS still publishing for them (pid ${hosted_dns_pid})"
 		log "  stop it with: kill ${hosted_dns_pid}"
 	else
-		stop_hosted_dns
+		if [[ -n ${hosted_dns_pid} ]]; then
+			stop_hosted_dns
+			# Pick up orders deleted since the last watch tick. The publisher
+			# prunes only files owned by this hub and only after a clean list.
+			"${script_dir}/hosted-dns.sh" >>"${hosted_dns_log}" 2>&1 ||
+				warn "final hosted DNS reconciliation failed; see ${hosted_dns_log}"
+		fi
 	fi
 	exit "${status}"
 }
 
 main() {
-	local kubeconfig cli pull_secret ssh_key kubectl
+	local kubeconfig cli pull_secret ssh_key kubectl runner
 	require_user_context
 
 	while [ $# -gt 0 ]; do
@@ -352,20 +387,30 @@ main() {
        (see --help); e.g. make osac-dev-e2e E2E_SUITE=vmaas/sanity"
 
 	suite=$(resolve_suite "${suite}")
-	require_tools uv kubectl
-	command -v grpcurl >/dev/null 2>&1 ||
-		warn "grpcurl is not on PATH; suites that use the gRPC client will fail"
+	runner=$(select_runner "${suite}")
+	require_tools kubectl
+	if [[ ${runner} == local ]]; then
+		require_tools uv
+		command -v grpcurl >/dev/null 2>&1 ||
+			warn "grpcurl is not on PATH; suites that use the gRPC client will fail"
+	fi
 
 	kubeconfig=$(hub_kubeconfig)
 	check_hub "${kubeconfig}"
 	kubectl=$(kubectl_bin)
 	[ -n "${kubectl}" ] || die "neither kubectl nor oc is on PATH"
 	check_node_pressure "${kubeconfig}" "${kubectl}"
-	cli=$(resolve_cli)
+	if [[ ${runner} == local ]]; then
+		cli=$(resolve_cli)
+	else
+		cli=${OSAC_CLI_PATH:-'from the deployed Fulfillment image'}
+	fi
 
 	export KUBECONFIG="${kubeconfig}"
 	export OSAC_NAMESPACE="${NS}"
-	export OSAC_CLI_PATH="${cli}"
+	if [[ ${runner} == local ]]; then
+		export OSAC_CLI_PATH="${cli}"
+	fi
 	if pull_secret=$(resolve_pull_secret "${kubeconfig}" "${kubectl}"); then
 		export OSAC_PULL_SECRET_PATH="${pull_secret}"
 	else
@@ -398,7 +443,7 @@ main() {
 
 	log "suite ${suite} on ${kubeconfig}"
 	[ "${repo}" = "${REPO_ROOT}" ] || log "tests from ${repo}"
-	log "cli ${OSAC_CLI_PATH}"
+	log "cli ${cli}"
 	[ -z "${OSAC_PULL_SECRET_PATH:-}" ] || log "pull secret ${OSAC_PULL_SECRET_PATH}"
 	[ -z "${OSAC_SSH_PUBLIC_KEY_PATH:-}" ] || log "ssh key ${OSAC_SSH_PUBLIC_KEY_PATH}"
 	[ -z "${filter_expr}" ] || log "filter -k ${filter_expr}"
@@ -409,14 +454,29 @@ main() {
 	fi
 
 	if [ "${dry_run}" = "1" ]; then
-		log "would run: uv run ${args[*]}"
+		if [[ ${runner} == remote-container ]]; then
+			log "would run via remote Podman on ${REMOTE_HOST}: ${args[*]}"
+		else
+			log "would run: uv run ${args[*]}"
+		fi
 		return 0
 	fi
 
-	cd "${repo}"
-	trap on_exit EXIT INT TERM
-	start_hosted_dns "${suite}"
-	uv run "${args[@]}"
+	trap on_exit EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	if [[ ${runner} == remote-container ]]; then
+		prepare_remote_e2e "${repo}" "${kubectl}"
+		if is_caas_suite "${suite}"; then
+			configure_dev_caas "${kubectl}"
+		fi
+		start_hosted_dns "${suite}" "${remote_e2e_output}/hosted-dns.log"
+		run_remote_e2e "${args[@]}"
+	else
+		cd "${repo}"
+		start_hosted_dns "${suite}"
+		uv run "${args[@]}"
+	fi
 }
 
 main "$@"
